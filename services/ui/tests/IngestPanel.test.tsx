@@ -60,12 +60,14 @@ describe("IngestPanel", () => {
     vi.restoreAllMocks();
   });
 
-  it("renders the Ingest heading and the JSON|Streams EnterpriseCallout banner", () => {
+  it("renders the Ingest heading and Streams + JSON EnterpriseCallout banners", () => {
     fetchMock.mockResolvedValue({ ok: true, json: async () => keysResponse(0) });
     renderPanel();
     expect(screen.getByRole("heading", { name: /^Ingest$/i, level: 1 })).toBeInTheDocument();
-    const callout = screen.getByTestId("enterprise-callout");
-    expect(callout).toHaveAttribute("data-signal", "JSON|Streams");
+    const callouts = screen.getAllByTestId("enterprise-callout");
+    const signals = callouts.map((c) => c.getAttribute("data-signal"));
+    expect(signals).toContain("Streams");
+    expect(signals).toContain("JSON");
   });
 
   it("polls GET /observability/keys?prefix=sens: and GET /observability/memory on mount", async () => {

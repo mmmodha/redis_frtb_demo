@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { EnterpriseCallout, type EnterpriseSignal } from "../components/EnterpriseCallout";
+import { EnterpriseCallout } from "../components/EnterpriseCallout";
 import { MetricTile } from "../components/MetricTile";
 import { PanelCard } from "../components/PanelCard";
 import {
@@ -9,11 +9,6 @@ import {
   type ObservabilityMemoryResponse,
 } from "../lib/api";
 import { listSources, startGenerator, startIngest, type Source } from "../lib/ingest";
-
-// "JSON|Streams" is a combined buying-signal callout per Wave 3 contract for
-// this panel. The shell agent's EnterpriseSignal union does not yet include
-// "Streams"; cast at the call site rather than edit task-1 files.
-const INGEST_SIGNAL = "JSON|Streams" as unknown as EnterpriseSignal;
 
 const POLL_MS = 1000;
 const MAX_SAMPLES = 60;
@@ -139,9 +134,14 @@ export function IngestPanel() {
         <p className="panel__subhead">Live throughput, memory growth and key locality for streaming sensitivities into Redis Enterprise.</p>
       </header>
 
-      <EnterpriseCallout signal={INGEST_SIGNAL}>
-        Sensitivities land via a durable Redis Stream and are written as native JSON documents — no row explosion, no flattening.
-      </EnterpriseCallout>
+      <div className="ingest-panel__callouts">
+        <EnterpriseCallout signal="Streams">
+          Sensitivities land via a durable Redis Stream — back-pressure, replay, and consumer groups for free.
+        </EnterpriseCallout>
+        <EnterpriseCallout signal="JSON">
+          Rows are written as native JSON documents — no row explosion, no flattening, indexable by RQE.
+        </EnterpriseCallout>
+      </div>
 
       <PanelCard
         title="Ingest controls"

@@ -85,9 +85,9 @@ describe("<CalcPanel />", () => {
     render(<CalcPanel />);
     const callouts = screen.getAllByText(/buying signal/i);
     expect(callouts.length).toBeGreaterThanOrEqual(3);
-    expect(screen.getByText(/InDatabaseCompute/)).toBeInTheDocument();
-    expect(screen.getByText(/MapReduce/)).toBeInTheDocument();
-    expect(screen.getByText(/HashTagLocality/)).toBeInTheDocument();
+    expect(screen.getByText("In-database compute")).toBeInTheDocument();
+    expect(screen.getByText("Map-Reduce")).toBeInTheDocument();
+    expect(screen.getByText("Hash-tag locality")).toBeInTheDocument();
   });
 
   it("renders an empty-state hint before the first calc", () => {
