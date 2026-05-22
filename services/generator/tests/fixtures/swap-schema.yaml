@@ -1,0 +1,40 @@
+# Deliberately different shape from multi-class.yaml.
+# Used to prove that swapping the schema YAML changes generated rows
+# with zero generator code changes (schema-driven contract).
+
+version: 1
+
+dimensions:
+  - { name: risk_class,       type: TAG,     indexed: true,  sortable: false, hash_tag_role: primary }
+  - { name: bucket,           type: TAG,     indexed: true,  sortable: false, hash_tag_role: primary }
+  - { name: risk_value,       type: NUMERIC, indexed: false, sortable: false }
+  - { name: weight,           type: NUMERIC, indexed: false, sortable: false }
+  - { name: sensitivity_type, type: TAG,     indexed: true,  sortable: false }
+  - { name: tenor,            type: TAG,     indexed: false, sortable: false }
+  - { name: pair,             type: TAG,     indexed: false, sortable: false }
+  - { name: spread,           type: NUMERIC, indexed: false, sortable: false }
+
+risk_classes:
+  FX:
+    dimensions: [risk_class, bucket, risk_value, weight, sensitivity_type, pair, spread]
+    buckets:
+      naming: pair
+      values: [USDEUR, USDGBP]
+    risk_weights_ref: fx_w
+    intra_bucket_correlation_ref: fx_r
+    cross_bucket_correlation_ref: fx_g
+
+frtb_binding:
+  risk_class: risk_class
+  bucket: bucket
+  tenor: tenor
+  risk_value: risk_value
+  weight: weight
+  sensitivity_type: sensitivity_type
+
+risk_weights:
+  fx_w: { constant: 0.075 }
+
+correlations:
+  fx_r: { kind: constant, value: 0.6 }
+  fx_g: { kind: constant, value: 0.6 }

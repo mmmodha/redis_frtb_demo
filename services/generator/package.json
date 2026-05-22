@@ -1,5 +1,5 @@
 {
-  "name": "@frtb-pov/generator",
+  "name": "@frtb/generator",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -11,8 +11,23 @@
     "build": "tsc -p tsconfig.json",
     "test": "vitest run",
     "test:watch": "vitest",
-    "start": "tsx src/cli.ts"
+    "start": "tsx src/cli.ts",
+    "typecheck": "tsc --noEmit"
   },
-  "dependencies": {},
-  "devDependencies": {}
+  "dependencies": {
+    "@frtb/schema": "*",
+    "commander": "^12.1.0",
+    "ioredis": "^5.4.2",
+    "pino": "^9.5.0",
+    "seedrandom": "^3.0.5",
+    "ulid": "^2.3.0",
+    "yaml": "^2.6.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/seedrandom": "^3.0.8",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
 }

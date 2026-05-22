@@ -1,0 +1,70 @@
+# Generator test fixture conforming to the @frtb/schema canonical Schema shape.
+# Covers three risk classes (GIRR with tenor array, EQUITY, FX) so the
+# generator's per-class row-shape behaviour can be exercised in isolation.
+
+version: 1
+
+dimensions:
+  - { name: risk_class,       type: TAG,           indexed: true,  sortable: false, hash_tag_role: primary }
+  - { name: bucket,           type: TAG,           indexed: true,  sortable: false, hash_tag_role: primary }
+  - { name: tenor,            type: TAG,           indexed: true,  sortable: true }
+  - { name: risk_value,       type: ARRAY_NUMERIC, indexed: false, sortable: false }
+  - { name: weight,           type: NUMERIC,       indexed: false, sortable: false }
+  - { name: sensitivity_type, type: TAG,           indexed: true,  sortable: false }
+  - { name: trade_id,         type: TAG,           indexed: false, sortable: false }
+  - { name: desk,             type: TAG,           indexed: true,  sortable: false, cardinality_hint: 4 }
+  - { name: issuer,           type: TAG,           indexed: true,  sortable: false, cardinality_hint: 6 }
+  - { name: pair,             type: TAG,           indexed: true,  sortable: false }
+
+risk_classes:
+  GIRR:
+    dimensions: [risk_class, bucket, tenor, risk_value, weight, sensitivity_type, trade_id, desk]
+    buckets:
+      naming: currency
+      values: [USD, EUR, GBP]
+    tenor:
+      count: 10
+      nodes: ["3M", "6M", "1Y", "2Y", "3Y", "5Y", "10Y", "15Y", "20Y", "30Y"]
+    risk_weights_ref: girr_weights
+    intra_bucket_correlation_ref: girr_rho
+    cross_bucket_correlation_ref: girr_gamma
+  EQUITY:
+    dimensions: [risk_class, bucket, risk_value, weight, sensitivity_type, trade_id, issuer]
+    buckets:
+      naming: bucket
+      values: ["1", "2", "3"]
+    risk_weights_ref: equity_weights
+    intra_bucket_correlation_ref: equity_rho
+    cross_bucket_correlation_ref: equity_gamma
+  FX:
+    dimensions: [risk_class, bucket, risk_value, weight, sensitivity_type, trade_id, pair]
+    buckets:
+      naming: pair
+      values: [USDEUR, USDGBP, USDJPY]
+    risk_weights_ref: fx_weights
+    intra_bucket_correlation_ref: fx_rho
+    cross_bucket_correlation_ref: fx_gamma
+
+frtb_binding:
+  risk_class: risk_class
+  bucket: bucket
+  tenor: tenor
+  risk_value: risk_value
+  weight: weight
+  sensitivity_type: sensitivity_type
+
+risk_weights:
+  girr_weights:
+    by_tenor: { "3M": 0.017, "6M": 0.017, "1Y": 0.016, "2Y": 0.013, "3Y": 0.012, "5Y": 0.011, "10Y": 0.011, "15Y": 0.011, "20Y": 0.011, "30Y": 0.011 }
+  equity_weights:
+    by_bucket: { "1": 0.55, "2": 0.6, "3": 0.45 }
+  fx_weights:
+    constant: 0.075
+
+correlations:
+  girr_rho:    { kind: constant, value: 0.99 }
+  girr_gamma:  { kind: constant, value: 0.5 }
+  equity_rho:  { kind: constant, value: 0.15 }
+  equity_gamma:{ kind: constant, value: 0.15 }
+  fx_rho:      { kind: constant, value: 0.6 }
+  fx_gamma:    { kind: constant, value: 0.6 }
