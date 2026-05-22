@@ -9,15 +9,45 @@ import { existsSync } from "node:fs";
 import { Redis } from "ioredis";
 import { loadSchema } from "@frtb/schema";
 import { createServer } from "./server.ts";
-import { getActiveTarget } from "./active-target.ts";
+import { getActiveTarget, setActiveTarget } from "./active-target.ts";
 import { buildCrossBucketCorrelations } from "./sbm/correlations.ts";
+import { createStore } from "./store.ts";
+import { seedConnections } from "./seed.ts";
 
 const PORT = Number(process.env.HEALTH_PORT ?? 8080);
 const SCHEMA_PATH = resolve(
   process.env.SCHEMA_FILE ?? "/app/config/schema/frtb-default.yaml"
 );
+const STORE_FILE = process.env.CONN_STORE_FILE ?? "/data/connections.enc.json";
+const MASTER_KEY = process.env.FRTB_MASTER_KEY ?? process.env.CONN_STORE_KEY;
 
 async function main(): Promise<void> {
+  if (!MASTER_KEY) {
+    console.error(JSON.stringify({
+      service: "api",
+      status: "fatal",
+      err: "FRTB_MASTER_KEY (or CONN_STORE_KEY) env var is required",
+    }));
+    process.exit(1);
+  }
+
+  const store = await createStore({ filePath: STORE_FILE, masterKey: MASTER_KEY });
+  await seedConnections(store);
+
+  // If a profile was already active when the process started, publish it to
+  // the active-target singleton so /redis/active-target and the Redis client
+  // below both pick up the persisted choice.
+  const activeRaw = store.getActiveRaw();
+  if (activeRaw) {
+    setActiveTarget({
+      host: activeRaw.host,
+      port: activeRaw.port,
+      tls: !!activeRaw.tls?.enabled,
+      db: activeRaw.db ?? 0,
+      label: activeRaw.name,
+    });
+  }
+
   const target = getActiveTarget();
   const redis = new Redis({
     host: target.host,
@@ -42,7 +72,7 @@ async function main(): Promise<void> {
     ? buildCrossBucketCorrelations(loadSchema(SCHEMA_PATH))
     : {};
 
-  const app = await createServer({ redis, correlations, logger: true });
+  const app = await createServer({ redis, correlations, store, logger: true });
   await app.listen({ port: PORT, host: "0.0.0.0" });
   console.log(JSON.stringify({ service: "api", status: "ready", port: PORT, target: target.label }));
 

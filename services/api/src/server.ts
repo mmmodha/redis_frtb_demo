@@ -6,11 +6,19 @@ import { registerPivotRoute } from "./routes/pivot.ts";
 import { registerCalcRoute } from "./routes/calc.ts";
 import { registerObservabilityRoutes } from "./routes/observability.ts";
 
+// Connections store + routes are owned by the Connections-store agent. Loaded
+// dynamically so this server boots even when that agent's files (store.ts,
+// routes/connections.ts) are not yet on disk during cross-agent development.
+export type ConnectionTester = (profile: unknown) => Promise<unknown>;
+export type ConnectionsStore = unknown;
+
 export interface CreateServerOpts {
-  redis: RedisLike;
+  redis?: RedisLike;
   activeTarget?: ActiveTarget;
   correlations?: Record<string, CorrelationSpec>;
   logger?: boolean;
+  store?: ConnectionsStore;
+  tester?: ConnectionTester;
 }
 
 export async function createServer(opts: CreateServerOpts): Promise<FastifyInstance> {
@@ -21,9 +29,19 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
   app.get("/healthz", async () => ({ service: "api", status: "ok" }));
   app.get("/redis/active-target", async () => getActiveTarget());
 
-  registerPivotRoute(app, opts.redis);
-  registerCalcRoute(app, opts.redis, { correlations: opts.correlations ?? {} });
-  registerObservabilityRoutes(app, opts.redis);
+  if (opts.redis) {
+    registerPivotRoute(app, opts.redis);
+    registerCalcRoute(app, opts.redis, { correlations: opts.correlations ?? {} });
+    registerObservabilityRoutes(app, opts.redis);
+  }
+
+  if (opts.store) {
+    const mod = await import("./routes/connections.ts").catch(() => null);
+    if (mod && typeof (mod as { registerConnectionsRoutes?: unknown }).registerConnectionsRoutes === "function") {
+      (mod as { registerConnectionsRoutes: (a: FastifyInstance, s: unknown, t?: unknown) => void })
+        .registerConnectionsRoutes(app, opts.store, opts.tester);
+    }
+  }
 
   return app;
 }

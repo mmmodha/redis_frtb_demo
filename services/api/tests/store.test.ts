@@ -78,9 +78,12 @@ describe("ConnectionsStore — CRUD + encryption-at-rest", () => {
   it("rejects loading a tampered store file (GCM auth)", async () => {
     const s = await createStore({ filePath, masterKey: KEY });
     await s.create({ name: "demo", host: "h", port: 1, password: "pw" });
-    const buf = readFileSync(filePath);
-    buf[buf.length - 1] ^= 0x01;
-    writeFileSync(filePath, buf);
+    // File is base64(iv|tag|ciphertext) — flip a bit in the decoded
+    // ciphertext region so GCM's auth tag verification fails on reload.
+    const raw = readFileSync(filePath, "utf8");
+    const decoded = Buffer.from(raw, "base64");
+    decoded[decoded.length - 1] ^= 0x01;
+    writeFileSync(filePath, decoded.toString("base64"));
     await expect(createStore({ filePath, masterKey: KEY })).rejects.toThrow();
   });
 
