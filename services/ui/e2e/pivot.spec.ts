@@ -36,7 +36,7 @@ test.describe("/pivot — Query/Pivot panel", () => {
 
   test("happy path: runs a pivot, renders results table and latency histogram", async ({ page }) => {
     let lastUrl = "";
-    await page.route("**/pivot*", async (route: Route) => {
+    await page.route(/\/pivot\?/, async (route: Route) => {
       lastUrl = route.request().url();
       await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(happyResponse) });
     });
@@ -65,14 +65,14 @@ test.describe("/pivot — Query/Pivot panel", () => {
     await page.goto("/pivot");
     await page.getByLabel(/risk class/i).selectOption("GIRR");
     const bucket = page.getByLabel(/^bucket$/i);
-    await expect(bucket.locator("option", { hasText: "USD-IRS" })).toHaveCount(1);
+    await expect(bucket.locator("option", { hasText: /^USD-IRS$/ })).toHaveCount(1);
     await page.getByLabel(/risk class/i).selectOption("Equity");
-    await expect(bucket.locator("option", { hasText: "B1" })).toHaveCount(1);
-    await expect(bucket.locator("option", { hasText: "USD-IRS" })).toHaveCount(0);
+    await expect(bucket.locator("option", { hasText: /^B1$/ })).toHaveCount(1);
+    await expect(bucket.locator("option", { hasText: /^USD-IRS$/ })).toHaveCount(0);
   });
 
   test("empty-result state shows the friendly empty message and no table", async ({ page }) => {
-    await page.route("**/pivot*", (route) =>
+    await page.route(/\/pivot\?/, (route) =>
       route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(emptyResponse) })
     );
     await page.goto("/pivot");
@@ -83,7 +83,7 @@ test.describe("/pivot — Query/Pivot panel", () => {
   });
 
   test("error state surfaces an alert when the api responds 5xx", async ({ page }) => {
-    await page.route("**/pivot*", (route) =>
+    await page.route(/\/pivot\?/, (route) =>
       route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "boom" }) })
     );
     await page.goto("/pivot");
@@ -93,7 +93,7 @@ test.describe("/pivot — Query/Pivot panel", () => {
   });
 
   test("error state surfaces an alert when fetch fails entirely", async ({ page }) => {
-    await page.route("**/pivot*", (route) => route.abort("failed"));
+    await page.route(/\/pivot\?/, (route) => route.abort("failed"));
     await page.goto("/pivot");
     await page.getByRole("button", { name: /run query/i }).click();
     await expect(page.getByRole("alert")).toBeVisible();
@@ -101,7 +101,7 @@ test.describe("/pivot — Query/Pivot panel", () => {
 
   test("filter combination: book free-text is forwarded as a TAG filter", async ({ page }) => {
     let observedUrl = "";
-    await page.route("**/pivot*", async (route) => {
+    await page.route(/\/pivot\?/, async (route) => {
       observedUrl = route.request().url();
       await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(emptyResponse) });
     });
@@ -114,7 +114,7 @@ test.describe("/pivot — Query/Pivot panel", () => {
 
   test("pagination Next advances offset by limit", async ({ page }) => {
     let calls: string[] = [];
-    await page.route("**/pivot*", async (route) => {
+    await page.route(/\/pivot\?/, async (route) => {
       calls.push(route.request().url());
       await route.fulfill({
         status: 200,

@@ -220,8 +220,10 @@ describe("PivotPanel", () => {
     const hist = await screen.findByTestId("latency-histogram");
     // server ms is reported, client ms is measured (non-zero)
     expect(hist).toHaveTextContent(/11\.1\s*ms/);
-    expect(within(hist).getByTestId("metric-tile-server-p50")).toBeInTheDocument();
-    expect(within(hist).getByTestId("metric-tile-client-p50")).toBeInTheDocument();
+    expect(within(hist).getByText(/server p50/i)).toBeInTheDocument();
+    expect(within(hist).getByText(/server p95/i)).toBeInTheDocument();
+    expect(within(hist).getByText(/server p99/i)).toBeInTheDocument();
+    expect(within(hist).getByText(/client p50/i)).toBeInTheDocument();
   });
 
   it("pagination Next button advances offset by limit and re-fetches", async () => {
