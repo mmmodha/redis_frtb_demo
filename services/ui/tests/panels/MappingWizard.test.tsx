@@ -43,8 +43,8 @@ describe("MappingWizard", () => {
         sourceName="girr-100k.csv"
         columns={COLUMNS}
         suggestion={suggestion}
-        onSaveAndIngest={onSaveAndIngest}
-        onCancel={onCancel}
+        onSaveAndIngest={onSaveAndIngest as unknown as (m: ColumnMapping) => void}
+        onCancel={onCancel as unknown as () => void}
       />,
     );
   }

@@ -137,8 +137,9 @@ describe("SourcesPanel", () => {
     renderPanel();
     const configureBtn = await waitFor(() => screen.getByRole("button", { name: /configure mapping/i }));
     fireEvent.click(configureBtn);
-    await waitFor(() => expect(screen.getByTestId("mapping-wizard")).toBeInTheDocument());
-    expect(screen.getByText("risk_class")).toBeInTheDocument();
+    const wizard = await waitFor(() => screen.getByTestId("mapping-wizard"));
+    const colsList = within(wizard).getByTestId("mapping-wizard__columns");
+    expect(within(colsList).getByText("risk_class")).toBeInTheDocument();
   });
 
   it("Save & Ingest from wizard → POST /mapping then POST /ingest then refreshes list", async () => {

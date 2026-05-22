@@ -417,21 +417,6 @@ button:hover, button:focus-visible {
 .panel__header h1 { margin-bottom: var(--grid); }
 .panel__subhead { color: var(--redis-text-secondary); margin: 0 0 calc(var(--grid) * 2); max-width: 80ch; }
 
-.btn { font-family: var(--font-body); }
-.btn--primary {
-  background: var(--redis-hyper);
-  color: #0A1A23;
-  border-color: var(--redis-hyper);
-  font-weight: 600;
-}
-.btn--primary:hover, .btn--primary:focus-visible {
-  background: var(--redis-deep-hyper);
-  border-color: var(--redis-deep-hyper);
-  color: #0A1A23;
-}
-.btn:disabled { opacity: 0.45; cursor: not-allowed; }
-.btn--primary:disabled { background: var(--redis-bg-tertiary); color: var(--redis-text-muted); border-color: var(--redis-border-secondary); }
-
 /* Sources panel */
 .sources-dropzone {
   display: grid;
