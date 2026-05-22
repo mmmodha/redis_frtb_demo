@@ -9,7 +9,9 @@
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "schema:generate": "pnpm --filter @frtb/schema-cli exec tsx src/bin.ts generate ../../config/schema/frtb-default.yaml --out ../../shared/schema/generated",
+    "schema:validate": "pnpm --filter @frtb/schema-cli exec tsx src/bin.ts validate"
   },
   "dependencies": {
     "yaml": "^2.6.1"

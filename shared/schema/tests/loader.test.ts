@@ -23,9 +23,9 @@ describe("loadSchema", () => {
   it("exposes risk classes keyed by name", () => {
     const schema = loadSchema(tiny);
     expect(Object.keys(schema.risk_classes)).toContain("GIRR");
-    const girr = schema.risk_classes.GIRR;
+    const girr = schema.risk_classes.GIRR!;
     expect(girr.buckets.values).toEqual(["USD", "EUR", "GBP"]);
-    expect(girr.tenor.nodes).toEqual(["3M", "6M", "1Y"]);
+    expect(girr.tenor!.nodes).toEqual(["3M", "6M", "1Y"]);
   });
 
   it("exposes the FRTB binding block", () => {

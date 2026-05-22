@@ -1,100 +1,443 @@
-# FRTB-SA bootstrap schema for the synthetic generator.
+# FRTB-SA Default Schema
+# -----------------------
+# Synthetic schema derived from BCBS d457 / MAR21 §21.4–§21.8.
+# Drives generator, ingest, RQE indexes, and SBM calc bindings.
+# When HSBC sends their real schema we swap this file (SCHEMA_FILE=...).
 #
-# This is a minimal default that the schema-design task is expected to expand
-# in place. Field names and types here become the contract that ingest, RQE
-# indexes, and Redis Functions bind against, so changes ripple downstream.
-#
-# Keys: sens:{risk_class}:{bucket}:{ulid} — the {risk_class}:{bucket} segment
-# is the cluster hash tag (cluster-hash-tag-strategy).
-
+# Conventions:
+#   - "indexed: true" → FT.CREATE adds the field to the RQE schema.
+#     Keep total indexed ≈ 10–15 of ~110 dims (RQE memory budget).
+#   - "hash_tag_role: primary" → participates in {risk_class}:{bucket} hash tag
+#     so per-bucket FCALL is slot-local.
+#   - tenor curves live in a single ARRAY_NUMERIC dimension — no row explosion.
 version: 1
-hash_tag_fields: [risk_class, bucket]
 
-# Shared / common dimensions that exist on every risk class.
-common_dimensions:
-  - { name: trade_id,         type: TAG }
-  - { name: book,             type: TAG,     cardinality_hint: 200 }
-  - { name: desk,             type: TAG,     cardinality_hint: 30 }
-  - { name: legal_entity,     type: TAG,     cardinality_hint: 12 }
-  - { name: portfolio,        type: TAG,     cardinality_hint: 120 }
-  - { name: currency,         type: TAG,     cardinality_hint: 30 }
-  - { name: as_of_date,       type: TAG }
-  - { name: sensitivity_type, type: TAG }     # delta | vega | curvature
-  - { name: risk_class,       type: TAG }     # girr | equity | fx | csr_ns | csr_sec_nonctp | csr_sec_ctp | commodity
-  - { name: bucket,           type: TAG }
-  - { name: weight,           type: NUMERIC }
+dimensions:
+  # ---- Common / cross-class identifiers + booking ----
+  - { name: risk_class, type: TAG, indexed: true, sortable: false, hash_tag_role: primary, cardinality_hint: 7 }
+  - { name: bucket, type: TAG, indexed: true, sortable: false, hash_tag_role: primary, cardinality_hint: 25 }
+  - { name: tenor, type: TAG, indexed: true, sortable: true, cardinality_hint: 12 }
+  - { name: risk_value, type: ARRAY_NUMERIC, indexed: false, sortable: false }
+  - { name: weight, type: NUMERIC, indexed: false, sortable: false }
+  - { name: sensitivity_type, type: TAG, indexed: true, sortable: false, cardinality_hint: 3 }
+  - { name: as_of_date, type: TAG, indexed: true, sortable: true, cardinality_hint: 30 }
+  - { name: calc_date, type: TAG, indexed: false, sortable: true }
+  - { name: currency, type: TAG, indexed: true, sortable: false, cardinality_hint: 30 }
+  - { name: ccy_pair, type: TAG, indexed: false, sortable: false }
+  - { name: desk, type: TAG, indexed: true, sortable: false, cardinality_hint: 200 }
+  - { name: book, type: TAG, indexed: false, sortable: false }
+  - { name: portfolio, type: TAG, indexed: false, sortable: false }
+  - { name: legal_entity, type: TAG, indexed: false, sortable: false }
+  - { name: trader, type: TAG, indexed: false, sortable: false }
+  - { name: trade_id, type: TAG, indexed: false, sortable: false }
+  - { name: position_id, type: TAG, indexed: false, sortable: false }
+  - { name: instrument_id, type: TAG, indexed: false, sortable: false }
+  - { name: instrument_type, type: TAG, indexed: false, sortable: false }
+  - { name: asof_ts, type: NUMERIC, indexed: false, sortable: true }
+  - { name: sensitivity_id, type: TAG, indexed: false, sortable: false }
+  - { name: source_system, type: TAG, indexed: false, sortable: false }
+  - { name: version, type: NUMERIC, indexed: false, sortable: false }
+
+  # ---- GIRR (General Interest Rate Risk) §21.40–§21.46 ----
+  - { name: girr_curve_type, type: TAG, indexed: false, sortable: false }    # yield / swap / basis
+  - { name: girr_basis_type, type: TAG, indexed: false, sortable: false }
+  - { name: girr_inflation_curve, type: TAG, indexed: false, sortable: false }
+  - { name: girr_repo_rate, type: NUMERIC, indexed: false, sortable: false }
+  - { name: girr_vol_option_maturity, type: TAG, indexed: false, sortable: false }
+  - { name: girr_vol_underlying_maturity, type: TAG, indexed: false, sortable: false }
+  - { name: girr_moneyness, type: NUMERIC, indexed: false, sortable: false }
+  - { name: girr_volatility_type, type: TAG, indexed: false, sortable: false }
+  - { name: girr_xccy_basis, type: NUMERIC, indexed: false, sortable: false }
+  - { name: girr_curve_node, type: TAG, indexed: false, sortable: false }
+
+  # ---- CSR non-securitisation §21.50–§21.55 ----
+  - { name: csr_credit_quality, type: TAG, indexed: true, sortable: false, cardinality_hint: 2 }  # IG/HY
+  - { name: csr_issuer_id, type: TAG, indexed: false, sortable: false }
+  - { name: csr_issuer_name, type: TAG, indexed: false, sortable: false }
+  - { name: csr_issuer_sector, type: TAG, indexed: false, sortable: false }
+  - { name: csr_issuer_region, type: TAG, indexed: false, sortable: false }
+  - { name: csr_seniority, type: TAG, indexed: false, sortable: false }
+  - { name: csr_rating, type: TAG, indexed: false, sortable: false }
+  - { name: csr_spread_curve_type, type: TAG, indexed: false, sortable: false }
+  - { name: csr_cds_basis, type: NUMERIC, indexed: false, sortable: false }
+  - { name: csr_cds_recovery_rate, type: NUMERIC, indexed: false, sortable: false }
+  - { name: csr_ref_obligation, type: TAG, indexed: false, sortable: false }
+  - { name: csr_restructuring_type, type: TAG, indexed: false, sortable: false }
+
+  # ---- CSR securitisation (non-CTP) §21.60–§21.65 ----
+  - { name: csrsec_tranche, type: TAG, indexed: false, sortable: false }
+  - { name: csrsec_attachment, type: NUMERIC, indexed: false, sortable: false }
+  - { name: csrsec_detachment, type: NUMERIC, indexed: false, sortable: false }
+  - { name: csrsec_pool_type, type: TAG, indexed: false, sortable: false }
+  - { name: csrsec_geographic_region, type: TAG, indexed: false, sortable: false }
+  - { name: csrsec_vintage, type: TAG, indexed: false, sortable: false }
+  - { name: csrsec_originator, type: TAG, indexed: false, sortable: false }
+  - { name: csrsec_servicer, type: TAG, indexed: false, sortable: false }
+  - { name: csrsec_credit_enhancement, type: NUMERIC, indexed: false, sortable: false }
+  - { name: csrsec_payment_priority, type: TAG, indexed: false, sortable: false }
+
+  # ---- CSR securitisation CTP §21.70–§21.75 ----
+  - { name: ctp_tranche_seniority, type: TAG, indexed: false, sortable: false }
+  - { name: ctp_index_name, type: TAG, indexed: false, sortable: false }
+  - { name: ctp_series, type: TAG, indexed: false, sortable: false }
+  - { name: ctp_version, type: TAG, indexed: false, sortable: false }
+  - { name: ctp_basket_type, type: TAG, indexed: false, sortable: false }
+  - { name: ctp_correlation, type: NUMERIC, indexed: false, sortable: false }
+  - { name: ctp_recovery_assumption, type: NUMERIC, indexed: false, sortable: false }
+  - { name: ctp_strike, type: NUMERIC, indexed: false, sortable: false }
+  - { name: ctp_attachment_point, type: NUMERIC, indexed: false, sortable: false }
+
+  # ---- Equity §21.78–§21.83 ----
+  - { name: equity_issuer_id, type: TAG, indexed: false, sortable: false }
+  - { name: equity_sector_code, type: TAG, indexed: false, sortable: false }
+  - { name: equity_market_cap, type: TAG, indexed: false, sortable: false }       # large / small
+  - { name: equity_market_region, type: TAG, indexed: false, sortable: false }    # emerging / advanced
+  - { name: equity_spot_or_repo, type: TAG, indexed: true, sortable: false, cardinality_hint: 2 }
+  - { name: equity_vol_type, type: TAG, indexed: false, sortable: false }
+  - { name: equity_moneyness, type: NUMERIC, indexed: false, sortable: false }
+  - { name: equity_option_maturity, type: TAG, indexed: false, sortable: false }
+  - { name: equity_index_membership, type: TAG, indexed: false, sortable: false }
+  - { name: equity_dividend_yield, type: NUMERIC, indexed: false, sortable: false }
+
+  # ---- Commodity §21.85–§21.90 ----
+  - { name: commodity_class, type: TAG, indexed: false, sortable: false }
+  - { name: commodity_contract_grade, type: TAG, indexed: false, sortable: false }
+  - { name: commodity_delivery_location, type: TAG, indexed: false, sortable: false }
+  - { name: commodity_delivery_month, type: TAG, indexed: false, sortable: false }
+  - { name: commodity_tenor_dim, type: TAG, indexed: false, sortable: false }
+  - { name: commodity_basis_type, type: TAG, indexed: false, sortable: false }
+  - { name: commodity_vol_type, type: TAG, indexed: false, sortable: false }
+  - { name: commodity_moneyness, type: NUMERIC, indexed: false, sortable: false }
+  - { name: commodity_strike, type: NUMERIC, indexed: false, sortable: false }
+  - { name: commodity_forward_curve, type: TAG, indexed: false, sortable: false }
+  - { name: commodity_contract_type, type: TAG, indexed: false, sortable: false }
+  - { name: commodity_settlement_type, type: TAG, indexed: false, sortable: false }
+  - { name: commodity_curve_node, type: TAG, indexed: false, sortable: false }
+
+  # ---- FX §21.88–§21.95 ----
+  - { name: fx_base_currency, type: TAG, indexed: false, sortable: false }
+  - { name: fx_quote_currency, type: TAG, indexed: false, sortable: false }
+  - { name: fx_vol_type, type: TAG, indexed: false, sortable: false }
+  - { name: fx_moneyness, type: NUMERIC, indexed: false, sortable: false }
+  - { name: fx_option_maturity, type: TAG, indexed: false, sortable: false }
+  - { name: fx_smile_dim, type: TAG, indexed: false, sortable: false }
+
+  # ---- Cross-class auxiliary dimensions ----
+  - { name: scenario_id, type: TAG, indexed: false, sortable: false }
+  - { name: shock_size_bp, type: NUMERIC, indexed: false, sortable: false }
+  - { name: shock_direction, type: TAG, indexed: false, sortable: false }
+  - { name: model_id, type: TAG, indexed: false, sortable: false }
+  - { name: model_version, type: TAG, indexed: false, sortable: false }
+  - { name: confidence_level, type: NUMERIC, indexed: false, sortable: false }
+  - { name: jurisdiction, type: TAG, indexed: false, sortable: false }
+  - { name: regulator, type: TAG, indexed: false, sortable: false }
+  - { name: reporting_currency, type: TAG, indexed: false, sortable: false }
+  - { name: fx_translation_rate, type: NUMERIC, indexed: false, sortable: false }
+  - { name: provenance_hash, type: TAG, indexed: false, sortable: false }
+  - { name: lineage_batch_id, type: TAG, indexed: false, sortable: false }
+  - { name: ingest_ts, type: NUMERIC, indexed: false, sortable: true }
+  - { name: notes, type: TEXT, indexed: false, sortable: false }
+  - { name: tags_csv, type: TAG, indexed: false, sortable: false }
+  - { name: position_quantity, type: NUMERIC, indexed: false, sortable: false }
+  - { name: market_value, type: NUMERIC, indexed: false, sortable: false }
+  - { name: pnl, type: NUMERIC, indexed: false, sortable: false }
+
+frtb_binding:
+  risk_class: risk_class
+  bucket: bucket
+  tenor: tenor
+  risk_value: risk_value
+  weight: weight
+  sensitivity_type: sensitivity_type
 
 risk_classes:
-  girr:
-    bucket_scheme: per_currency
-    buckets: [USD, EUR, GBP, JPY, CHF, AUD, CAD, SEK, NOK, NZD, SGD, HKD, CNY, BRL, ZAR, MXN]
-    tenor_count: 10
-    tenor_points: ["3M", "6M", "1Y", "2Y", "3Y", "5Y", "10Y", "15Y", "20Y", "30Y"]
+  GIRR:
     dimensions:
-      - { name: tenor,      type: ARRAY_TAG,     length: 10 }
-      - { name: risk_value, type: ARRAY_NUMERIC, length: 10 }
-      - { name: curve_type, type: TAG, values: [yield, basis, inflation] }
-  equity:
-    bucket_scheme: per_bucket
-    buckets: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13"]
-    dimensions:
-      - { name: issuer,     type: TAG,     cardinality_hint: 500 }
-      - { name: spot_repo,  type: TAG,     values: [spot, repo] }
-      - { name: risk_value, type: NUMERIC }
-  fx:
-    bucket_scheme: per_pair
+      - risk_class
+      - bucket
+      - tenor
+      - risk_value
+      - weight
+      - sensitivity_type
+      - currency
+      - desk
+      - book
+      - trade_id
+      - girr_curve_type
+      - girr_basis_type
+      - girr_inflation_curve
+      - girr_repo_rate
+      - girr_vol_option_maturity
+      - girr_vol_underlying_maturity
+      - girr_moneyness
+      - girr_volatility_type
+      - girr_xccy_basis
+      - girr_curve_node
     buckets:
-      - USDEUR
-      - USDGBP
-      - USDJPY
-      - USDCHF
-      - USDCAD
-      - USDAUD
-      - USDSGD
-      - USDHKD
-      - USDCNY
-      - USDBRL
-      - EURGBP
-      - EURJPY
-      - EURCHF
-      - GBPJPY
-    dimensions:
-      - { name: pair,       type: TAG }
-      - { name: risk_value, type: NUMERIC }
-  csr_ns:
-    bucket_scheme: per_bucket
-    buckets: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16"]
-    dimensions:
-      - { name: issuer,     type: TAG, cardinality_hint: 800 }
-      - { name: tenor,      type: TAG, values: ["6M", "1Y", "3Y", "5Y", "10Y"] }
-      - { name: risk_value, type: NUMERIC }
-  csr_sec_nonctp:
-    bucket_scheme: per_bucket
-    buckets: ["1", "2", "3", "4", "5", "6", "7", "8"]
-    dimensions:
-      - { name: tranche,    type: TAG }
-      - { name: risk_value, type: NUMERIC }
-  csr_sec_ctp:
-    bucket_scheme: per_bucket
-    buckets: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16"]
-    dimensions:
-      - { name: tranche,    type: TAG }
-      - { name: risk_value, type: NUMERIC }
-  commodity:
-    bucket_scheme: per_bucket
-    buckets: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"]
-    dimensions:
-      - { name: commodity_name, type: TAG, cardinality_hint: 60 }
-      - { name: tenor,          type: TAG, values: ["6M", "1Y", "3Y", "5Y", "10Y"] }
-      - { name: risk_value,     type: NUMERIC }
+      naming: currency
+      values: [USD, EUR, GBP, JPY, CHF, CAD, AUD, SEK, NOK, NZD, OTHER]
+    tenor:
+      count: 10
+      nodes: ["3M", "6M", "1Y", "2Y", "3Y", "5Y", "10Y", "15Y", "20Y", "30Y"]
+    risk_weights_ref: girr_delta_weights
+    intra_bucket_correlation_ref: girr_rho_kl
+    cross_bucket_correlation_ref: girr_gamma_bc
 
-mix:
-  # Probability weights when --classes all is selected. Wider risk classes
-  # like GIRR / CSR carry more rows in real HSBC books.
-  girr: 0.30
-  csr_ns: 0.18
-  csr_sec_nonctp: 0.05
-  csr_sec_ctp: 0.04
-  equity: 0.20
-  fx: 0.13
-  commodity: 0.10
+  CSR_NON_SEC:
+    dimensions:
+      - risk_class
+      - bucket
+      - tenor
+      - risk_value
+      - weight
+      - sensitivity_type
+      - currency
+      - desk
+      - csr_credit_quality
+      - csr_issuer_id
+      - csr_issuer_sector
+      - csr_issuer_region
+      - csr_seniority
+      - csr_rating
+      - csr_spread_curve_type
+      - csr_cds_basis
+      - csr_cds_recovery_rate
+      - csr_ref_obligation
+      - csr_restructuring_type
+    buckets:
+      naming: sector_quality
+      values: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16"]
+    tenor:
+      count: 5
+      nodes: ["0.5Y", "1Y", "3Y", "5Y", "10Y"]
+    risk_weights_ref: csr_non_sec_weights
+    intra_bucket_correlation_ref: csr_non_sec_rho
+    cross_bucket_correlation_ref: csr_non_sec_gamma
+
+  CSR_SEC_NON_CTP:
+    dimensions:
+      - risk_class
+      - bucket
+      - tenor
+      - risk_value
+      - weight
+      - sensitivity_type
+      - currency
+      - desk
+      - csrsec_tranche
+      - csrsec_attachment
+      - csrsec_detachment
+      - csrsec_pool_type
+      - csrsec_geographic_region
+      - csrsec_vintage
+      - csrsec_originator
+      - csrsec_servicer
+      - csrsec_credit_enhancement
+      - csrsec_payment_priority
+    buckets:
+      naming: sec_non_ctp_bucket
+      values: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
+               "11", "12", "13", "14", "15", "16", "17", "18", "19", "20",
+               "21", "22", "23", "24", "25"]
+    tenor:
+      count: 5
+      nodes: ["0.5Y", "1Y", "3Y", "5Y", "10Y"]
+    risk_weights_ref: csr_sec_non_ctp_weights
+    intra_bucket_correlation_ref: csr_sec_non_ctp_rho
+    cross_bucket_correlation_ref: csr_sec_non_ctp_gamma
+
+  CSR_SEC_CTP:
+    dimensions:
+      - risk_class
+      - bucket
+      - tenor
+      - risk_value
+      - weight
+      - sensitivity_type
+      - currency
+      - desk
+      - ctp_tranche_seniority
+      - ctp_index_name
+      - ctp_series
+      - ctp_version
+      - ctp_basket_type
+      - ctp_correlation
+      - ctp_recovery_assumption
+      - ctp_strike
+      - ctp_attachment_point
+    buckets:
+      naming: ctp_bucket
+      values: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16"]
+    tenor:
+      count: 5
+      nodes: ["0.5Y", "1Y", "3Y", "5Y", "10Y"]
+    risk_weights_ref: csr_sec_ctp_weights
+    intra_bucket_correlation_ref: csr_sec_ctp_rho
+    cross_bucket_correlation_ref: csr_sec_ctp_gamma
+
+  EQUITY:
+    dimensions:
+      - risk_class
+      - bucket
+      - risk_value
+      - weight
+      - sensitivity_type
+      - currency
+      - desk
+      - book
+      - equity_issuer_id
+      - equity_sector_code
+      - equity_market_cap
+      - equity_market_region
+      - equity_spot_or_repo
+      - equity_vol_type
+      - equity_moneyness
+      - equity_option_maturity
+      - equity_index_membership
+      - equity_dividend_yield
+    buckets:
+      naming: equity_bucket
+      values: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13"]
+    risk_weights_ref: equity_weights
+    intra_bucket_correlation_ref: equity_rho
+    cross_bucket_correlation_ref: equity_gamma
+
+  COMMODITY:
+    dimensions:
+      - risk_class
+      - bucket
+      - tenor
+      - risk_value
+      - weight
+      - sensitivity_type
+      - currency
+      - desk
+      - commodity_class
+      - commodity_contract_grade
+      - commodity_delivery_location
+      - commodity_delivery_month
+      - commodity_tenor_dim
+      - commodity_basis_type
+      - commodity_vol_type
+      - commodity_moneyness
+      - commodity_strike
+      - commodity_forward_curve
+      - commodity_contract_type
+      - commodity_settlement_type
+      - commodity_curve_node
+    buckets:
+      naming: commodity_bucket
+      values: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"]
+    tenor:
+      count: 5
+      nodes: ["0.25Y", "0.5Y", "1Y", "2Y", "5Y"]
+    risk_weights_ref: commodity_weights
+    intra_bucket_correlation_ref: commodity_rho
+    cross_bucket_correlation_ref: commodity_gamma
+
+  FX:
+    dimensions:
+      - risk_class
+      - bucket
+      - risk_value
+      - weight
+      - sensitivity_type
+      - ccy_pair
+      - desk
+      - book
+      - fx_base_currency
+      - fx_quote_currency
+      - fx_vol_type
+      - fx_moneyness
+      - fx_option_maturity
+      - fx_smile_dim
+    buckets:
+      naming: fx_pair_bucket
+      values: ["EURUSD", "GBPUSD", "USDJPY", "USDCHF", "AUDUSD", "USDCAD", "NZDUSD", "EURGBP", "EURJPY", "GBPJPY", "OTHER"]
+    risk_weights_ref: fx_weights
+    intra_bucket_correlation_ref: fx_rho
+    cross_bucket_correlation_ref: fx_gamma
+
+risk_weights:
+  girr_delta_weights:
+    description: GIRR delta risk weights per tenor (MAR21.42 — illustrative magnitudes)
+    by_tenor:
+      "3M": 0.017
+      "6M": 0.017
+      "1Y": 0.016
+      "2Y": 0.013
+      "3Y": 0.012
+      "5Y": 0.011
+      "10Y": 0.011
+      "15Y": 0.011
+      "20Y": 0.011
+      "30Y": 0.011
+  csr_non_sec_weights:
+    description: CSR non-sec illustrative weights per bucket
+    by_bucket: { "1": 0.005, "2": 0.010, "3": 0.050, "4": 0.030, "5": 0.030,
+                 "6": 0.020, "7": 0.015, "8": 0.025, "9": 0.030, "10": 0.030,
+                 "11": 0.040, "12": 0.045, "13": 0.030, "14": 0.080, "15": 0.120, "16": 0.080 }
+  csr_sec_non_ctp_weights:
+    description: CSR sec non-CTP weights placeholder
+    constant: 0.040
+  csr_sec_ctp_weights:
+    description: CSR sec CTP weights placeholder
+    constant: 0.060
+  equity_weights:
+    description: Equity risk weights per bucket (MAR21.78)
+    by_bucket: { "1": 0.55, "2": 0.60, "3": 0.45, "4": 0.55, "5": 0.30,
+                 "6": 0.35, "7": 0.40, "8": 0.50, "9": 0.70, "10": 0.50,
+                 "11": 0.70, "12": 0.15, "13": 0.25 }
+  commodity_weights:
+    description: Commodity risk weights per bucket (MAR21.82)
+    by_bucket: { "1": 0.30, "2": 0.35, "3": 0.60, "4": 0.80, "5": 0.40,
+                 "6": 0.45, "7": 0.20, "8": 0.35, "9": 0.25, "10": 0.35, "11": 0.50 }
+  fx_weights:
+    description: FX risk weight (single weight applied — MAR21.88)
+    constant: 0.075
+
+correlations:
+  girr_rho_kl:
+    description: GIRR intra-bucket tenor correlation (single representative ρ_kl)
+    kind: constant
+    value: 0.99
+  girr_gamma_bc:
+    description: GIRR cross-bucket correlation γ_bc (single representative)
+    kind: constant
+    value: 0.50
+  csr_non_sec_rho:
+    kind: constant
+    value: 0.65
+  csr_non_sec_gamma:
+    kind: constant
+    value: 0.20
+  csr_sec_non_ctp_rho:
+    kind: constant
+    value: 0.60
+  csr_sec_non_ctp_gamma:
+    kind: constant
+    value: 0.10
+  csr_sec_ctp_rho:
+    kind: constant
+    value: 0.70
+  csr_sec_ctp_gamma:
+    kind: constant
+    value: 0.15
+  equity_rho:
+    kind: constant
+    value: 0.50
+  equity_gamma:
+    kind: constant
+    value: 0.15
+  commodity_rho:
+    kind: constant
+    value: 0.55
+  commodity_gamma:
+    kind: constant
+    value: 0.20
+  fx_rho:
+    kind: constant
+    value: 0.60
+  fx_gamma:
+    kind: constant
+    value: 0.60

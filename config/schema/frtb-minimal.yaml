@@ -1,0 +1,75 @@
+# FRTB-SA Minimal Schema (swap-demo target)
+# ------------------------------------------
+# Deliberately a different shape from frtb-default.yaml so the demo step 9
+# "schema swap" moment proves the architecture is data-model-agnostic:
+#   - Fewer dimensions (≈25 vs ≈115)
+#   - GIRR-only — no other risk classes wired
+#   - GIRR buckets renamed by region (NA, EU, APAC) instead of ISO currency
+#   - Tenor grid uses different node names ("1m", "3m", "1y", "5y", "30y")
+#   - risk_value stays an ARRAY_NUMERIC — that contract is preserved
+version: 1
+
+dimensions:
+  - { name: risk_class, type: TAG, indexed: true, sortable: false, hash_tag_role: primary, cardinality_hint: 1 }
+  - { name: bucket, type: TAG, indexed: true, sortable: false, hash_tag_role: primary, cardinality_hint: 3 }
+  - { name: tenor, type: TAG, indexed: true, sortable: true, cardinality_hint: 5 }
+  - { name: risk_value, type: ARRAY_NUMERIC, indexed: false, sortable: false }
+  - { name: weight, type: NUMERIC, indexed: false, sortable: false }
+  - { name: sensitivity_type, type: TAG, indexed: true, sortable: false, cardinality_hint: 2 }
+  - { name: as_of_date, type: TAG, indexed: true, sortable: true, cardinality_hint: 30 }
+  - { name: desk, type: TAG, indexed: true, sortable: false, cardinality_hint: 50 }
+  - { name: trade_id, type: TAG, indexed: false, sortable: false }
+  - { name: girr_curve_type, type: TAG, indexed: false, sortable: false }
+  - { name: girr_curve_node, type: TAG, indexed: false, sortable: false }
+  - { name: notes, type: TEXT, indexed: false, sortable: false }
+
+frtb_binding:
+  risk_class: risk_class
+  bucket: bucket
+  tenor: tenor
+  risk_value: risk_value
+  weight: weight
+  sensitivity_type: sensitivity_type
+
+risk_classes:
+  GIRR:
+    dimensions:
+      - risk_class
+      - bucket
+      - tenor
+      - risk_value
+      - weight
+      - sensitivity_type
+      - desk
+      - trade_id
+      - girr_curve_type
+      - girr_curve_node
+    buckets:
+      naming: region
+      values: [NA, EU, APAC]
+    tenor:
+      count: 5
+      nodes: ["1m", "3m", "1y", "5y", "30y"]
+    risk_weights_ref: girr_minimal_weights
+    intra_bucket_correlation_ref: girr_minimal_rho
+    cross_bucket_correlation_ref: girr_minimal_gamma
+
+risk_weights:
+  girr_minimal_weights:
+    description: Minimal-schema GIRR weights per tenor (flat for the swap demo)
+    by_tenor:
+      "1m": 0.020
+      "3m": 0.018
+      "1y": 0.015
+      "5y": 0.012
+      "30y": 0.010
+
+correlations:
+  girr_minimal_rho:
+    description: Minimal-schema intra-bucket correlation
+    kind: constant
+    value: 0.95
+  girr_minimal_gamma:
+    description: Minimal-schema cross-bucket correlation
+    kind: constant
+    value: 0.40
