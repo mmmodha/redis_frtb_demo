@@ -83,13 +83,13 @@ export function CalcPanel() {
 
       <div className="calc-panel__callouts">
         <EnterpriseCallout signal="Functions">
-          <strong>InDatabaseCompute</strong> — SBM math runs inside Redis via Redis Functions; no row-by-row network round-trip.
+          <strong>In-database compute</strong> — SBM math runs inside Redis via Redis Functions; no row-by-row network round-trip.
         </EnterpriseCallout>
         <EnterpriseCallout signal="ClusterScaleOut">
-          <strong>MapReduce</strong> — one FCALL per bucket fans out across shards; coordinator aggregates K_b → risk-class charge.
+          <strong>Map-Reduce</strong> — one FCALL per bucket fans out across shards; coordinator aggregates K_b → risk-class charge.
         </EnterpriseCallout>
         <EnterpriseCallout signal="RQE">
-          <strong>HashTagLocality</strong> — <code>sens:{"{risk_class:bucket}"}:...</code> hash tag keeps every bucket's FCALL slot-local.
+          <strong>Hash-tag locality</strong> — <code>sens:{"{risk_class:bucket}"}:...</code> hash tag keeps every bucket's FCALL slot-local.
         </EnterpriseCallout>
       </div>
 

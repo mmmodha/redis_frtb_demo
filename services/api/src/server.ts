@@ -5,6 +5,7 @@ import { getActiveTarget, setActiveTarget, type ActiveTarget } from "./active-ta
 import { registerPivotRoute } from "./routes/pivot.ts";
 import { registerCalcRoute } from "./routes/calc.ts";
 import { registerObservabilityRoutes } from "./routes/observability.ts";
+import { registerSourcesProxyRoutes } from "./routes/sources-proxy.ts";
 
 // Connections store + routes are owned by the Connections-store agent. Loaded
 // dynamically so this server boots even when that agent's files (store.ts,
@@ -19,6 +20,9 @@ export interface CreateServerOpts {
   logger?: boolean;
   store?: ConnectionsStore;
   tester?: ConnectionTester;
+  // Upstream base URL for the source-service proxy. Falls back to
+  // SOURCE_BASE env var, then to the compose-internal default.
+  sourceBase?: string;
 }
 
 export async function createServer(opts: CreateServerOpts): Promise<FastifyInstance> {
@@ -34,6 +38,8 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
     registerCalcRoute(app, opts.redis, { correlations: opts.correlations ?? {} });
     registerObservabilityRoutes(app, opts.redis);
   }
+
+  registerSourcesProxyRoutes(app, { sourceBase: opts.sourceBase });
 
   if (opts.store) {
     const mod = await import("./routes/connections.ts").catch(() => null);

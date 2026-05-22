@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 // in the spec. Stub component for Wave 3; Wave 4.5 wires it to signals.yaml.
 export type EnterpriseSignal =
   | "JSON"
+  | "Streams"
   | "RQE"
   | "RedisQueryEngine"
   | "Functions"
