@@ -5,11 +5,14 @@
   "description": "HSBC FRTB-SA SBM PoV on Redis Enterprise — sales vehicle demo",
   "workspaces": [
     "services/*",
-    "shared/*"
+    "shared/*",
+    "tools/*"
   ],
   "scripts": {
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "schema:generate": "npm run -w @frtb/schema-cli generate --",
+    "schema:validate": "npm run -w @frtb/schema-cli validate --"
   },
   "devDependencies": {
     "vitest": "^4.1.7",

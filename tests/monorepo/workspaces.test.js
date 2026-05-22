@@ -9,10 +9,23 @@ const APP_SERVICES = ['ui', 'api', 'generator', 'source', 'ingest', 'calc', 'loa
 const SHARED_PACKAGES = ['schema'];
 
 describe('monorepo layout', () => {
-  it('root package.json declares npm workspaces for services/* and shared/*', () => {
+  it('root package.json declares npm workspaces for services/*, shared/*, tools/*', () => {
     const pkg = readJson(resolve(ROOT, 'package.json'));
-    expect(pkg.workspaces).toEqual(expect.arrayContaining(['services/*', 'shared/*']));
+    expect(pkg.workspaces).toEqual(expect.arrayContaining(['services/*', 'shared/*', 'tools/*']));
     expect(pkg.private, 'root must be private').toBe(true);
+  });
+
+  it('root package.json wires schema:generate and schema:validate to @frtb/schema-cli', () => {
+    const pkg = readJson(resolve(ROOT, 'package.json'));
+    expect(pkg.scripts?.['schema:generate'], 'schema:generate script required').toMatch(/@frtb\/schema-cli/);
+    expect(pkg.scripts?.['schema:validate'], 'schema:validate script required').toMatch(/@frtb\/schema-cli/);
+  });
+
+  it('tsconfig.base.json exists at repo root for package tsconfigs to extend', () => {
+    const tsBase = resolve(ROOT, 'tsconfig.base.json');
+    expect(existsSync(tsBase), 'tsconfig.base.json must exist').toBe(true);
+    const cfg = readJson(tsBase);
+    expect(cfg.compilerOptions?.strict, 'tsconfig.base must enable strict').toBe(true);
   });
 
   it('every application service folder has a package.json with a private @frtb-scoped name', () => {
