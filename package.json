@@ -11,8 +11,8 @@
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
-    "schema:generate": "npm run -w @frtb/schema-cli generate --",
-    "schema:validate": "npm run -w @frtb/schema-cli validate --"
+    "schema:generate": "npm run -w @frtb/schema-cli generate -- ../../config/schema/frtb-default.yaml --out ../../shared/schema/generated",
+    "schema:validate": "npm run -w @frtb/schema-cli validate -- ../../config/schema/frtb-default.yaml"
   },
   "devDependencies": {
     "vitest": "^4.1.7",
