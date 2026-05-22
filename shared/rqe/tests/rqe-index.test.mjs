@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -25,24 +25,37 @@ let tmp;
 let redis;
 let searchAvailable = false;
 
+function binaryOnPath(binary) {
+  // Use `which` rather than spawning the binary blindly — a bad spawn would
+  // emit an unhandled "error" event before any listener could attach, which
+  // crashes the test runner.
+  const r = spawnSync("which", [binary], { stdio: ["ignore", "pipe", "ignore"] });
+  return r.status === 0;
+}
+
 function spawnRedis(binary, port, dir) {
-  return spawn(
+  const p = spawn(
     binary,
     ["--port", String(port), "--dir", dir, "--save", "", "--appendonly", "no", "--protected-mode", "no"],
     { stdio: "ignore" }
   );
+  p.on("error", () => { /* swallow — tryBoot returns undefined on connection timeout */ });
+  return p;
 }
 
 async function tryBoot(binary, port, dir) {
+  if (!binaryOnPath(binary)) return undefined;
   const p = spawnRedis(binary, port, dir);
   for (let i = 0; i < 30; i++) {
+    const r = new Redis({ port, lazyConnect: true, maxRetriesPerRequest: 1 });
+    r.on("error", () => { /* expected during boot probe — handled by retry */ });
     try {
-      const r = new Redis({ port, lazyConnect: true, maxRetriesPerRequest: 1 });
       await r.connect();
       await r.ping();
       await r.quit();
       return p;
     } catch {
+      try { r.disconnect(); } catch { /* noop */ }
       await wait(100);
     }
   }
