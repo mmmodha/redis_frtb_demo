@@ -1,0 +1,24 @@
+{
+  "name": "@frtb/rqe-index-cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Live demo control surface for the idx:sens RQE index — ensure / drop / recreate / info",
+  "bin": {
+    "rqe-index-cli": "./src/bin.mjs"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "ensure": "node src/bin.mjs ensure",
+    "drop": "node src/bin.mjs drop",
+    "recreate": "node src/bin.mjs recreate",
+    "info": "node src/bin.mjs info"
+  },
+  "dependencies": {
+    "@frtb/rqe": "*",
+    "ioredis": "^5.4.2"
+  },
+  "devDependencies": {
+    "vitest": "^2.1.8"
+  }
+}
