@@ -8,11 +8,12 @@
 
 import { describe, it, expect } from "vitest";
 import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { ingestFile } from "../src/ingest.ts";
 import { makeFakeRedis } from "./helpers/fake-redis.ts";
 import type { ColumnMapping } from "../src/infer/mapping.ts";
 
-const FIXTURES = resolve(__dirname, "fixtures");
+const FIXTURES = resolve(fileURLToPath(import.meta.url), "..", "fixtures");
 
 describe("ingestFile — CSV with direct field mapping", () => {
   it("emits one XADD per row into sensitivities:in", async () => {

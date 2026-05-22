@@ -2,9 +2,10 @@
 
 import { describe, it, expect } from "vitest";
 import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { sampleJsonl } from "../src/readers/jsonl.ts";
 
-const FIXTURES = resolve(__dirname, "fixtures");
+const FIXTURES = resolve(fileURLToPath(import.meta.url), "..", "fixtures");
 
 describe("sampleJsonl", () => {
   it("reads a JSON object per line and surfaces the union of keys as columns", async () => {

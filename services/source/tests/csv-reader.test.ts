@@ -8,9 +8,10 @@
 
 import { describe, it, expect } from "vitest";
 import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { sampleCsv } from "../src/readers/csv.ts";
 
-const FIXTURES = resolve(__dirname, "fixtures");
+const FIXTURES = resolve(fileURLToPath(import.meta.url), "..", "fixtures");
 
 describe("sampleCsv", () => {
   it("returns header columns and rows from a small file", async () => {
