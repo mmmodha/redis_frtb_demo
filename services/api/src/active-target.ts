@@ -15,6 +15,9 @@ export interface ActiveTarget {
   tls: boolean;
   db: number;
   label: string;
+  // Locked Wave-2 contract addition (router agent): true when target is a
+  // multi-shard Redis Enterprise cluster requiring cluster-mode ioredis.
+  clusterMode?: boolean;
 }
 
 export type ActiveTargetListener = (t: ActiveTarget) => void;
@@ -25,7 +28,7 @@ let cachedClient: Redis | null = null;
 let cachedClientKey = "";
 
 function targetKey(t: ActiveTarget): string {
-  return `${t.host}|${t.port}|${t.tls ? 1 : 0}|${t.db}`;
+  return `${t.host}|${t.port}|${t.tls ? 1 : 0}|${t.db}|${t.clusterMode ? 1 : 0}`;
 }
 
 export function setActiveTarget(t: ActiveTarget): void {
@@ -37,6 +40,7 @@ export function setActiveTarget(t: ActiveTarget): void {
     tls: !!t.tls,
     db: t.db ?? 0,
     label: t.label,
+    ...(t.clusterMode ? { clusterMode: true } : {}),
   };
   for (const fn of listeners) {
     try { fn(override); } catch { /* listener errors must not break the setter */ }
