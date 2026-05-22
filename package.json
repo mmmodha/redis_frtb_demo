@@ -1,0 +1,21 @@
+{
+  "name": "frtb-sbm-redis-pov",
+  "version": "0.1.0",
+  "private": true,
+  "description": "HSBC FRTB-SA SBM PoV on Redis Enterprise — sales vehicle demo",
+  "workspaces": [
+    "services/*",
+    "shared/*"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.7",
+    "yaml": "^2.9.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

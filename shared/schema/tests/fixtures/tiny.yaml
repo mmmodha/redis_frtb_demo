@@ -1,0 +1,68 @@
+# Minimal fixture for loader tests
+version: 1
+dimensions:
+  - name: risk_class
+    type: TAG
+    indexed: true
+    sortable: false
+    hash_tag_role: primary
+  - name: bucket
+    type: TAG
+    indexed: true
+    sortable: false
+    hash_tag_role: primary
+  - name: tenor
+    type: TAG
+    indexed: true
+    sortable: true
+  - name: risk_value
+    type: ARRAY_NUMERIC
+    indexed: false
+    sortable: false
+  - name: weight
+    type: NUMERIC
+    indexed: false
+    sortable: false
+  - name: sensitivity_type
+    type: TAG
+    indexed: true
+    sortable: false
+
+risk_classes:
+  GIRR:
+    dimensions: [risk_class, bucket, tenor, risk_value, weight, sensitivity_type]
+    buckets:
+      naming: currency
+      values: [USD, EUR, GBP]
+    tenor:
+      count: 3
+      nodes: [3M, 6M, 1Y]
+    risk_weights_ref: girr_weights
+    intra_bucket_correlation_ref: girr_rho
+    cross_bucket_correlation_ref: girr_gamma
+
+frtb_binding:
+  risk_class: risk_class
+  bucket: bucket
+  tenor: tenor
+  risk_value: risk_value
+  weight: weight
+  sensitivity_type: sensitivity_type
+
+risk_weights:
+  girr_weights:
+    description: GIRR delta weights per tenor (illustrative)
+    by_tenor:
+      "3M": 0.017
+      "6M": 0.017
+      "1Y": 0.016
+
+correlations:
+  girr_rho:
+    description: GIRR intra-bucket tenor correlation (constant 0.99 for fixture)
+    kind: constant
+    value: 0.99
+  girr_gamma:
+    description: GIRR cross-bucket correlation (constant 0.5 for fixture)
+    kind: constant
+    value: 0.5
