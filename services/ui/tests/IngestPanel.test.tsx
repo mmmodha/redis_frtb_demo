@@ -52,12 +52,10 @@ describe("IngestPanel", () => {
   let fetchMock: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
-    vi.useFakeTimers();
     fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
   });
   afterEach(() => {
-    vi.useRealTimers();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
