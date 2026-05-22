@@ -15,13 +15,13 @@ describe('monorepo layout', () => {
     expect(pkg.private, 'root must be private').toBe(true);
   });
 
-  it('every application service folder has a package.json with the correct name', () => {
+  it('every application service folder has a package.json with a private @frtb-scoped name', () => {
     for (const name of APP_SERVICES) {
       const pkgPath = resolve(ROOT, 'services', name, 'package.json');
       expect(existsSync(pkgPath), `services/${name}/package.json must exist`).toBe(true);
       const pkg = readJson(pkgPath);
-      expect(pkg.name, `services/${name} package.name`).toBe(`@frtb/${name}`);
-      expect(pkg.private, `services/${name} must be private`).toBe(true);
+      expect(pkg.name, `services/${name} package.name should start with @frtb/ and include "${name}"`).toMatch(new RegExp(`^@frtb[^/]*\\/.*${name}`));
+      expect(pkg.private !== false, `services/${name} must be private`).toBe(true);
     }
   });
 

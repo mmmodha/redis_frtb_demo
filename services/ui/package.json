@@ -1,0 +1,10 @@
+{
+  "name": "@frtb/ui",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "FRTB SBM PoV — Next.js UI (placeholder stub; real UI shipped in Wave 3)",
+  "scripts": {
+    "start": "node src/index.mjs"
+  }
+}

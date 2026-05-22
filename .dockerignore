@@ -1,0 +1,16 @@
+**/node_modules
+**/dist
+**/build
+**/.next
+**/coverage
+**/.git
+**/.gitignore
+**/.env
+**/.env.*
+**/*.log
+**/.DS_Store
+**/tests
+**/__tests__
+**/*.test.*
+**/*.spec.*
+.augment

@@ -13,7 +13,8 @@ describe('docker-compose.yml', () => {
 
   beforeAll(() => {
     expect(existsSync(COMPOSE), 'docker-compose.yml must exist at repo root').toBe(true);
-    doc = parse(readFileSync(COMPOSE, 'utf8'));
+    // merge:true expands `<<: *anchor` keys the way docker compose itself does
+    doc = parse(readFileSync(COMPOSE, 'utf8'), { merge: true });
   });
 
   it('defines all 7 application services', () => {

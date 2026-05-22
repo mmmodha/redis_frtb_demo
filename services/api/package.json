@@ -1,0 +1,10 @@
+{
+  "name": "@frtb/api",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "FRTB SBM PoV — Fastify api gateway (placeholder stub; pivot/calc/observability endpoints land in Wave 2)",
+  "scripts": {
+    "start": "node src/index.mjs"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "name": "@frtb/loadgen",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "FRTB SBM PoV — concurrent-analyst load generator (placeholder stub; runner lands in Wave 4)",
+  "scripts": {
+    "start": "node src/index.mjs"
+  }
+}

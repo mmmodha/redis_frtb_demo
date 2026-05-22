@@ -1,0 +1,2 @@
+# Bind-mount target for the docker `data` named volume.
+# Holds connections.enc.json, sources.json, uploads/ at runtime.

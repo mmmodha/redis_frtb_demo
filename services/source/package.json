@@ -1,0 +1,10 @@
+{
+  "name": "@frtb/source",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "FRTB SBM PoV — file/upload source service (placeholder stub; column-mapping wizard lands in Wave 2.5)",
+  "scripts": {
+    "start": "node src/index.mjs"
+  }
+}
