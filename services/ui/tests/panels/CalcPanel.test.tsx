@@ -1,0 +1,146 @@
+import { describe, it, expect, afterEach, vi } from "vitest";
+import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
+import { CalcPanel } from "../../src/panels/CalcPanel";
+import type { CalcSbmResponse } from "../../src/lib/calc";
+
+const originalFetch = globalThis.fetch;
+
+function mockCalcResponse(body: CalcSbmResponse | { error: string }, status = 200) {
+  globalThis.fetch = vi.fn(async () =>
+    new Response(JSON.stringify(body), {
+      status,
+      headers: { "content-type": "application/json" },
+    }),
+  ) as typeof fetch;
+}
+
+function deferredCalcResponse(body: CalcSbmResponse) {
+  let resolveFn: () => void = () => {};
+  const released = new Promise<void>((resolve) => {
+    resolveFn = resolve;
+  });
+  globalThis.fetch = vi.fn(async () => {
+    await released;
+    return new Response(JSON.stringify(body), {
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+  return resolveFn;
+}
+
+const baseResponse: CalcSbmResponse = {
+  charge: 1234567.89,
+  per_bucket: [
+    { bucket: "USD-IRS", K_b: 200, S_b: 180, count: 5000, ms: 12 },
+    { bucket: "EUR-IRS", K_b: 100, S_b: 90, count: 2500, ms: 7 },
+    { bucket: "JPY-IRS", K_b: 50, S_b: 45, count: 1000, ms: 5 },
+  ],
+  total_ms: 1500.4,
+  shard_breakdown: [
+    { shard: "shard-1", buckets: ["USD-IRS"], ms: 12 },
+    { shard: "shard-2", buckets: ["EUR-IRS"], ms: 7 },
+    { shard: "shard-3", buckets: ["JPY-IRS"], ms: 5 },
+  ],
+  fanout_ms: 14.6,
+};
+
+afterEach(() => {
+  globalThis.fetch = originalFetch;
+  vi.restoreAllMocks();
+});
+
+describe("<CalcPanel />", () => {
+  it("renders the Calc heading and a dominant Calculate SBM risk charge button", () => {
+    render(<CalcPanel />);
+    expect(screen.getByRole("heading", { name: /^Calc$/, level: 1 })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /calculate sbm risk charge/i })).toBeInTheDocument();
+  });
+
+  it("renders risk_class and sensitivity_type selectors with GIRR/Delta defaults", () => {
+    render(<CalcPanel />);
+    const rc = screen.getByLabelText(/risk class/i) as HTMLSelectElement;
+    const st = screen.getByLabelText(/sensitivity type/i) as HTMLSelectElement;
+    expect(rc.value).toBe("GIRR");
+    expect(st.value).toBe("Delta");
+    expect(within(rc).getByRole("option", { name: /GIRR/ })).toBeInTheDocument();
+    expect(within(rc).getByRole("option", { name: /Equity/ })).toBeInTheDocument();
+    expect(within(rc).getByRole("option", { name: /FX/ })).toBeInTheDocument();
+    expect(within(st).getByRole("option", { name: "Delta" })).toBeInTheDocument();
+    expect(within(st).getByRole("option", { name: "Vega" })).toBeInTheDocument();
+  });
+
+  it("shows a Wave 4 badge when Equity or FX is selected", () => {
+    render(<CalcPanel />);
+    const rc = screen.getByLabelText(/risk class/i) as HTMLSelectElement;
+    expect(screen.queryByText(/wave 4/i)).toBeNull();
+    fireEvent.change(rc, { target: { value: "Equity" } });
+    expect(screen.getByText(/wave 4/i)).toBeInTheDocument();
+    fireEvent.change(rc, { target: { value: "FX" } });
+    expect(screen.getByText(/wave 4/i)).toBeInTheDocument();
+    fireEvent.change(rc, { target: { value: "GIRR" } });
+    expect(screen.queryByText(/wave 4/i)).toBeNull();
+  });
+
+  it("renders three EnterpriseCallout banners for in-database compute / map-reduce / hash-tag locality", () => {
+    render(<CalcPanel />);
+    const callouts = screen.getAllByText(/buying signal/i);
+    expect(callouts.length).toBeGreaterThanOrEqual(3);
+    expect(screen.getByText(/InDatabaseCompute/)).toBeInTheDocument();
+    expect(screen.getByText(/MapReduce/)).toBeInTheDocument();
+    expect(screen.getByText(/HashTagLocality/)).toBeInTheDocument();
+  });
+
+  it("renders an empty-state hint before the first calc", () => {
+    render(<CalcPanel />);
+    expect(screen.getByText(/press calculate/i)).toBeInTheDocument();
+  });
+
+  it("disables the button and shows a loading state while the calc is in flight", async () => {
+    const release = deferredCalcResponse(baseResponse);
+    render(<CalcPanel />);
+    const button = screen.getByRole("button", { name: /calculate sbm risk charge/i });
+    fireEvent.click(button);
+    await waitFor(() => expect(button).toBeDisabled());
+    expect(screen.getByText(/calculating/i)).toBeInTheDocument();
+    release();
+    await waitFor(() => expect(button).not.toBeDisabled());
+  });
+
+  it("renders the headline charge and per-bucket table on success", async () => {
+    mockCalcResponse(baseResponse);
+    render(<CalcPanel />);
+    fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
+    await waitFor(() => expect(screen.getByTestId("calc-charge")).toBeInTheDocument());
+    const charge = screen.getByTestId("calc-charge");
+    expect(charge.textContent).toMatch(/1[,\s]?234[,\s]?567/);
+    const table = screen.getByRole("table", { name: /per-bucket/i });
+    expect(within(table).getByText("USD-IRS")).toBeInTheDocument();
+    expect(within(table).getByText("EUR-IRS")).toBeInTheDocument();
+    expect(within(table).getByText("JPY-IRS")).toBeInTheDocument();
+  });
+
+  it("renders the TimingStrip with per-shard timings from shard_breakdown", async () => {
+    mockCalcResponse(baseResponse);
+    render(<CalcPanel />);
+    fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
+    await waitFor(() => expect(screen.getByText("shard-1")).toBeInTheDocument());
+    expect(screen.getByText("shard-2")).toBeInTheDocument();
+    expect(screen.getByText("shard-3")).toBeInTheDocument();
+    expect(screen.getByText(/12 ms/)).toBeInTheDocument();
+  });
+
+  it("sorts the per-bucket table by K_b descending when the K_b header is clicked", async () => {
+    mockCalcResponse(baseResponse);
+    render(<CalcPanel />);
+    fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
+    await waitFor(() => expect(screen.getByTestId("calc-charge")).toBeInTheDocument());
+    const initialRows = screen.getAllByTestId("bucket-row").map((r) => r.getAttribute("data-bucket"));
+    expect(initialRows).toEqual(["USD-IRS", "EUR-IRS", "JPY-IRS"]);
+    fireEvent.click(screen.getByRole("button", { name: /sort by k_b/i }));
+    const sortedRows = screen.getAllByTestId("bucket-row").map((r) => r.getAttribute("data-bucket"));
+    expect(sortedRows).toEqual(["USD-IRS", "EUR-IRS", "JPY-IRS"]);
+    fireEvent.click(screen.getByRole("button", { name: /sort by count/i }));
+    const byCount = screen.getAllByTestId("bucket-row").map((r) => r.getAttribute("data-bucket"));
+    expect(byCount[0]).toBe("USD-IRS");
+  });
+});
