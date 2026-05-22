@@ -395,6 +395,9 @@ risk_weights:
   fx_weights:
     description: FX risk weight (single weight applied — MAR21.88)
     constant: 0.075
+  girr_vega_weights:
+    description: GIRR Vega risk weight (CRE22.62 — representative constant)
+    constant: 1.0
 
 correlations:
   girr_rho_kl:
@@ -441,3 +444,11 @@ correlations:
   fx_gamma:
     kind: constant
     value: 0.60
+  girr_vega_rho_kl:
+    description: GIRR Vega intra-bucket option-maturity-pair correlation (CRE22.66 — representative constant)
+    kind: constant
+    value: 0.50
+  girr_vega_gamma_bc:
+    description: GIRR Vega cross-bucket correlation γ_bc (representative constant)
+    kind: constant
+    value: 0.50

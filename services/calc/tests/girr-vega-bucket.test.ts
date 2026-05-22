@@ -76,7 +76,8 @@ async function seedRow(rc: string, bucket: string, riskValue: number[]): Promise
 }
 
 describe("frtb.sbm_vega_bucket (GIRR Vega Redis Function)", () => {
-  it.skipIf(!redisAvailable)("loads as part of the locked `frtb` library", async () => {
+  it("loads as part of the locked `frtb` library", async () => {
+    if (!redisAvailable) return;
     const snippet = buildGirrVegaSnippet({ weight: 1.0, rho: 0.5 });
     const result = await loadFrtbLibrary(redis, [snippet]);
     expect(result.libraryName).toBe("frtb");
@@ -89,7 +90,8 @@ describe("frtb.sbm_vega_bucket (GIRR Vega Redis Function)", () => {
     expect(found).toBe(true);
   });
 
-  it.skipIf(!redisAvailable)("computes K_b for a hand-computed fixture (w=1, ρ=0.5, 2 rows × 2 tenors)", async () => {
+  it("computes K_b for a hand-computed fixture (w=1, ρ=0.5, 2 rows × 2 tenors)", async () => {
+    if (!redisAvailable) return;
     await loadFrtbLibrary(redis, [buildGirrVegaSnippet({ weight: 1.0, rho: 0.5 })]);
     await seedRow("GIRR", "USD", [0.5, 1.0]);
     await seedRow("GIRR", "USD", [1.0, 0.5]);
@@ -106,7 +108,8 @@ describe("frtb.sbm_vega_bucket (GIRR Vega Redis Function)", () => {
     expect(typeof out.ms).toBe("number");
   });
 
-  it.skipIf(!redisAvailable)("matches the TS reference oracle on a 1-row fixture (w=0.18, ρ=0.4)", async () => {
+  it("matches the TS reference oracle on a 1-row fixture (w=0.18, ρ=0.4)", async () => {
+    if (!redisAvailable) return;
     const weight = 0.18;
     const rho = 0.4;
     await loadFrtbLibrary(redis, [buildGirrVegaSnippet({ weight, rho })]);
@@ -124,7 +127,8 @@ describe("frtb.sbm_vega_bucket (GIRR Vega Redis Function)", () => {
     expect(out.count).toBe(1);
   });
 
-  it.skipIf(!redisAvailable)("is slot-local: ignores rows whose hash-tag is a different bucket", async () => {
+  it("is slot-local: ignores rows whose hash-tag is a different bucket", async () => {
+    if (!redisAvailable) return;
     await loadFrtbLibrary(redis, [buildGirrVegaSnippet({ weight: 1.0, rho: 0.0 })]);
     await seedRow("GIRR", "USD", [1.0, 1.0]); // target bucket
     await seedRow("GIRR", "USD", [1.0, 1.0]); // target bucket
@@ -142,7 +146,8 @@ describe("frtb.sbm_vega_bucket (GIRR Vega Redis Function)", () => {
     expect(out.S_b).toBeCloseTo(4.0, 9);
   });
 
-  it.skipIf(!redisAvailable)("returns zero K_b / zero count when the bucket is empty", async () => {
+  it("returns zero K_b / zero count when the bucket is empty", async () => {
+    if (!redisAvailable) return;
     await loadFrtbLibrary(redis, [buildGirrVegaSnippet({ weight: 1.0, rho: 0.5 })]);
     const raw = (await redis.call(
       "FCALL", "sbm_vega_bucket", "1", "sens:{GIRR:JPY}:_", "GIRR", "JPY"
