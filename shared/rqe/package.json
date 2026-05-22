@@ -1,0 +1,21 @@
+{
+  "name": "@frtb/rqe",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Redis Query Engine index definitions for FRTB sensitivity pivot queries (Wave 2 locked contract: idx:sens over prefix sens:)",
+  "main": "src/index.mjs",
+  "exports": {
+    ".": "./src/index.mjs"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "ioredis": "^5.4.2"
+  },
+  "devDependencies": {
+    "vitest": "^2.1.8"
+  }
+}
