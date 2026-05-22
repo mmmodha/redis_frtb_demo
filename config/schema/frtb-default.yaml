@@ -1,0 +1,100 @@
+# FRTB-SA bootstrap schema for the synthetic generator.
+#
+# This is a minimal default that the schema-design task is expected to expand
+# in place. Field names and types here become the contract that ingest, RQE
+# indexes, and Redis Functions bind against, so changes ripple downstream.
+#
+# Keys: sens:{risk_class}:{bucket}:{ulid} — the {risk_class}:{bucket} segment
+# is the cluster hash tag (cluster-hash-tag-strategy).
+
+version: 1
+hash_tag_fields: [risk_class, bucket]
+
+# Shared / common dimensions that exist on every risk class.
+common_dimensions:
+  - { name: trade_id,         type: TAG }
+  - { name: book,             type: TAG,     cardinality_hint: 200 }
+  - { name: desk,             type: TAG,     cardinality_hint: 30 }
+  - { name: legal_entity,     type: TAG,     cardinality_hint: 12 }
+  - { name: portfolio,        type: TAG,     cardinality_hint: 120 }
+  - { name: currency,         type: TAG,     cardinality_hint: 30 }
+  - { name: as_of_date,       type: TAG }
+  - { name: sensitivity_type, type: TAG }     # delta | vega | curvature
+  - { name: risk_class,       type: TAG }     # girr | equity | fx | csr_ns | csr_sec_nonctp | csr_sec_ctp | commodity
+  - { name: bucket,           type: TAG }
+  - { name: weight,           type: NUMERIC }
+
+risk_classes:
+  girr:
+    bucket_scheme: per_currency
+    buckets: [USD, EUR, GBP, JPY, CHF, AUD, CAD, SEK, NOK, NZD, SGD, HKD, CNY, BRL, ZAR, MXN]
+    tenor_count: 10
+    tenor_points: ["3M", "6M", "1Y", "2Y", "3Y", "5Y", "10Y", "15Y", "20Y", "30Y"]
+    dimensions:
+      - { name: tenor,      type: ARRAY_TAG,     length: 10 }
+      - { name: risk_value, type: ARRAY_NUMERIC, length: 10 }
+      - { name: curve_type, type: TAG, values: [yield, basis, inflation] }
+  equity:
+    bucket_scheme: per_bucket
+    buckets: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13"]
+    dimensions:
+      - { name: issuer,     type: TAG,     cardinality_hint: 500 }
+      - { name: spot_repo,  type: TAG,     values: [spot, repo] }
+      - { name: risk_value, type: NUMERIC }
+  fx:
+    bucket_scheme: per_pair
+    buckets:
+      - USDEUR
+      - USDGBP
+      - USDJPY
+      - USDCHF
+      - USDCAD
+      - USDAUD
+      - USDSGD
+      - USDHKD
+      - USDCNY
+      - USDBRL
+      - EURGBP
+      - EURJPY
+      - EURCHF
+      - GBPJPY
+    dimensions:
+      - { name: pair,       type: TAG }
+      - { name: risk_value, type: NUMERIC }
+  csr_ns:
+    bucket_scheme: per_bucket
+    buckets: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16"]
+    dimensions:
+      - { name: issuer,     type: TAG, cardinality_hint: 800 }
+      - { name: tenor,      type: TAG, values: ["6M", "1Y", "3Y", "5Y", "10Y"] }
+      - { name: risk_value, type: NUMERIC }
+  csr_sec_nonctp:
+    bucket_scheme: per_bucket
+    buckets: ["1", "2", "3", "4", "5", "6", "7", "8"]
+    dimensions:
+      - { name: tranche,    type: TAG }
+      - { name: risk_value, type: NUMERIC }
+  csr_sec_ctp:
+    bucket_scheme: per_bucket
+    buckets: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16"]
+    dimensions:
+      - { name: tranche,    type: TAG }
+      - { name: risk_value, type: NUMERIC }
+  commodity:
+    bucket_scheme: per_bucket
+    buckets: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"]
+    dimensions:
+      - { name: commodity_name, type: TAG, cardinality_hint: 60 }
+      - { name: tenor,          type: TAG, values: ["6M", "1Y", "3Y", "5Y", "10Y"] }
+      - { name: risk_value,     type: NUMERIC }
+
+mix:
+  # Probability weights when --classes all is selected. Wider risk classes
+  # like GIRR / CSR carry more rows in real HSBC books.
+  girr: 0.30
+  csr_ns: 0.18
+  csr_sec_nonctp: 0.05
+  csr_sec_ctp: 0.04
+  equity: 0.20
+  fx: 0.13
+  commodity: 0.10

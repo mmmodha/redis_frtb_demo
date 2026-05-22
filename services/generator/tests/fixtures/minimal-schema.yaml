@@ -1,0 +1,31 @@
+# Minimal fixture schema used to prove the generator is schema-driven.
+# Only two risk classes, no tenor arrays, deliberately different shape from
+# the default to catch any hard-coded behaviour in the generator.
+
+version: 1
+hash_tag_fields: [risk_class, bucket]
+
+common_dimensions:
+  - { name: trade_id,         type: TAG }
+  - { name: risk_class,       type: TAG }
+  - { name: bucket,           type: TAG }
+  - { name: sensitivity_type, type: TAG }
+  - { name: weight,           type: NUMERIC }
+
+risk_classes:
+  fx:
+    bucket_scheme: per_pair
+    buckets: [USDEUR, USDGBP]
+    dimensions:
+      - { name: pair,       type: TAG }
+      - { name: risk_value, type: NUMERIC }
+  equity:
+    bucket_scheme: per_bucket
+    buckets: ["1", "2"]
+    dimensions:
+      - { name: issuer,     type: TAG, cardinality_hint: 5 }
+      - { name: risk_value, type: NUMERIC }
+
+mix:
+  fx: 0.5
+  equity: 0.5
