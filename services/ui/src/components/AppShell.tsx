@@ -1,5 +1,7 @@
-import type { ReactNode } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { NavLink } from "react-router-dom";
+import { ActiveTargetPill, type ActiveTargetState } from "./ActiveTargetPill";
+import { getActiveTarget, type ActiveTarget } from "../lib/connections";
 
 const SECTIONS = [
   { to: "/connections", label: "Connections" },
@@ -15,12 +17,35 @@ export interface AppShellProps {
 }
 
 export function AppShell({ children }: AppShellProps) {
+  const [target, setTarget] = useState<ActiveTarget | null>(null);
+  const [state, setState] = useState<ActiveTargetState>("disconnected");
+
+  const refreshTarget = useCallback(async () => {
+    try {
+      const t = await getActiveTarget();
+      setTarget(t);
+      setState("live");
+    } catch {
+      setTarget(null);
+      setState("disconnected");
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshTarget();
+    const onChanged = () => { void refreshTarget(); };
+    window.addEventListener("connections:active-changed", onChanged);
+    return () => window.removeEventListener("connections:active-changed", onChanged);
+  }, [refreshTarget]);
+
   return (
     <div className="app-shell">
       <header className="app-shell__header" role="banner">
         <span className="app-shell__brand-mark" aria-hidden="true" />
         <span className="app-shell__brand">FRTB SBM</span>
         <span className="app-shell__brand-sub">· on Redis Enterprise</span>
+        <div className="app-shell__header-spacer" />
+        <ActiveTargetPill target={target} state={state} />
       </header>
       <nav className="app-shell__nav" aria-label="Primary">
         <ul>

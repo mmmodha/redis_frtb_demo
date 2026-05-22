@@ -51,7 +51,7 @@ describe("<ConnectionsPanel/>", () => {
     vi.restoreAllMocks();
   });
 
-  function routeJson(url: string, method: string, body: unknown, status = 200) {
+  function routeJson(url: string | RegExp, method: string, body: unknown, status = 200) {
     return (input: RequestInfo, init?: RequestInit) =>
       String(input).match(url) && (init?.method ?? "GET") === method
         ? Promise.resolve(new Response(body == null ? null : JSON.stringify(body), {
@@ -133,10 +133,10 @@ describe("<ConnectionsPanel/>", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: /add cluster/i })).toBeInTheDocument());
     fireEvent.click(screen.getByRole("button", { name: /add cluster/i }));
     const dialog = await screen.findByRole("dialog", { name: /add cluster/i });
-    expect(within(dialog).getByLabelText(/name/i)).toBeInTheDocument();
-    expect(within(dialog).getByLabelText(/host/i)).toBeInTheDocument();
-    expect(within(dialog).getByLabelText(/port/i)).toBeInTheDocument();
-    expect(within(dialog).getByLabelText(/password/i)).toBeInTheDocument();
+    expect(within(dialog).getByLabelText(/^name$/i)).toBeInTheDocument();
+    expect(within(dialog).getByLabelText(/^host$/i)).toBeInTheDocument();
+    expect(within(dialog).getByLabelText(/^port$/i)).toBeInTheDocument();
+    expect(within(dialog).getByLabelText(/^password$/i)).toBeInTheDocument();
     expect(within(dialog).getByLabelText(/tls/i)).toBeInTheDocument();
   });
 
@@ -156,10 +156,10 @@ describe("<ConnectionsPanel/>", () => {
     renderPanel();
     fireEvent.click(await screen.findByRole("button", { name: /add cluster/i }));
     const dialog = await screen.findByRole("dialog", { name: /add cluster/i });
-    fireEvent.change(within(dialog).getByLabelText(/name/i), { target: { value: "demo-cluster" } });
-    fireEvent.change(within(dialog).getByLabelText(/host/i), { target: { value: "redis-1.lab" } });
-    fireEvent.change(within(dialog).getByLabelText(/port/i), { target: { value: "12000" } });
-    fireEvent.change(within(dialog).getByLabelText(/password/i), { target: { value: "s3cret" } });
+    fireEvent.change(within(dialog).getByLabelText(/^name$/i), { target: { value: "demo-cluster" } });
+    fireEvent.change(within(dialog).getByLabelText(/^host$/i), { target: { value: "redis-1.lab" } });
+    fireEvent.change(within(dialog).getByLabelText(/^port$/i), { target: { value: "12000" } });
+    fireEvent.change(within(dialog).getByLabelText(/^password$/i), { target: { value: "s3cret" } });
     fireEvent.click(within(dialog).getByRole("button", { name: /save/i }));
     await waitFor(() => expect(postedBody).not.toBeNull());
     expect(postedBody).toMatchObject({ name: "demo-cluster", host: "redis-1.lab", port: 12000, password: "s3cret" });
