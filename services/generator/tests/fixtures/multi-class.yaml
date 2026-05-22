@@ -62,9 +62,9 @@ risk_weights:
     constant: 0.075
 
 correlations:
-  girr_rho:    { kind: constant, value: 0.99 }
-  girr_gamma:  { kind: constant, value: 0.5 }
-  equity_rho:  { kind: constant, value: 0.15 }
-  equity_gamma:{ kind: constant, value: 0.15 }
-  fx_rho:      { kind: constant, value: 0.6 }
-  fx_gamma:    { kind: constant, value: 0.6 }
+  girr_rho: { kind: constant, value: 0.99 }
+  girr_gamma: { kind: constant, value: 0.5 }
+  equity_rho: { kind: constant, value: 0.15 }
+  equity_gamma: { kind: constant, value: 0.15 }
+  fx_rho: { kind: constant, value: 0.6 }
+  fx_gamma: { kind: constant, value: 0.6 }
