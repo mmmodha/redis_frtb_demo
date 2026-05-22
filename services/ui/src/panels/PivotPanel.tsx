@@ -95,6 +95,12 @@ export function PivotPanel(): JSX.Element {
     void runAt(0);
   }
 
+  async function runBurst(n: number): Promise<void> {
+    for (let i = 0; i < n; i++) {
+      await runAt(0);
+    }
+  }
+
   const hasPrev = result !== null && offset > 0;
   const hasNext = result !== null && offset + result.rows.length < result.total;
 
@@ -108,9 +114,14 @@ export function PivotPanel(): JSX.Element {
       <PanelCard
         title="Filters"
         actions={
-          <button type="button" onClick={() => void runAt(0)} disabled={loading}>
-            {loading ? "Running…" : "Run query"}
-          </button>
+          <>
+            <button type="button" onClick={() => void runAt(0)} disabled={loading}>
+              {loading ? "Running…" : "Run query"}
+            </button>
+            <button type="button" onClick={() => void runBurst(100)} disabled={loading}>
+              Run 100x
+            </button>
+          </>
         }
       >
         <form onSubmit={onSubmit} className="pivot-filters">
@@ -161,6 +172,12 @@ export function PivotPanel(): JSX.Element {
           />
         </form>
       </PanelCard>
+
+      {result !== null && result.ms < 100 && (
+        <div data-testid="sub-100ms-callout" className="pivot-sub100" role="status">
+          <strong>Sub-100ms</strong> on Redis Enterprise — last pivot returned in <strong>{result.ms}</strong> ms.
+        </div>
+      )}
 
       <PanelCard title="Latency histogram (last 100 runs)">
         <div data-testid="latency-histogram" className="pivot-latency">
