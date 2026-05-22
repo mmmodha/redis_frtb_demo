@@ -1,0 +1,4 @@
+risk_class,bucket,sensitivity_type,tenor_3M,tenor_6M,tenor_1Y,tenor_2Y,tenor_5Y,tenor_10Y,book
+GIRR,USD-IRS,Delta,0.10,0.20,0.30,0.40,0.50,0.60,BOOK-A
+GIRR,EUR-IRS,Delta,0.11,0.21,0.31,0.41,0.51,0.61,BOOK-B
+GIRR,GBP-IRS,Delta,0.12,0.22,0.32,0.42,0.52,0.62,BOOK-C

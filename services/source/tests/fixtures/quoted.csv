@@ -1,0 +1,4 @@
+name,description,value
+"Alpha","first, comma inside",1.5
+"Beta","quoted ""inner"" word",2.5
+Gamma,plain,3.5

@@ -3,8 +3,25 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
-  "description": "FRTB SBM PoV — file/upload source service (placeholder stub; column-mapping wizard lands in Wave 2.5)",
+  "description": "FRTB SBM PoV — source service: file uploads, column inference, FRTB-binding mapping, stream ingest",
   "scripts": {
-    "start": "node src/index.mjs"
+    "build": "tsc -p tsconfig.json",
+    "start": "tsx src/index.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@fastify/multipart": "^9.0.3",
+    "@frtb/schema": "*",
+    "fastify": "^5.8.5",
+    "ioredis": "^5.10.1",
+    "ulid": "^2.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.19",
+    "tsx": "^4.22.3",
+    "typescript": "^5.9.3",
+    "vitest": "^2.1.9"
   }
 }

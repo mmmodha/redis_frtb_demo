@@ -1,0 +1,7 @@
+risk_class,bucket,sensitivity_type,tenor,risk_value,weight,trade_id,book,currency
+GIRR,USD-IRS,Delta,0.25,0.12,0.017,T-001,BOOK-A,USD
+GIRR,USD-IRS,Delta,0.5,0.34,0.017,T-001,BOOK-A,USD
+GIRR,USD-IRS,Delta,1,0.56,0.017,T-001,BOOK-A,USD
+GIRR,EUR-IRS,Delta,2,0.78,0.013,T-002,BOOK-B,EUR
+GIRR,EUR-IRS,Delta,5,0.42,0.013,T-002,BOOK-B,EUR
+GIRR,GBP-IRS,Vega,1,0.91,0.011,T-003,BOOK-C,GBP
