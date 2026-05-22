@@ -251,5 +251,28 @@ describe("PivotPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: /next/i }));
     await waitFor(() => expect(screen.getByRole("button", { name: /previous/i })).toBeEnabled());
   });
+
+  it("Run 100x button fires 100 sequential pivots and populates the histogram", async () => {
+    // Stub every call with a small randomised latency so percentiles are non-zero.
+    fetchMock.mockImplementation(async () => ({
+      ok: true,
+      json: async () => pivotResponse({ ms: 5 + Math.random() * 20 }),
+    }));
+    renderPanel();
+    const burst = screen.getByRole("button", { name: /run 100x/i });
+    fireEvent.click(burst);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(100), { timeout: 5000 });
+    // burst button is re-enabled once the run completes
+    await waitFor(() => expect(burst).toBeEnabled());
+  });
+
+  it("renders a <100ms 'sub-100ms' callout on the first successful run when server ms < 100", async () => {
+    fetchMock.mockResolvedValueOnce({ ok: true, json: async () => pivotResponse({ ms: 7.5 }) });
+    renderPanel();
+    fireEvent.click(screen.getByRole("button", { name: /run query/i }));
+    const callout = await screen.findByTestId("sub-100ms-callout");
+    expect(callout).toHaveTextContent(/sub.?100/i);
+    expect(callout).toHaveTextContent(/7\.5\s*ms/);
+  });
 });
 
