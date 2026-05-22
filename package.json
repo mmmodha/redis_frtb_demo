@@ -11,6 +11,7 @@
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
+    "typecheck": "npm run typecheck --workspaces --if-present",
     "schema:generate": "npm run -w @frtb/schema-cli generate -- ../../config/schema/frtb-default.yaml --out ../../shared/schema/generated",
     "schema:validate": "npm run -w @frtb/schema-cli validate -- ../../config/schema/frtb-default.yaml"
   },

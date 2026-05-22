@@ -16,17 +16,34 @@ interface CalcOpts {
 
 const ALLOWED_LEG = new Set(["delta", "vega"]);
 
-// RESP map replies arrive as flat key/value arrays from ioredis. Tolerate both
-// shapes (flat array or object) — the real Function library will return RESP3
-// maps via redis.register_function; the stub library used in integration tests
-// returns flat arrays.
+// FCALL replies arrive in three shapes:
+//   1. JSON string — the real `frtb` Lua library returns cjson.encode({...})
+//      (RESP2 bulk-string). This is the production path.
+//   2. Flat key/value array — RESP2 map fallback used by some test stubs.
+//   3. Plain object — RESP3 map or in-process test stub.
+// `Buffer` is also possible from ioredis if the connection is in binary mode;
+// we coerce via String() before JSON.parse.
 function parseBucketReply(reply: unknown): BucketResult | null {
+  if (typeof reply === "string" || reply instanceof Buffer) {
+    try {
+      const parsed = JSON.parse(String(reply)) as Record<string, unknown>;
+      return {
+        bucket: "",
+        K_b: Number(parsed.K_b),
+        S_b: Number(parsed.S_b),
+        count: Number(parsed.count),
+        ms: Number(parsed.ms),
+      };
+    } catch {
+      return null;
+    }
+  }
   if (Array.isArray(reply)) {
     const m: Record<string, string> = {};
     for (let i = 0; i < reply.length; i += 2) m[String(reply[i])] = String(reply[i + 1]);
     if (m.K_b === undefined) return null;
     return {
-      bucket: "", // filled in by caller
+      bucket: "",
       K_b: Number(m.K_b),
       S_b: Number(m.S_b),
       count: Number(m.count),

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
-import { spawn, type ChildProcess, spawnSync } from "node:child_process";
+import { spawn, execSync, type ChildProcess, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve, join } from "node:path";
@@ -25,9 +25,17 @@ const PORT = 16400;
 let proc: ChildProcess | undefined;
 let tmp: string;
 let redis: Redis;
-let redisAvailable = false;
+
+// `it.skipIf` evaluates at test-registration time — detect redis-server on
+// PATH synchronously at module load so the skip decision is made up-front.
+function hasOnPath(cmd: string): boolean {
+  try { execSync(`command -v ${cmd}`, { stdio: "ignore" }); return true; }
+  catch { return false; }
+}
+const redisAvailable = hasOnPath("redis-server");
 
 beforeAll(async () => {
+  if (!redisAvailable) return;
   tmp = mkdtempSync(join(tmpdir(), "frtb-gen-cli-"));
   proc = spawnRedis(PORT, tmp);
   for (let i = 0; i < 30; i++) {
@@ -36,13 +44,13 @@ beforeAll(async () => {
       await r.connect();
       await r.ping();
       await r.quit();
-      redisAvailable = true;
-      break;
+      redis = new Redis({ port: PORT });
+      return;
     } catch {
       await wait(100);
     }
   }
-  if (redisAvailable) redis = new Redis({ port: PORT });
+  throw new Error("redis-server is on PATH but failed to start on port " + PORT);
 });
 
 afterAll(async () => {
@@ -56,8 +64,7 @@ beforeEach(async () => {
 });
 
 describe("generator CLI", () => {
-  it("produces --rows N rows to the Stream when --classes is restricted to one class", () => {
-    if (!redisAvailable) return;
+  it.skipIf(!redisAvailable)("produces --rows N rows to the Stream when --classes is restricted to one class", () => {
     const res = spawnSync(
       process.execPath,
       [tsx, cli, "--rows", "500", "--classes", "fx", "--seed", "1", "--batch-size", "100"],
@@ -76,8 +83,7 @@ describe("generator CLI", () => {
     expect((res.stdout + res.stderr).toLowerCase()).toMatch(/done|finished|rows\/sec/);
   });
 
-  it("respects --classes all and produces rows across every schema-defined class", async () => {
-    if (!redisAvailable) return;
+  it.skipIf(!redisAvailable)("respects --classes all and produces rows across every schema-defined class", async () => {
     const res = spawnSync(
       process.execPath,
       [tsx, cli, "--rows", "300", "--classes", "all", "--seed", "2"],
@@ -107,8 +113,7 @@ describe("generator CLI", () => {
     expect(classes).toEqual(new Set(["GIRR", "EQUITY", "FX"]));
   });
 
-  it("each Stream entry carries _hash_tag = '{risk_class}:{bucket}'", async () => {
-    if (!redisAvailable) return;
+  it.skipIf(!redisAvailable)("each Stream entry carries _hash_tag = '{risk_class}:{bucket}'", async () => {
     spawnSync(
       process.execPath,
       [tsx, cli, "--rows", "50", "--classes", "girr", "--seed", "3"],
@@ -133,8 +138,7 @@ describe("generator CLI", () => {
     }
   });
 
-  it("re-running with a different SCHEMA_FILE produces rows in the new shape (proves schema swap)", async () => {
-    if (!redisAvailable) return;
+  it.skipIf(!redisAvailable)("re-running with a different SCHEMA_FILE produces rows in the new shape (proves schema swap)", async () => {
     const swap = resolve(here, "fixtures/swap-schema.yaml");
     spawnSync(
       process.execPath,

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, execSync, type ChildProcess } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -24,9 +24,18 @@ const PORT = 16410;
 let proc: ChildProcess | undefined;
 let tmp: string;
 let redis: Redis;
-let redisAvailable = false;
+
+// Synchronous PATH check at module load — `it.skipIf` evaluates its condition
+// at test-registration time, not at runtime, so the previous beforeAll-mutated
+// flag pattern would always skip even when redis-server was available.
+function hasOnPath(cmd: string): boolean {
+  try { execSync(`command -v ${cmd}`, { stdio: "ignore" }); return true; }
+  catch { return false; }
+}
+const redisAvailable = hasOnPath("redis-server");
 
 beforeAll(async () => {
+  if (!redisAvailable) return;
   tmp = mkdtempSync(join(tmpdir(), "frtb-calc-redis-"));
   proc = spawnRedis(PORT, tmp);
   for (let i = 0; i < 30; i++) {
@@ -35,13 +44,13 @@ beforeAll(async () => {
       await r.connect();
       await r.ping();
       await r.quit();
-      redisAvailable = true;
-      break;
+      redis = new Redis({ port: PORT });
+      return;
     } catch {
       await wait(100);
     }
   }
-  if (redisAvailable) redis = new Redis({ port: PORT });
+  throw new Error("redis-server is on PATH but failed to start on port " + PORT);
 });
 
 afterAll(async () => {
@@ -76,8 +85,7 @@ async function seedRow(rc: string, bucket: string, riskValue: number[]): Promise
 }
 
 describe("frtb.sbm_vega_bucket (GIRR Vega Redis Function)", () => {
-  it("loads as part of the locked `frtb` library", async () => {
-    if (!redisAvailable) return;
+  it.skipIf(!redisAvailable)("loads as part of the locked `frtb` library", async () => {
     const snippet = buildGirrVegaSnippet({ weight: 1.0, rho: 0.5 });
     const result = await loadFrtbLibrary(redis, [snippet]);
     expect(result.libraryName).toBe("frtb");
@@ -90,8 +98,7 @@ describe("frtb.sbm_vega_bucket (GIRR Vega Redis Function)", () => {
     expect(found).toBe(true);
   });
 
-  it("computes K_b for a hand-computed fixture (w=1, ρ=0.5, 2 rows × 2 tenors)", async () => {
-    if (!redisAvailable) return;
+  it.skipIf(!redisAvailable)("computes K_b for a hand-computed fixture (w=1, ρ=0.5, 2 rows × 2 tenors)", async () => {
     await loadFrtbLibrary(redis, [buildGirrVegaSnippet({ weight: 1.0, rho: 0.5 })]);
     await seedRow("GIRR", "USD", [0.5, 1.0]);
     await seedRow("GIRR", "USD", [1.0, 0.5]);
@@ -108,8 +115,7 @@ describe("frtb.sbm_vega_bucket (GIRR Vega Redis Function)", () => {
     expect(typeof out.ms).toBe("number");
   });
 
-  it("matches the TS reference oracle on a 1-row fixture (w=0.18, ρ=0.4)", async () => {
-    if (!redisAvailable) return;
+  it.skipIf(!redisAvailable)("matches the TS reference oracle on a 1-row fixture (w=0.18, ρ=0.4)", async () => {
     const weight = 0.18;
     const rho = 0.4;
     await loadFrtbLibrary(redis, [buildGirrVegaSnippet({ weight, rho })]);
@@ -127,8 +133,7 @@ describe("frtb.sbm_vega_bucket (GIRR Vega Redis Function)", () => {
     expect(out.count).toBe(1);
   });
 
-  it("is slot-local: ignores rows whose hash-tag is a different bucket", async () => {
-    if (!redisAvailable) return;
+  it.skipIf(!redisAvailable)("is slot-local: ignores rows whose hash-tag is a different bucket", async () => {
     await loadFrtbLibrary(redis, [buildGirrVegaSnippet({ weight: 1.0, rho: 0.0 })]);
     await seedRow("GIRR", "USD", [1.0, 1.0]); // target bucket
     await seedRow("GIRR", "USD", [1.0, 1.0]); // target bucket
@@ -146,8 +151,7 @@ describe("frtb.sbm_vega_bucket (GIRR Vega Redis Function)", () => {
     expect(out.S_b).toBeCloseTo(4.0, 9);
   });
 
-  it("returns zero K_b / zero count when the bucket is empty", async () => {
-    if (!redisAvailable) return;
+  it.skipIf(!redisAvailable)("returns zero K_b / zero count when the bucket is empty", async () => {
     await loadFrtbLibrary(redis, [buildGirrVegaSnippet({ weight: 1.0, rho: 0.5 })]);
     const raw = (await redis.call(
       "FCALL", "sbm_vega_bucket", "1", "sens:{GIRR:JPY}:_", "GIRR", "JPY"

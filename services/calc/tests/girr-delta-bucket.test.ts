@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, execSync, type ChildProcess } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -24,13 +24,22 @@ const PORT = 16411;
 let proc: ChildProcess | undefined;
 let tmp: string;
 let redis: Redis;
-let redisAvailable = false;
+
+// Synchronous PATH check at module load — `it.skipIf` evaluates its condition
+// at test-registration time, not at runtime, so the previous beforeAll-mutated
+// flag pattern would always skip even when redis-server was available.
+function hasOnPath(cmd: string): boolean {
+  try { execSync(`command -v ${cmd}`, { stdio: "ignore" }); return true; }
+  catch { return false; }
+}
+const redisAvailable = hasOnPath("redis-server");
 
 // Canonical GIRR Delta weights per tenor (MAR21.42 — see config/schema/frtb-default.yaml).
 const GIRR_W = [0.017, 0.017, 0.016, 0.013, 0.012, 0.011, 0.011, 0.011, 0.011, 0.011];
 const GIRR_RHO = 0.99;
 
 beforeAll(async () => {
+  if (!redisAvailable) return;
   tmp = mkdtempSync(join(tmpdir(), "frtb-calc-delta-redis-"));
   proc = spawnRedis(PORT, tmp);
   for (let i = 0; i < 30; i++) {
@@ -39,13 +48,13 @@ beforeAll(async () => {
       await r.connect();
       await r.ping();
       await r.quit();
-      redisAvailable = true;
-      break;
+      redis = new Redis({ port: PORT });
+      return;
     } catch {
       await wait(100);
     }
   }
-  if (redisAvailable) redis = new Redis({ port: PORT });
+  throw new Error("redis-server is on PATH but failed to start on port " + PORT);
 });
 
 afterAll(async () => {
@@ -83,8 +92,7 @@ async function seedDelta(
 }
 
 describe("frtb.sbm_delta_bucket (GIRR Delta Redis Function)", () => {
-  it("loads as part of the locked `frtb` library", async () => {
-    if (!redisAvailable) return;
+  it.skipIf(!redisAvailable)("loads as part of the locked `frtb` library", async () => {
     const snippet = buildGirrDeltaSnippet({ weights: GIRR_W, rho: GIRR_RHO });
     const result = await loadFrtbLibrary(redis, [snippet]);
     expect(result.libraryName).toBe("frtb");
@@ -96,8 +104,7 @@ describe("frtb.sbm_delta_bucket (GIRR Delta Redis Function)", () => {
     expect(found).toBe(true);
   });
 
-  it("coexists with Vega in the same library when both snippets are loaded", async () => {
-    if (!redisAvailable) return;
+  it.skipIf(!redisAvailable)("coexists with Vega in the same library when both snippets are loaded", async () => {
     const delta = buildGirrDeltaSnippet({ weights: GIRR_W, rho: GIRR_RHO });
     // Minimal Vega snippet via direct source — we don't import the Vega builder
     // because we don't want to depend on its config presence; this test just
@@ -114,8 +121,7 @@ describe("frtb.sbm_delta_bucket (GIRR Delta Redis Function)", () => {
     expect(list).toContain("sbm_vega_bucket");
   });
 
-  it("computes K_b for a hand-computed fixture (3 rows × 10 tenors, GIRR weights, ρ=0.99)", async () => {
-    if (!redisAvailable) return;
+  it.skipIf(!redisAvailable)("computes K_b for a hand-computed fixture (3 rows × 10 tenors, GIRR weights, ρ=0.99)", async () => {
     await loadFrtbLibrary(redis, [buildGirrDeltaSnippet({ weights: GIRR_W, rho: GIRR_RHO })]);
     const rowA = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
     const rowB = [10, 9, 8, 7, 6, 5, 4, 3, 2, 1];
@@ -144,8 +150,7 @@ describe("frtb.sbm_delta_bucket (GIRR Delta Redis Function)", () => {
     expect(typeof out.ms).toBe("number");
   });
 
-  it("matches the TS reference oracle within 1e-9 on a randomised fixture", async () => {
-    if (!redisAvailable) return;
+  it.skipIf(!redisAvailable)("matches the TS reference oracle within 1e-9 on a randomised fixture", async () => {
     await loadFrtbLibrary(redis, [buildGirrDeltaSnippet({ weights: GIRR_W, rho: GIRR_RHO })]);
     const rows = [
       [0.13, -0.42, 0.71, 1.05, -0.66, 0.33, -0.18, 0.92, -0.51, 0.27],
@@ -167,8 +172,7 @@ describe("frtb.sbm_delta_bucket (GIRR Delta Redis Function)", () => {
     expect(out.count).toBe(3);
   });
 
-  it("is slot-local: ignores rows whose hash-tag is a different bucket", async () => {
-    if (!redisAvailable) return;
+  it.skipIf(!redisAvailable)("is slot-local: ignores rows whose hash-tag is a different bucket", async () => {
     await loadFrtbLibrary(redis, [buildGirrDeltaSnippet({ weights: [1,1,1,1,1,1,1,1,1,1], rho: 0 })]);
     await seedDelta("GIRR", "USD", [1,0,0,0,0,0,0,0,0,0]);
     await seedDelta("GIRR", "USD", [0,1,0,0,0,0,0,0,0,0]);
@@ -185,8 +189,7 @@ describe("frtb.sbm_delta_bucket (GIRR Delta Redis Function)", () => {
     expect(out.S_b).toBeCloseTo(2, 9);
   });
 
-  it("filters out non-Delta sensitivity rows in the same bucket", async () => {
-    if (!redisAvailable) return;
+  it.skipIf(!redisAvailable)("filters out non-Delta sensitivity rows in the same bucket", async () => {
     await loadFrtbLibrary(redis, [buildGirrDeltaSnippet({ weights: [1,1,1,1,1,1,1,1,1,1], rho: 0 })]);
     await seedDelta("GIRR", "JPY", [1,0,0,0,0,0,0,0,0,0], "Delta");
     await seedDelta("GIRR", "JPY", [9,9,9,9,9,9,9,9,9,9], "Vega");
@@ -201,8 +204,7 @@ describe("frtb.sbm_delta_bucket (GIRR Delta Redis Function)", () => {
     expect(out.S_b).toBeCloseTo(1, 9);
   });
 
-  it("returns zero K_b / zero count when the bucket is empty", async () => {
-    if (!redisAvailable) return;
+  it.skipIf(!redisAvailable)("returns zero K_b / zero count when the bucket is empty", async () => {
     await loadFrtbLibrary(redis, [buildGirrDeltaSnippet({ weights: GIRR_W, rho: GIRR_RHO })]);
     const raw = (await redis.call(
       "FCALL", "sbm_delta_bucket", "1", "sens:{GIRR:CHF}:_", "GIRR", "CHF"

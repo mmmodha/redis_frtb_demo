@@ -15,7 +15,7 @@ describe("computeKbDelta (TS reference oracle)", () => {
 
     // Expected WS_k = w_k * (k+1)
     const expectedWS = GIRR_W.map((w, i) => w * (i + 1));
-    for (let k = 0; k < 10; k++) expect(out.WS[k]).toBeCloseTo(expectedWS[k], 12);
+    for (let k = 0; k < 10; k++) expect(out.WS[k]).toBeCloseTo(expectedWS[k]!, 12);
 
     // K_b² = ΣWS² + ρ·((ΣWS)² − ΣWS²)
     const sumWs = expectedWS.reduce((a, b) => a + b, 0);
@@ -34,7 +34,7 @@ describe("computeKbDelta (TS reference oracle)", () => {
     const out = computeKbDelta(rows, GIRR_W, 0.99);
     expect(out.count).toBe(2);
     // s1+s2 = 11 for every tenor
-    for (let k = 0; k < 10; k++) expect(out.WS[k]).toBeCloseTo(GIRR_W[k] * 11, 12);
+    for (let k = 0; k < 10; k++) expect(out.WS[k]).toBeCloseTo(GIRR_W[k]! * 11, 12);
   });
 
   it("ignores non-Delta sensitivity types (Vega / Curvature filtered)", () => {
@@ -45,8 +45,8 @@ describe("computeKbDelta (TS reference oracle)", () => {
     ];
     const out = computeKbDelta(rows, GIRR_W, 0.99);
     expect(out.count).toBe(1);
-    expect(out.K_b).toBeCloseTo(GIRR_W[0], 12);
-    expect(out.S_b).toBeCloseTo(GIRR_W[0], 12);
+    expect(out.K_b).toBeCloseTo(GIRR_W[0]!, 12);
+    expect(out.S_b).toBeCloseTo(GIRR_W[0]!, 12);
   });
 
   it("collapses to √ΣWS² when ρ=0", () => {
@@ -74,6 +74,6 @@ describe("computeKbDelta (TS reference oracle)", () => {
     const rows = [{ sensitivity_type: "Delta", risk_value: [1, NaN, 3, 4, 5, 6, 7, 8, 9, 10] }];
     const out = computeKbDelta(rows, GIRR_W, 0.99);
     expect(out.WS[1]).toBe(0);
-    expect(out.WS[0]).toBeCloseTo(GIRR_W[0], 12);
+    expect(out.WS[0]).toBeCloseTo(GIRR_W[0]!, 12);
   });
 });

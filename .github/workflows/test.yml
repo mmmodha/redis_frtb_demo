@@ -1,0 +1,62 @@
+name: test
+
+on:
+  push:
+    branches: [main, frtb-sbm-redis-pov]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      # redis-stack-server provides Redis 7 (FUNCTION LOAD), JSON, and Search —
+      # the three modules the api / calc / e2e tests exercise. Exposing 6379 so
+      # tests that just need a redis-server can use the same instance.
+      redis-stack:
+        image: redis/redis-stack-server:7.4.0-v0
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      # Install redis-tools so the calc / generator tests' `which redis-server`
+      # detection succeeds on the runner (they spawn their own ephemeral
+      # redis-server instances on distinct ports).
+      - name: Install redis-server CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y redis-server redis-tools
+          redis-server --version
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Typecheck (all workspaces)
+        run: npm run typecheck
+
+      - name: Test (all workspaces)
+        run: npm test --workspaces --if-present
+        env:
+          # Verifier sanity: ensure the MVP e2e test against redis-stack-server
+          # (via testcontainers) can find a Docker daemon. GitHub-hosted runners
+          # always have Docker available, so this is mostly documentation.
+          DOCKER_HOST: unix:///var/run/docker.sock

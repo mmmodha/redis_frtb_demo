@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
-import { spawn, type ChildProcess, spawnSync } from "node:child_process";
+import { spawn, execSync, type ChildProcess, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve, join } from "node:path";
@@ -25,9 +25,17 @@ const PORT = 16401;
 let proc: ChildProcess | undefined;
 let tmp: string;
 let redis: Redis;
-let redisAvailable = false;
+
+// `it.skipIf` evaluates at test-registration time — detect redis-server on
+// PATH synchronously at module load so the skip decision is made up-front.
+function hasOnPath(cmd: string): boolean {
+  try { execSync(`command -v ${cmd}`, { stdio: "ignore" }); return true; }
+  catch { return false; }
+}
+const redisAvailable = hasOnPath("redis-server");
 
 beforeAll(async () => {
+  if (!redisAvailable) return;
   tmp = mkdtempSync(join(tmpdir(), "frtb-gen-resume-"));
   proc = spawnRedis(PORT, tmp);
   for (let i = 0; i < 30; i++) {
@@ -36,13 +44,13 @@ beforeAll(async () => {
       await r.connect();
       await r.ping();
       await r.quit();
-      redisAvailable = true;
-      break;
+      redis = new Redis({ port: PORT });
+      return;
     } catch {
       await wait(100);
     }
   }
-  if (redisAvailable) redis = new Redis({ port: PORT });
+  throw new Error("redis-server is on PATH but failed to start on port " + PORT);
 });
 
 afterAll(async () => {
@@ -56,8 +64,7 @@ beforeEach(async () => {
 });
 
 describe("generator resumability (DoD: killed mid-stream, resumed safely)", () => {
-  it("appending a second run to the same stream does not corrupt the first run's entries", async () => {
-    if (!redisAvailable) return;
+  it.skipIf(!redisAvailable)("appending a second run to the same stream does not corrupt the first run's entries", async () => {
     const env = {
       ...process.env,
       SCHEMA_FILE: multiClass,

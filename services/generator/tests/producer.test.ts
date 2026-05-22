@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, execSync, type ChildProcess } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve, join } from "node:path";
@@ -21,27 +21,32 @@ const PORT = 16399;
 let proc: ChildProcess | undefined;
 let tmp: string;
 let redis: Redis;
-let redisAvailable = false;
+
+// `it.skipIf` evaluates at test-registration time — detect redis-server on
+// PATH synchronously at module load so the skip decision is made up-front.
+function hasOnPath(cmd: string): boolean {
+  try { execSync(`command -v ${cmd}`, { stdio: "ignore" }); return true; }
+  catch { return false; }
+}
+const redisAvailable = hasOnPath("redis-server");
 
 beforeAll(async () => {
+  if (!redisAvailable) return;
   tmp = mkdtempSync(join(tmpdir(), "frtb-gen-redis-"));
   proc = spawnRedis(PORT, tmp);
-  // Wait for redis to come up
   for (let i = 0; i < 30; i++) {
     try {
       const r = new Redis({ port: PORT, lazyConnect: true, maxRetriesPerRequest: 1 });
       await r.connect();
       await r.ping();
       await r.quit();
-      redisAvailable = true;
-      break;
+      redis = new Redis({ port: PORT });
+      return;
     } catch {
       await wait(100);
     }
   }
-  if (redisAvailable) {
-    redis = new Redis({ port: PORT });
-  }
+  throw new Error("redis-server is on PATH but failed to start on port " + PORT);
 });
 
 afterAll(async () => {
@@ -55,8 +60,7 @@ beforeEach(async () => {
 });
 
 describe("createStreamProducer (XADD batching + pipelining)", () => {
-  it.runIf(true)("appends rows to the configured stream via XADD", async function () {
-    if (!redisAvailable) return; // skip — redis-server not available
+  it.skipIf(!redisAvailable)("appends rows to the configured stream via XADD", async function () {
     const producer = createStreamProducer(redis, { stream: "sensitivities:in", batchSize: 64 });
     const row: SensitivityRow = {
       risk_class: "GIRR",
@@ -82,8 +86,7 @@ describe("createStreamProducer (XADD batching + pipelining)", () => {
     expect(payload.risk_value).toEqual([1, 2, 3]);
   });
 
-  it("batches XADDs via pipelining when the buffer fills", async () => {
-    if (!redisAvailable) return;
+  it.skipIf(!redisAvailable)("batches XADDs via pipelining when the buffer fills", async () => {
     const producer = createStreamProducer(redis, { stream: "sensitivities:in", batchSize: 50 });
     for (let i = 0; i < 137; i++) {
       await producer.add({
@@ -100,8 +103,7 @@ describe("createStreamProducer (XADD batching + pipelining)", () => {
     expect(producer.batchCount).toBe(3);
   });
 
-  it("reports running totals so the CLI can print rows/sec", async () => {
-    if (!redisAvailable) return;
+  it.skipIf(!redisAvailable)("reports running totals so the CLI can print rows/sec", async () => {
     const producer = createStreamProducer(redis, { stream: "sensitivities:in", batchSize: 10 });
     for (let i = 0; i < 25; i++) {
       await producer.add({
