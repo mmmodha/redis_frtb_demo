@@ -1,0 +1,7 @@
+# Pinned dependencies for the FRTB SBM Python reference oracle.
+# Used by tools/reference-sbm/sbm.py and the pytest suite under
+# tools/reference-sbm/tests/. Versions are pinned so the oracle output
+# is bit-stable across machines and CI runs.
+numpy==1.26.4
+pandas==2.2.2
+pytest==8.2.2
