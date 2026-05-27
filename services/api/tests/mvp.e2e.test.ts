@@ -2,14 +2,20 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { GenericContainer, type StartedTestContainer } from "testcontainers";
 import { Redis } from "ioredis";
 import { monotonicFactory } from "ulid";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { execSync } from "node:child_process";
 
 import { createServer } from "../src/server.ts";
-import { reduceRiskClassCharge, type BucketResult } from "../src/sbm/reduce.ts";
+import { reduceRiskClassCharge, type BucketResult, type CorrelationSpec } from "../src/sbm/reduce.ts";
 import { buildGirrDeltaSnippet } from "../../calc/src/girrDeltaSnippet.ts";
 import { buildGirrVegaSnippet } from "../../calc/src/girrVegaSnippet.ts";
-import { loadFrtbLibrary } from "../../calc/src/loadFrtbLibrary.ts";
+import { buildEquityDeltaSnippet } from "../../calc/src/equityDeltaSnippet.ts";
+import { buildEquityVegaSnippet } from "../../calc/src/equityVegaSnippet.ts";
+import { buildFxDeltaSnippet } from "../../calc/src/fxDeltaSnippet.ts";
+import { buildFxVegaSnippet } from "../../calc/src/fxVegaSnippet.ts";
+import { loadFrtbLibrary, type FrtbLibrarySnippet } from "../../calc/src/loadFrtbLibrary.ts";
 import { computeKbDelta } from "../../calc/src/girrDeltaReference.ts";
 import { computeKbVega } from "../../calc/src/girrVegaReference.ts";
 import { createStreamProducer, type SensitivityRow } from "../../generator/src/producer.ts";
@@ -29,6 +35,21 @@ const GIRR_VEGA_RHO = 0.5;
 const CROSS_BUCKET_GAMMA = 0.5;
 const BUCKETS = ["USD", "EUR", "GBP"] as const;
 const TENOR = ["3M", "6M", "1Y", "2Y", "3Y", "5Y", "10Y", "15Y", "20Y", "30Y"];
+
+// Equity / FX constants — values mirror config/schema/frtb-default.yaml so that
+// the Lua snippets are configured with the same parameters the Python oracle
+// used when it produced tools/reference-sbm/golden/expected.json.
+const EQUITY_WEIGHTS: Record<string, number> = {
+  "1": 0.55, "2": 0.60, "3": 0.45, "4": 0.55, "5": 0.30, "6": 0.35, "7": 0.40,
+  "8": 0.50, "9": 0.70, "10": 0.50, "11": 0.70, "12": 0.15, "13": 0.25,
+};
+const EQUITY_RHO = 0.50;
+const EQUITY_GAMMA = 0.15;
+const FX_WEIGHT = 0.075;
+const FX_GAMMA = 0.60;
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const GOLDEN_DIR = resolve(HERE, "..", "..", "..", "tools", "reference-sbm", "golden");
 
 let container: StartedTestContainer | undefined;
 let redis: Redis | undefined;
@@ -233,4 +254,160 @@ describe("MVP end-to-end: ingest → frtb library → POST /calc/sbm", () => {
     },
     180_000,
   );
+});
+
+
+// ---------------------------------------------------------------------------
+// Wave 4.3 — Equity + FX oracle compare cases
+// ---------------------------------------------------------------------------
+// Read each golden CSV in tools/reference-sbm/golden/, ingest into Redis,
+// POST /calc/sbm, and assert response.charge ≈ the Python oracle's expected
+// charge (from expected.json) to <= 1e-4. The CSV + expected.json are the
+// canonical out-of-process oracle; they're authored by tools/reference-sbm
+// and consumed here without re-deriving the math in TypeScript.
+
+interface GoldenRow {
+  risk_class: string;
+  bucket: string;
+  sensitivity_type: string;
+  // Scalar for Equity / FX; array of per-tenor floats for GIRR.
+  risk_value: number | number[];
+}
+
+// Minimal CSV parser tailored to the golden fixtures. The risk_value column
+// is the only one that may be double-quoted (when it contains a JSON array),
+// so a hand-rolled splitter is sufficient — no need for a CSV dep.
+function parseGoldenCsv(text: string): GoldenRow[] {
+  const lines = text.split(/\r?\n/).filter((l) => l.length > 0);
+  const header = lines.shift();
+  if (!header) throw new Error("golden csv: empty");
+  const cols = header.split(",");
+  const idx = {
+    risk_class: cols.indexOf("risk_class"),
+    bucket: cols.indexOf("bucket"),
+    sensitivity_type: cols.indexOf("sensitivity_type"),
+    risk_value: cols.indexOf("risk_value"),
+  };
+  for (const [k, v] of Object.entries(idx)) {
+    if (v < 0) throw new Error(`golden csv: missing column ${k}`);
+  }
+  return lines.map((line) => {
+    // risk_value is the last column. If it starts with a double-quote, the
+    // remainder of the line (minus the wrapping quotes) is its JSON payload.
+    const firstComma = line.indexOf(",");
+    const secondComma = line.indexOf(",", firstComma + 1);
+    const thirdComma = line.indexOf(",", secondComma + 1);
+    const risk_class = line.slice(0, firstComma);
+    const bucket = line.slice(firstComma + 1, secondComma);
+    const sensitivity_type = line.slice(secondComma + 1, thirdComma);
+    let rvField = line.slice(thirdComma + 1);
+    let risk_value: number | number[];
+    if (rvField.startsWith('"')) {
+      rvField = rvField.slice(1, rvField.lastIndexOf('"'));
+      risk_value = JSON.parse(rvField) as number[];
+    } else {
+      risk_value = Number(rvField);
+    }
+    return { risk_class, bucket, sensitivity_type, risk_value };
+  });
+}
+
+interface ExpectedManifest {
+  [filename: string]: { risk_class: string; sensitivity_type: string; charge: number };
+}
+
+function readGolden(filename: string): { rows: GoldenRow[]; expectedCharge: number } {
+  const csvText = readFileSync(resolve(GOLDEN_DIR, filename), "utf8");
+  const manifest = JSON.parse(
+    readFileSync(resolve(GOLDEN_DIR, "expected.json"), "utf8"),
+  ) as ExpectedManifest;
+  const entry = manifest[filename];
+  if (!entry) throw new Error(`expected.json missing entry for ${filename}`);
+  return { rows: parseGoldenCsv(csvText), expectedCharge: entry.charge };
+}
+
+// Convert golden rows into the SensitivityRow shape used by the producer.
+// Stamps _hash_tag = "{risk_class}:{bucket}" so the consumer routes them to
+// the slot-affine `sens:{risk_class:bucket}:{ulid}` key shape.
+function toSensitivityRows(golden: GoldenRow[]): SensitivityRow[] {
+  const ulid = monotonicFactory();
+  return golden.map((g) => ({
+    risk_class: g.risk_class,
+    bucket: g.bucket,
+    _hash_tag: `${g.risk_class}:${g.bucket}`,
+    _id: ulid(),
+    sensitivity_type: g.sensitivity_type,
+    risk_value: g.risk_value,
+  }));
+}
+
+// Build the full set of FRTB snippets (GIRR + Equity + FX) so the loaded
+// `frtb` library can serve any (risk_class, sensitivity_type) the API may
+// dispatch to. Mirrors how a production deployment would load the library.
+function buildAllSnippets(): FrtbLibrarySnippet[] {
+  return [
+    buildGirrDeltaSnippet({ weights: GIRR_W, rho: GIRR_RHO_DELTA }),
+    buildGirrVegaSnippet({ weight: GIRR_VEGA_W, rho: GIRR_VEGA_RHO }),
+    buildEquityDeltaSnippet({ weights: EQUITY_WEIGHTS, rho: EQUITY_RHO }),
+    buildEquityVegaSnippet({ weight: 1.0, rho: EQUITY_RHO }),
+    buildFxDeltaSnippet({ weight: FX_WEIGHT }),
+    buildFxVegaSnippet({ weight: FX_WEIGHT }),
+  ];
+}
+
+async function setupAndIngestGolden(rows: SensitivityRow[]): Promise<void> {
+  await redis!.flushall();
+  await redis!.call("FUNCTION", "FLUSH").catch(() => undefined);
+  await ingestFixture(redis!, rows);
+  await createIndex(redis!);
+  await loadFrtbLibrary(redis!, buildAllSnippets());
+}
+
+interface GoldenCase {
+  filename: string;
+  risk_class: "EQUITY" | "FX";
+  sensitivity_type: "Delta" | "Vega";
+  gamma: number;
+}
+
+const EQUITY_FX_CASES: GoldenCase[] = [
+  { filename: "equity-delta.csv", risk_class: "EQUITY", sensitivity_type: "Delta", gamma: EQUITY_GAMMA },
+  { filename: "equity-vega.csv",  risk_class: "EQUITY", sensitivity_type: "Vega",  gamma: EQUITY_GAMMA },
+  { filename: "fx-delta.csv",     risk_class: "FX",     sensitivity_type: "Delta", gamma: FX_GAMMA },
+  { filename: "fx-vega.csv",      risk_class: "FX",     sensitivity_type: "Vega",  gamma: FX_GAMMA },
+];
+
+describe("Equity + FX oracle compare (golden CSVs vs Python oracle)", () => {
+  for (const c of EQUITY_FX_CASES) {
+    it.skipIf(!HAS_DOCKER)(
+      `${c.risk_class} ${c.sensitivity_type}: /calc/sbm matches oracle expected.json to <=1e-4 (${c.filename})`,
+      async () => {
+        const { rows: golden, expectedCharge } = readGolden(c.filename);
+        const sensRows = toSensitivityRows(golden);
+        await setupAndIngestGolden(sensRows);
+        const correlations: Record<string, CorrelationSpec> = {
+          [c.risk_class]: { kind: "constant", value: c.gamma },
+        };
+        const app = await createServer({ redis: redis!, correlations });
+        try {
+          const res = await app.inject({
+            method: "POST",
+            url: "/calc/sbm",
+            payload: { risk_class: c.risk_class, sensitivity_type: c.sensitivity_type },
+          });
+          expect(res.statusCode).toBe(200);
+          const body = res.json();
+          // 1e-4 absolute tolerance per the Wave 4.3 contract — the goldens
+          // are small enough that relative + absolute tolerances coincide.
+          expect(Math.abs(body.charge - expectedCharge)).toBeLessThanOrEqual(1e-4);
+          const expectedBuckets = Array.from(new Set(golden.map((g) => g.bucket))).sort();
+          expect(body.per_bucket.map((p: BucketResult) => p.bucket).sort())
+            .toEqual(expectedBuckets);
+        } finally {
+          await app.close();
+        }
+      },
+      180_000,
+    );
+  }
 });
