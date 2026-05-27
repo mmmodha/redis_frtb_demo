@@ -46,6 +46,7 @@ const EQUITY_WEIGHTS: Record<string, number> = {
 const EQUITY_RHO = 0.50;
 const EQUITY_GAMMA = 0.15;
 const FX_WEIGHT = 0.075;
+const FX_RHO = 0.60;
 const FX_GAMMA = 0.60;
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -349,9 +350,9 @@ function buildAllSnippets(): FrtbLibrarySnippet[] {
     buildGirrDeltaSnippet({ weights: GIRR_W, rho: GIRR_RHO_DELTA }),
     buildGirrVegaSnippet({ weight: GIRR_VEGA_W, rho: GIRR_VEGA_RHO }),
     buildEquityDeltaSnippet({ weights: EQUITY_WEIGHTS, rho: EQUITY_RHO }),
-    buildEquityVegaSnippet({ weight: 1.0, rho: EQUITY_RHO }),
-    buildFxDeltaSnippet({ weight: FX_WEIGHT }),
-    buildFxVegaSnippet({ weight: FX_WEIGHT }),
+    buildEquityVegaSnippet({ weights: EQUITY_WEIGHTS, rho: EQUITY_RHO }),
+    buildFxDeltaSnippet({ weight: FX_WEIGHT, rho: FX_RHO }),
+    buildFxVegaSnippet({ weight: FX_WEIGHT, rho: FX_RHO }),
   ];
 }
 

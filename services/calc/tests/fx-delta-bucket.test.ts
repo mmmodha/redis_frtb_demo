@@ -126,7 +126,8 @@ describe("frtb.fx_delta (FX Delta Redis Function)", () => {
     )) as string;
     const out = JSON.parse(raw) as { K_b: number; S_b: number; count: number };
     expect(out.count).toBe(2);
-    expect(out.K_b).toBeCloseTo(2.0, 9);
+    // Per-row formula with ρ=0 → K_b = √(1² + 1²) = √2 (S_b still sums to 2).
+    expect(out.K_b).toBeCloseTo(Math.sqrt(2), 9);
     expect(out.S_b).toBeCloseTo(2.0, 9);
   });
 

@@ -78,8 +78,10 @@ async function seedRow(rc: string, bucket: string, riskValue: number[]): Promise
     weight_ref: "girr_vega_weights",
     correlation_ref: "girr_vega_rho_kl",
   };
-  // Plain key+JSON.stringify — ReJSON not required for the per-bucket function
-  // (it scans by key pattern + GET); the actual ingest path uses JSON.SET.
+  // Plain string SET — these tests run against a vanilla redis-server (no
+  // ReJSON module). The per-bucket Lua functions transparently fall back to
+  // GET when JSON.GET is unavailable, so the test stays representative of
+  // the bucket-K_b math.
   await redis.set(key, JSON.stringify(doc));
   return key;
 }

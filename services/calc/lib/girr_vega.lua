@@ -25,28 +25,34 @@ local function _vega_iter_bucket(risk_class, bucket)
     cursor = res[1]
     local keys = res[2]
     for i = 1, #keys do
-      local raw = redis.call('GET', keys[i])
+      local ok_j, raw = pcall(redis.call, 'JSON.GET', keys[i])
+      if not ok_j then
+        local ok_g, plain = pcall(redis.call, 'GET', keys[i])
+        raw = ok_g and plain or nil
+      end
       if raw then
-        local doc = cjson.decode(raw)
-        local rv = doc.risk_value
-        if type(rv) == 'table' then
-          for t = 1, #rv do
-            local s = tonumber(rv[t])
+        local ok, doc = pcall(cjson.decode, raw)
+        if ok and type(doc) == 'table' and doc.sensitivity_type == 'Vega' then
+          local rv = doc.risk_value
+          if type(rv) == 'table' then
+            for t = 1, #rv do
+              local s = tonumber(rv[t])
+              if s then
+                local ws = w * s
+                sum_ws = sum_ws + ws
+                sum_ws_sq = sum_ws_sq + ws * ws
+              end
+            end
+          elseif rv then
+            local s = tonumber(rv)
             if s then
               local ws = w * s
               sum_ws = sum_ws + ws
               sum_ws_sq = sum_ws_sq + ws * ws
             end
           end
-        elseif rv then
-          local s = tonumber(rv)
-          if s then
-            local ws = w * s
-            sum_ws = sum_ws + ws
-            sum_ws_sq = sum_ws_sq + ws * ws
-          end
+          row_count = row_count + 1
         end
-        row_count = row_count + 1
       end
     end
   until cursor == '0'

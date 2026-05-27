@@ -7,12 +7,13 @@
 --   WS_k = w · s_k                                 -- per-row weighted vega
 --   K_b² = ΣWS² + ρ · ((ΣWS)² − ΣWS²)
 --   S_b  = Σ WS
--- The loader substitutes __EQUITY_VEGA_WEIGHT__ and __EQUITY_VEGA_RHO__ with
--- numeric literals.
+-- The loader substitutes __EQUITY_VEGA_WEIGHTS__ (either a per-bucket Lua
+-- table or a metatable-backed table returning a single constant for any
+-- bucket id) and __EQUITY_VEGA_RHO__ with numeric literals.
 -- Only rows with sensitivity_type == "Vega" contribute.
 
-local function _eq_vega_iter_bucket(bucket, w)
-  local pattern = 'sens:{Equity:' .. bucket .. '}:*'
+local function _eq_vega_iter_bucket(risk_class, bucket, w)
+  local pattern = 'sens:{' .. risk_class .. ':' .. bucket .. '}:*'
   local cursor = '0'
   local sum_ws = 0.0
   local sum_ws_sq = 0.0
@@ -22,7 +23,11 @@ local function _eq_vega_iter_bucket(bucket, w)
     cursor = res[1]
     local keys = res[2]
     for i = 1, #keys do
-      local raw = redis.call('GET', keys[i])
+      local ok_j, raw = pcall(redis.call, 'JSON.GET', keys[i])
+      if not ok_j then
+        local ok_g, plain = pcall(redis.call, 'GET', keys[i])
+        raw = ok_g and plain or nil
+      end
       if raw then
         local ok, doc = pcall(cjson.decode, raw)
         if ok and type(doc) == 'table' and doc.sensitivity_type == 'Vega' then
@@ -46,10 +51,14 @@ redis.register_function('equity_vega', function(keys, args)
   if not risk_class or not bucket then
     return redis.error_reply('equity_vega: requires (risk_class, bucket) args')
   end
-  local w = __EQUITY_VEGA_WEIGHT__
+  local weights = __EQUITY_VEGA_WEIGHTS__
   local rho = __EQUITY_VEGA_RHO__
+  local w = weights[bucket]
+  if not w then
+    return redis.error_reply('equity_vega: no weight for bucket ' .. tostring(bucket))
+  end
   local t0 = redis.call('TIME')
-  local sum_ws, sum_ws_sq, count = _eq_vega_iter_bucket(bucket, w)
+  local sum_ws, sum_ws_sq, count = _eq_vega_iter_bucket(risk_class, bucket, w)
   local cross = sum_ws * sum_ws - sum_ws_sq
   if cross < 0 then cross = 0 end
   local kb_sq = sum_ws_sq + rho * cross

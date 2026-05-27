@@ -2,16 +2,17 @@
 // Mirrors the Lua function frtb.fx_delta; used by integration tests to
 // cross-check the Redis Function output.
 //
-// Per MAR21 §21.88–§21.91 (FX Delta), the bucket is a currency pair and
-// holds a single risk factor: all rows in the same bucket aggregate to one
-// factor (k=1), so the cross-term collapses:
+// Per MAR21 §21.88–§21.91 (FX Delta) with the constant-ρ specialisation
+// used across this PoV (matches the Python oracle's scalar_constant kernel):
 //
-//   s_b  = Σ s_row                                 (raw sensi sum)
-//   WS   = w · s_b
-//   S_b  = WS                                      (signed; used by reduce)
-//   K_b  = |WS|                                    (single-factor)
+//   WS_k = w · s_k                                 (per-row weighted Δ-sensi)
+//   S_b  = Σ WS_k                                  (signed; used by reduce)
+//   K_b² = Σ WS_k² + ρ · ((Σ WS_k)² − Σ WS_k²)
+//   K_b  = √max(0, K_b²)
 //
-// Only rows whose sensitivity_type === "Delta" contribute.
+// ρ is optional (default 0); when ρ=0 the kernel collapses to the legacy
+// single-factor specialisation K_b = √Σ WS_k² (and to |WS| for single-row
+// buckets). Only rows whose sensitivity_type === "Delta" contribute.
 
 export interface FxDeltaKbResult {
   K_b: number;
@@ -27,16 +28,21 @@ export interface FxDeltaRow {
 export function computeKbFxDelta(
   rows: ReadonlyArray<FxDeltaRow>,
   weight: number,
+  rho: number = 0,
 ): FxDeltaKbResult {
-  let sumS = 0;
+  let sumWs = 0;
+  let sumWsSq = 0;
   let count = 0;
   for (const row of rows) {
     if (!row || row.sensitivity_type !== "Delta") continue;
     const rv = row.risk_value;
     if (typeof rv !== "number" || !Number.isFinite(rv)) continue;
-    sumS += rv;
+    const ws = weight * rv;
+    sumWs += ws;
+    sumWsSq += ws * ws;
     count += 1;
   }
-  const ws = weight * sumS;
-  return { K_b: Math.abs(ws), S_b: ws, count };
+  const cross = Math.max(0, sumWs * sumWs - sumWsSq);
+  const kbSq = Math.max(0, sumWsSq + rho * cross);
+  return { K_b: Math.sqrt(kbSq), S_b: sumWs, count };
 }

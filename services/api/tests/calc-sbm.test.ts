@@ -59,7 +59,7 @@ describe("POST /calc/sbm — MVP endpoint", () => {
     const fcalls = fr.calls.filter((c) => c.command === "FCALL");
     expect(fcalls).toHaveLength(2);
     for (const c of fcalls) {
-      expect(c.args[0]).toBe("frtb.sbm_delta_bucket");
+      expect(c.args[0]).toBe("sbm_delta_bucket");
       expect(c.args[1]).toBe("1"); // numkeys
       const key = String(c.args[2]);
       expect(key).toMatch(/^sens:\{GIRR:[^}]+\}:_route$/);
@@ -73,7 +73,7 @@ describe("POST /calc/sbm — MVP endpoint", () => {
     expect(agg!.args).toContain("GROUPBY");
   });
 
-  it("Vega routes to frtb.sbm_vega_bucket and accepts case-insensitive sensitivity_type", async () => {
+  it("Vega routes to sbm_vega_bucket and accepts case-insensitive sensitivity_type", async () => {
     const fr = fakeRedis();
     fr.setResponse("FT.AGGREGATE", ftAggregateReply(["1"]));
     fr.setResponse("FCALL", ["K_b", "2", "S_b", "2", "count", "10", "ms", "1"]);
@@ -89,10 +89,10 @@ describe("POST /calc/sbm — MVP endpoint", () => {
     expect(res.statusCode).toBe(200);
     expect(res.json().charge).toBeCloseTo(2, 10);
     const fc = fr.calls.find((c) => c.command === "FCALL");
-    expect(fc!.args[0]).toBe("frtb.sbm_vega_bucket");
+    expect(fc!.args[0]).toBe("sbm_vega_bucket");
   });
 
-  it("Equity routes Delta to frtb.equity_delta and Vega to frtb.equity_vega", async () => {
+  it("Equity routes Delta to equity_delta and Vega to equity_vega", async () => {
     const fr = fakeRedis();
     fr.setResponse("FT.AGGREGATE", ftAggregateReply(["1"]));
     fr.setResponse("FCALL", ["K_b", "1", "S_b", "1", "count", "5", "ms", "1"]);
@@ -106,7 +106,7 @@ describe("POST /calc/sbm — MVP endpoint", () => {
       payload: { risk_class: "Equity", sensitivity_type: "Delta" },
     });
     expect(delta.statusCode).toBe(200);
-    expect(fr.calls.find((c) => c.command === "FCALL")!.args[0]).toBe("frtb.equity_delta");
+    expect(fr.calls.find((c) => c.command === "FCALL")!.args[0]).toBe("equity_delta");
 
     fr.calls.length = 0;
     const vega = await app.inject({
@@ -115,10 +115,10 @@ describe("POST /calc/sbm — MVP endpoint", () => {
       payload: { risk_class: "Equity", sensitivity_type: "Vega" },
     });
     expect(vega.statusCode).toBe(200);
-    expect(fr.calls.find((c) => c.command === "FCALL")!.args[0]).toBe("frtb.equity_vega");
+    expect(fr.calls.find((c) => c.command === "FCALL")!.args[0]).toBe("equity_vega");
   });
 
-  it("FX routes Delta to frtb.fx_delta and Vega to frtb.fx_vega", async () => {
+  it("FX routes Delta to fx_delta and Vega to fx_vega", async () => {
     const fr = fakeRedis();
     fr.setResponse("FT.AGGREGATE", ftAggregateReply(["EURUSD"]));
     fr.setResponse("FCALL", ["K_b", "1", "S_b", "1", "count", "3", "ms", "1"]);
@@ -132,7 +132,7 @@ describe("POST /calc/sbm — MVP endpoint", () => {
       payload: { risk_class: "FX", sensitivity_type: "Delta" },
     });
     expect(delta.statusCode).toBe(200);
-    expect(fr.calls.find((c) => c.command === "FCALL")!.args[0]).toBe("frtb.fx_delta");
+    expect(fr.calls.find((c) => c.command === "FCALL")!.args[0]).toBe("fx_delta");
 
     fr.calls.length = 0;
     const vega = await app.inject({
@@ -141,7 +141,7 @@ describe("POST /calc/sbm — MVP endpoint", () => {
       payload: { risk_class: "FX", sensitivity_type: "Vega" },
     });
     expect(vega.statusCode).toBe(200);
-    expect(fr.calls.find((c) => c.command === "FCALL")!.args[0]).toBe("frtb.fx_vega");
+    expect(fr.calls.find((c) => c.command === "FCALL")!.args[0]).toBe("fx_vega");
   });
 
   it("returns 400 on missing risk_class or invalid sensitivity_type", async () => {

@@ -28,7 +28,11 @@ local function _delta_iter_bucket(risk_class, bucket, weights)
     cursor = res[1]
     local keys = res[2]
     for i = 1, #keys do
-      local raw = redis.call('GET', keys[i])
+      local ok_j, raw = pcall(redis.call, 'JSON.GET', keys[i])
+      if not ok_j then
+        local ok_g, plain = pcall(redis.call, 'GET', keys[i])
+        raw = ok_g and plain or nil
+      end
       if raw then
         local ok, doc = pcall(cjson.decode, raw)
         if ok and type(doc) == 'table' and doc.sensitivity_type == 'Delta' then

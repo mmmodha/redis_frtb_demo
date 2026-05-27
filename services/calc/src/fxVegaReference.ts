@@ -2,12 +2,16 @@
 // Mirrors the Lua function frtb.fx_vega; used by integration tests to
 // cross-check the Redis Function output.
 //
-// Per MAR21 §21.92 (FX Vega), single-factor-per-currency-pair specialisation:
+// Per MAR21 §21.92 (FX Vega) with the constant-ρ specialisation
+// (matches the Python oracle's scalar_constant kernel):
 //
-//   s_b  = Σ vega_row                              (raw sensi sum, Vega rows only)
-//   WS   = w · s_b
-//   S_b  = WS
-//   K_b  = |WS|
+//   WS_k = w · s_k                                 (per-row weighted vega)
+//   S_b  = Σ WS_k
+//   K_b² = Σ WS_k² + ρ · ((Σ WS_k)² − Σ WS_k²)
+//   K_b  = √max(0, K_b²)
+//
+// ρ is optional (default 0); when ρ=0 the kernel collapses to the legacy
+// single-factor specialisation. Only Vega rows contribute.
 
 export interface FxVegaKbResult {
   K_b: number;
@@ -23,16 +27,21 @@ export interface FxVegaRow {
 export function computeKbFxVega(
   rows: ReadonlyArray<FxVegaRow>,
   weight: number,
+  rho: number = 0,
 ): FxVegaKbResult {
-  let sumS = 0;
+  let sumWs = 0;
+  let sumWsSq = 0;
   let count = 0;
   for (const row of rows) {
     if (!row || row.sensitivity_type !== "Vega") continue;
     const rv = row.risk_value;
     if (typeof rv !== "number" || !Number.isFinite(rv)) continue;
-    sumS += rv;
+    const ws = weight * rv;
+    sumWs += ws;
+    sumWsSq += ws * ws;
     count += 1;
   }
-  const ws = weight * sumS;
-  return { K_b: Math.abs(ws), S_b: ws, count };
+  const cross = Math.max(0, sumWs * sumWs - sumWsSq);
+  const kbSq = Math.max(0, sumWsSq + rho * cross);
+  return { K_b: Math.sqrt(kbSq), S_b: sumWs, count };
 }

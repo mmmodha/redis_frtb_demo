@@ -1,10 +1,12 @@
 // Builds the FX Delta Lua snippet that registers the `fx_delta` function
 // into the cross-agent `frtb` library.
 //
-// Weight comes from config/schema/frtb-default.yaml:
+// Weight and correlation come from config/schema/frtb-default.yaml:
 //   risk_weights.fx_weights.constant → __FX_DELTA_WEIGHT__
-// FX has a single risk factor per currency pair, so no intra-bucket
-// correlation parameter is needed.
+//   correlations.fx_rho.value        → __FX_DELTA_RHO__ (default 0)
+// `rho` is optional for backwards-compatibility with the legacy
+// single-factor specialisation (K_b = |Σ WS|); when omitted the kernel
+// reduces to that form.
 
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -16,6 +18,7 @@ const LUA_PATH = resolve(HERE, "..", "lib", "fx_delta.lua");
 
 export interface FxDeltaParams {
   weight: number;
+  rho?: number;
 }
 
 function luaNumber(n: number): string {
@@ -28,6 +31,8 @@ function luaNumber(n: number): string {
 
 export function buildFxDeltaSnippet(params: FxDeltaParams): FrtbLibrarySnippet {
   const template = readFileSync(LUA_PATH, "utf8");
-  const code = template.replaceAll("__FX_DELTA_WEIGHT__", luaNumber(params.weight));
+  const code = template
+    .replaceAll("__FX_DELTA_WEIGHT__", luaNumber(params.weight))
+    .replaceAll("__FX_DELTA_RHO__", luaNumber(params.rho ?? 0));
   return { name: "fx_delta", code };
 }

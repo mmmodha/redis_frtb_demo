@@ -16,7 +16,11 @@ interface CalcOpts {
 
 const ALLOWED_LEG = new Set(["delta", "vega"]);
 
-// Routing table: (risk_class lowercased, leg) -> Lua function name.
+// Routing table: (risk_class lowercased, leg) -> Redis Function name.
+// Names are the bare function ids registered via redis.register_function in the
+// frtb library snippets (services/calc/lib/*.lua); FCALL takes the function id
+// only, NOT a "library.function" qualifier (the library is a container, not a
+// namespace at call time — see Redis Functions docs / RESP3 FCALL spec).
 // GIRR uses the original generic sbm_*_bucket pair (multi-tenor vectors).
 // Equity and FX each ship dedicated single-purpose Delta/Vega functions that
 // mirror the same locked I/O shape but encode the asset-class specifics
@@ -24,9 +28,9 @@ const ALLOWED_LEG = new Set(["delta", "vega"]);
 // Unknown risk classes fall back to the generic GIRR pair so older calc paths
 // keep working until each asset class is added.
 const FUNC_BY_RISK_CLASS: Record<string, { delta: string; vega: string }> = {
-  girr: { delta: "frtb.sbm_delta_bucket", vega: "frtb.sbm_vega_bucket" },
-  equity: { delta: "frtb.equity_delta", vega: "frtb.equity_vega" },
-  fx: { delta: "frtb.fx_delta", vega: "frtb.fx_vega" },
+  girr: { delta: "sbm_delta_bucket", vega: "sbm_vega_bucket" },
+  equity: { delta: "equity_delta", vega: "equity_vega" },
+  fx: { delta: "fx_delta", vega: "fx_vega" },
 };
 const DEFAULT_FUNCS = FUNC_BY_RISK_CLASS.girr!;
 
