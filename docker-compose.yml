@@ -72,10 +72,15 @@ services:
       <<: *app-env
       HEALTH_PORT: 8080
       CONN_STORE_KEY: ${CONN_STORE_KEY:-dev-only-change-in-prod}
+      # Wave 5.8.5: point seedConnections() at the bind-mounted fixture so the
+      # `demo-cluster` / `scale-cluster` profiles auto-appear in the Connections
+      # panel on api boot — required by the live e2e (e2e/full-demo.spec.ts).
+      SEED_CONNECTIONS_FILE: /app/fixtures/seed-connections.json
     ports:
       - "8080:8080"
     volumes:
       - data:/data
+      - ./services/api/fixtures/seed-connections.json:/app/fixtures/seed-connections.json:ro
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/healthz"]
       interval: 10s

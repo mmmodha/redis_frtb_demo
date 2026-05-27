@@ -1,0 +1,16 @@
+[
+  {
+    "name": "demo-cluster",
+    "host": "redis-demo.lab",
+    "port": 12000,
+    "tls": { "enabled": true },
+    "clusterMode": true
+  },
+  {
+    "name": "scale-cluster",
+    "host": "redis-scale.lab",
+    "port": 12001,
+    "tls": { "enabled": true },
+    "clusterMode": true
+  }
+]

@@ -33,6 +33,10 @@ The 11-step spec (`e2e/full-demo.spec.ts`) has two modes, gated by the `INTEGRAT
 
 Override the live base URL with `UI_BASE_URL=http://… npm run test:e2e:live` if the ui is exposed elsewhere.
 
+### Seed connection prerequisite
+
+The live e2e asserts `getByText('demo-cluster')` (and `scale-cluster`) on the Connections panel at Step 2a. These profiles are auto-created on api boot by `seedConnections()`, which reads `SEED_CONNECTIONS_FILE` — wired in `docker-compose.yml` to bind-mount `services/api/fixtures/seed-connections.json` at `/app/fixtures/seed-connections.json` on the api container. No manual UI step is needed; `docker compose up -d --wait` is sufficient.
+
 ## Why MP4s are not in git
 
 Large binary assets — track via Git LFS or cloud storage. Add the link to `docs/asset-pack/README.md` when the recording lands.
