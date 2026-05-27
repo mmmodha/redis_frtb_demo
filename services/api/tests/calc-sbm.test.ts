@@ -156,18 +156,60 @@ describe("POST /calc/sbm — MVP endpoint", () => {
     expect(b.statusCode).toBe(400);
   });
 
-  it("returns charge=0 when no buckets discovered for the risk_class", async () => {
+  // Wave 5.8.4: a 200 with charge=0 on a portfolio that has no rows (or no
+  // idx:sens on some shards) silently masks a precondition failure. The route
+  // must hard-fail with a diagnostic 503 when the discover step finds no
+  // buckets AND a follow-up FT.SEARCH confirms zero matching rows.
+  it("returns 503 no-data-or-index when FT.AGGREGATE is empty AND FT.SEARCH finds zero rows", async () => {
     const fr = fakeRedis();
     fr.setResponse("FT.AGGREGATE", ftAggregateReply([]));
+    // FT.SEARCH ... LIMIT 0 0 returns [totalMatches] when no rows match.
+    fr.setResponse("FT.SEARCH", [0]);
     app = await createServer({ redis: fr, correlations: { GIRR: { kind: "constant", value: 0 } } });
     const res = await app.inject({
       method: "POST",
       url: "/calc/sbm",
       payload: { risk_class: "GIRR", sensitivity_type: "Delta" },
     });
-    expect(res.statusCode).toBe(200);
+    expect(res.statusCode).toBe(503);
     const body = res.json();
-    expect(body.charge).toBe(0);
-    expect(body.per_bucket).toEqual([]);
+    expect(body).toMatchObject({
+      error: "no-data-or-index",
+      risk_class: "GIRR",
+      measure: "delta",
+    });
+    expect(typeof body.hint).toBe("string");
+    expect(body.hint.length).toBeGreaterThan(0);
+
+    // Verify the precondition probe was issued against the same risk_class
+    // filter as the discover step.
+    const search = fr.calls.find((c) => c.command === "FT.SEARCH");
+    expect(search).toBeDefined();
+    expect(search!.args[0]).toBe("idx:sens");
+    expect(String(search!.args[1])).toContain("@risk_class:{GIRR}");
+    // FCALL must NOT be issued when the precondition failed.
+    expect(fr.calls.find((c) => c.command === "FCALL")).toBeUndefined();
+  });
+
+  it("returns 503 no-data-or-index when FT.SEARCH itself errors (missing index)", async () => {
+    const fr = fakeRedis();
+    fr.setResponse("FT.AGGREGATE", ftAggregateReply([]));
+    // Simulate `idx:sens` missing on this shard — FT.SEARCH throws.
+    fr.setResponse("FT.SEARCH", () => {
+      throw new Error("Unknown Index name");
+    });
+    app = await createServer({ redis: fr, correlations: { GIRR: { kind: "constant", value: 0 } } });
+    const res = await app.inject({
+      method: "POST",
+      url: "/calc/sbm",
+      payload: { risk_class: "GIRR", sensitivity_type: "Vega" },
+    });
+    expect(res.statusCode).toBe(503);
+    const body = res.json();
+    expect(body).toMatchObject({
+      error: "no-data-or-index",
+      risk_class: "GIRR",
+      measure: "vega",
+    });
   });
 });

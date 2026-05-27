@@ -97,6 +97,20 @@ function parseBucketsFromAggregate(reply: unknown): string[] {
   return buckets;
 }
 
+/**
+ * Registers `POST /calc/sbm`.
+ *
+ * Response shapes:
+ *   200 { charge, per_bucket, total_ms, shard_breakdown, fanout_ms } — normal result
+ *   400 { error }                                                    — bad request body
+ *   503 { error: "no-data-or-index", risk_class, measure, hint }     — precondition failure
+ *
+ * The 503 branch fires when FT.AGGREGATE discovers zero buckets AND a follow-up
+ * FT.SEARCH probe finds zero matching rows for the requested risk_class. This
+ * distinguishes "the index is missing on some/all shards or nothing has been
+ * ingested yet" from a real zero charge on a populated portfolio (which would
+ * still return 200). See Wave 5.8.4 for context.
+ */
 export function registerCalcRoute(app: FastifyInstance, redis: RedisLike, opts: CalcOpts): void {
   app.post<{ Body: CalcBody }>("/calc/sbm", async (req, reply) => {
     const risk_class = req.body?.risk_class;
@@ -132,6 +146,41 @@ export function registerCalcRoute(app: FastifyInstance, redis: RedisLike, opts: 
       "2"
     );
     const buckets = parseBucketsFromAggregate(aggReply);
+
+    // 1a) Precondition probe: an empty bucket list could mean either a real
+    //     zero-data portfolio or — the Wave 5.7 failure mode — the index is
+    //     missing on some shards. Issue a cheap FT.SEARCH ... LIMIT 0 0 to
+    //     read the match count without paging documents. If the count is zero
+    //     (or the search itself errors because no index exists), surface a 503
+    //     with a diagnostic body so callers don't mistake "no data" for a
+    //     genuine sbm_charge=0.
+    if (buckets.length === 0) {
+      let matchCount = 0;
+      try {
+        const searchReply = await redis.call(
+          "FT.SEARCH",
+          "idx:sens",
+          `@risk_class:{${risk_class}}`,
+          "LIMIT",
+          "0",
+          "0"
+        );
+        if (Array.isArray(searchReply) && searchReply.length > 0) {
+          matchCount = Number(searchReply[0]) || 0;
+        }
+      } catch {
+        matchCount = 0;
+      }
+      if (matchCount === 0) {
+        reply.code(503);
+        return {
+          error: "no-data-or-index",
+          risk_class,
+          measure: leg,
+          hint: "ensure idx:sens exists on all masters and stream has been ingested",
+        };
+      }
+    }
 
     // 2) Fan out one FCALL per bucket — runs slot-local on the owning shard
     //    because the routing key carries the {risk_class:bucket} hash-tag.
