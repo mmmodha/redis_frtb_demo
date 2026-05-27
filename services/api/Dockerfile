@@ -24,6 +24,10 @@ RUN npm install --workspaces --include-workspace-root --omit=dev=false
 
 COPY services/api/tsconfig.json ./services/api/tsconfig.json
 COPY services/api/src ./services/api/src
+# Schema YAMLs are loaded at runtime via SCHEMA_FILE (set in docker-compose.yml
+# to /app/config/schema/frtb-default.yaml). Baked into the image so the api's
+# Wave 5.6.3 bootstrap can load the frtb library without a host bind-mount.
+COPY config/schema ./config/schema
 
 ENV HEALTH_PORT=3000
 EXPOSE 3000

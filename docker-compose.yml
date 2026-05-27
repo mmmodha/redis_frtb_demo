@@ -76,6 +76,10 @@ services:
       # `demo-cluster` / `scale-cluster` profiles auto-appear in the Connections
       # panel on api boot — required by the live e2e (e2e/full-demo.spec.ts).
       SEED_CONNECTIONS_FILE: /app/fixtures/seed-connections.json
+      # Wave 5.12.1: point the api bootstrap at the schema baked into the image
+      # (see services/api/Dockerfile). Mirrors the generator service for parity
+      # and makes SCHEMA_FILE overridable at runtime for alt-schema testing.
+      SCHEMA_FILE: ${SCHEMA_FILE:-/app/config/schema/frtb-default.yaml}
     ports:
       - "8080:8080"
     volumes:
