@@ -62,15 +62,15 @@ export function parseClusterNodes(text: string): ParsedNode[] {
     if (!line.trim()) continue;
     const parts = line.trim().split(/\s+/);
     if (parts.length < 8) continue;
-    const id = parts[0];
-    const flags = parts[2].split(",");
+    const id = parts[0] ?? "";
+    const flags = (parts[2] ?? "").split(",");
     const isMaster = flags.includes("master");
     const isSlave = flags.includes("slave");
     if (!isMaster && !isSlave) continue;
     let slotCount = 0;
     for (let i = 8; i < parts.length; i++) {
-      const slot = parts[i];
-      if (slot.startsWith("[")) continue; // importing/migrating markers
+      const slot = parts[i] ?? "";
+      if (!slot || slot.startsWith("[")) continue; // importing/migrating markers
       const dash = slot.indexOf("-");
       if (dash >= 0) {
         const lo = Number(slot.slice(0, dash));
