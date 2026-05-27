@@ -29,13 +29,17 @@ x-app-env: &app-env
   LOG_LEVEL: ${LOG_LEVEL:-info}
   API_URL: http://api:8080
 
-# Redis connection env passed through from the host's .env.local. Listed
-# explicitly per service (rather than using a top-level env_file) so each
-# service block documents exactly which Redis vars it consumes.
-x-redis-env: &redis-env
-  REDIS_URL: ${REDIS_URL:-}
-  REDIS_TLS: ${REDIS_TLS:-false}
-  REDIS_CLUSTER: ${REDIS_CLUSTER:-true}
+# Redis connection env (REDIS_URL / REDIS_TLS / REDIS_CLUSTER) is sourced
+# from the host's `.env.local` (gitignored) via the `env_file` directive on
+# every Redis-touching service. This means `docker compose up` (with NO
+# `--env-file` flag) picks the real cluster URL up automatically — Compose
+# v2's project-level auto-load only covers `.env`, never `.env.local`, and
+# Wave 5.5's smoke run proved that interpolating `${REDIS_URL:-}` in the
+# `environment:` block silently overrode the env_file value back to "".
+# `required: false` keeps the `dev-redis` profile usable without `.env.local`.
+x-env-file: &env-file
+  - path: .env.local
+    required: false
 
 services:
   ui:
@@ -63,8 +67,9 @@ services:
     build:
       context: .
       dockerfile: services/api/Dockerfile
+    env_file: *env-file
     environment:
-      <<: [*app-env, *redis-env]
+      <<: *app-env
       HEALTH_PORT: 8080
       CONN_STORE_KEY: ${CONN_STORE_KEY:-dev-only-change-in-prod}
     ports:
@@ -83,9 +88,14 @@ services:
     build:
       context: .
       dockerfile: services/generator/Dockerfile
+    env_file: *env-file
     environment:
-      <<: [*app-env, *redis-env]
+      <<: *app-env
       HEALTH_PORT: 8081
+      # Wave 5.6.2: point the CLI at the schema baked into the image at
+      # /app/config/schema/ (see services/generator/Dockerfile). Without this
+      # the container exits with "schema file path missing".
+      SCHEMA_FILE: ${SCHEMA_FILE:-/app/config/schema/frtb-default.yaml}
     depends_on:
       api:
         condition: service_healthy
@@ -101,8 +111,9 @@ services:
     build:
       context: .
       dockerfile: services/source/Dockerfile
+    env_file: *env-file
     environment:
-      <<: [*app-env, *redis-env]
+      <<: *app-env
       HEALTH_PORT: 8082
     volumes:
       - data:/data
@@ -121,8 +132,9 @@ services:
     build:
       context: .
       dockerfile: services/ingest/Dockerfile
+    env_file: *env-file
     environment:
-      <<: [*app-env, *redis-env]
+      <<: *app-env
       HEALTH_PORT: 8083
     volumes:
       - data:/data
@@ -141,8 +153,9 @@ services:
     build:
       context: .
       dockerfile: services/calc/Dockerfile
+    env_file: *env-file
     environment:
-      <<: [*app-env, *redis-env]
+      <<: *app-env
       HEALTH_PORT: 8084
     depends_on:
       api:
@@ -159,8 +172,9 @@ services:
     build:
       context: .
       dockerfile: services/loadgen/Dockerfile
+    env_file: *env-file
     environment:
-      <<: [*app-env, *redis-env]
+      <<: *app-env
       HEALTH_PORT: 8085
     depends_on:
       api:

@@ -43,6 +43,10 @@ COPY --from=builder /app/shared/redis-client ./shared/redis-client
 COPY services/generator/package.json ./services/generator/package.json
 COPY services/generator/tsconfig.json ./services/generator/tsconfig.json
 COPY services/generator/src ./services/generator/src
+# Schema YAMLs are loaded at runtime via SCHEMA_FILE (set in docker-compose.yml
+# to /app/config/schema/frtb-default.yaml). Copied here so the generator runs
+# inside the container without bind-mounting the repo.
+COPY config/schema ./config/schema
 
 ENV HEALTH_PORT=8081
 EXPOSE 8081
