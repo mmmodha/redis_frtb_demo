@@ -27,6 +27,9 @@ export interface CreateServerOpts {
   // Upstream base URL for the loadgen-service proxy. Falls back to
   // LOADGEN_BASE env var, then to the compose-internal default.
   loadgenBase?: string;
+  // SSE tick interval for /observability/shards/stream (default 1000ms). The
+  // tests dial this down so the suite stays fast.
+  sseIntervalMs?: number;
 }
 
 export async function createServer(opts: CreateServerOpts): Promise<FastifyInstance> {
@@ -40,7 +43,7 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
   if (opts.redis) {
     registerPivotRoute(app, opts.redis);
     registerCalcRoute(app, opts.redis, { correlations: opts.correlations ?? {} });
-    registerObservabilityRoutes(app, opts.redis);
+    registerObservabilityRoutes(app, opts.redis, { sseIntervalMs: opts.sseIntervalMs });
   }
 
   registerSourcesProxyRoutes(app, { sourceBase: opts.sourceBase });
