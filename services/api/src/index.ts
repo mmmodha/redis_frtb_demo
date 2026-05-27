@@ -15,6 +15,7 @@ import { buildCrossBucketCorrelations } from "./sbm/correlations.ts";
 import { createStore } from "./store.ts";
 import { seedConnections } from "./seed.ts";
 import { bootstrapFrtb } from "./bootstrap.ts";
+import { ensureRedisReady } from "./redis-ready.ts";
 
 const PORT = Number(process.env.HEALTH_PORT ?? 8080);
 const SCHEMA_PATH = resolve(
@@ -68,17 +69,22 @@ async function main(): Promise<void> {
       maxRetriesPerRequest: 3,
     });
   }
-  let redisConnected = false;
-  try {
-    await redis.connect();
-    redisConnected = true;
-  } catch (err) {
+  // Wave 5.8.1: ioredis Cluster auto-connects on construction, so we cannot
+  // call .connect() on it (throws "already connecting/connected"). Use a
+  // bounded readiness wait that handles both shapes; either way the api
+  // still starts and serves /healthz when Redis is unreachable.
+  const readiness = await ensureRedisReady(redis, { hasUrl: !!process.env.REDIS_URL });
+  const redisConnected = readiness.connected;
+  if (!redisConnected) {
     // Don't crash the api just because Redis isn't reachable yet — the demo
     // flow has the SA pointing at a cluster via the Connections panel after
     // the api is already up. Endpoints will surface the Redis error per-call.
     console.log(
-      JSON.stringify({ service: "api", status: "redis-unreachable", target: target.label, err: String(err) })
+      JSON.stringify({ service: "api", status: "redis-unreachable", target: target.label, err: String(readiness.err) })
     );
+  } else if (readiness.mode === "cluster") {
+    // Smoke runs grep for this exact line to confirm bootstrap is reachable.
+    console.log(JSON.stringify({ service: "api", status: "redis-ready", mode: "cluster" }));
   }
 
   const schema = existsSync(SCHEMA_PATH) ? loadSchema(SCHEMA_PATH) : undefined;
