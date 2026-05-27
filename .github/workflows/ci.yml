@@ -117,6 +117,27 @@ jobs:
         run: npm ci --ignore-scripts
       - name: Run Testcontainers-gated tests
         run: |
-          npx --workspace @frtb/api    vitest run tests/mvp.e2e.test.ts tests/calc-sbm.integration.test.ts
-          npx --workspace @frtb/rqe    vitest run tests/rqe-index.test.mjs
-          npx --workspace @frtb/ingest vitest run tests/consumer.test.ts
+          set -e
+          mkdir -p /tmp/tc-logs
+          npx --workspace @frtb/api    vitest run tests/mvp.e2e.test.ts tests/calc-sbm.integration.test.ts \
+            --reporter=verbose 2>&1 | tee /tmp/tc-logs/api.log
+          npx --workspace @frtb/rqe    vitest run tests/rqe-index.test.mjs \
+            --reporter=verbose 2>&1 | tee /tmp/tc-logs/rqe.log
+          npx --workspace @frtb/ingest vitest run tests/consumer.test.ts \
+            --reporter=verbose 2>&1 | tee /tmp/tc-logs/ingest.log
+      - name: Assert no Testcontainers-gated test was silently skipped
+        run: |
+          # Guard against the failure mode where Docker is unavailable but the
+          # job still passes because every it.skipIf(!HAS_DOCKER) collapsed to
+          # a skip. Fail loudly here so the testcontainers job means what it
+          # says: these four tests RAN.
+          fail=0
+          for f in /tmp/tc-logs/api.log /tmp/tc-logs/rqe.log /tmp/tc-logs/ingest.log; do
+            if grep -E "skipped" "$f" >/dev/null; then
+              echo "::error file=$f::Test marked as skipped — Docker likely unavailable"
+              grep -nE "skipped|↓" "$f" || true
+              fail=1
+            fi
+          done
+          if [ "$fail" = "1" ]; then exit 1; fi
+          echo "All Testcontainers-gated tests ran (no silent skips)."
