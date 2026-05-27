@@ -18,18 +18,19 @@ export interface ObservabilityMemoryResponse {
   [k: string]: number | string | undefined;
 }
 
+// Per-shard observability record as returned by GET /observability/shards.
+// Shape mirrors services/api/src/routes/observability.ts `Shard`.
 export interface ObservabilityShard {
-  id: string;
-  role?: string;
-  ops_per_sec?: number;
-  keys?: number;
-  used_memory?: number;
-  ms?: number;
+  shardId: string;
+  role: string;
+  opsPerSec: number;
+  slotCount: number;
+  usedMemoryBytes: number;
+  netInBytes: number;
+  netOutBytes: number;
 }
 
-export interface ObservabilityShardsResponse {
-  shards: ObservabilityShard[];
-}
+export type ObservabilityShardsResponse = ObservabilityShard[];
 
 export function apiBase(): string {
   const fromEnv = (import.meta as ImportMeta & { env?: { VITE_API_BASE?: string } }).env?.VITE_API_BASE;

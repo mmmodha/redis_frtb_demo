@@ -5,3 +5,5 @@ export { TimingStrip } from "./TimingStrip";
 export { EnterpriseCallout } from "./EnterpriseCallout";
 export { ActiveTargetPill } from "./ActiveTargetPill";
 export type { ActiveTargetState, ActiveTargetPillProps } from "./ActiveTargetPill";
+export { ShardMetricsStrip } from "./ShardMetricsStrip";
+export type { Shard as ShardMetric, ShardMetricsStripProps } from "./ShardMetricsStrip";

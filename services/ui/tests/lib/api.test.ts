@@ -37,16 +37,16 @@ describe("api client", () => {
     expect(calls[0]).toMatch(/\/observability\/memory$/);
   });
 
-  it("getObservabilityShards calls /observability/shards", async () => {
+  it("getObservabilityShards calls /observability/shards and returns an array", async () => {
     const calls: string[] = [];
     globalThis.fetch = (async (input: RequestInfo | URL) => {
       calls.push(typeof input === "string" ? input : input.toString());
-      return new Response(JSON.stringify({ shards: [] }), {
+      return new Response(JSON.stringify([]), {
         headers: { "content-type": "application/json" },
       });
     }) as typeof fetch;
     const result = await getObservabilityShards();
-    expect(result.shards).toEqual([]);
+    expect(result).toEqual([]);
     expect(calls[0]).toMatch(/\/observability\/shards$/);
   });
 

@@ -54,12 +54,10 @@ describe("<Observability />", () => {
         return jsonResponse({ used_memory: 1048576, used_memory_human: "1.00M", ms: 1.2 });
       }
       if (url.endsWith("/observability/shards")) {
-        return jsonResponse({
-          shards: [
-            { id: "shard-1", role: "master", ops_per_sec: 1200, keys: 600, used_memory: 524288 },
-            { id: "shard-2", role: "master", ops_per_sec: 980, keys: 634, used_memory: 524288 },
-          ],
-        });
+        return jsonResponse([
+          { shardId: "shard-1", role: "master", opsPerSec: 1200, slotCount: 5461, usedMemoryBytes: 524288, netInBytes: 0, netOutBytes: 0 },
+          { shardId: "shard-2", role: "master", opsPerSec: 980, slotCount: 5462, usedMemoryBytes: 524288, netInBytes: 0, netOutBytes: 0 },
+        ]);
       }
       return jsonResponse({}, 404);
     });
@@ -68,8 +66,8 @@ describe("<Observability />", () => {
       expect(screen.getByText("1,234")).toBeInTheDocument();
     });
     expect(screen.getByText(/1\.00M/)).toBeInTheDocument();
-    expect(screen.getByText("shard-1")).toBeInTheDocument();
-    expect(screen.getByText("shard-2")).toBeInTheDocument();
+    expect(screen.getAllByText("shard-1").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("shard-2").length).toBeGreaterThan(0);
   });
 
   it("renders an empty state when there are 0 keys and 0 shards", async () => {
@@ -81,7 +79,7 @@ describe("<Observability />", () => {
         return jsonResponse({ used_memory: 0, used_memory_human: "0B", ms: 0 });
       }
       if (url.endsWith("/observability/shards")) {
-        return jsonResponse({ shards: [] });
+        return jsonResponse([]);
       }
       return jsonResponse({}, 404);
     });
@@ -108,7 +106,7 @@ describe("<Observability />", () => {
         return jsonResponse({ used_memory: 1, used_memory_human: "1B", ms: 0 });
       }
       if (url.endsWith("/observability/shards")) {
-        return jsonResponse({ shards: [] });
+        return jsonResponse([]);
       }
       return jsonResponse({}, 404);
     });

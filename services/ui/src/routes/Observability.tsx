@@ -3,6 +3,7 @@ import { PanelCard } from "../components/PanelCard";
 import { MetricTile } from "../components/MetricTile";
 import { TimingStrip } from "../components/TimingStrip";
 import { EnterpriseCallout } from "../components/EnterpriseCallout";
+import { ShardMetricsStrip } from "../components/ShardMetricsStrip";
 import {
   getObservabilityKeys,
   getObservabilityMemory,
@@ -113,6 +114,9 @@ function ObservabilityReady({ data }: { data: ObservabilityData }) {
             ms: s.ops_per_sec ?? 0,
           }))}
         />
+      </PanelCard>
+      <PanelCard title="Live shard metrics">
+        <ShardMetricsStrip />
       </PanelCard>
     </>
   );
