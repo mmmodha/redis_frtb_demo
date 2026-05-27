@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=1024" />
+  <title>Redis Enterprise — FRTB-SA Competitive Positioning</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reset.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" />
+  <style>
+    :root {
+      --redis-red: #FF4438;
+      --redis-ink: #091A23;
+      --redis-ink-2: #163341;
+    }
+    body { background: var(--redis-ink); }
+    .reveal { font-family: "Space Grotesk", -apple-system, sans-serif; }
+    .reveal h1, .reveal h2, .reveal h3 { color: #fff; font-weight: 600; letter-spacing: -0.01em; }
+    .reveal h2 .accent { color: var(--redis-red); }
+    .reveal table { font-size: 0.55em; border-collapse: collapse; margin: 0.5em auto; }
+    .reveal table th { background: var(--redis-ink-2); color: #fff; padding: 8px 10px; border: 1px solid #2a4754; }
+    .reveal table td { padding: 6px 10px; border: 1px solid #2a4754; color: #d8e3e8; }
+    .reveal table td.us { background: rgba(255, 68, 56, 0.12); color: #fff; font-weight: 600; }
+    .reveal .yes { color: var(--redis-red); font-weight: 700; }
+    .reveal .no { color: #6b7c84; }
+    .reveal .partial { color: #c89a3a; }
+    .reveal .footer-note { font-size: 0.4em; color: #6b7c84; margin-top: 1em; }
+    .reveal code { font-family: "Space Mono", monospace; color: var(--redis-red); background: rgba(255,68,56,0.08); padding: 0 4px; border-radius: 3px; }
+    .reveal section.title h1 { font-size: 2.2em; }
+    .reveal section.title .tagline { color: var(--redis-red); font-size: 0.6em; letter-spacing: 0.04em; text-transform: uppercase; }
+  </style>
+</head>
+<body>
+  <div class="reveal">
+    <div class="slides">
+
+      <section class="title">
+        <div class="tagline">HSBC FRTB-SA · Redis Enterprise Software</div>
+        <h1>Competitive Positioning</h1>
+        <p style="color:#a0b3bd">Why Redis Enterprise — and not the alternatives — wins the live FRTB calc layer.</p>
+      </section>
+
+      <section data-id="competitive">
+        <h2>Competitive Positioning — <span class="accent">FRTB-SA on Redis Enterprise</span></h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Capability the workload needs</th>
+              <th>OSS Redis</th>
+              <th>ClickHouse / Snowflake</th>
+              <th>Aerospike / Scylla / DynamoDB</th>
+              <th>KDB+</th>
+              <th>Oracle + Spark</th>
+              <th>Redis Enterprise</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>JSON-native nested arrays (<code>risk_value[10]</code>)</td>
+              <td class="partial">partial</td>
+              <td class="no">flattened</td>
+              <td class="no">opaque</td>
+              <td class="no">denormalised</td>
+              <td class="no">child table</td>
+              <td class="us">✅ ReJSON</td>
+            </tr>
+            <tr>
+              <td>Search over JSON fields (RQE)</td>
+              <td class="partial">partial</td>
+              <td class="partial">scan-based</td>
+              <td class="no">bolt-on Elastic</td>
+              <td class="partial">q/sql</td>
+              <td class="no">denorm + index</td>
+              <td class="us">✅ RediSearch / RQE</td>
+            </tr>
+            <tr>
+              <td>In-database SBM compute</td>
+              <td class="partial">partial</td>
+              <td class="partial">UDF (sandboxed)</td>
+              <td class="partial">UDFs, no ecosystem</td>
+              <td class="partial">q</td>
+              <td class="no">JVM round-trip</td>
+              <td class="us">✅ Redis Functions / FCALL</td>
+            </tr>
+            <tr>
+              <td>Multi-threaded shards</td>
+              <td class="no">❌</td>
+              <td>n/a</td>
+              <td class="partial">varies</td>
+              <td>n/a</td>
+              <td>n/a</td>
+              <td class="us">✅</td>
+            </tr>
+            <tr>
+              <td>Auto Tiering (RAM + NVMe)</td>
+              <td class="no">❌</td>
+              <td>n/a</td>
+              <td class="partial">partial</td>
+              <td class="no">❌</td>
+              <td>n/a</td>
+              <td class="us">✅ Enterprise-only</td>
+            </tr>
+            <tr>
+              <td>Active-Active CRDT (geo)</td>
+              <td class="partial">async only</td>
+              <td class="no">❌</td>
+              <td class="partial">AWS-only</td>
+              <td class="no">❌</td>
+              <td class="no">❌</td>
+              <td class="us">✅ Enterprise-only</td>
+            </tr>
+            <tr>
+              <td>K8s Operator + Ansible</td>
+              <td class="partial">DIY</td>
+              <td class="partial">DIY</td>
+              <td class="partial">varies</td>
+              <td class="partial">DIY</td>
+              <td class="partial">DIY</td>
+              <td class="us">✅ official</td>
+            </tr>
+            <tr>
+              <td>RBAC + TLS + audit-ready</td>
+              <td class="partial">bolt-on</td>
+              <td class="yes">✅</td>
+              <td class="yes">✅</td>
+              <td class="partial">bolt-on</td>
+              <td class="yes">✅</td>
+              <td class="us">✅</td>
+            </tr>
+            <tr>
+              <td>Module bundle in one license</td>
+              <td class="no">self-assemble</td>
+              <td>n/a</td>
+              <td>n/a</td>
+              <td>n/a</td>
+              <td>n/a</td>
+              <td class="us">✅</td>
+            </tr>
+            <tr>
+              <td>HSBC perimeter, no SaaS dependency</td>
+              <td class="yes">✅</td>
+              <td class="partial">varies</td>
+              <td class="partial">DynamoDB AWS-only</td>
+              <td class="yes">✅</td>
+              <td class="yes">✅</td>
+              <td class="us">✅</td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="footer-note">No single alternative checks every box for the FRTB-SA operational workload. Redis Enterprise does.</p>
+        <aside class="notes">
+          Speaker notes:
+          1. OSS is single-threaded, no Auto Tiering, no Active-Active, no Operator. Free is not the same as fit-for-purpose.
+          2. ClickHouse / Snowflake are analytical, not operational. Wrong layer.
+          3. KV stores (Aerospike, Scylla, DynamoDB) cannot host the JSON shape with in-database compute.
+          4. KDB is cost, talent scarcity, lock-in. Right answer for 2010 tick capture, wrong answer for 2026 FRTB JSON.
+          5. Oracle + Spark is the incumbent — augment it, don't rip-and-replace.
+        </aside>
+      </section>
+
+      <section>
+        <h2>The close</h2>
+        <p><strong>Two-week scoped POC</strong> on one risk class with HSBC's own data.</p>
+        <p>Acceptance: live SBM charge reproduces incumbent oracle to within <code>0.01%</code>, wall-clock under <code>2 s</code>.</p>
+        <p style="color:#a0b3bd">Path to production: 14–18 weeks via the K8s Operator. Active-Active geo topology in parallel.</p>
+      </section>
+
+    </div>
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <script>
+    Reveal.initialize({ hash: true, slideNumber: 'c/t', transition: 'fade' });
+  </script>
+</body>
+</html>

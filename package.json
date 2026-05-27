@@ -13,7 +13,8 @@
     "test:watch": "vitest",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "schema:generate": "npm run -w @frtb/schema-cli generate -- ../../config/schema/frtb-default.yaml --out ../../shared/schema/generated",
-    "schema:validate": "npm run -w @frtb/schema-cli validate -- ../../config/schema/frtb-default.yaml"
+    "schema:validate": "npm run -w @frtb/schema-cli validate -- ../../config/schema/frtb-default.yaml",
+    "asset-pack": "node tools/asset-pack/src/cli.mjs"
   },
   "devDependencies": {
     "vitest": "^4.1.7",

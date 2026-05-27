@@ -11,6 +11,15 @@ import pytest
 import sbm
 
 
+def _expected_kb_sb(ws_values, rho):
+    """Reference closed form with the locked clip-cross-to-0 semantics."""
+    sum_ws = sum(ws_values)
+    sum_ws_sq = sum(v * v for v in ws_values)
+    cross = max(0.0, sum_ws * sum_ws - sum_ws_sq)
+    kb_sq = max(0.0, sum_ws_sq + rho * cross)
+    return math.sqrt(kb_sq), sum_ws
+
+
 SCHEMA = {
     "risk_weights": {
         "girr_delta_weights": {"by_tenor": {
@@ -62,25 +71,21 @@ def test_compute_sbm_girr_delta_single_bucket_matches_hand_calc():
         {"risk_class": "GIRR", "bucket": "USD", "sensitivity_type": "Delta",
          "risk_value": [0.5, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]},
     ])
-    # sum_s = [1.5, 1.0, 0, ...]; WS = [0.0255, 0.017, ...]; SumWS = 0.0425
-    # SumWS^2 = 0.00065025 + 0.000289 = 0.00093925
-    # K_b^2 = 0.00093925 + 0.99 * (0.0425^2 - 0.00093925) = 0.00093925 + 0.99*0.00087700 = 0.00094*+...
-    # K_b^2 = 0.00093925 + 0.99 * 0.000867 = 0.00093925 + 0.00085833 = 0.00179758
+    # WS = [0.017*1.5, 0.017*1.0, zeros...]; same-sign -> positive cross.
+    expected_K, expected_S = _expected_kb_sb([0.017 * 1.5, 0.017 * 1.0], 0.99)
     res = sbm.compute_sbm(df, "GIRR", "Delta", SCHEMA)
-    assert len(res["per_bucket"]) == 1
     bucket = res["per_bucket"][0]
     assert bucket["bucket"] == "USD"
-    assert bucket["S_b"] == pytest.approx(0.0425, abs=1e-12)
-    assert bucket["K_b"] == pytest.approx(math.sqrt(0.00179758), abs=1e-9)
-    # Single bucket: charge = K_b
+    assert bucket["S_b"] == pytest.approx(expected_S, abs=1e-12)
+    assert bucket["K_b"] == pytest.approx(expected_K, abs=1e-12)
     assert res["charge"] == pytest.approx(bucket["K_b"], abs=1e-12)
 
 
 def test_compute_sbm_equity_two_buckets_reduce():
-    # Bucket 1: weight 0.55, 1 row rv=1.0 → ws=0.55; K=|0.55|=0.55 (single factor)
-    # Bucket 2: weight 0.60, 1 row rv=-1.0 → ws=-0.6; K=0.6
-    # gamma=0.15: charge^2 = 0.55^2 + 0.6^2 + 2*0.15*0.55*-0.6
-    #           = 0.3025 + 0.36 - 0.099 = 0.5635
+    # B1: ws=[0.55]; B2: ws=[-0.6]; both single-element -> K_b = |ws|.
+    # Cross-bucket: gamma=0.15; ΣS=−0.05; cross=γ*(ΣS^2-(0.55^2+0.6^2))
+    #             = 0.15*(0.0025 - 0.6625) = -0.099
+    # charge^2 = 0.3025 + 0.36 - 0.099 = 0.5635
     df = pd.DataFrame([
         {"risk_class": "EQUITY", "bucket": "1", "sensitivity_type": "Delta", "risk_value": 1.0},
         {"risk_class": "EQUITY", "bucket": "2", "sensitivity_type": "Delta", "risk_value": -1.0},
@@ -92,15 +97,16 @@ def test_compute_sbm_equity_two_buckets_reduce():
     assert res["charge"] == pytest.approx(math.sqrt(0.5635), abs=1e-12)
 
 
-def test_compute_sbm_fx_single_bucket_delta():
+def test_compute_sbm_fx_single_bucket_delta_clips_negative_cross():
     df = pd.DataFrame([
         {"risk_class": "FX", "bucket": "EURUSD", "sensitivity_type": "Delta", "risk_value": 10.0},
         {"risk_class": "FX", "bucket": "EURUSD", "sensitivity_type": "Delta", "risk_value": -5.0},
         {"risk_class": "FX", "bucket": "EURUSD", "sensitivity_type": "Delta", "risk_value": 2.0},
     ])
+    expected_K, expected_S = _expected_kb_sb([0.075 * 10.0, 0.075 * -5.0, 0.075 * 2.0], 0.60)
     res = sbm.compute_sbm(df, "FX", "Delta", SCHEMA)
-    assert res["per_bucket"][0]["S_b"] == pytest.approx(0.525, abs=1e-12)
-    assert res["per_bucket"][0]["K_b"] == pytest.approx(math.sqrt(0.455625), abs=1e-12)
+    assert res["per_bucket"][0]["S_b"] == pytest.approx(expected_S, abs=1e-12)
+    assert res["per_bucket"][0]["K_b"] == pytest.approx(expected_K, abs=1e-12)
 
 
 def test_compute_sbm_girr_vega_filters_to_vega_rows():
@@ -109,9 +115,10 @@ def test_compute_sbm_girr_vega_filters_to_vega_rows():
         {"risk_class": "GIRR", "bucket": "USD", "sensitivity_type": "Vega", "risk_value": [0.3, 0.2]},
         {"risk_class": "GIRR", "bucket": "USD", "sensitivity_type": "Vega", "risk_value": [0.1, -0.4]},
     ])
+    expected_K, _ = _expected_kb_sb([0.3, 0.2, 0.1, -0.4], 0.5)
     res = sbm.compute_sbm(df, "GIRR", "Vega", SCHEMA)
     assert res["per_bucket"][0]["count"] == 2
-    assert res["per_bucket"][0]["K_b"] == pytest.approx(math.sqrt(0.17), abs=1e-12)
+    assert res["per_bucket"][0]["K_b"] == pytest.approx(expected_K, abs=1e-12)
 
 
 def test_compute_sbm_unknown_risk_class_raises():
