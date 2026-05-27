@@ -16,6 +16,25 @@ interface CalcOpts {
 
 const ALLOWED_LEG = new Set(["delta", "vega"]);
 
+// Routing table: (risk_class lowercased, leg) -> Lua function name.
+// GIRR uses the original generic sbm_*_bucket pair (multi-tenor vectors).
+// Equity and FX each ship dedicated single-purpose Delta/Vega functions that
+// mirror the same locked I/O shape but encode the asset-class specifics
+// (per-bucket weight map for Equity, single-factor-per-pair for FX).
+// Unknown risk classes fall back to the generic GIRR pair so older calc paths
+// keep working until each asset class is added.
+const FUNC_BY_RISK_CLASS: Record<string, { delta: string; vega: string }> = {
+  girr: { delta: "frtb.sbm_delta_bucket", vega: "frtb.sbm_vega_bucket" },
+  equity: { delta: "frtb.equity_delta", vega: "frtb.equity_vega" },
+  fx: { delta: "frtb.fx_delta", vega: "frtb.fx_vega" },
+};
+const DEFAULT_FUNCS = FUNC_BY_RISK_CLASS.girr!;
+
+function funcNameFor(risk_class: string, leg: "delta" | "vega"): string {
+  const entry = FUNC_BY_RISK_CLASS[risk_class.toLowerCase()] ?? DEFAULT_FUNCS;
+  return entry[leg];
+}
+
 // FCALL replies arrive in three shapes:
 //   1. JSON string — the real `frtb` Lua library returns cjson.encode({...})
 //      (RESP2 bulk-string). This is the production path.
@@ -91,7 +110,7 @@ export function registerCalcRoute(app: FastifyInstance, redis: RedisLike, opts: 
       reply.code(400);
       return { error: `sensitivity_type must be one of: Delta, Vega (got ${legRaw})` };
     }
-    const funcName = leg === "delta" ? "frtb.sbm_delta_bucket" : "frtb.sbm_vega_bucket";
+    const funcName = funcNameFor(risk_class, leg as "delta" | "vega");
     const corr: CorrelationSpec = opts.correlations[risk_class] ?? { kind: "constant", value: 0 };
 
     const t0 = process.hrtime.bigint();

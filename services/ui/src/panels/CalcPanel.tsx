@@ -14,8 +14,8 @@ type Tone = "green" | "amber" | "red";
 
 const RISK_CLASS_OPTIONS: Array<{ value: RiskClass; label: string; live: boolean }> = [
   { value: "GIRR", label: "GIRR", live: true },
-  { value: "Equity", label: "Equity", live: false },
-  { value: "FX", label: "FX", live: false },
+  { value: "Equity", label: "Equity", live: true },
+  { value: "FX", label: "FX", live: true },
 ];
 
 const SENSITIVITY_OPTIONS: SensitivityType[] = ["Delta", "Vega"];
