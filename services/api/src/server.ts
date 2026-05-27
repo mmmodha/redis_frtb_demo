@@ -6,6 +6,7 @@ import { registerPivotRoute } from "./routes/pivot.ts";
 import { registerCalcRoute } from "./routes/calc.ts";
 import { registerObservabilityRoutes } from "./routes/observability.ts";
 import { registerSourcesProxyRoutes } from "./routes/sources-proxy.ts";
+import { registerLoadgenProxyRoutes } from "./routes/loadgen-proxy.ts";
 
 // Connections store + routes are owned by the Connections-store agent. Loaded
 // dynamically so this server boots even when that agent's files (store.ts,
@@ -23,6 +24,9 @@ export interface CreateServerOpts {
   // Upstream base URL for the source-service proxy. Falls back to
   // SOURCE_BASE env var, then to the compose-internal default.
   sourceBase?: string;
+  // Upstream base URL for the loadgen-service proxy. Falls back to
+  // LOADGEN_BASE env var, then to the compose-internal default.
+  loadgenBase?: string;
 }
 
 export async function createServer(opts: CreateServerOpts): Promise<FastifyInstance> {
@@ -40,6 +44,7 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
   }
 
   registerSourcesProxyRoutes(app, { sourceBase: opts.sourceBase });
+  registerLoadgenProxyRoutes(app, { loadgenBase: opts.loadgenBase });
 
   if (opts.store) {
     const mod = await import("./routes/connections.ts").catch(() => null);

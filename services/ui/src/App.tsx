@@ -6,6 +6,7 @@ import { Ingest } from "./routes/Ingest";
 import { Pivot } from "./routes/Pivot";
 import { Calc } from "./routes/Calc";
 import { Observability } from "./routes/Observability";
+import { Loadgen } from "./routes/Loadgen";
 
 export function App() {
   return (
@@ -18,6 +19,7 @@ export function App() {
         <Route path="/pivot" element={<Pivot />} />
         <Route path="/calc" element={<Calc />} />
         <Route path="/observability" element={<Observability />} />
+        <Route path="/loadgen" element={<Loadgen />} />
       </Routes>
     </AppShell>
   );

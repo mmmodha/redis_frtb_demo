@@ -8,7 +8,10 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 
 let lastOnFrame: ((f: unknown) => void) | null = null;
-const startMock = vi.fn(async () => ({ running: true, config: { concurrency: 200, duration_sec: 60, mix: { pivot: 0.5, calc: 0.5 } } }));
+const startMock = vi.fn(async (_req: unknown) => ({
+  running: true,
+  config: { concurrency: 200, duration_sec: 60, mix: { pivot: 0.5, calc: 0.5 } },
+}));
 const stopMock = vi.fn(async () => ({ stopped: true }));
 const statusMock = vi.fn(async () => ({ running: false }));
 const subscribeMock = vi.fn((cb: (f: unknown) => void) => {
@@ -17,9 +20,9 @@ const subscribeMock = vi.fn((cb: (f: unknown) => void) => {
 });
 
 vi.mock("../../src/lib/loadgen", () => ({
-  startLoadgen: (...a: unknown[]) => startMock(...a),
-  stopLoadgen: (...a: unknown[]) => stopMock(...a),
-  getLoadgenStatus: (...a: unknown[]) => statusMock(...a),
+  startLoadgen: (req: unknown) => startMock(req as never),
+  stopLoadgen: () => stopMock(),
+  getLoadgenStatus: () => statusMock(),
   subscribeMetrics: (cb: (f: unknown) => void) => subscribeMock(cb),
 }));
 
@@ -68,7 +71,7 @@ describe("<LoadgenPanel />", () => {
     fireEvent.change(screen.getByLabelText(/concurrency/i), { target: { value: "50" } });
     fireEvent.click(screen.getByRole("button", { name: /start/i }));
     await waitFor(() => expect(startMock).toHaveBeenCalledTimes(1));
-    const arg = startMock.mock.calls[0]![0] as Record<string, unknown>;
+    const arg = startMock.mock.calls[0]![0] as unknown as Record<string, unknown>;
     expect(arg.concurrency).toBe(50);
     expect(arg.mix).toEqual({ pivot: 0.5, calc: 0.5 });
   });

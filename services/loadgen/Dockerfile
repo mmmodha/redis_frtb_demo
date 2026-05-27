@@ -1,18 +1,25 @@
-# Placeholder Dockerfile for the loadgen service.
-# Real implementation replaces this in a later wave.
+# Dockerfile for the loadgen service.
+# Boots the Fastify control surface (src/index.ts) under tsx. Drives a
+# configurable workforce of pivot+calc requests against the api and exports
+# live SSE metrics on /loadgen/metrics.
 FROM node:20-alpine AS runtime
 WORKDIR /app
-
-# Copy only this service's package + source. No Redis client deps yet — the
-# real api/ingest/calc images add their dependencies in their own Wave 2 tasks.
-COPY services/loadgen/package.json ./
-COPY services/loadgen/src ./src
-
-ENV HEALTH_PORT=3000
-EXPOSE 3000
 
 # curl is used by the compose healthcheck.
 RUN apk add --no-cache curl
 
+# Workspace install: copy root + workspace manifests, then install. Building
+# from the monorepo root keeps install consistent with the other services.
+COPY package.json package-lock.json* ./
+COPY services/loadgen/package.json ./services/loadgen/package.json
+RUN npm install --workspaces --include-workspace-root --omit=dev=false
+
+COPY services/loadgen/tsconfig.json ./services/loadgen/tsconfig.json
+COPY services/loadgen/src ./services/loadgen/src
+
+ENV HEALTH_PORT=8085
+EXPOSE 8085
+
 USER node
-CMD ["node", "src/index.mjs"]
+WORKDIR /app/services/loadgen
+CMD ["npx", "tsx", "src/index.ts"]
