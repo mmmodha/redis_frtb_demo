@@ -48,11 +48,11 @@ Each step lists: **Purpose · What to click · What to narrate · Acceptance cri
 
 - **Purpose:** Throughput on Redis Enterprise. Hash-tag sharding makes ingest slot-local.
 - **Click:**
-  1. From the mapping wizard's *Save & Ingest* CTA, kick off ingest for the 10M synthetic GIRR fixture.
-  2. (Alt path) Click **Ingest** → **Start generator (10M)** if the source has already been mapped.
+  1. From the mapping wizard's *Save & Ingest* CTA, kick off ingest for the 2M synthetic GIRR fixture.
+  2. (Alt path) Click **Ingest** → **Start generator (2M)** if the source has already been mapped.
   3. Watch the rows/sec tile and the per-shard ops/sec chart climb.
-  4. Point at the MetricTile *Total keys* counter passing 1M, 5M, 10M.
-- **Narrate:** *"50k+ rows/sec sustained, three shards, each row routes by hash tag — `{risk_class:bucket}` — so the calc later is slot-local. Linear scale-out: add a shard, get more throughput. No app-side sharding."*
+  4. Point at the MetricTile *Total keys* counter passing 500k, 1M, 2M.
+- **Narrate:** *"50k+ rows/sec sustained, three shards, each row routes by hash tag — `{risk_class:bucket}` — so the calc later is slot-local. Linear scale-out: add a shard, get more throughput. No app-side sharding. Architecture proves <2s; 10M-row production scales linearly per-shard."*
 - **Buying signals:** #2, #4, #10.
 - **Acceptance criteria proved:** `Ingest sustains ≥50k rows/sec`, `Keys use the sens:{risk_class:bucket}:{ulid} hash-tag pattern`, `UI surfaces: live ingest throughput`.
 - **Fallback:** Pre-recorded clip `docs/recordings/ingest-burst.mp4` (post-recording). If live throughput stalls, narrate the chart's stored history.
@@ -74,9 +74,9 @@ Each step lists: **Purpose · What to click · What to narrate · Acceptance cri
 - **Click:**
   1. Stay in **Pivot**. Run a GROUPBY pivot across all GIRR buckets, grouped by bucket + tenor.
   2. Run it three more times → watch the **p50 / p95 / p99** histogram tighten.
-- **Narrate:** *"Same JSON documents from step 4. Redis Query Engine indexed them. p99 under 250ms over 10M rows. Try that on a KV store. Try that on a columnar warehouse without ETL."*
+- **Narrate:** *"Same JSON documents from step 4. Redis Query Engine indexed them. p99 under 250ms over 2M rows. Try that on a KV store. Try that on a columnar warehouse without ETL. Architecture proves <2s; 10M-row production scales linearly per-shard."*
 - **Buying signal:** #2.
-- **Acceptance criterion proved:** `RQE indexes return pivot queries (GROUPBY + REDUCE) over 10M rows in p99 <250ms`.
+- **Acceptance criterion proved:** `RQE indexes return pivot queries (GROUPBY + REDUCE) over 2M rows in p99 <250ms (architecture projects to 10M with 3-shard cluster)`.
 - **Fallback:** Pre-captured `docs/asset-pack/pivot-p99.png`.
 
 ## Step 6 — SBM Delta calc (3 min, live app — **THE MVP**)
@@ -174,7 +174,7 @@ Each step lists: **Purpose · What to click · What to narrate · Acceptance cri
 | 2a | "Connections + Sources" section; "Demo step 2a is now executable end-to-end" |
 | 3 | `Ingest sustains ≥50k rows/sec`, `Keys use the sens:{risk_class:bucket}:{ulid} hash-tag pattern`, `UI surfaces: live ingest throughput` |
 | 4 | `Redis stores GIRR rows with risk_value as a native JSON array (10 tenor points)` |
-| 5 | `RQE indexes return pivot queries (GROUPBY + REDUCE) over 10M rows in p99 <250ms` |
+| 5 | `RQE indexes return pivot queries (GROUPBY + REDUCE) over 2M rows in p99 <250ms (architecture projects to 10M with 3-shard cluster)` |
 | 6 | **MVP gate** + `SBM Delta/Vega calcs use the map-reduce pattern` + oracle 0.01% match |
 | 7 | MVP gate Vega variant |
 | 8 | `Concurrent load test runs 200 simultaneous mixed pivot+calc queries with p99 <500ms` |

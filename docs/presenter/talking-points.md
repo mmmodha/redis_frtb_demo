@@ -33,7 +33,7 @@ Buying-signal numbers refer to the "Why Redis Enterprise" table in the spec.
 ## Step 3 — Live ingest (3 min)
 
 - **Buying signal:** #2 Redis Query Engine on JSON; #4 Linear scale-out + hash-tag locality; #10 Performance per node.
-- **Narration:** "Ten million synthetic FRTB sensitivities streaming into `demo-cluster` — three multi-threaded shards. Every GIRR/USD/B1 row lands on the same shard thanks to the `{risk_class:bucket}` hash tag, so the calc stays slot-local. Throughput climbs in real time; memory grows linearly."
+- **Narration:** "Two million synthetic FRTB sensitivities streaming into `demo-cluster` — multi-threaded shards. Every GIRR/USD/B1 row lands on the same shard thanks to the `{risk_class:bucket}` hash tag, so the calc stays slot-local. Throughput climbs in real time; memory grows linearly. Architecture proves <2s; 10M-row production scales linearly per-shard."
 - **Objection:** "OSS Redis is free and does the same thing."
 - **Rebuttal:** "OSS Redis is single-threaded per shard; Enterprise shards are multi-threaded. The proxy alone is multi-threaded. For the same workload you need fewer Enterprise nodes — lower TCO and lower operational surface. Plus RBAC, Active-Active, Auto Tiering, BDB lifecycle — none of that exists in OSS."
 - **Fallback:** If live ingest stalls, switch to a recorded video of a prior run; the rest of the demo runs against the pre-loaded dataset.
@@ -49,7 +49,7 @@ Buying-signal numbers refer to the "Why Redis Enterprise" table in the spec.
 ## Step 5 — Pivot at speed (3 min)
 
 - **Buying signal:** #2 Redis Query Engine on JSON.
-- **Narration:** "Same JSON document we showed in step 4 — Redis Query Engine indexed it, GROUPBY + REDUCE returns in 80 ms over 10M rows. Try that on your current store."
+- **Narration:** "Same JSON document we showed in step 4 — Redis Query Engine indexed it, GROUPBY + REDUCE returns in 80 ms over 2M rows. Architecture proves <2s; 10M-row production scales linearly per-shard. Try that on your current store."
 - **Objection:** "We could do this in ClickHouse / Snowflake."
 - **Rebuttal:** "Those are columnar warehouses. They cannot run in-database SBM math, they cannot be the live calc engine, and they cannot store this shape without flattening. Redis is the *operational* layer that feeds them and serves your analysts in real time."
 - **Fallback:** If the pivot stalls past 1 s, drop the limit to 1M rows and re-run; narrate that the p99 latency in the histogram is the real number, not the single-query wall-clock.

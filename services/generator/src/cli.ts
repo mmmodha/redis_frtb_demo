@@ -25,7 +25,7 @@ async function main(): Promise<void> {
   program
     .name("generator")
     .description("Synthetic FRTB-SA sensitivity generator → Redis Stream")
-    .option("--rows <n>", "total rows to produce", "10000")
+    .option("--rows <n>", "total rows to produce", "2000000")
     .option("--rate <n>", "max rows/sec (omit for unbounded)")
     .option("--classes <list>", "comma list or 'all'", "all")
     .option("--seed <s>", "PRNG seed", "0")
