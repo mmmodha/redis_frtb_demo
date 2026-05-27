@@ -1,0 +1,45 @@
+/* Observability panel — empty/error/loading states + live shard tile grid. */
+
+.observability__empty,
+.observability__error,
+.observability__loading {
+  padding: calc(var(--grid) * 4);
+  text-align: center;
+  color: var(--redis-text-secondary);
+}
+.observability__error { color: var(--redis-hyper); }
+
+/* ShardMetricsStrip — Wave 4.6 live tile grid driven by SSE. */
+.shard-metrics-strip { display: grid; gap: var(--grid); }
+.shard-metrics-strip__error {
+  color: var(--redis-hyper);
+  font-size: 0.8125rem;
+}
+.shard-metrics-strip__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: var(--grid);
+}
+.shard-tile {
+  background: var(--redis-bg-tertiary);
+  border: 1px solid var(--redis-border-secondary);
+  border-radius: var(--radius);
+  padding: calc(var(--grid) * 1.5);
+  display: grid;
+  gap: 4px;
+}
+.shard-tile__header {
+  display: flex; justify-content: space-between; align-items: center;
+  border-bottom: 1px solid var(--redis-border-primary);
+  padding-bottom: 4px;
+  margin-bottom: 4px;
+}
+.shard-tile__id { font-family: var(--font-mono); font-size: 0.8125rem; color: var(--redis-text-primary); }
+.shard-tile__role {
+  font-size: 0.625rem; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+  color: var(--redis-text-secondary);
+}
+.shard-tile__role[data-role="master"] { color: var(--redis-hyper); }
+.shard-tile__row { display: flex; justify-content: space-between; align-items: baseline; font-size: 0.8125rem; }
+.shard-tile__label { color: var(--redis-text-secondary); }
+.shard-tile__value { font-family: var(--font-mono); color: var(--redis-text-primary); font-weight: 600; }
