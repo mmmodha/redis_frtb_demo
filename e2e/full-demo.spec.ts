@@ -176,9 +176,15 @@ async function installCommonRoutes(page: Page, opts: { activeName?: string } = {
 
 test.describe.configure({ mode: "serial" });
 
+// INTEGRATION=1 — bypass page.route() mocks so the spec drives the live stack
+// (Wave 5.5 smoke). Unset (default) keeps fully-mocked fast CI behaviour.
+const INTEGRATION = process.env.INTEGRATION === "1";
+
 test.describe("Full HSBC demo — 11-step flow (storyboard + protection)", () => {
   test.beforeEach(async ({ page }) => {
-    await installCommonRoutes(page);
+    if (!INTEGRATION) {
+      await installCommonRoutes(page);
+    }
   });
 
   test("drives all 11 steps end-to-end and screenshots each", async ({ page }) => {

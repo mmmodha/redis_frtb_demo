@@ -14,7 +14,8 @@
     "typecheck": "npm run typecheck --workspaces --if-present",
     "schema:generate": "npm run -w @frtb/schema-cli generate -- ../../config/schema/frtb-default.yaml --out ../../shared/schema/generated",
     "schema:validate": "npm run -w @frtb/schema-cli validate -- ../../config/schema/frtb-default.yaml",
-    "asset-pack": "node tools/asset-pack/src/cli.mjs"
+    "asset-pack": "node tools/asset-pack/src/cli.mjs",
+    "test:e2e:live": "INTEGRATION=1 playwright test --config e2e/playwright.config.ts e2e/full-demo.spec.ts"
   },
   "devDependencies": {
     "vitest": "^4.1.7",

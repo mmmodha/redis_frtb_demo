@@ -17,6 +17,22 @@ This directory holds the recorded demo assets for the HSBC walkthrough.
 4. Capture with Loom or QuickTime at 1440×900 viewport, mic on, second monitor disabled.
 5. Save to `dry-run-15min.mp4`, no trimming heavier than splash/outro.
 
+## Running the e2e spec — mocks vs. live
+
+The 11-step spec (`e2e/full-demo.spec.ts`) has two modes, gated by the `INTEGRATION` env var:
+
+- **Mocks mode (default, fast, CI)** — every API call is intercepted by `installCommonRoutes(page)` so the spec runs against the Vite dev server with no backend.
+
+      npx playwright test --config e2e/playwright.config.ts e2e/full-demo.spec.ts
+
+- **Live mode (Wave 5.5 smoke)** — mocks are bypassed and the spec hits the real `ui` container at `http://localhost:3000`, which in turn talks to the live `api` / `calc` / `generator` services and Redis Enterprise.
+
+      npm run test:e2e:live
+
+  ⚠️ **Live mode requires** a populated `.env.local` (Redis Cloud creds + active connection profile) **and** the full stack already running via `docker compose up`. Playwright will **not** start the dev server in this mode; it expects the ui container on port 3000.
+
+Override the live base URL with `UI_BASE_URL=http://… npm run test:e2e:live` if the ui is exposed elsewhere.
+
 ## Why MP4s are not in git
 
 Large binary assets — track via Git LFS or cloud storage. Add the link to `docs/asset-pack/README.md` when the recording lands.
