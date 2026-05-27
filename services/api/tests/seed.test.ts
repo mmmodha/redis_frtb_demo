@@ -1,8 +1,8 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createStore } from "../src/store.ts";
+import { createStore, type ConnectionsStore } from "../src/store.ts";
 import { seedConnections } from "../src/seed.ts";
 
 const KEY = "test-master-key";
@@ -74,5 +74,40 @@ describe("seedConnections", () => {
     await seedConnections(store);
     const names = (await store.list()).map((p) => p.name).sort();
     expect(names).toEqual(["from-file-1", "from-file-2"]);
+  });
+
+  it("does not throw when store.create() fails with EACCES; logs a structured warn", async () => {
+    process.env.RS_DEMO_HOST = "demo.rs.local";
+    process.env.RS_DEMO_PORT = "12000";
+    process.env.RS_DEMO_PASSWORD = "demo-secret";
+
+    const eaccesErr = Object.assign(new Error("EACCES: permission denied, open '/data/connections.enc.json.tmp'"), { code: "EACCES" });
+    const fakeStore: ConnectionsStore = {
+      create: vi.fn().mockRejectedValue(eaccesErr),
+      get: vi.fn().mockResolvedValue(null),
+      getRaw: vi.fn().mockResolvedValue(null),
+      list: vi.fn().mockResolvedValue([]),
+      update: vi.fn().mockResolvedValue(null),
+      delete: vi.fn().mockResolvedValue(false),
+      setActive: vi.fn().mockResolvedValue(null),
+      getActive: vi.fn().mockReturnValue(null),
+      getActiveRaw: vi.fn().mockReturnValue(null),
+      on: vi.fn(),
+      off: vi.fn(),
+    };
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await expect(seedConnections(fakeStore)).resolves.toBeUndefined();
+      expect(fakeStore.create).toHaveBeenCalledTimes(1);
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      const payload = JSON.parse(warnSpy.mock.calls[0][0] as string);
+      expect(payload.service).toBe("api");
+      expect(payload.warn).toBe("seed-connections-failed");
+      expect(payload.name).toBe("rs-demo-cluster");
+      expect(payload.err).toContain("EACCES");
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 });

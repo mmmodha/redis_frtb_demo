@@ -30,6 +30,10 @@ EXPOSE 3000
 
 # The Connections store file lives here by default; compose mounts a named
 # volume so cluster profiles + the active selection persist across restarts.
+# Pre-seed /data with node:node ownership so Docker's first-mount semantics
+# copy that ownership into the named volume — otherwise the volume is created
+# root-owned and UID 1000 hits EACCES on the first atomic write.
+RUN mkdir -p /data && chown node:node /data
 VOLUME ["/data"]
 
 USER node

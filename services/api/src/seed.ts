@@ -53,7 +53,21 @@ export async function seedConnections(store: ConnectionsStore): Promise<void> {
 
   for (const input of inputs) {
     if (existing.has(input.name)) continue;
-    await store.create(input);
-    existing.add(input.name);
+    try {
+      await store.create(input);
+      existing.add(input.name);
+    } catch (err) {
+      // Non-fatal: an EACCES (or any other persistence error) on the
+      // connections store should not crash bootstrap. The operator can add
+      // connections later via the UI; surface as a structured warn so the
+      // ownership drift is still visible in logs.
+      console.warn(JSON.stringify({
+        service: "api",
+        warn: "seed-connections-failed",
+        name: input.name,
+        err: String(err),
+      }));
+      return;
+    }
   }
 }
