@@ -4,7 +4,7 @@
 > **Goal:** Land Redis Enterprise Software buying signals (not "explain FRTB").
 > **Length:** 15–20 min walkthrough + 2 min Q&A.
 > **Presenter:** Redis Solutions Architect (SA).
-> **Stack assumed live at start:** `docker compose up` healthy, `demo-cluster` profile pre-seeded and Active, sample CSV pre-uploaded so the wizard is warm, `scale-cluster` profile pre-seeded (not Active), 450M-row file mounted at known path. See [presenter-checklist.md](./presenter-checklist.md).
+> **Stack assumed live at start:** `.env.local` populated at repo root (Compose loads it automatically via `env_file` — no `--env-file` flag needed), `docker compose up -d --wait` returned healthy, `demo-cluster` profile pre-seeded and Active, sample CSV pre-uploaded so the wizard is warm, `scale-cluster` profile pre-seeded (not Active), 450M-row file mounted at known path. See [presenter-checklist.md](./presenter-checklist.md).
 
 Each step lists: **Purpose · What to click · What to narrate · Acceptance criterion proved · Fallback**.
 

@@ -29,7 +29,7 @@ The 11-step spec (`e2e/full-demo.spec.ts`) has two modes, gated by the `INTEGRAT
 
       npm run test:e2e:live
 
-  ⚠️ **Live mode requires** a populated `.env.local` (Redis Cloud creds + active connection profile) **and** the full stack already running via `docker compose up`. Playwright will **not** start the dev server in this mode; it expects the ui container on port 3000.
+  ⚠️ **Live mode requires** a populated `.env.local` at repo root (Redis Cloud creds + active connection profile) **and** the full stack already running. Bring it up with plain `docker compose up -d --wait` — every Redis-touching service has `env_file: .env.local` declared, so Compose loads it automatically; **do not** pass `--env-file`. Playwright will **not** start the dev server in this mode; it expects the ui container on port 3000.
 
 Override the live base URL with `UI_BASE_URL=http://… npm run test:e2e:live` if the ui is exposed elsewhere.
 

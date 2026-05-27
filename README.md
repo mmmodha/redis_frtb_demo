@@ -55,8 +55,20 @@ Auto Tiering, scale pivot moment).
 
 ### Boot the application stack
 
+First, populate `.env.local` with your Redis Enterprise URL — copy the
+template and fill in the real credentials (`.env.local` is gitignored):
+
 ```bash
-docker compose up -d
+cp .env.example .env.local
+# edit .env.local — at minimum set REDIS_URL
+```
+
+Then bring the stack up. Each Redis-touching service has `env_file: .env.local`
+declared in `docker-compose.yml`, so Compose loads it automatically — **no
+`--env-file` flag required**:
+
+```bash
+docker compose up -d --wait
 docker compose ps
 ```
 
