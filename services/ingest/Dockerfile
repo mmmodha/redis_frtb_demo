@@ -4,8 +4,11 @@ FROM node:22-alpine AS runtime
 WORKDIR /app
 
 # Workspace manifests first so layer cache hits when only sources change.
+# @frtb/redis-client is a workspace: sibling dep of @frtb/ingest — its
+# directory must exist before `npm ci` so the workspace symlink resolves.
 COPY package.json package-lock.json ./
 COPY services/ingest/package.json services/ingest/
+COPY shared/redis-client shared/redis-client
 # tsx is in devDependencies, install full set so the runtime entry works.
 RUN npm ci --workspace=@frtb/ingest --include-workspace-root=false
 

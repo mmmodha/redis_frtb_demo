@@ -8,12 +8,14 @@ WORKDIR /app
 # curl is used by the compose healthcheck.
 RUN apk add --no-cache curl
 
-# Workspace install: copy root + workspace manifests, plus @frtb/schema source
-# (a runtime dep of @frtb/source), then install. Building from the monorepo
-# root lets npm resolve the workspace: protocol for @frtb/schema.
+# Workspace install: copy root + workspace manifests, plus @frtb/schema and
+# @frtb/redis-client sources (both runtime deps of @frtb/source), then
+# install. Building from the monorepo root lets npm resolve the workspace:
+# protocol for @frtb/* siblings.
 COPY package.json package-lock.json* ./
 COPY services/source/package.json ./services/source/package.json
 COPY shared/schema ./shared/schema
+COPY shared/redis-client ./shared/redis-client
 RUN npm install --workspaces --include-workspace-root --omit=dev=false
 
 COPY services/source/tsconfig.json ./services/source/tsconfig.json
