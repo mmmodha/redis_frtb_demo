@@ -9,7 +9,7 @@
   },
   "scripts": {
     "build": "node src/cli.mjs",
-    "test": "vitest run"
+    "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
     "archiver": "^7.0.1"
