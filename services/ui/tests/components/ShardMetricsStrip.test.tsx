@@ -52,14 +52,14 @@ describe("<ShardMetricsStrip />", () => {
     installFakeEventSource();
     render(<ShardMetricsStrip />);
     expect(FakeEventSource.instances).toHaveLength(1);
-    expect(FakeEventSource.instances[0].url).toMatch(/\/observability\/shards\/stream$/);
+    expect(FakeEventSource.instances[0]!.url).toMatch(/\/observability\/shards\/stream$/);
   });
 
   it("renders one tile per primary shard once the first SSE frame arrives", async () => {
     installFakeEventSource();
     render(<ShardMetricsStrip />);
     await act(async () => {
-      FakeEventSource.instances[0].emit([
+      FakeEventSource.instances[0]!.emit([
         { shardId: "a1a1a1a1", role: "master", opsPerSec: 1200, slotCount: 5461, usedMemoryBytes: 524288, netInBytes: 10, netOutBytes: 20 },
         { shardId: "b2b2b2b2", role: "master", opsPerSec:  980, slotCount: 5462, usedMemoryBytes: 524288, netInBytes: 11, netOutBytes: 21 },
         { shardId: "c3c3c3c3", role: "master", opsPerSec:  860, slotCount: 5461, usedMemoryBytes: 524288, netInBytes: 12, netOutBytes: 22 },
@@ -76,7 +76,7 @@ describe("<ShardMetricsStrip />", () => {
     installFakeEventSource();
     render(<ShardMetricsStrip />);
     await act(async () => {
-      FakeEventSource.instances[0].emit([
+      FakeEventSource.instances[0]!.emit([
         { shardId: "a1a1a1a1", role: "master", opsPerSec: 1234, slotCount: 5461, usedMemoryBytes: 1048576, netInBytes: 0, netOutBytes: 0 },
       ]);
     });
@@ -89,13 +89,13 @@ describe("<ShardMetricsStrip />", () => {
     installFakeEventSource();
     render(<ShardMetricsStrip />);
     await act(async () => {
-      FakeEventSource.instances[0].emit([
+      FakeEventSource.instances[0]!.emit([
         { shardId: "a1a1a1a1", role: "master", opsPerSec: 100, slotCount: 16384, usedMemoryBytes: 1024, netInBytes: 0, netOutBytes: 0 },
       ]);
     });
     expect(screen.getByText("100")).toBeInTheDocument();
     await act(async () => {
-      FakeEventSource.instances[0].emit([
+      FakeEventSource.instances[0]!.emit([
         { shardId: "a1a1a1a1", role: "master", opsPerSec: 9999, slotCount: 16384, usedMemoryBytes: 2048, netInBytes: 0, netOutBytes: 0 },
       ]);
     });
@@ -107,6 +107,6 @@ describe("<ShardMetricsStrip />", () => {
     installFakeEventSource();
     const { unmount } = render(<ShardMetricsStrip />);
     unmount();
-    expect(FakeEventSource.instances[0].closed).toBe(true);
+    expect(FakeEventSource.instances[0]!.closed).toBe(true);
   });
 });

@@ -81,7 +81,7 @@ export function Observability() {
 function ObservabilityReady({ data }: { data: ObservabilityData }) {
   const totalKeys = data.keys.dbsize;
   const memHuman = data.memory.used_memory_human ?? "—";
-  const shards = data.shards.shards;
+  const shards = data.shards;
 
   if (totalKeys === 0 && shards.length === 0) {
     return (
@@ -94,7 +94,7 @@ function ObservabilityReady({ data }: { data: ObservabilityData }) {
     );
   }
 
-  const totalOps = shards.reduce((acc, s) => acc + (s.ops_per_sec ?? 0), 0);
+  const totalOps = shards.reduce((acc, s) => acc + (s.opsPerSec ?? 0), 0);
 
   return (
     <>
@@ -109,9 +109,9 @@ function ObservabilityReady({ data }: { data: ObservabilityData }) {
       <PanelCard title="Per-shard breakdown">
         <TimingStrip
           shards={shards.map((s) => ({
-            id: s.id,
-            label: s.id,
-            ms: s.ops_per_sec ?? 0,
+            id: s.shardId,
+            label: s.shardId,
+            ms: s.opsPerSec ?? 0,
           }))}
         />
       </PanelCard>
