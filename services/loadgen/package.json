@@ -1,10 +1,23 @@
 {
   "name": "@frtb/loadgen",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "FRTB SBM PoV — concurrent-analyst load generator (placeholder stub; runner lands in Wave 4)",
+  "description": "FRTB SBM PoV — concurrent-analyst load generator: drives mixed pivot+calc workload against the api and exports live SSE metrics",
   "scripts": {
-    "start": "node src/index.mjs"
+    "build": "tsc -p tsconfig.json",
+    "start": "tsx src/index.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "fastify": "^5.8.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.19",
+    "tsx": "^4.22.3",
+    "typescript": "^5.9.3",
+    "vitest": "^2.1.9"
   }
 }
