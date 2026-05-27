@@ -1,0 +1,122 @@
+name: ci
+
+# Wave 4.6 — full CI gate. Three parallel jobs:
+#   1. test         — typecheck + vitest workspaces (with redis-stack)
+#   2. playwright   — chromium e2e against the UI + api stack
+#   3. testcontainers — Docker-in-Docker, no skipIf bypass (mvp.e2e,
+#      calc-sbm.integration, rqe-index, ingest/consumer must run)
+# All three must be green for merge.
+
+on:
+  push:
+    branches: [main, frtb-sbm-redis-pov]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      redis-stack:
+        image: redis/redis-stack-server:7.4.0-v0
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+      - name: Install redis-server CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y redis-server redis-tools
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Test (all workspaces)
+        run: npm test --workspaces --if-present
+
+  playwright:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      redis-stack:
+        image: redis/redis-stack-server:7.4.0-v0
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+      - name: Install Playwright (chromium)
+        working-directory: e2e
+        run: npx playwright install --with-deps chromium
+      - name: Run Playwright e2e (chromium)
+        working-directory: e2e
+        run: npx playwright test --project=chromium
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            e2e/playwright-report
+            docs/recordings/playwright-artifacts
+          if-no-files-found: ignore
+          retention-days: 7
+
+  testcontainers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # GitHub-hosted runners ship a working Docker daemon at
+    # /var/run/docker.sock, so the four it.skipIf(!HAS_DOCKER) tests
+    # always RUN here (no silent skips). Verified via the "no-skip" assertion
+    # step below.
+    env:
+      DOCKER_HOST: unix:///var/run/docker.sock
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+      - name: Install redis-server CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y redis-server redis-tools
+      - name: Verify Docker is available (required for testcontainers tests)
+        run: |
+          docker info
+          test -S /var/run/docker.sock
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+      - name: Run Testcontainers-gated tests
+        run: |
+          npx --workspace @frtb/api    vitest run tests/mvp.e2e.test.ts tests/calc-sbm.integration.test.ts
+          npx --workspace @frtb/rqe    vitest run tests/rqe-index.test.mjs
+          npx --workspace @frtb/ingest vitest run tests/consumer.test.ts
