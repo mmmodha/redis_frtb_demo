@@ -5,8 +5,12 @@
   "type": "module",
   "description": "Redis Query Engine index definitions for FRTB sensitivity pivot queries (Wave 2 locked contract: idx:sens over prefix sens:)",
   "main": "src/index.mjs",
+  "types": "src/index.d.mts",
   "exports": {
-    ".": "./src/index.mjs"
+    ".": {
+      "types": "./src/index.d.mts",
+      "default": "./src/index.mjs"
+    }
   },
   "scripts": {
     "test": "vitest run",

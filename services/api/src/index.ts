@@ -14,6 +14,7 @@ import { getActiveTarget, setActiveTarget } from "./active-target.ts";
 import { buildCrossBucketCorrelations } from "./sbm/correlations.ts";
 import { createStore } from "./store.ts";
 import { seedConnections } from "./seed.ts";
+import { bootstrapFrtb } from "./bootstrap.ts";
 
 const PORT = Number(process.env.HEALTH_PORT ?? 8080);
 const SCHEMA_PATH = resolve(
@@ -67,8 +68,10 @@ async function main(): Promise<void> {
       maxRetriesPerRequest: 3,
     });
   }
+  let redisConnected = false;
   try {
     await redis.connect();
+    redisConnected = true;
   } catch (err) {
     // Don't crash the api just because Redis isn't reachable yet — the demo
     // flow has the SA pointing at a cluster via the Connections panel after
@@ -78,9 +81,32 @@ async function main(): Promise<void> {
     );
   }
 
-  const correlations = existsSync(SCHEMA_PATH)
-    ? buildCrossBucketCorrelations(loadSchema(SCHEMA_PATH))
-    : {};
+  const schema = existsSync(SCHEMA_PATH) ? loadSchema(SCHEMA_PATH) : undefined;
+  const correlations = schema ? buildCrossBucketCorrelations(schema) : {};
+
+  // Wave 5.6.3: idempotently create idx:sens and load the frtb Functions
+  // library on every master shard. Failures are logged but do NOT crash the
+  // process — endpoints surface the underlying error per-call (mirrors the
+  // redis-unreachable graceful-degrade pattern above).
+  if (redisConnected && schema) {
+    try {
+      await bootstrapFrtb(redis, schema);
+    } catch (err) {
+      console.error(JSON.stringify({
+        service: "api",
+        bootstrap: "frtb",
+        action: "failed",
+        err: String(err),
+      }));
+    }
+  } else if (redisConnected && !schema) {
+    console.log(JSON.stringify({
+      service: "api",
+      bootstrap: "skipped",
+      reason: "schema-missing",
+      path: SCHEMA_PATH,
+    }));
+  }
 
   const app = await createServer({ redis, correlations, store, logger: true });
   await app.listen({ port: PORT, host: "0.0.0.0" });

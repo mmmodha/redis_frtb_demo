@@ -12,6 +12,9 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@frtb/calc": "*",
+    "@frtb/redis-client": "^0.0.1",
+    "@frtb/rqe": "*",
     "@frtb/schema": "*",
     "fastify": "^5.8.5",
     "ioredis": "^5.10.1",
