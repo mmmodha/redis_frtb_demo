@@ -17,9 +17,9 @@
   - `SEED_CONNECTIONS_FILE=/abs/path/to/seed-connections.json`
   - `CONN_STORE_KEY=<32-byte hex>` (do NOT commit)
   - `SOURCE_DATA_DIR=/abs/path/to/data/sources`
-  - `API_BASE=http://localhost:3001` (UI default)
+  - `API_BASE=http://localhost:8080` (UI default)
 - [ ] **Bring up the app stack:** `docker compose up -d --build`. Wait for all 7 services healthy.
-- [ ] **Smoke check the api:** `curl -fsS http://localhost:3001/healthz` returns `{"ok":true}`.
+- [ ] **Smoke check the api:** `curl -fsS http://localhost:8080/healthz` returns `{"ok":true}`.
 - [ ] **Smoke check `GET /redis/active-target`** — returns `demo-cluster` host/port/tls (no password leak).
 - [ ] **Open the UI:** `http://localhost:5173`. Confirm:
   - Active-target pill in header shows green `demo-cluster`.

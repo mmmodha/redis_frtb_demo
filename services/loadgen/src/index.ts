@@ -8,7 +8,7 @@ const port = Number(process.env.HEALTH_PORT ?? 8085);
 
 async function main(): Promise<void> {
   const app = await createServer({
-    apiBase: process.env.API_URL ?? "http://api:3001",
+    apiBase: process.env.API_URL ?? "http://api:8080",
     snapshotIntervalMs: Number(process.env.SNAPSHOT_INTERVAL_MS ?? 1000),
   });
   await app.listen({ port, host: "0.0.0.0" });

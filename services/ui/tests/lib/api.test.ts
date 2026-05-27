@@ -7,8 +7,8 @@ afterEach(() => {
 });
 
 describe("api client", () => {
-  it("apiBase defaults to http://localhost:3001", () => {
-    expect(apiBase()).toBe("http://localhost:3001");
+  it("apiBase defaults to http://localhost:8080", () => {
+    expect(apiBase()).toBe("http://localhost:8080");
   });
 
   it("getObservabilityKeys calls /observability/keys?prefix=sens: by default", async () => {

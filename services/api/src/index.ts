@@ -6,7 +6,8 @@
 
 import { resolve } from "node:path";
 import { existsSync } from "node:fs";
-import { Redis } from "ioredis";
+import type { Cluster, Redis } from "ioredis";
+import { createRedisClient } from "@frtb/redis-client";
 import { loadSchema } from "@frtb/schema";
 import { createServer } from "./server.ts";
 import { getActiveTarget, setActiveTarget } from "./active-target.ts";
@@ -49,14 +50,23 @@ async function main(): Promise<void> {
   }
 
   const target = getActiveTarget();
-  const redis = new Redis({
-    host: target.host,
-    port: target.port,
-    db: target.db,
-    tls: target.tls ? {} : undefined,
-    lazyConnect: true,
-    maxRetriesPerRequest: 3,
-  });
+  // Prefer REDIS_URL (Wave 5.2 wiring): when set, construct a cluster-aware
+  // client straight from the URL — password and TLS scheme included. The
+  // active-target singleton still drives per-route routing via the UI.
+  let redis: Redis | Cluster;
+  if (process.env.REDIS_URL) {
+    redis = createRedisClient({ lazyConnect: true, maxRetriesPerRequest: 3 });
+  } else {
+    const { Redis: RedisCtor } = await import("ioredis");
+    redis = new RedisCtor({
+      host: target.host,
+      port: target.port,
+      db: target.db,
+      tls: target.tls ? {} : undefined,
+      lazyConnect: true,
+      maxRetriesPerRequest: 3,
+    });
+  }
   try {
     await redis.connect();
   } catch (err) {

@@ -34,7 +34,7 @@ export type ObservabilityShardsResponse = ObservabilityShard[];
 
 export function apiBase(): string {
   const fromEnv = (import.meta as ImportMeta & { env?: { VITE_API_BASE?: string } }).env?.VITE_API_BASE;
-  return fromEnv ?? "http://localhost:3001";
+  return fromEnv ?? "http://localhost:8080";
 }
 
 async function getJson<T>(path: string): Promise<T> {

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import { Redis, Cluster } from "ioredis";
+import { createRedisClient } from "@frtb/redis-client";
 import pino from "pino";
 import { loadSchema } from "@frtb/schema";
 import { createRowGenerator } from "./row-generator.js";
@@ -82,11 +83,14 @@ async function main(): Promise<void> {
 }
 
 function createClient(url: string): Redis | Cluster {
+  // Wave 5.2: route through the shared cluster-aware helper (honours
+  // REDIS_CLUSTER / REDIS_TLS env). The legacy `redis-cluster://` prefix
+  // remains an explicit-override escape hatch for back-compat with tests.
   if (url.startsWith("redis-cluster://")) {
     const stripped = url.replace("redis-cluster://", "redis://");
     return new Cluster([stripped]);
   }
-  return new Redis(url);
+  return createRedisClient({ url });
 }
 
 async function closeClient(client: Redis | Cluster): Promise<void> {

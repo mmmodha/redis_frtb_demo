@@ -1,18 +1,33 @@
-# Placeholder Dockerfile for the ui service.
-# Real Next.js build replaces this in Wave 3.
-FROM node:20-alpine AS runtime
+# Wave 5.1 — multi-stage build for the @frtb/ui Vite + React app.
+# Stage 1: node:20-alpine builds the SPA. Stage 2: nginx:alpine serves the
+# built dist/ on :3000 and answers /healthz for the compose healthcheck.
+# Built from the monorepo root so npm workspaces resolves @frtb/ui correctly.
+
+FROM node:20-alpine AS builder
 WORKDIR /app
 
-# Copy only this service's package + source. No Redis client deps yet — the
-# real api/ingest/calc images add their dependencies in their own Wave 2 tasks.
-COPY services/ui/package.json ./
-COPY services/ui/src ./src
+# Workspace install — copy the root manifest + ui manifest only so the
+# install layer caches independently of any source changes. UI has no
+# @frtb/* runtime deps so we don't need to copy shared/* here.
+COPY package.json package-lock.json* ./
+COPY services/ui/package.json ./services/ui/package.json
+RUN npm install --workspace=@frtb/ui --include-workspace-root --no-audit --no-fund
 
-ENV HEALTH_PORT=3000
-EXPOSE 3000
+# Source. tsconfig.base.json is referenced by services/ui/tsconfig.json.
+COPY tsconfig.base.json ./
+COPY services/ui ./services/ui
 
-# curl is used by the compose healthcheck.
+# Vite build → services/ui/dist
+WORKDIR /app/services/ui
+RUN npm run build
+
+FROM nginx:alpine AS runtime
+
+# curl is used by the compose healthcheck (matches placeholder behaviour).
 RUN apk add --no-cache curl
 
-USER node
-CMD ["node", "src/index.mjs"]
+COPY services/ui/nginx.conf /etc/nginx/conf.d/default.conf
+COPY --from=builder /app/services/ui/dist /usr/share/nginx/html
+
+EXPOSE 3000
+HEALTHCHECK NONE

@@ -73,6 +73,7 @@ describe("generator CLI", () => {
           ...process.env,
           SCHEMA_FILE: multiClass,
           REDIS_URL: `redis://127.0.0.1:${PORT}`,
+          REDIS_CLUSTER: "false",
           STREAM_KEY: "sensitivities:in",
         },
         encoding: "utf8",
@@ -92,6 +93,7 @@ describe("generator CLI", () => {
           ...process.env,
           SCHEMA_FILE: multiClass,
           REDIS_URL: `redis://127.0.0.1:${PORT}`,
+          REDIS_CLUSTER: "false",
           STREAM_KEY: "sensitivities:in",
         },
         encoding: "utf8",
@@ -122,6 +124,7 @@ describe("generator CLI", () => {
           ...process.env,
           SCHEMA_FILE: multiClass,
           REDIS_URL: `redis://127.0.0.1:${PORT}`,
+          REDIS_CLUSTER: "false",
           STREAM_KEY: "sensitivities:in",
         },
         encoding: "utf8",
@@ -144,7 +147,7 @@ describe("generator CLI", () => {
       process.execPath,
       [tsx, cli, "--rows", "20", "--classes", "fx", "--seed", "4"],
       {
-        env: { ...process.env, SCHEMA_FILE: swap, REDIS_URL: `redis://127.0.0.1:${PORT}`, STREAM_KEY: "sensitivities:in" },
+        env: { ...process.env, SCHEMA_FILE: swap, REDIS_URL: `redis://127.0.0.1:${PORT}`, REDIS_CLUSTER: "false", STREAM_KEY: "sensitivities:in" },
         encoding: "utf8",
         timeout: 30_000,
       }

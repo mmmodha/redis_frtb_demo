@@ -45,7 +45,7 @@ export interface RunnerSnapshot {
 const DEFAULTS: RunnerConfig = {
   concurrency: 200,
   duration_sec: 300,
-  api_base: "http://api:3001",
+  api_base: "http://api:8080",
   mix: { pivot: 0.5, calc: 0.5 },
 };
 

@@ -7,7 +7,8 @@
 
 import { resolve } from "node:path";
 import { existsSync } from "node:fs";
-import { Redis } from "ioredis";
+import type { Cluster, Redis } from "ioredis";
+import { createRedisClient } from "@frtb/redis-client";
 import { loadSchema } from "@frtb/schema";
 import { createServer } from "./server.ts";
 import { createSourceStore } from "./store.ts";
@@ -37,15 +38,24 @@ async function resolveTarget(): Promise<ActiveTarget> {
 }
 
 async function main(): Promise<void> {
-  const target = await resolveTarget();
-  const redis = new Redis({
-    host: target.host,
-    port: target.port,
-    db: target.db ?? 0,
-    tls: target.tls ? {} : undefined,
-    lazyConnect: true,
-    maxRetriesPerRequest: 3,
-  });
+  // Wave 5.2: prefer REDIS_URL when set (cluster-aware via shared helper).
+  // Otherwise fall back to the api's active-target host/port for compose
+  // setups where the api owns the connection registry.
+  let redis: Redis | Cluster;
+  if (process.env.REDIS_URL) {
+    redis = createRedisClient({ lazyConnect: true, maxRetriesPerRequest: 3 });
+  } else {
+    const target = await resolveTarget();
+    const { Redis: RedisCtor } = await import("ioredis");
+    redis = new RedisCtor({
+      host: target.host,
+      port: target.port,
+      db: target.db ?? 0,
+      tls: target.tls ? {} : undefined,
+      lazyConnect: true,
+      maxRetriesPerRequest: 3,
+    });
+  }
   try { await redis.connect(); } catch (err) {
     console.log(JSON.stringify({ service: "source", status: "redis-unreachable", err: String(err) }));
   }

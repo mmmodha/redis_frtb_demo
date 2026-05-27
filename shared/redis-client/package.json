@@ -1,0 +1,23 @@
+{
+  "name": "@frtb/redis-client",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "FRTB SBM PoV — shared ioredis client factory (parses REDIS_URL/REDIS_CLUSTER/REDIS_TLS env vars into a Redis or Cluster instance)",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "ioredis": "^5.10.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.19",
+    "typescript": "^5.9.3",
+    "vitest": "^2.1.9"
+  }
+}

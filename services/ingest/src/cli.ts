@@ -2,6 +2,7 @@
 import http from "node:http";
 import os from "node:os";
 import { Redis, Cluster } from "ioredis";
+import { createRedisClient } from "@frtb/redis-client";
 import pino from "pino";
 import { createConsumer, ensureGroup, type RedisLike } from "./consumer.js";
 
@@ -31,12 +32,15 @@ async function fetchActiveTarget(apiUrl: string): Promise<ActiveTarget> {
 
 function createClient(target: ActiveTarget | string): RedisLike {
   if (typeof target === "string") {
+    // Wave 5.2: REDIS_URL path → cluster-aware shared helper (honours
+    // REDIS_CLUSTER / REDIS_TLS env). Legacy `redis-cluster://` prefix is
+    // still supported as an explicit override.
     if (target.startsWith("redis-cluster://")) {
       return new Cluster([target.replace("redis-cluster://", "redis://")]);
     }
-    return new Redis(target);
+    return createRedisClient({ url: target }) as unknown as RedisLike;
   }
-  if (target.url) return new Redis(target.url);
+  if (target.url) return createRedisClient({ url: target.url }) as unknown as RedisLike;
   return new Redis({
     host: target.host,
     port: target.port,

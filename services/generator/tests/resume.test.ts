@@ -69,6 +69,7 @@ describe("generator resumability (DoD: killed mid-stream, resumed safely)", () =
       ...process.env,
       SCHEMA_FILE: multiClass,
       REDIS_URL: `redis://127.0.0.1:${PORT}`,
+      REDIS_CLUSTER: "false",
       STREAM_KEY: "sensitivities:in",
     };
     const args = ["--rows", "50", "--classes", "fx", "--seed", "1"];
