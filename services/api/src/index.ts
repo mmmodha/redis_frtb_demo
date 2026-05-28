@@ -9,7 +9,7 @@ import { existsSync } from "node:fs";
 import type { Cluster, Redis } from "ioredis";
 import { createRedisClient } from "@frtb/redis-client";
 import { loadSchema } from "@frtb/schema";
-import { createServer } from "./server.ts";
+import { createServer, markBootstrapReady, markBootstrapFailed, markBootstrapSkipped } from "./server.ts";
 import { getActiveTarget, setActiveTarget } from "./active-target.ts";
 import { buildCrossBucketCorrelations } from "./sbm/correlations.ts";
 import { createStore } from "./store.ts";
