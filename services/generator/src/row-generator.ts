@@ -18,7 +18,7 @@ export interface RowGenerator {
   generate(riskClass: string): SensitivityRow;
 }
 
-const SENSITIVITY_TYPES = ["DELTA", "VEGA"];
+const SENSITIVITY_TYPES = ["Delta", "Vega"];
 
 // Per-dimension op codes — resolved once per schema, then executed per row.
 type Op =

@@ -95,7 +95,7 @@ describe("consumer pure helpers", () => {
       _hash_tag: "GIRR:USD",
       _id: "01HZ...",
       payload: JSON.stringify({
-        sensitivity_type: "DELTA",
+        sensitivity_type: "Delta",
         tenor: ["3M","6M"],
         risk_value: [0.1,0.2],
         weight_ref: "girr_delta_weights",
@@ -106,7 +106,7 @@ describe("consumer pure helpers", () => {
     expect(doc).toEqual({
       risk_class: "GIRR",
       bucket: "USD",
-      sensitivity_type: "DELTA",
+      sensitivity_type: "Delta",
       tenor: ["3M","6M"],
       risk_value: [0.1,0.2],
       weight_ref: "girr_delta_weights",
@@ -140,9 +140,9 @@ describe("XREADGROUP consumer → JSON.SET", () => {
   integration("writes one JSON doc per stream entry at sens:{rc:bucket}:{ulid} and XACKs it", async () => {
     await ensureGroup(redis, "sensitivities:in", "ingest");
     const rows = [
-      makeRow("GIRR", "USD", { sensitivity_type: "DELTA", tenor: ["3M","1Y","10Y"], risk_value: [0.1,0.2,0.3], weight_ref: "girr_delta_weights", correlation_ref: "girr_corr", trade_id: "T1" }),
-      makeRow("EQUITY", "1", { sensitivity_type: "DELTA", risk_value: 0.5, weight_ref: "equity_delta_weights", correlation_ref: "equity_corr", trade_id: "T2" }),
-      makeRow("FX", "USDEUR", { sensitivity_type: "VEGA", risk_value: 0.75, weight_ref: "fx_weights", correlation_ref: "fx_corr", trade_id: "T3" }),
+      makeRow("GIRR", "USD", { sensitivity_type: "Delta", tenor: ["3M","1Y","10Y"], risk_value: [0.1,0.2,0.3], weight_ref: "girr_delta_weights", correlation_ref: "girr_corr", trade_id: "T1" }),
+      makeRow("EQUITY", "1", { sensitivity_type: "Delta", risk_value: 0.5, weight_ref: "equity_delta_weights", correlation_ref: "equity_corr", trade_id: "T2" }),
+      makeRow("FX", "USDEUR", { sensitivity_type: "Vega", risk_value: 0.75, weight_ref: "fx_weights", correlation_ref: "fx_corr", trade_id: "T3" }),
     ];
     for (const r of rows) await xaddRow("sensitivities:in", r);
 
@@ -164,7 +164,7 @@ describe("XREADGROUP consumer → JSON.SET", () => {
   integration("stored JSON doc shape matches the locked Wave 2 contract", async () => {
     await ensureGroup(redis, "sensitivities:in", "ingest");
     const row = makeRow("GIRR", "USD-IRS", {
-      sensitivity_type: "DELTA",
+      sensitivity_type: "Delta",
       tenor: [0.25, 0.5, 1, 2, 3, 5, 10, 15, 20, 30],
       risk_value: [0.12, 0.34, 0.5, 0.6, 0.7, 0.65, 0.5, 0.4, 0.3, 0.2],
       weight_ref: "girr_delta_weights",
@@ -180,7 +180,7 @@ describe("XREADGROUP consumer → JSON.SET", () => {
     expect(stored).toMatchObject({
       risk_class: "GIRR",
       bucket: "USD-IRS",
-      sensitivity_type: "DELTA",
+      sensitivity_type: "Delta",
       weight_ref: "girr_delta_weights",
       correlation_ref: "girr_corr",
       trade_id: "T-7",
@@ -199,7 +199,7 @@ describe("XREADGROUP consumer → JSON.SET", () => {
   integration("is idempotent — re-running on the same logical rows produces no duplicate keys", async () => {
     await ensureGroup(redis, "sensitivities:in", "ingest");
     const rows = Array.from({ length: 25 }, (_, i) =>
-      makeRow("GIRR", "USD", { sensitivity_type: "DELTA", risk_value: [i, i+1], trade_id: `T-${i}` })
+      makeRow("GIRR", "USD", { sensitivity_type: "Delta", risk_value: [i, i+1], trade_id: `T-${i}` })
     );
     for (const r of rows) await xaddRow("sensitivities:in", r);
 
@@ -216,7 +216,7 @@ describe("XREADGROUP consumer → JSON.SET", () => {
   integration("createConsumer runs an XREADGROUP loop and drains on stop()", async () => {
     await ensureGroup(redis, "sensitivities:in", "ingest");
     const rows = Array.from({ length: 50 }, () =>
-      makeRow("EQUITY", "2", { sensitivity_type: "DELTA", risk_value: 1.23 })
+      makeRow("EQUITY", "2", { sensitivity_type: "Delta", risk_value: 1.23 })
     );
     for (const r of rows) await xaddRow("sensitivities:in", r);
 
