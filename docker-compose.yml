@@ -94,6 +94,18 @@ services:
 
   generator:
     <<: *service-defaults
+    # Wave 5.15d.2: generator is an explicit-invocation tool, NOT an autostart
+    # service. Putting it behind the `tools` profile keeps it out of
+    # `docker compose up -d --wait` (so the bogus HTTP healthcheck below — the
+    # generator has no HTTP server — can no longer make `compose ps` report
+    # "6/7 with generator unhealthy", and the default ENTRYPOINT no longer
+    # pumps rows into a freshly-booted 2 GB cluster behind the smoke runbook's
+    # explicit step-4 invocation). `docker compose run --rm generator …` still
+    # works: Compose auto-activates the profile of any named service when
+    # invoked via `run`, so the smoke runbook's
+    #   `docker compose run --rm generator --rows N --classes X,Y`
+    # contract from Wave 5.14b.2 is unchanged.
+    profiles: ["tools"]
     build:
       context: .
       dockerfile: services/generator/Dockerfile

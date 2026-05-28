@@ -53,9 +53,17 @@ The Wave 5.14a diagnostic ([smoke-run-6/diagnostic.md](smoke-run-6/diagnostic.md
 |------|---------|-----|
 | 0    | `docker compose down -v` | Drop local volumes. |
 | **0.5** | **`scripts/smoke-reset-cluster.sh --yes`** | **Mandatory.** FLUSHALL every master shard, then `FT._LIST`-assert each master has 0 indexes. Closes the orphaned-index reproducer surfaced by Wave 5.14a; also prevents OOM inheritance. |
-| 1    | `docker compose up -d --wait` | Compose only marks `api` healthy once `/healthz` is 200 — i.e. only after `bootstrapFrtb()` has actually created idx:sens + loaded the Functions library. A bootstrap failure now correctly cascades through every dependent service's healthcheck. |
+| 1    | `docker compose up -d --wait` | Compose only marks `api` healthy once `/healthz` is 200 — i.e. only after `bootstrapFrtb()` has actually created idx:sens + loaded the Functions library. A bootstrap failure now correctly cascades through every dependent service's healthcheck. **Wave 5.15d.2:** the `generator` service is now in the `tools` profile, so this command brings up `ui`, `api`, `source`, `ingest`, `calc`, `loadgen` (6 services) and **does not** start the generator. `docker compose ps` will not list generator at all until it is explicitly invoked at step 4. |
 
 Skipping step 0.5 reproduces the Wave 5.14a failure mode and is **not** an optional optimisation — the orphaned-index path is silent and only surfaces three steps later as `SEARCH_INDEX_NOT_FOUND` on the first `/calc/sbm` call.
+
+### Step 4 — generator invocation (unchanged contract)
+
+The generator is the only ingest trigger, invoked explicitly (per the Wave 5.14b.2 ENTRYPOINT contract):
+
+      docker compose run --rm generator --rows <N> --classes <X,Y>
+
+Because `generator` is in the `tools` profile (Wave 5.15d.2), `compose run` auto-activates the profile for the named service — no `--profile tools` flag is needed. Dependencies (`api`) are auto-started if not already healthy; in the normal smoke flow they were brought up at step 1. Rows are no longer pumped behind the runbook by an autostart container, so the smoke-tuned `--rows` value is the only ingest pressure on the 2 GB cluster.
 
 
 
