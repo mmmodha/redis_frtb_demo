@@ -53,4 +53,9 @@ EXPOSE 8081
 
 USER node
 WORKDIR /app/services/generator
-CMD ["node", "/usr/local/lib/node_modules/tsx/dist/cli.mjs", "src/cli.ts"]
+# Wave 5.14b.2: ENTRYPOINT (not CMD) so `docker compose run generator --rows N
+# --classes girr,equity` appends user flags to the script invocation rather than
+# replacing the whole command (which previously made docker try to exec `--rows`
+# directly). Default `docker compose up generator` still runs the entrypoint
+# with no extra args — commander uses its built-in defaults.
+ENTRYPOINT ["node", "/usr/local/lib/node_modules/tsx/dist/cli.mjs", "src/cli.ts"]

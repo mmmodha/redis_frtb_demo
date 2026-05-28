@@ -169,7 +169,10 @@ async function installCommonRoutes(page: Page, opts: { activeName?: string } = {
       body: JSON.stringify({ running: true, concurrency: 200, p99_ms: 412, ops_per_sec: 12_500, run_id: "run-200x" }),
     }),
   );
-  await page.route("**/loadgen/stream", (route: Route) =>
+  // Wave 5.14b.2: realign to the actual SSE route the UI subscribes to
+  // (services/ui/src/lib/loadgen.ts → /loadgen/metrics). The previous
+  // **/loadgen/stream glob matched nothing and left the EventSource unmocked.
+  await page.route("**/loadgen/metrics", (route: Route) =>
     route.fulfill({ status: 200, contentType: "text/event-stream", body: "" }),
   );
 }

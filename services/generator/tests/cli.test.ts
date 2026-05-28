@@ -141,6 +141,41 @@ describe("generator CLI", () => {
     }
   });
 
+  // Wave 5.14b.2: pins the literal argv shape that the smoke-run-6 author
+  // tried to pass through `docker compose run --rm generator --rows 10000
+  // --classes girr,equity` and that the Dockerfile CMD-vs-ENTRYPOINT fix
+  // unblocks. Validates argv reaches the script (commander parses --rows and
+  // --classes), not the docker layer.
+  it.skipIf(!redisAvailable)("argv --rows 10000 --classes girr,equity reaches the script and produces rows only across those classes", async () => {
+    const res = spawnSync(
+      process.execPath,
+      [tsx, cli, "--rows", "10000", "--classes", "girr,equity", "--seed", "5", "--batch-size", "1000"],
+      {
+        env: {
+          ...process.env,
+          SCHEMA_FILE: multiClass,
+          REDIS_URL: `redis://127.0.0.1:${PORT}`,
+          REDIS_CLUSTER: "false",
+          STREAM_KEY: "sensitivities:in",
+        },
+        encoding: "utf8",
+        timeout: 60_000,
+      }
+    );
+    expect(res.status, `stdout:\n${res.stdout}\nstderr:\n${res.stderr}`).toBe(0);
+    const len = await redis.xlen("sensitivities:in");
+    expect(len).toBe(10000);
+    const items = await redis.xrange("sensitivities:in", "-", "+", "COUNT", 10000);
+    const classes = new Set<string>();
+    for (const [, fields] of items) {
+      const map = Object.fromEntries(
+        Array.from({ length: fields.length / 2 }, (_, i) => [fields[i * 2], fields[i * 2 + 1]])
+      );
+      classes.add(map.risk_class as string);
+    }
+    expect(classes).toEqual(new Set(["GIRR", "EQUITY"]));
+  });
+
   it.skipIf(!redisAvailable)("re-running with a different SCHEMA_FILE produces rows in the new shape (proves schema swap)", async () => {
     const swap = resolve(here, "fixtures/swap-schema.yaml");
     spawnSync(

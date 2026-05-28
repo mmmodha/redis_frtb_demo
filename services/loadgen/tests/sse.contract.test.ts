@@ -126,6 +126,25 @@ describe("POST /loadgen/stop", () => {
   });
 });
 
+// Wave 5.14b.2: pins the SSE route registration so a future rename or accidental
+// removal of /loadgen/metrics breaks loudly. The smoke-run-6 author hit
+// /loadgen/metrics/stream and saw 404 — that path was never registered; the
+// real SSE route is /loadgen/metrics.
+describe("route table — SSE registration snapshot", () => {
+  it("registers GET /loadgen/metrics (the SSE route) and does not register the wrong-path variants", () => {
+    const tree = app.printRoutes({ commonPrefix: false });
+    expect(tree).toMatch(/\/loadgen\/metrics\s+\(GET/);
+    expect(tree).not.toContain("/loadgen/metrics/stream");
+    expect(tree).not.toContain("/loadgen/stream");
+    expect(tree).not.toContain("/loadgen/events");
+  });
+
+  it("returns 404 (not 5xx) for the stale /loadgen/metrics/stream path so consumers fail loudly", async () => {
+    const res = await app.inject({ method: "GET", url: "/loadgen/metrics/stream" });
+    expect(res.statusCode).toBe(404);
+  });
+});
+
 describe("GET /loadgen/status", () => {
   it("reports the current runner snapshot inline (running flag + config)", async () => {
     await app.inject({ method: "POST", url: "/loadgen/start", payload: { concurrency: 3, duration_sec: 60 } });
