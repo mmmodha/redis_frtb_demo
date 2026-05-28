@@ -53,9 +53,11 @@ The Wave 5.14a diagnostic ([smoke-run-6/diagnostic.md](smoke-run-6/diagnostic.md
 |------|---------|-----|
 | 0    | `docker compose down -v` | Drop local volumes. |
 | **0.5** | **`scripts/smoke-reset-cluster.sh --yes`** | **Mandatory.** FLUSHALL every master shard, then `FT._LIST`-assert each master has 0 indexes. Closes the orphaned-index reproducer surfaced by Wave 5.14a; also prevents OOM inheritance. |
-| 1    | `docker compose up -d --wait` | Compose only marks `api` healthy once `/healthz` is 200 — i.e. only after `bootstrapFrtb()` has actually created idx:sens + loaded the Functions library. A bootstrap failure now correctly cascades through every dependent service's healthcheck. **Wave 5.15d.2:** the `generator` service is now in the `tools` profile, so this command brings up `ui`, `api`, `source`, `ingest`, `calc`, `loadgen` (6 services) and **does not** start the generator. `docker compose ps` will not list generator at all until it is explicitly invoked at step 4. |
+| 1    | `docker compose up -d --build --wait` | **Wave 5.15h:** `--build` is mandatory. Compose only marks `api` healthy once `/healthz` is 200 — i.e. only after `bootstrapFrtb()` has actually created idx:sens + loaded the Functions library. A bootstrap failure now correctly cascades through every dependent service's healthcheck. **Wave 5.15d.2:** the `generator` service is now in the `tools` profile, so this command brings up `ui`, `api`, `source`, `ingest`, `calc`, `loadgen` (6 services) and **does not** start the generator. `docker compose ps` will not list generator at all until it is explicitly invoked at step 4. |
 
 Skipping step 0.5 reproduces the Wave 5.14a failure mode and is **not** an optional optimisation — the orphaned-index path is silent and only surfaces three steps later as `SEARCH_INDEX_NOT_FOUND` on the first `/calc/sbm` call.
+
+**Always rebuild service images before a smoke run.** Compose otherwise reuses cached layers and any `.ts` / `.py` / `.lua` source change that does not also touch a `Dockerfile` will not propagate to the running container. See Wave 5.15g (smoke-run-10) for the reference failure mode: the Wave 5.15f case-mismatch fix to `services/generator/src/row-generator.ts` landed in git but never reached the running container because step 1 of this runbook used `docker compose up -d --wait` (no `--build`), so Compose reused a generator image built 34 h before the fix and the smoke run RED-ed with `sbm_charge=0` across every variant.
 
 ### Step 4 — generator invocation (unchanged contract)
 
