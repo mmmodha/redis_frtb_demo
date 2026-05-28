@@ -1,0 +1,14 @@
+{
+  "xlen_stream_post_ingest": 300000,
+  "ft_num_docs_post_ingest": 124100,
+  "ft_hash_indexing_failures": 0,
+  "ingest_consumed": 300000,
+  "ingest_errors": 0,
+  "density_pct": 41.37,
+  "per_shard": {
+    "18.117.107.213:10395": { "sens_keys_on_this_shard": 124100 },
+    "16.59.25.183:10395":   { "sens_keys_on_this_shard": 0 }
+  },
+  "classification": "data-density-low",
+  "classification_reason": "hash_indexing_failures=0 and both shards 682.21M / 737.91M peak (no eviction, no OOM); fingerprint identical to smoke-run-9 (42.05%) — same generator-side key collision (sens:{trade_id}:{factor} overwrite causing 300k stream entries to materialise as ~124k unique hash keys)."
+}

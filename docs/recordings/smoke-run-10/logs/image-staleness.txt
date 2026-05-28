@@ -1,0 +1,40 @@
+# Wave 5.15g — Docker image staleness evidence (root cause of AC1 ❌)
+
+## Build timestamp vs Wave 5.15f commit timestamp
+
+generator image build : 2026-05-27 12:20:58 UTC
+api       image build :   (same wave — built before 5.15f)
+Wave 5.15f commit     : 2026-05-28 22:47:45 UTC (d962231)
+
+Δ = generator image is 34h 26m OLDER than the Wave 5.15f fix.
+
+## Source file inside the generator image
+
+$ docker run --rm --entrypoint sh frtb-sbm-redis-pov-generator:latest \
+    -c 'grep -n "SENSITIVITY_TYPES" /app/services/generator/src/row-generator.ts'
+21:const SENSITIVITY_TYPES = ["DELTA", "VEGA"];     # ← UPPERCASE (pre-5.15f)
+
+## Source file in the git working tree
+
+$ grep -n "SENSITIVITY_TYPES" services/generator/src/row-generator.ts
+21:const SENSITIVITY_TYPES = ["Delta", "Vega"];     # ← PascalCase (5.15f fix)
+
+## Runbook step 1 verbatim
+
+    docker compose up -d --wait
+
+NOTE: The runbook does NOT pass --build. Compose reuses any existing image
+with the project name regardless of source-tree age. So Wave 5.15f's
+source-only fix never reached the running container.
+
+## Observable consequence
+
+Stored sens doc (sample, post-ingest):
+    {"risk_class":"FX","bucket":"USDCAD",...,"sensitivity_type":"DELTA",...}
+                                                                 ^^^^^^^
+Lua filter (services/calc/lib/girr_delta.lua, line 40):
+    if ok and type(doc) == 'table' and doc.sensitivity_type == 'Delta' then
+                                                              ^^^^^^^
+Filter rejects every row -> SCAN finds keys (8736 for sens:{GIRR:JPY}:*),
+JSON.GET / cjson.decode succeed, but the equality check fails for every
+doc -> count==0 in every per_bucket entry -> charge=0 -> AC1 fails.
