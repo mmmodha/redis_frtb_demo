@@ -156,15 +156,16 @@ describe("POST /calc/sbm — MVP endpoint", () => {
     expect(b.statusCode).toBe(400);
   });
 
-  // Wave 5.8.4: a 200 with charge=0 on a portfolio that has no rows (or no
-  // idx:sens on some shards) silently masks a precondition failure. The route
-  // must hard-fail with a diagnostic 503 when the discover step finds no
-  // buckets AND a follow-up FT.SEARCH confirms zero matching rows.
-  it("returns 503 no-data-or-index when FT.AGGREGATE is empty AND FT.SEARCH finds zero rows", async () => {
+  // Wave 5.8.4 + 5.15d.1: a 200 with charge=0 on a portfolio that has no rows
+  // (or no idx:sens on some shards) silently masks a precondition failure. The
+  // route must hard-fail with a diagnostic 503 when the cluster-aware discover
+  // step finds no buckets AND FT.INFO reports num_docs=0.
+  it("returns 503 no-data-or-index when FT.AGGREGATE is empty AND FT.INFO num_docs is 0", async () => {
     const fr = fakeRedis();
     fr.setResponse("FT.AGGREGATE", ftAggregateReply([]));
-    // FT.SEARCH ... LIMIT 0 0 returns [totalMatches] when no rows match.
-    fr.setResponse("FT.SEARCH", [0]);
+    // FT.INFO returns a flat key/value array; num_docs is cluster-aggregated
+    // by ioredis Cluster's coordinator (sum across masters).
+    fr.setResponse("FT.INFO", ["index_name", "idx:sens", "num_docs", "0"]);
     app = await createServer({ redis: fr, correlations: { GIRR: { kind: "constant", value: 0 } } });
     const res = await app.inject({
       method: "POST",
@@ -181,21 +182,19 @@ describe("POST /calc/sbm — MVP endpoint", () => {
     expect(typeof body.hint).toBe("string");
     expect(body.hint.length).toBeGreaterThan(0);
 
-    // Verify the precondition probe was issued against the same risk_class
-    // filter as the discover step.
-    const search = fr.calls.find((c) => c.command === "FT.SEARCH");
-    expect(search).toBeDefined();
-    expect(search!.args[0]).toBe("idx:sens");
-    expect(String(search!.args[1])).toContain("@risk_class:{GIRR}");
+    // Verify the precondition probe was issued against idx:sens.
+    const info = fr.calls.find((c) => c.command === "FT.INFO");
+    expect(info).toBeDefined();
+    expect(info!.args[0]).toBe("idx:sens");
     // FCALL must NOT be issued when the precondition failed.
     expect(fr.calls.find((c) => c.command === "FCALL")).toBeUndefined();
   });
 
-  it("returns 503 no-data-or-index when FT.SEARCH itself errors (missing index)", async () => {
+  it("returns 503 no-data-or-index when FT.INFO itself errors (missing index)", async () => {
     const fr = fakeRedis();
     fr.setResponse("FT.AGGREGATE", ftAggregateReply([]));
-    // Simulate `idx:sens` missing on this shard — FT.SEARCH throws.
-    fr.setResponse("FT.SEARCH", () => {
+    // Simulate `idx:sens` missing — FT.INFO throws.
+    fr.setResponse("FT.INFO", () => {
       throw new Error("Unknown Index name");
     });
     app = await createServer({ redis: fr, correlations: { GIRR: { kind: "constant", value: 0 } } });
@@ -211,5 +210,103 @@ describe("POST /calc/sbm — MVP endpoint", () => {
       risk_class: "GIRR",
       measure: "vega",
     });
+  });
+
+  // Wave 5.15d.1: in cluster mode the FT.AGGREGATE coordinator does NOT
+  // aggregate replies across shards (only FT.INFO does). The route must fan
+  // out FT.AGGREGATE per master via redis.nodes("master") and union the
+  // bucket sets in TS. This test wires a fake cluster client with two node
+  // fakes that each own a disjoint slice of buckets and asserts the route
+  // sees the union and FCALLs every bucket.
+  it("cluster mode: fans FT.AGGREGATE per master and unions disjoint bucket sets", async () => {
+    const nodeA = fakeRedis();
+    const nodeB = fakeRedis();
+    nodeA.setResponse("FT.AGGREGATE", ftAggregateReply(["USD-IRS"]));
+    nodeB.setResponse("FT.AGGREGATE", ftAggregateReply(["EUR-IRS"]));
+
+    // Coordinator-level fake serves cluster-aggregated commands (FT.INFO) and
+    // routed commands (FCALL). The cluster client exposes .nodes("master") so
+    // the route's per-master fanout discovers nodeA + nodeB.
+    const coord = fakeRedis();
+    coord.setResponse("FCALL", (args: unknown[]) => {
+      const bucket = args[4] as string;
+      if (bucket === "USD-IRS") return ["K_b", "3", "S_b", "3", "count", "10", "ms", "1"];
+      return ["K_b", "4", "S_b", "4", "count", "20", "ms", "1"];
+    });
+    const cluster = {
+      ...coord,
+      nodes: (_role: string) => [nodeA, nodeB],
+    };
+
+    app = await createServer({
+      redis: cluster as unknown as Parameters<typeof createServer>[0]["redis"],
+      correlations: { GIRR: { kind: "constant", value: 0 } },
+    });
+    const res = await app.inject({
+      method: "POST",
+      url: "/calc/sbm",
+      payload: { risk_class: "GIRR", sensitivity_type: "Delta" },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    // Both masters' buckets must be present — union, not single-shard view.
+    expect(body.per_bucket).toHaveLength(2);
+    const seenBuckets = body.per_bucket.map((b: { bucket: string }) => b.bucket).sort();
+    expect(seenBuckets).toEqual(["EUR-IRS", "USD-IRS"]);
+
+    // Each node-level fake recorded exactly one FT.AGGREGATE.
+    expect(nodeA.calls.filter((c) => c.command === "FT.AGGREGATE")).toHaveLength(1);
+    expect(nodeB.calls.filter((c) => c.command === "FT.AGGREGATE")).toHaveLength(1);
+    // FT.INFO was NOT called — buckets were non-empty so the probe short-circuited.
+    expect(coord.calls.find((c) => c.command === "FT.INFO")).toBeUndefined();
+    // FCALL ran on the coordinator (real ioredis routes by hash-tag).
+    expect(coord.calls.filter((c) => c.command === "FCALL")).toHaveLength(2);
+  });
+
+  it("cluster mode: empty per-shard FT.AGGREGATE + FT.INFO num_docs > 0 → 200 with charge=0", async () => {
+    // The precondition probe uses FT.INFO (cluster-aggregated num_docs). When
+    // num_docs > 0 but the requested risk_class has no rows across either
+    // master, the route returns 200 with an empty per_bucket — NOT 503,
+    // because the index is populated for other risk classes.
+    const nodeA = fakeRedis();
+    const nodeB = fakeRedis();
+    nodeA.setResponse("FT.AGGREGATE", ftAggregateReply([]));
+    nodeB.setResponse("FT.AGGREGATE", ftAggregateReply([]));
+    const coord = fakeRedis();
+    coord.setResponse("FT.INFO", ["index_name", "idx:sens", "num_docs", "27000"]);
+    const cluster = {
+      ...coord,
+      nodes: (_role: string) => [nodeA, nodeB],
+    };
+    app = await createServer({
+      redis: cluster as unknown as Parameters<typeof createServer>[0]["redis"],
+      correlations: { GIRR: { kind: "constant", value: 0 } },
+    });
+    const res = await app.inject({
+      method: "POST",
+      url: "/calc/sbm",
+      payload: { risk_class: "GIRR", sensitivity_type: "Delta" },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().per_bucket).toHaveLength(0);
+    // The probe was issued once on the coordinator (cluster-aggregated).
+    expect(coord.calls.filter((c) => c.command === "FT.INFO")).toHaveLength(1);
+  });
+
+  it("standalone mode: bucket discovery still issues a single FT.AGGREGATE (no regression)", async () => {
+    // Asserts the resolveQueryNodes feature-check correctly falls back to
+    // [client] when .nodes() is absent (standalone Redis), so the call count
+    // matches the pre-5.15d.1 behaviour.
+    const fr = fakeRedis();
+    fr.setResponse("FT.AGGREGATE", ftAggregateReply(["B1"]));
+    fr.setResponse("FCALL", ["K_b", "1", "S_b", "1", "count", "1", "ms", "1"]);
+    app = await createServer({ redis: fr, correlations: { GIRR: { kind: "constant", value: 0 } } });
+    const res = await app.inject({
+      method: "POST",
+      url: "/calc/sbm",
+      payload: { risk_class: "GIRR", sensitivity_type: "Delta" },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(fr.calls.filter((c) => c.command === "FT.AGGREGATE")).toHaveLength(1);
   });
 });

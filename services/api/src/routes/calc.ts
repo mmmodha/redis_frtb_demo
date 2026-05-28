@@ -101,6 +101,38 @@ function parseBucketsFromAggregate(reply: unknown): string[] {
   return buckets;
 }
 
+// FT.INFO returns a flat key/value array like ["index_name", "idx:sens",
+// ..., "num_docs", "27000", ...]. ioredis Cluster's coordinator sums
+// num_docs across master shards, so a single call gives the cluster-wide
+// populated count.
+function parseFtInfoNumDocs(reply: unknown): number {
+  if (Array.isArray(reply)) {
+    for (let i = 0; i < reply.length - 1; i += 2) {
+      if (String(reply[i]) === "num_docs") {
+        return Number(reply[i + 1]) || 0;
+      }
+    }
+    return 0;
+  }
+  if (reply && typeof reply === "object") {
+    const r = reply as Record<string, unknown>;
+    return Number(r.num_docs) || 0;
+  }
+  return 0;
+}
+
+// Returns master-node clients for fan-out (one entry per master in cluster
+// mode), or [client] in standalone mode. Feature-detection mirrors
+// resolveMasterNodes() in bootstrap.ts: ioredis Cluster has .nodes(), Redis
+// does not.
+function resolveQueryNodes(client: RedisLike): RedisLike[] {
+  const maybe = client as { nodes?: (role: string) => RedisLike[] };
+  if (typeof maybe.nodes === "function") {
+    return maybe.nodes("master");
+  }
+  return [client];
+}
+
 /**
  * Registers `POST /calc/sbm`.
  *
@@ -109,11 +141,11 @@ function parseBucketsFromAggregate(reply: unknown): string[] {
  *   400 { error }                                                    — bad request body
  *   503 { error: "no-data-or-index", risk_class, measure, hint }     — precondition failure
  *
- * The 503 branch fires when FT.AGGREGATE discovers zero buckets AND a follow-up
- * FT.SEARCH probe finds zero matching rows for the requested risk_class. This
- * distinguishes "the index is missing on some/all shards or nothing has been
- * ingested yet" from a real zero charge on a populated portfolio (which would
- * still return 200). See Wave 5.8.4 for context.
+ * The 503 branch fires when the cluster-aware bucket discovery returns zero
+ * buckets AND FT.INFO reports num_docs=0 (or errors because no index exists).
+ * This distinguishes "the index is missing on some/all shards or nothing has
+ * been ingested yet" from a real zero charge on a populated portfolio (which
+ * would still return 200). See Wave 5.8.4 + 5.15d.1 for context.
  */
 export function registerCalcRoute(app: FastifyInstance, redis: RedisLike, opts: CalcOpts): void {
   app.post<{ Body: CalcBody }>("/calc/sbm", async (req, reply) => {
@@ -133,49 +165,50 @@ export function registerCalcRoute(app: FastifyInstance, redis: RedisLike, opts: 
 
     const t0 = process.hrtime.bigint();
 
-    // 1) Discover buckets present for this risk_class — slot-fan-out friendly
-    //    because @risk_class is a TAG filter and GROUPBY @bucket returns one
-    //    row per bucket regardless of how rows are sharded.
-    const aggReply = await redis.call(
-      "FT.AGGREGATE",
-      "idx:sens",
-      `@risk_class:{${risk_class}}`,
-      "GROUPBY",
-      "1",
-      "@bucket",
-      "LIMIT",
-      "0",
-      "10000",
-      "DIALECT",
-      "2"
-    );
-    const buckets = parseBucketsFromAggregate(aggReply);
+    // 1) Discover buckets present for this risk_class — per-master fan-out.
+    //    ioredis Cluster's coordinator does NOT aggregate FT.SEARCH / FT.AGGREGATE
+    //    replies the way it aggregates FT.INFO: a single .call() lands on one
+    //    slot owner and returns only that shard's view of the cluster-wide
+    //    idx:sens. So we query every master and union the bucket sets in TS.
+    //    In standalone mode resolveQueryNodes returns [client] and this is a
+    //    single call exactly as before.
+    const queryNodes = resolveQueryNodes(redis);
+    const bucketSet = new Set<string>();
+    for (const node of queryNodes) {
+      const aggReply = await node.call(
+        "FT.AGGREGATE",
+        "idx:sens",
+        `@risk_class:{${risk_class}}`,
+        "GROUPBY",
+        "1",
+        "@bucket",
+        "LIMIT",
+        "0",
+        "10000",
+        "DIALECT",
+        "2"
+      );
+      for (const b of parseBucketsFromAggregate(aggReply)) bucketSet.add(b);
+    }
+    const buckets = Array.from(bucketSet);
 
-    // 1a) Precondition probe: an empty bucket list could mean either a real
-    //     zero-data portfolio or — the Wave 5.7 failure mode — the index is
-    //     missing on some shards. Issue a cheap FT.SEARCH ... LIMIT 0 0 to
-    //     read the match count without paging documents. If the count is zero
-    //     (or the search itself errors because no index exists), surface a 503
-    //     with a diagnostic body so callers don't mistake "no data" for a
-    //     genuine sbm_charge=0.
+    // 1a) Precondition probe: an empty bucket list could mean either no data
+    //     for this risk_class or — the Wave 5.7 failure mode — the index is
+    //     missing on some shards. FT.INFO IS cluster-aggregated by ioredis
+    //     Cluster (it sums num_docs across masters), so a single call gives
+    //     the cluster-wide populated total without a per-shard fan-out. If
+    //     num_docs is zero (or FT.INFO errors because no index exists),
+    //     surface a 503 so callers don't mistake "no data" for a genuine
+    //     sbm_charge=0.
     if (buckets.length === 0) {
-      let matchCount = 0;
+      let numDocs = 0;
       try {
-        const searchReply = await redis.call(
-          "FT.SEARCH",
-          "idx:sens",
-          `@risk_class:{${risk_class}}`,
-          "LIMIT",
-          "0",
-          "0"
-        );
-        if (Array.isArray(searchReply) && searchReply.length > 0) {
-          matchCount = Number(searchReply[0]) || 0;
-        }
+        const infoReply = await redis.call("FT.INFO", "idx:sens");
+        numDocs = parseFtInfoNumDocs(infoReply);
       } catch {
-        matchCount = 0;
+        numDocs = 0;
       }
-      if (matchCount === 0) {
+      if (numDocs === 0) {
         reply.code(503);
         return {
           error: "no-data-or-index",
