@@ -220,6 +220,47 @@ run_reset() {
     echo "[smoke-reset] WARNING: stream sensitivities:in is not empty after flush (${xlen_after})" >&2
     return 1
   fi
+
+  # Wave 5.14b.1 — orphaned-index second line of defence. Wave 5.14a's
+  # diagnostic found that an FT.CREATE issued before the previous run's
+  # FLUSHALL left `idx:sens` registered on one shard, so the next
+  # FT.CREATE returned `Index already exists` and bootstrapFrtb() bailed.
+  # Per spec: after FLUSHALL, every master must report 0 indexes from
+  # FT._LIST; if any survive, abort non-zero so the operator notices
+  # before the smoke run starts.
+  echo "[smoke-reset] FT._LIST sanity: asserting no indexes survive FLUSHALL"
+  local survivors=0 idx_out idx_clean
+  if [[ ${#MASTERS[@]} -eq 0 ]]; then
+    idx_out="$(url_cli FT._LIST 2>/dev/null || true)"
+    idx_clean="$(printf '%s' "$idx_out" | tr -d '\r' | sed '/^[[:space:]]*$/d')"
+    if [[ -n "$idx_clean" ]]; then
+      echo "[smoke-reset] FAIL: orphaned index(es) survived FLUSHALL on URL endpoint:" >&2
+      printf '  %s\n' $idx_clean >&2
+      survivors=1
+    else
+      echo "  url-endpoint: 0 indexes"
+    fi
+  else
+    local m host port
+    for m in "${MASTERS[@]}"; do
+      host="${m%:*}"; port="${m##*:}"
+      idx_out="$(shard_cli "$host" "$port" FT._LIST 2>/dev/null || true)"
+      idx_clean="$(printf '%s' "$idx_out" | tr -d '\r' | sed '/^[[:space:]]*$/d')"
+      if [[ -n "$idx_clean" ]]; then
+        echo "[smoke-reset] FAIL: orphaned index(es) survived FLUSHALL on shard@${port}:" >&2
+        printf '  %s\n' $idx_clean >&2
+        survivors=1
+      else
+        echo "  shard@${port}: 0 indexes"
+      fi
+    done
+  fi
+  if [[ $survivors -ne 0 ]]; then
+    echo "[smoke-reset] FT._LIST sanity FAILED — aborting before smoke run" >&2
+    return 1
+  fi
+  echo "[smoke-reset] FT._LIST sanity: OK"
+
   echo "[smoke-reset] done"
 }
 

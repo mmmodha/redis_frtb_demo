@@ -97,13 +97,18 @@ async function main(): Promise<void> {
   if (redisConnected && schema) {
     try {
       await bootstrapFrtb(redis, schema);
+      // Wave 5.14b.1 — flip /healthz from 503 → 200 only on success.
+      markBootstrapReady();
     } catch (err) {
+      // Wave 5.14b.1 — keep logging (diagnostic surface) but also wire the
+      // flag so /healthz returns 503 + the error string. Do NOT crash.
       console.error(JSON.stringify({
         service: "api",
         bootstrap: "frtb",
         action: "failed",
         err: String(err),
       }));
+      markBootstrapFailed(err);
     }
   } else if (redisConnected && !schema) {
     console.log(JSON.stringify({
@@ -112,6 +117,13 @@ async function main(): Promise<void> {
       reason: "schema-missing",
       path: SCHEMA_PATH,
     }));
+    // Wave 5.14b.1 — schema-missing leaves /healthz 503 (no idx:sens behind us).
+    markBootstrapSkipped("schema-missing");
+  } else {
+    // Redis unreachable: bootstrap never ran. Leave the flag at {ok:false}
+    // so /healthz stays 503 until an operator wires a reachable target and
+    // restarts the api.
+    markBootstrapSkipped("redis-unreachable");
   }
 
   const app = await createServer({ redis, correlations, store, logger: true });
