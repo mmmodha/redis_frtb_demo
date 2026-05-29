@@ -1,0 +1,14 @@
+{
+  "xlen_stream": 413515,
+  "dbsize_per_master": {
+    "18.117.107.213:10395": 23712,
+    "16.59.25.183:10395": 0
+  },
+  "dbsize_total": 23712,
+  "ft_search_count": 0
+}
+{
+  "xlen_stream_pre_teardown": 420515,
+  "ft_num_docs_pre_teardown": 27357,
+  "ft_hash_indexing_failures": 0
+}
