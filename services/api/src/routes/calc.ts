@@ -146,12 +146,25 @@ function resolveQueryNodes(client: RedisLike): RedisLike[] {
  * This distinguishes "the index is missing on some/all shards or nothing has
  * been ingested yet" from a real zero charge on a populated portfolio (which
  * would still return 200). See Wave 5.8.4 + 5.15d.1 for context.
+ *
+ * Wave 5.15l (Option A — UPPERCASE at API entry): the generator writes keys
+ * as `sens:{<UPPERCASE risk_class>:<bucket>}:*` and indexes the same value
+ * under `@risk_class`. The Lua FRTB library at services/calc/lib/*.lua builds
+ * its SCAN pattern from the FCALL `risk_class` arg via string concatenation,
+ * which is case-sensitive even though RediSearch TAG matching is not. We
+ * normalise the caller-supplied `risk_class` to UPPERCASE once at entry so
+ * the FT.AGGREGATE query, the FCALL routing-key hash-tag, the FCALL
+ * `risk_class` arg, the correlation-spec lookup, and the 503 diagnostic
+ * payload all carry the canonical storage-shape form. Option B (lowercase on
+ * ingest) was rejected because it would break every existing key and force a
+ * full re-ingest. See smoke-run-12 SUMMARY "Named root cause" for the
+ * end-to-end evidence chain.
  */
 export function registerCalcRoute(app: FastifyInstance, redis: RedisLike, opts: CalcOpts): void {
   app.post<{ Body: CalcBody }>("/calc/sbm", async (req, reply) => {
-    const risk_class = req.body?.risk_class;
+    const risk_class_raw = req.body?.risk_class;
     const legRaw = req.body?.sensitivity_type;
-    if (!risk_class || !legRaw) {
+    if (!risk_class_raw || !legRaw) {
       reply.code(400);
       return { error: "risk_class and sensitivity_type are required" };
     }
@@ -160,6 +173,10 @@ export function registerCalcRoute(app: FastifyInstance, redis: RedisLike, opts: 
       reply.code(400);
       return { error: `sensitivity_type must be one of: Delta, Vega (got ${legRaw})` };
     }
+    // Wave 5.15l: normalise to UPPERCASE so downstream consumers (FT.AGGREGATE
+    // query, routeKey hash-tag, FCALL arg, Lua-side SCAN pattern) all see the
+    // canonical storage-shape form regardless of inbound casing.
+    const risk_class = String(risk_class_raw).toUpperCase();
     const funcName = funcNameFor(risk_class, leg as "delta" | "vega");
     const corr: CorrelationSpec = opts.correlations[risk_class] ?? { kind: "constant", value: 0 };
 

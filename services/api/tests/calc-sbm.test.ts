@@ -293,6 +293,65 @@ describe("POST /calc/sbm — MVP endpoint", () => {
     expect(coord.calls.filter((c) => c.command === "FT.INFO")).toHaveLength(1);
   });
 
+  // Wave 5.15l: cross-component regression. Drives an HTTP request through the
+  // calc route against a fakeRedis whose discover/FCALL responses are wired to
+  // simulate the production failure mode: stored keys/index tags carry
+  // UPPERCASE risk_class ("sens:{GIRR:JPY}:*"), but the calc payload from
+  // scripts/run-calc.sh sends lowercase ("girr"). Before the fix the route
+  // passed lowercase straight into FT.AGGREGATE / FCALL / routeKey and the
+  // Lua-side SCAN matched zero keys, yielding 200 + charge=0 (smoke-run-12 RED).
+  // After the fix the route uppercases at entry so every downstream consumer
+  // sees the canonical form and the call returns 200 + charge > 0.
+  it("Wave 5.15l: lowercase request body matches stored UPPERCASE risk_class keys (calc-api-risk-class-case-pass-through)", async () => {
+    const fr = fakeRedis();
+    // Discover stage: simulate FT.SEARCH/AGGREGATE under the *production*
+    // schema where TAG values are stored UPPERCASE. RediSearch TAG matching is
+    // case-insensitive by default — so in practice the discover stage would
+    // still find buckets even with a lowercase query — but the failure mode
+    // we lock here is the SCAN/routeKey leg, so we keep discover responsive
+    // to whatever case arrives (it returns buckets in both cases).
+    fr.setResponse("FT.AGGREGATE", ftAggregateReply(["JPY", "AUD"]));
+    // FCALL: mirror the Lua SCAN logic — only return non-zero K_b/count when
+    // the risk_class argument matches the stored UPPERCASE shape. Lowercase
+    // arg → SCAN miss → all-zero result (the smoke-run-12 RED signature).
+    fr.setResponse("FCALL", (args: unknown[]) => {
+      const riskClassArg = String(args[3]);
+      if (riskClassArg === "GIRR") {
+        return ["K_b", "5", "S_b", "5", "count", "10", "ms", "1"];
+      }
+      return ["K_b", "0", "S_b", "0", "count", "0", "ms", "1"];
+    });
+    app = await createServer({
+      redis: fr,
+      correlations: { GIRR: { kind: "constant", value: 0 } },
+    });
+
+    // POST lowercase body — exactly what scripts/run-calc.sh sent in smoke-run-12.
+    const res = await app.inject({
+      method: "POST",
+      url: "/calc/sbm",
+      payload: { risk_class: "girr", sensitivity_type: "delta" },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    // Pre-fix: FCALL received "girr" → zero K_b/count → charge=0.
+    // Post-fix: route uppercases at entry → FCALL receives "GIRR" → non-zero.
+    expect(body.charge).toBeGreaterThan(0);
+    expect(body.per_bucket).toHaveLength(2);
+    expect(body.per_bucket.every((pb: { count: number }) => pb.count > 0)).toBe(true);
+
+    // Lock the downstream shape: routing key + FCALL arg + discover query all
+    // carry the canonical UPPERCASE form regardless of inbound casing.
+    const fc = fr.calls.find((c) => c.command === "FCALL");
+    expect(fc).toBeDefined();
+    expect(fc!.args[3]).toBe("GIRR");
+    expect(String(fc!.args[2])).toMatch(/^sens:\{GIRR:[^}]+\}:_route$/);
+    const agg = fr.calls.find((c) => c.command === "FT.AGGREGATE");
+    expect(agg).toBeDefined();
+    expect(String(agg!.args[1])).toContain("@risk_class:{GIRR}");
+  });
+
   it("standalone mode: bucket discovery still issues a single FT.AGGREGATE (no regression)", async () => {
     // Asserts the resolveQueryNodes feature-check correctly falls back to
     // [client] when .nodes() is absent (standalone Redis), so the call count

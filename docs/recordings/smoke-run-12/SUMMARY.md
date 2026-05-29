@@ -94,7 +94,7 @@ Full bodies in `calc-results.json`; raw log in `logs/calc-6variants.log`.
 
 All 6 active cells: `200-zero` (HTTP 200, sbm_charge=0). No 503/5xx/timeouts.
 
-## Acceptance criteria
+## AC results
 
 | AC  | Definition                                                                 | Observed                                                                              | Verdict |
 |----:|-----------------------------------------------------------------------------|---------------------------------------------------------------------------------------|:-------:|
@@ -103,13 +103,20 @@ All 6 active cells: `200-zero` (HTTP 200, sbm_charge=0). No 503/5xx/timeouts.
 
 ## Secrets safety
 
-`grep -rlF "$REDIS_URL" docs/recordings/smoke-run-12/` → no match. Host
-substring `grep -rlF "<redacted host>"` → no match. `host:port` substring
-→ no match. The `REDIS_URL` parsed via Python (without printing) yielded
-an empty password component, so no password substring needed to be
-checked beyond the URL-wide grep. No artefact carries cluster credentials.
+Verified clean. The cluster connection-string env var, its host substring,
+and its `host:port` substring were each searched across the whole
+`docs/recordings/smoke-run-12/` tree without printing the values: zero
+matches. The parsed connection string yielded an empty credential
+component, so no further substring check was required. No artefact under
+this run carries cluster credentials.
 
-## Named hypothesis for Wave 5.15l: `calc-api-risk-class-case-pass-through`
+## Named root cause: `calc-api-risk-class-case-pass-through`
+
+(Originally captured here as "Named hypothesis for Wave 5.15l"; promoted to
+root cause and locked by the Wave 5.15l regression test in
+`services/api/tests/calc-sbm.test.ts` — see `## Wave 5.15l fix decision`
+below.)
+
 
 The Wave 5.15f case-alignment fix corrected `SENSITIVITY_TYPES` in the
 generator. There is a **second, structurally identical** case-mismatch on
@@ -160,6 +167,70 @@ comfortably, or the schema's per-row JSON payload is larger than the
 shard plan accounted for. Defer to whichever Wave 5 task owns the
 sizing model; this run does not depend on it (DoD #9: density does not
 block AC1).
+
+## Wave 5.15l fix decision
+
+**Chosen: Option A — UPPERCASE the body in `services/api/src/routes/calc.ts`
+at the API entry point** (one `.toUpperCase()` immediately after the 400-guard,
+before `funcNameFor`, correlation lookup, FT.AGGREGATE query, FCALL
+routing-key construction, and FCALL `risk_class` arg pass-through).
+
+**Rationale:**
+- Smallest possible blast radius (one production file, one normalisation
+  call) that aligns every downstream consumer with the canonical
+  storage-shape form already written by the generator.
+- Keeps the caller-facing API lowercase-tolerant — no client of
+  `POST /calc/sbm` (UI, run-calc.sh, loadgen) has to change.
+- Storage shape (`sens:{GIRR:JPY}:*`) is unchanged: no re-ingest required,
+  no Lua library change across 6 `.lua` files.
+- `buildCrossBucketCorrelations` in `services/api/src/sbm/correlations.ts`
+  already keys its output by UPPERCASE risk-class id, so the
+  `opts.correlations[risk_class]` lookup is now consistent with the
+  production key shape (was effectively case-sensitive against an
+  UPPERCASE map — a latent miss before the fix).
+
+**Rejected: Option B — lowercase everything on ingest.** Would change the
+storage shape of every existing key, force a full re-ingest, break the
+Lua SCAN pattern in 6 functions, and invert the historical
+`risk_class="GIRR"` convention used by the schema + the generator.
+
+**Locked by:** new cross-component regression test
+`POST /calc/sbm — MVP endpoint > Wave 5.15l: lowercase request body
+matches stored UPPERCASE risk_class keys (calc-api-risk-class-case-pass-through)`
+in `services/api/tests/calc-sbm.test.ts`. Drives an HTTP request through
+the calc route via `app.inject`, simulates the case-sensitive Lua SCAN at
+the FCALL boundary, asserts 200 + `charge > 0` + UPPERCASE downstream
+arguments. Demonstrated FAIL pre-fix (`expected 0 to be greater than 0`)
+→ PASS post-fix.
+
+## Open questions
+
+1. **Single-shard data anomaly** (forensic, defer to Wave 5.15m diagnostic).
+   `logs/per-shard-sens-scan.json` records **120,246 `sens:*` keys on master
+   `18.117.107.213:10395`** (shard B) and **0 `sens:*` keys on master
+   `16.59.25.183:10395`** (shard A) at the post-ingest snapshot. Both
+   masters' `FT.INFO idx:sens` reports `num_docs = 120,246` (matches the
+   cluster-aggregated total written to `logs/ft-info-post-ingest.json`),
+   which is consistent with FT.INFO being cluster-aggregated by the
+   ioredis Cluster coordinator (Wave 5.15d.1 finding). The open question
+   is *why* shard A holds zero `sens:*` keys despite the hash-tag
+   `{<risk_class>:<bucket>}` distribution covering at least
+   GIRR/EQUITY/FX × 4–6 buckets each — naive expectation is a roughly
+   even split across the two masters' slot ranges. Hypothesis to test in
+   Wave 5.15m: the hash-tag content space (15 distinct
+   `<risk_class>:<bucket>` pairs across 3 risk classes) is small enough
+   that CRC16 collisions plausibly land every active hash-tag in shard
+   B's slot range, but this needs a per-tag `CLUSTER KEYSLOT` audit to
+   confirm. Does not block Wave 5.15l (calc still returns the correct
+   per-bucket union because bucket discovery fans out per master); does
+   block any "balanced shard load" narrative for the demo.
+2. **Density 40 %** under volatile-lru with the current 300,000-row smoke
+   budget (see Secondary observation above) — open whether the smoke
+   `--rows` budget should drop or the shard memory plan should grow.
+3. **Wave 5.15m smoke validation** must re-run steps 0–11 against the
+   Wave 5.15l-patched API image to confirm AC1 flips to ✅ in a real
+   cluster context. This SUMMARY back-fill does **not** include a smoke
+   re-run; that is explicitly Wave 5.15m's scope.
 
 ## Artefacts captured
 
