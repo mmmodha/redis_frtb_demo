@@ -48,4 +48,29 @@ describe('docs/recordings/README.md — image-rebuild gate (Wave 5.15h)', () => 
     expect(content).toMatch(/Wave 5\.15g/);
     expect(content).toMatch(/smoke-run-10/);
   });
+
+  // Wave 5.15j regression gate. Smoke-run-11 (Wave 5.15i) STOP-ed at
+  // the freshness gate because step 1's `compose up --build` only
+  // rebuilds default-profile services and never touches the
+  // `tools`-profile generator. The fix is to add `--build` to the
+  // step-4 `compose run` invocation. This test anchors that fix.
+  it('step 4 invokes `docker compose run` with `--build` on the generator', () => {
+    const content = read(RUNBOOK);
+    expect(
+      content,
+      'step-4 generator invocation must pass `--build` to `docker compose run` (Wave 5.15j regression gate)',
+    ).toMatch(/docker\s+compose\s+run\b[^\n]*--build\b[^\n]*generator\b/);
+  });
+
+  it('runbook prose explains why step-4 needs its own --build (tools profile)', () => {
+    const content = read(RUNBOOK);
+    // Assert the substantive content of the Wave 5.15j note without
+    // pinning exact wording. Must cite the 5.15i failure and reference
+    // the smoke-run-11 forensics.
+    expect(content).toMatch(/Wave 5\.15j/);
+    expect(content).toMatch(/Wave 5\.15i/);
+    expect(content).toMatch(/smoke-run-11/);
+    expect(content).toMatch(/tools.*profile/i);
+    expect(content).toMatch(/default.*profile/i);
+  });
 });

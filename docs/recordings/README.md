@@ -63,9 +63,11 @@ Skipping step 0.5 reproduces the Wave 5.14a failure mode and is **not** an optio
 
 The generator is the only ingest trigger, invoked explicitly (per the Wave 5.14b.2 ENTRYPOINT contract):
 
-      docker compose run --rm generator --rows <N> --classes <X,Y>
+      docker compose run --build --rm generator --rows <N> --classes <X,Y>
 
 Because `generator` is in the `tools` profile (Wave 5.15d.2), `compose run` auto-activates the profile for the named service — no `--profile tools` flag is needed. Dependencies (`api`) are auto-started if not already healthy; in the normal smoke flow they were brought up at step 1. Rows are no longer pumped behind the runbook by an autostart container, so the smoke-tuned `--rows` value is the only ingest pressure on the 2 GB cluster.
+
+**Wave 5.15j:** the `--build` flag on the step-4 `compose run` invocation is mandatory and is the only thing that rebuilds the generator image. Step 1's `docker compose up --build` (Wave 5.15h) only rebuilds services in the **default** profile — `ui`, `api`, `source`, `ingest`, `calc`, `loadgen` — and explicitly does **not** touch services in the `tools` profile (Wave 5.15d.2), where `generator` now lives. See Wave 5.15i ([smoke-run-11](smoke-run-11/SUMMARY.md)) for the reference failure mode: the runbook had `--build` on step 1 but not on step 4, the freshness gate STOP-ed the run because the generator image SHA was identical to smoke-run-10's, and no generator source changes since Wave 5.15f reached the running container. Adding `--build` to `compose run` closes that gap.
 
 
 
