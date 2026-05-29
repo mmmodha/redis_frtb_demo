@@ -67,6 +67,12 @@ The generator is the only ingest trigger, invoked explicitly (per the Wave 5.14b
 
 Because `generator` is in the `tools` profile (Wave 5.15d.2), `compose run` auto-activates the profile for the named service — no `--profile tools` flag is needed. Dependencies (`api`) are auto-started if not already healthy; in the normal smoke flow they were brought up at step 1. Rows are no longer pumped behind the runbook by an autostart container, so the smoke-tuned `--rows` value is the only ingest pressure on the 2 GB cluster.
 
+**Wave 5.15n smoke-tuned default:** `--rows 200000 --classes GIRR,EQUITY,FX`.
+
+      docker compose run --build --rm generator --rows 200000 --classes GIRR,EQUITY,FX
+
+Rationale: smoke-run-13 ([SUMMARY](smoke-run-13/SUMMARY.md)) recorded a peak of **738.30 M** per shard at `--rows 300000`, crossing each shard's 700 M `maxmemory` ceiling and triggering `volatile-lru` eviction of shard A's entire `sens:*` cohort (post-ingest distribution: shard A = 0 keys, shard B = 115,796 keys — see [smoke-run-13/logs/per-shard-data-distribution.json](smoke-run-13/logs/per-shard-data-distribution.json)). At the smoke-run-13 738 M / 300 k ratio, `--rows 200000` projects to ≈ **492 M** peak per shard — ~33 % headroom under the 700 M ceiling — so both shards should retain their `sens:*` cohort and the multi-shard `FCALL` fan-out is exercised end-to-end. If the post-step-6 density gate still shows a single-shard distribution, drop to `--rows 150000` and re-run; do not raise rows mid-run.
+
 **Wave 5.15j:** the `--build` flag on the step-4 `compose run` invocation is mandatory and is the only thing that rebuilds the generator image. Step 1's `docker compose up --build` (Wave 5.15h) only rebuilds services in the **default** profile — `ui`, `api`, `source`, `ingest`, `calc`, `loadgen` — and explicitly does **not** touch services in the `tools` profile (Wave 5.15d.2), where `generator` now lives. See Wave 5.15i ([smoke-run-11](smoke-run-11/SUMMARY.md)) for the reference failure mode: the runbook had `--build` on step 1 but not on step 4, the freshness gate STOP-ed the run because the generator image SHA was identical to smoke-run-10's, and no generator source changes since Wave 5.15f reached the running container. Adding `--build` to `compose run` closes that gap.
 
 
