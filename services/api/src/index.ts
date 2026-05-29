@@ -6,7 +6,7 @@
 
 import { resolve } from "node:path";
 import { existsSync } from "node:fs";
-import type { Cluster, Redis } from "ioredis";
+import { Cluster, type Redis } from "ioredis";
 import { createRedisClient } from "@frtb/redis-client";
 import { loadSchema } from "@frtb/schema";
 import { createServer, markBootstrapReady, markBootstrapFailed, markBootstrapSkipped } from "./server.ts";
@@ -73,7 +73,7 @@ async function main(): Promise<void> {
   // call .connect() on it (throws "already connecting/connected"). Use a
   // bounded readiness wait that handles both shapes; either way the api
   // still starts and serves /healthz when Redis is unreachable.
-  const readiness = await ensureRedisReady(redis, { hasUrl: !!process.env.REDIS_URL });
+  const readiness = await ensureRedisReady(redis, { cluster: redis instanceof Cluster });
   const redisConnected = readiness.connected;
   if (!redisConnected) {
     // Don't crash the api just because Redis isn't reachable yet — the demo

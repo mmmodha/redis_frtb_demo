@@ -23,9 +23,11 @@ export interface RedisReadiness {
 }
 
 export interface EnsureRedisReadyOptions {
-  // hasUrl=true means REDIS_URL is set and the client was built via
-  // createRedisClient — i.e. a Cluster that auto-connects on construction.
-  hasUrl: boolean;
+  // cluster=true → ioredis Cluster (auto-connects on construction); wait for
+  // the 'ready' event. cluster=false → standalone Redis with lazyConnect:true;
+  // call .connect(). Wave 5.15r: dispatch must key off the cluster flag (not
+  // URL presence) — a standalone client can perfectly well have a REDIS_URL.
+  cluster: boolean;
   // Bound the wait so /healthz still comes up even if Redis never becomes
   // ready. Defaults to 5 000 ms.
   timeoutMs?: number;
@@ -47,7 +49,7 @@ export async function ensureRedisReady(
   redis: Redis | Cluster,
   opts: EnsureRedisReadyOptions
 ): Promise<RedisReadiness> {
-  const mode: RedisConnectionMode = opts.hasUrl ? "cluster" : "standalone";
+  const mode: RedisConnectionMode = opts.cluster ? "cluster" : "standalone";
   const envTimeout = Number(process.env.REDIS_READY_TIMEOUT_MS);
   const timeoutMs = opts.timeoutMs ?? (Number.isFinite(envTimeout) && envTimeout > 0 ? envTimeout : 5_000);
 
