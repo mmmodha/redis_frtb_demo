@@ -48,7 +48,8 @@ export async function ensureRedisReady(
   opts: EnsureRedisReadyOptions
 ): Promise<RedisReadiness> {
   const mode: RedisConnectionMode = opts.hasUrl ? "cluster" : "standalone";
-  const timeoutMs = opts.timeoutMs ?? 5_000;
+  const envTimeout = Number(process.env.REDIS_READY_TIMEOUT_MS);
+  const timeoutMs = opts.timeoutMs ?? (Number.isFinite(envTimeout) && envTimeout > 0 ? envTimeout : 5_000);
 
   if (mode === "cluster") {
     const emitter = redis as unknown as ReadyEmitter;
