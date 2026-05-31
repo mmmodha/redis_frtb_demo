@@ -95,6 +95,11 @@ function gammaOf(
 // §21.5(5)(b) fallback: when the interior is negative, recompute with
 // S_b clipped into [-K_b, +K_b] (mirrors the §21.4(7) clip-and-recompute
 // pattern in services/api/src/sbm/reduce.ts).
+//
+// Text-fidelity caveat: Implements §21.5(5)(b) by clipping to ±K_b
+// (consistent with §21.4(7) reduce.ts:51-62 shape). A strict
+// Curvature-only reading of §21.5(5)(b) clips negatives to 0; flagged
+// for HSBC business sign-off before production.
 export function aggregateAcrossBuckets(
   per: ReadonlyArray<BucketCurvature>,
   gammaCurv: CurvatureGammaSpec,

@@ -92,6 +92,36 @@ describe("computeFxCurvatureCharge (TS reference oracle)", () => {
     expect(out.direction).toBe("down");
   });
 
+  it("same-direction mixed-sign CVR pair exercises the ψ=1 branch with negatives present (verifier gap fix)", () => {
+    // Single bucket, two FX factors. Factor 1: cvr_up=+2, cvr_down=-0.5.
+    // Factor 2: cvr_up=-1, cvr_down=+1.5. ρ_delta=0.5 ⇒ ρ²=0.25.
+    // Every (k,l) pair has at least one non-negative ⇒ ψ=1 throughout (the gap
+    // the verifier flagged — ψ=0 branch tested but ψ=1-with-negatives was not).
+    // Hand-computed expected values:
+    //   K_b_up²   = 2² + (-1)² + 0.25·(2·(-1) + (-1)·2)         = 5 + 0.25·(-4) = 4
+    //   K_b_up    = 2
+    //   K_b_down² = (-0.5)² + 1.5² + 0.25·((-0.5)·1.5 + 1.5·(-0.5)) = 2.5 + 0.25·(-1.5) = 2.125
+    //   K_b_down  = √2.125
+    //   K_b       = max(2, √2.125) = 2, direction = "up"
+    //   S_b       = 2 + (-1) = 1
+    const rows = [
+      { sensitivity_type: "Curvature", bucket: "EURUSD", risk_value: { cvr_up: 2.0, cvr_down: -0.5 } },
+      { sensitivity_type: "Curvature", bucket: "EURUSD", risk_value: { cvr_up: -1.0, cvr_down: 1.5 } },
+    ];
+    const out = computeFxCurvatureCharge(rows, {
+      intraBucketRhoDelta: 0.5,
+      crossBucketGammaDelta: { kind: "constant", value: 0 },
+    });
+    const b = out.perBucket[0]!;
+    expect(b.K_b_up).toBeCloseTo(2, 12);
+    expect(b.K_b_down).toBeCloseTo(Math.sqrt(2.125), 12);
+    expect(b.K_b).toBeCloseTo(2, 12);
+    expect(b.direction).toBe("up");
+    expect(b.S_b).toBeCloseTo(1, 12);
+    expect(out.riskClassCharge).toBeCloseTo(2, 12);
+    expect(out.usedFallback).toBe(false);
+  });
+
   it("ignores non-Curvature rows and returns zeros for an empty input", () => {
     const out = computeFxCurvatureCharge([
       { sensitivity_type: "Vega", bucket: "EURUSD", risk_value: { cvr_up: 9, cvr_down: -9 } },
