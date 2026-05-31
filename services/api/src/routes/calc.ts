@@ -1,6 +1,11 @@
 import type { FastifyInstance } from "fastify";
 import type { RedisLike } from "../redis-like.ts";
-import { reduceRiskClassCharge, type BucketResult, type CorrelationSpec } from "../sbm/reduce.ts";
+import {
+  reduceCurvatureCharge,
+  reduceRiskClassCharge,
+  type BucketResult,
+  type CorrelationSpec,
+} from "../sbm/reduce.ts";
 
 interface CalcBody {
   risk_class?: string;
@@ -14,7 +19,8 @@ interface CalcOpts {
   correlations: Record<string, CorrelationSpec>;
 }
 
-const ALLOWED_LEG = new Set(["delta", "vega"]);
+const ALLOWED_LEG = new Set(["delta", "vega", "curvature"]);
+type Leg = "delta" | "vega" | "curvature";
 
 // Routing table: (risk_class lowercased, leg) -> Redis Function name.
 // Names are the bare function ids registered via redis.register_function in the
@@ -25,16 +31,20 @@ const ALLOWED_LEG = new Set(["delta", "vega"]);
 // Equity and FX each ship dedicated single-purpose Delta/Vega functions that
 // mirror the same locked I/O shape but encode the asset-class specifics
 // (per-bucket weight map for Equity, single-factor-per-pair for FX).
+// Curvature ships per-asset-class functions (Wave 5.16a/b) — bucket-level K_b
+// is computed by the FCALL (which picks the worse of K_b^+/K_b^-), and the
+// risk-class roll-up uses reduceCurvatureCharge with γ_curv = γ_delta² per
+// §21.5(5).
 // Unknown risk classes fall back to the generic GIRR pair so older calc paths
 // keep working until each asset class is added.
-const FUNC_BY_RISK_CLASS: Record<string, { delta: string; vega: string }> = {
-  girr: { delta: "sbm_delta_bucket", vega: "sbm_vega_bucket" },
-  equity: { delta: "equity_delta", vega: "equity_vega" },
-  fx: { delta: "fx_delta", vega: "fx_vega" },
+const FUNC_BY_RISK_CLASS: Record<string, { delta: string; vega: string; curvature: string }> = {
+  girr: { delta: "sbm_delta_bucket", vega: "sbm_vega_bucket", curvature: "girr_curvature" },
+  equity: { delta: "equity_delta", vega: "equity_vega", curvature: "equity_curvature" },
+  fx: { delta: "fx_delta", vega: "fx_vega", curvature: "fx_curvature" },
 };
 const DEFAULT_FUNCS = FUNC_BY_RISK_CLASS.girr!;
 
-function funcNameFor(risk_class: string, leg: "delta" | "vega"): string {
+function funcNameFor(risk_class: string, leg: Leg): string {
   const entry = FUNC_BY_RISK_CLASS[risk_class.toLowerCase()] ?? DEFAULT_FUNCS;
   return entry[leg];
 }
@@ -171,13 +181,13 @@ export function registerCalcRoute(app: FastifyInstance, redis: RedisLike, opts: 
     const leg = String(legRaw).toLowerCase();
     if (!ALLOWED_LEG.has(leg)) {
       reply.code(400);
-      return { error: `sensitivity_type must be one of: Delta, Vega (got ${legRaw})` };
+      return { error: `sensitivity_type must be one of: Delta, Vega, Curvature (got ${legRaw})` };
     }
     // Wave 5.15l: normalise to UPPERCASE so downstream consumers (FT.AGGREGATE
     // query, routeKey hash-tag, FCALL arg, Lua-side SCAN pattern) all see the
     // canonical storage-shape form regardless of inbound casing.
     const risk_class = String(risk_class_raw).toUpperCase();
-    const funcName = funcNameFor(risk_class, leg as "delta" | "vega");
+    const funcName = funcNameFor(risk_class, leg as Leg);
     const corr: CorrelationSpec = opts.correlations[risk_class] ?? { kind: "constant", value: 0 };
 
     const t0 = process.hrtime.bigint();
@@ -257,8 +267,14 @@ export function registerCalcRoute(app: FastifyInstance, redis: RedisLike, opts: 
     );
     const fanoutMs = Number(process.hrtime.bigint() - fanoutStart) / 1e6;
 
-    // 3) Reduce per-bucket K_b/S_b → risk-class charge
-    const charge = reduceRiskClassCharge(results, corr);
+    // 3) Reduce per-bucket K_b/S_b → risk-class charge. Curvature follows the
+    //    §21.5(5)/(5)(b) shape (γ² + ψ-gated cross terms); Delta/Vega use the
+    //    §21.4(5)/(7) shape. `corr` carries the Delta γ in both cases —
+    //    reduceCurvatureCharge squares it internally per §21.5(5).
+    const charge =
+      leg === "curvature"
+        ? reduceCurvatureCharge(results, corr)
+        : reduceRiskClassCharge(results, corr);
     const total_ms = Number(process.hrtime.bigint() - t0) / 1e6;
 
     return {

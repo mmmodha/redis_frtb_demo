@@ -30,7 +30,8 @@ function spawnRedis(port: number, dir: string): ChildProcess {
   );
 }
 
-const PORT = 16412;
+// Port bumped from 16412 in Wave 5.16c to avoid collision with equity-delta-bucket.test.ts.
+const PORT = 16419;
 let proc: ChildProcess | undefined;
 let tmp: string;
 let redis: Redis;

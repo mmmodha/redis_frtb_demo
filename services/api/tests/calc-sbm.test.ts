@@ -148,13 +148,65 @@ describe("POST /calc/sbm — MVP endpoint", () => {
     app = await createServer({ redis: fakeRedis() });
     const a = await app.inject({ method: "POST", url: "/calc/sbm", payload: {} });
     expect(a.statusCode).toBe(400);
+    // Wave 5.16c: Curvature is now a first-class leg; an unknown sensitivity
+    // type ("Foo") still returns 400.
     const b = await app.inject({
       method: "POST",
       url: "/calc/sbm",
-      payload: { risk_class: "GIRR", sensitivity_type: "Curvature" },
+      payload: { risk_class: "GIRR", sensitivity_type: "Foo" },
     });
     expect(b.statusCode).toBe(400);
   });
+
+  // Wave 5.16c: Curvature dispatch. Each risk_class routes Curvature to its
+  // dedicated FCALL (girr_curvature / equity_curvature / fx_curvature) and the
+  // reduce step uses reduceCurvatureCharge (§21.5(5) γ² + ψ-gated cross terms).
+  // For γ=0 the cross term vanishes and the risk-class charge collapses to
+  // √(ΣK_b²) — same as the Delta/Vega γ=0 sanity case.
+  const curvatureRouteCases: Array<{ riskClass: string; funcName: string; buckets: string[] }> = [
+    { riskClass: "GIRR", funcName: "girr_curvature", buckets: ["USD-IRS", "EUR-IRS"] },
+    { riskClass: "Equity", funcName: "equity_curvature", buckets: ["1", "5"] },
+    { riskClass: "FX", funcName: "fx_curvature", buckets: ["EURUSD", "GBPUSD"] },
+  ];
+  it.each(curvatureRouteCases)(
+    "Wave 5.16c: $riskClass Curvature routes to $funcName and reduces via §21.5(5)",
+    async ({ riskClass, funcName, buckets }) => {
+      const fr = fakeRedis();
+      fr.setResponse("FT.AGGREGATE", ftAggregateReply(buckets));
+      // Stub Curvature FCALL replies — bucket-level K_b/S_b already resolved by
+      // the Lua function (it picks the worse of K_b^+/K_b^- per §21.5(3)).
+      fr.setResponse("FCALL", (args: unknown[]) => {
+        const bucket = String(args[4]);
+        if (bucket === buckets[0]) {
+          return ["K_b", "3", "S_b", "3", "count", "10", "ms", "1"];
+        }
+        return ["K_b", "4", "S_b", "4", "count", "20", "ms", "1"];
+      });
+      app = await createServer({
+        redis: fr,
+        // γ_delta = 0 → γ_curv = 0² = 0 → charge = √(9+16) = 5.
+        correlations: { [riskClass.toUpperCase()]: { kind: "constant", value: 0 } },
+      });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: { risk_class: riskClass, sensitivity_type: "Curvature" },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.charge).toBeCloseTo(5, 10);
+      expect(body.per_bucket).toHaveLength(2);
+      expect(body.total_ms).toBeGreaterThanOrEqual(0);
+      expect(Array.isArray(body.shard_breakdown)).toBe(true);
+      // Routing: every FCALL hits the curvature function for this risk class.
+      const fcalls = fr.calls.filter((c) => c.command === "FCALL");
+      expect(fcalls).toHaveLength(2);
+      for (const c of fcalls) {
+        expect(c.args[0]).toBe(funcName);
+        expect(String(c.args[2])).toMatch(/^sens:\{[A-Z]+:[^}]+\}:_route$/);
+      }
+    },
+  );
 
   // Wave 5.8.4 + 5.15d.1: a 200 with charge=0 on a portfolio that has no rows
   // (or no idx:sens on some shards) silently masks a precondition failure. The
