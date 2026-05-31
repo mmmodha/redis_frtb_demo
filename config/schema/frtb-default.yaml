@@ -19,6 +19,13 @@ dimensions:
   - { name: tenor, type: TAG, indexed: true, sortable: true, cardinality_hint: 12 }
   - { name: risk_value, type: ARRAY_NUMERIC, indexed: false, sortable: false }
   - { name: weight, type: NUMERIC, indexed: false, sortable: false }
+  # sensitivity_type values: Delta | Vega | Curvature (MAR21 §21.4 / §21.5).
+  # risk_value shape is inferred at runtime per sensitivity_type:
+  #   - Delta/Vega: scalar or per-tenor array<number> (per risk-class convention).
+  #   - Curvature (shape A, per docs/demo/curvature-scope.md §3a):
+  #       GIRR    → { cvr_up: array<number>, cvr_down: array<number> } (per-tenor)
+  #       Equity  → { cvr_up: number, cvr_down: number }               (scalar)
+  #       FX      → { cvr_up: number, cvr_down: number }               (scalar)
   - { name: sensitivity_type, type: TAG, indexed: true, sortable: false, cardinality_hint: 3 }
   - { name: as_of_date, type: TAG, indexed: true, sortable: true, cardinality_hint: 30 }
   - { name: calc_date, type: TAG, indexed: false, sortable: true }

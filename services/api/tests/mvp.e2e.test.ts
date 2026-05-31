@@ -15,6 +15,9 @@ import { buildEquityDeltaSnippet } from "../../calc/src/equityDeltaSnippet.ts";
 import { buildEquityVegaSnippet } from "../../calc/src/equityVegaSnippet.ts";
 import { buildFxDeltaSnippet } from "../../calc/src/fxDeltaSnippet.ts";
 import { buildFxVegaSnippet } from "../../calc/src/fxVegaSnippet.ts";
+import { buildGirrCurvatureSnippet } from "../../calc/src/girrCurvatureSnippet.ts";
+import { buildEquityCurvatureSnippet } from "../../calc/src/equityCurvatureSnippet.ts";
+import { buildFxCurvatureSnippet } from "../../calc/src/fxCurvatureSnippet.ts";
 import { loadFrtbLibrary, type FrtbLibrarySnippet } from "../../calc/src/loadFrtbLibrary.ts";
 import { computeKbDelta } from "../../calc/src/girrDeltaReference.ts";
 import { computeKbVega } from "../../calc/src/girrVegaReference.ts";
@@ -346,6 +349,9 @@ function toSensitivityRows(golden: GoldenRow[]): SensitivityRow[] {
 // `frtb` library can serve any (risk_class, sensitivity_type) the API may
 // dispatch to. Mirrors how a production deployment would load the library.
 function buildAllSnippets(): FrtbLibrarySnippet[] {
+  // Curvature snippets receive ρ_curv = (ρ_delta)² per MAR21 §21.5(3); the
+  // builders take the already-squared value so the Lua kernels stay
+  // arithmetic-only (matches the Delta/Vega substitution convention).
   return [
     buildGirrDeltaSnippet({ weights: GIRR_W, rho: GIRR_RHO_DELTA }),
     buildGirrVegaSnippet({ weight: GIRR_VEGA_W, rho: GIRR_VEGA_RHO }),
@@ -353,6 +359,9 @@ function buildAllSnippets(): FrtbLibrarySnippet[] {
     buildEquityVegaSnippet({ weights: EQUITY_WEIGHTS, rho: EQUITY_RHO }),
     buildFxDeltaSnippet({ weight: FX_WEIGHT, rho: FX_RHO }),
     buildFxVegaSnippet({ weight: FX_WEIGHT, rho: FX_RHO }),
+    buildGirrCurvatureSnippet({ tenors: TENOR.length, rho: GIRR_RHO_DELTA * GIRR_RHO_DELTA }),
+    buildEquityCurvatureSnippet({ rho: EQUITY_RHO * EQUITY_RHO }),
+    buildFxCurvatureSnippet({ rho: FX_RHO * FX_RHO }),
   ];
 }
 
@@ -404,6 +413,141 @@ describe("Equity + FX oracle compare (golden CSVs vs Python oracle)", () => {
           const expectedBuckets = Array.from(new Set(golden.map((g) => g.bucket))).sort();
           expect(body.per_bucket.map((p: BucketResult) => p.bucket).sort())
             .toEqual(expectedBuckets);
+        } finally {
+          await app.close();
+        }
+      },
+      180_000,
+    );
+  }
+});
+
+
+// ---------------------------------------------------------------------------
+// Wave 5.16d — Curvature variants (3 new cases, completing the 9-variant matrix)
+// ---------------------------------------------------------------------------
+// Extends the 6-variant matrix (GIRR/Equity/FX × Delta/Vega) with three
+// Curvature variants (GIRR/Equity/FX × Curvature) using a small in-process
+// fixture (50 rows total, ~17 per risk class). This is shape-only assertion —
+// status 200, body.charge numeric ≥ 0, per_bucket array present — NOT a
+// numeric-oracle compare. Numeric pinning against the Python oracle on a
+// 2,000-row dataset lands in 5.16e (smoke run against Redis Cloud).
+
+interface CurvatureCase {
+  risk_class: "GIRR" | "EQUITY" | "FX";
+  gamma: number;
+  buckets: readonly string[];
+  rowCount: number;
+}
+
+// 17 + 17 + 16 = 50 Curvature rows total — total, NOT per class — as
+// specified by the task scope for in-process e2e speed.
+const CURVATURE_CASES: CurvatureCase[] = [
+  { risk_class: "GIRR",   gamma: CROSS_BUCKET_GAMMA, buckets: ["USD", "EUR", "GBP"], rowCount: 17 },
+  { risk_class: "EQUITY", gamma: EQUITY_GAMMA,      buckets: ["1", "2", "3"],       rowCount: 17 },
+  { risk_class: "FX",     gamma: FX_GAMMA,          buckets: ["EURUSD", "GBPUSD", "USDJPY"], rowCount: 16 },
+];
+
+// Deterministic shape-A Curvature row factory. Seeded by (n, k) so the
+// fixture is bit-for-bit reproducible across machines (same convention as
+// buildFixture() above).
+function makeCurvatureRow(
+  risk_class: "GIRR" | "EQUITY" | "FX",
+  bucket: string,
+  ulid: () => string,
+  n: number,
+): SensitivityRow {
+  const isVector = risk_class === "GIRR";
+  let risk_value: { cvr_up: number[]; cvr_down: number[] } | { cvr_up: number; cvr_down: number };
+  if (isVector) {
+    const up = TENOR.map((_, k) => {
+      const s = (n * 31 + k * 7 + 1) * 2654435761;
+      return ((s % 1_500_001) / 1_000_000) * 15 - 5; // ∈ [-5, +10]
+    });
+    const down = TENOR.map((_, k) => {
+      const s = (n * 53 + k * 11 + 3) * 2654435761;
+      return ((s % 1_500_001) / 1_000_000) * 15 - 10; // ∈ [-10, +5]
+    });
+    risk_value = { cvr_up: up, cvr_down: down };
+  } else {
+    const s1 = (n * 31 + 1) * 2654435761;
+    const s2 = (n * 53 + 3) * 2654435761;
+    risk_value = {
+      cvr_up: ((s1 % 1_500_001) / 1_000_000) * 15 - 5,
+      cvr_down: ((s2 % 1_500_001) / 1_000_000) * 15 - 10,
+    };
+  }
+  return {
+    risk_class,
+    bucket,
+    _hash_tag: `${risk_class}:${bucket}`,
+    _id: ulid(),
+    sensitivity_type: "Curvature",
+    risk_value,
+  };
+}
+
+function buildCurvatureFixture(): SensitivityRow[] {
+  const ulid = monotonicFactory();
+  const rows: SensitivityRow[] = [];
+  let n = 0;
+  for (const c of CURVATURE_CASES) {
+    for (let r = 0; r < c.rowCount; r++) {
+      const bucket = c.buckets[r % c.buckets.length]!;
+      rows.push(makeCurvatureRow(c.risk_class, bucket, ulid, n));
+      n += 1;
+    }
+  }
+  return rows;
+}
+
+describe("Curvature shape e2e (Wave 5.16d — 9-variant matrix completion)", () => {
+  for (const c of CURVATURE_CASES) {
+    it.skipIf(!HAS_DOCKER)(
+      `${c.risk_class} Curvature: /calc/sbm returns 200, body.charge ≥ 0, per_bucket populated (shape-only)`,
+      async () => {
+        const rows = buildCurvatureFixture();
+        await setupAndIngestGolden(rows);
+        const correlations: Record<string, CorrelationSpec> = {
+          [c.risk_class]: { kind: "constant", value: c.gamma },
+        };
+        const app = await createServer({ redis: redis!, correlations });
+        try {
+          // Ingest-sanity probe — confirm Curvature rows are FT.SEARCHable
+          // with the right schema field types (TAG @risk_class, @bucket,
+          // @sensitivity_type). The downstream FT.AGGREGATE in /calc/sbm
+          // groups by @bucket, which exercises the same indexed fields.
+          const ftReply = await redis!.call(
+            "FT.SEARCH", "idx:sens",
+            `@risk_class:{${c.risk_class}} @sensitivity_type:{Curvature}`,
+            "LIMIT", "0", "1",
+          ) as unknown[];
+          expect(Array.isArray(ftReply)).toBe(true);
+          expect(Number(ftReply[0])).toBeGreaterThan(0);
+
+          const res = await app.inject({
+            method: "POST",
+            url: "/calc/sbm",
+            payload: { risk_class: c.risk_class, sensitivity_type: "Curvature" },
+          });
+          expect(res.statusCode).toBe(200);
+          const body = res.json();
+          expect(typeof body.charge).toBe("number");
+          expect(Number.isFinite(body.charge)).toBe(true);
+          // Shape contract: non-negative SBM charge per MAR21 §21.5(5).
+          expect(body.charge).toBeGreaterThanOrEqual(0);
+          // per_bucket breakdown present and at least one bucket reported.
+          expect(Array.isArray(body.per_bucket)).toBe(true);
+          expect(body.per_bucket.length).toBeGreaterThan(0);
+          for (const pb of body.per_bucket as BucketResult[]) {
+            expect(typeof pb.bucket).toBe("string");
+            expect(typeof pb.K_b).toBe("number");
+            expect(typeof pb.S_b).toBe("number");
+          }
+          // Buckets reported must be a subset of the buckets this risk class
+          // wrote into Redis (sanity — no cross-class leakage).
+          const reported = new Set(body.per_bucket.map((p: BucketResult) => p.bucket));
+          for (const b of reported) expect(c.buckets).toContain(b);
         } finally {
           await app.close();
         }

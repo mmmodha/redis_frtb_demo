@@ -12,13 +12,21 @@ export type SensitivityRow = {
 
 export interface RowGeneratorOptions {
   seed?: number | string;
+  /**
+   * Sensitivity types to draw from when emitting rows. Default ["Delta","Vega"]
+   * preserves pre-5.16d behaviour. Pass ["Curvature"] (or include it in the
+   * mix) to emit shape-A Curvature rows: GIRR `{cvr_up: number[], cvr_down:
+   * number[]}` per-tenor, Equity/FX `{cvr_up: number, cvr_down: number}` per
+   * factor (mirrors the Delta scalar-vs-array convention per risk class).
+   */
+  sensitivityTypes?: readonly string[];
 }
 
 export interface RowGenerator {
   generate(riskClass: string): SensitivityRow;
 }
 
-const SENSITIVITY_TYPES = ["Delta", "Vega"];
+const DEFAULT_SENSITIVITY_TYPES = ["Delta", "Vega"] as const;
 
 // Per-dimension op codes — resolved once per schema, then executed per row.
 type Op =
@@ -48,6 +56,9 @@ export function createRowGenerator(
 ): RowGenerator {
   const rng = seedrandom(String(opts.seed ?? 0));
   const ulid = monotonicFactory();
+  const sensTypes = opts.sensitivityTypes && opts.sensitivityTypes.length > 0
+    ? opts.sensitivityTypes
+    : DEFAULT_SENSITIVITY_TYPES;
   const dimsByName = new Map<string, Dimension>();
   for (const d of schema.dimensions) dimsByName.set(d.name, d);
   const binding = schema.frtb_binding;
@@ -112,6 +123,10 @@ export function createRowGenerator(
       const plan = planFor(riskClass);
       const buckets = plan.buckets;
       const bucket = buckets[(rng() * buckets.length) | 0]!;
+      // Pre-pick the sensitivity_type for this row so the rv_array/rv_scalar
+      // handlers can branch on it (the sens_type op may come AFTER risk_value
+      // in the dimension list — we cannot rely on op execution order).
+      const sensType = sensTypes[(rng() * sensTypes.length) | 0]!;
       const row: SensitivityRow = {
         risk_class: riskClass,
         bucket,
@@ -124,15 +139,44 @@ export function createRowGenerator(
         switch (op.k) {
           case "risk_class": row[op.name] = riskClass; break;
           case "bucket": row[op.name] = bucket; break;
-          case "sens_type": row[op.name] = SENSITIVITY_TYPES[(rng() * 2) | 0]!; break;
+          case "sens_type": row[op.name] = sensType; break;
           case "tenor_array": row[op.name] = plan.tenorNodes ?? []; break;
           case "tenor_pick": row[op.name] = plan.tenorNodes ? plan.tenorNodes[(rng() * plan.tenorNodes.length) | 0]! : ""; break;
           case "rv_array": {
-            const arr = new Array(op.len);
-            for (let j = 0; j < op.len; j++) arr[j] = Math.round((rng() * 2 - 1) * 1e6) / 1e6;
-            row[op.name] = arr; break;
+            if (sensType === "Curvature") {
+              // Shape A per docs/demo/curvature-scope.md §3a — per-tenor
+              // CVR_k^+ / CVR_k^- pairs. cvr_up ∈ [-5, +10], cvr_down ∈
+              // [-10, +5] with mild per-tenor correlation so cross-bucket /
+              // cross-tenor math (γ_curv = γ_delta², ψ-gate) actually exercises.
+              const up = new Array(op.len);
+              const down = new Array(op.len);
+              for (let j = 0; j < op.len; j++) {
+                const u = rng();
+                const v = 0.5 * u + 0.5 * rng();
+                up[j] = Math.round((u * 15 - 5) * 1e4) / 1e4;
+                down[j] = Math.round((v * 15 - 10) * 1e4) / 1e4;
+              }
+              row[op.name] = { cvr_up: up, cvr_down: down };
+            } else {
+              const arr = new Array(op.len);
+              for (let j = 0; j < op.len; j++) arr[j] = Math.round((rng() * 2 - 1) * 1e6) / 1e6;
+              row[op.name] = arr;
+            }
+            break;
           }
-          case "rv_scalar": row[op.name] = Math.round((rng() * 2 - 1) * 1e6) / 1e6; break;
+          case "rv_scalar": {
+            if (sensType === "Curvature") {
+              // Shape A scalar (Equity / FX): a single CVR^+ / CVR^- per factor.
+              const u = rng();
+              const v = 0.5 * u + 0.5 * rng();
+              const cvr_up = Math.round((u * 15 - 5) * 1e4) / 1e4;
+              const cvr_down = Math.round((v * 15 - 10) * 1e4) / 1e4;
+              row[op.name] = { cvr_up, cvr_down };
+            } else {
+              row[op.name] = Math.round((rng() * 2 - 1) * 1e6) / 1e6;
+            }
+            break;
+          }
           case "weight_const": row[op.name] = op.value; break;
           case "weight_by_tenor": row[op.name] = op.values[(rng() * op.values.length) | 0]!; break;
           case "weight_by_bucket": row[op.name] = op.table[bucket] ?? 0; break;
