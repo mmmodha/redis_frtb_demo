@@ -1,7 +1,7 @@
 # Technical Brief — FRTB-SA Architecture on Redis Enterprise
 
 ## Architecture summary
-- **State + search + compute consolidated in one product.** Redis Enterprise Software (RS) cluster runs inside HSBC's perimeter. The application sits in front of RS via the Fastify `api` service. There is no separate search store, no separate compute layer for the per-bucket SBM math.
+- **State + search + compute consolidated in one product.** Redis Enterprise Software (RS) cluster runs inside the bank's perimeter. The application sits in front of RS via the Fastify `api` service. There is no separate search store, no separate compute layer for the per-bucket SBM math.
 - **Microservices, fault-isolated.** `ui`, `api`, `generator`, `ingest`, `source`, `calc`, `loadgen`. Each restarts independently. `docker compose up` is the dev loop.
 - **All UI traffic goes through the api.** Browsers never speak Redis directly.
 
@@ -30,7 +30,7 @@
 - **Sources:** `synthetic` (generator) and `file` (browser upload < 2 GB or server path / S3 reference for 450M-row files). `source` infers columns and presents a mapping wizard.
 
 ## Security posture
-- TLS in transit (mTLS available), encryption at rest with HSBC's KMS (BYOK), audit logs to HSBC's SIEM, support for fully air-gapped installs, RBAC + ACL per database.
+- TLS in transit (mTLS available), encryption at rest with the bank's KMS (BYOK), audit logs to the bank's SIEM, support for fully air-gapped installs, RBAC + ACL per database.
 
 ## What's in the asset pack
 - This brief, the executive summary, the talking-points cheat-sheet, the competitive-positioning doc, the sizing worksheet, the Reveal.js deck (PDF), and screenshots of every demo step.

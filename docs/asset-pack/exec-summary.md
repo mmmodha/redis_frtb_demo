@@ -1,4 +1,4 @@
-# Executive Summary — Redis Enterprise for HSBC FRTB-SA
+# Executive Summary — Redis Enterprise for Tier-1 bank FRTB-SA
 
 ## The pain
 FRTB-SA goes live in January. Your incumbent stack (Oracle + Spark + JVM risk engines) was built for end-of-day batch. The desk wants live recalc on 450M sensitivities across ~110 dimensions with tenor arrays. The current architecture cannot deliver the latency, the shape, or the cost envelope at that scale.
@@ -11,7 +11,7 @@ FRTB-SA goes live in January. Your incumbent stack (Oracle + Spark + JVM risk en
 - **In-database SBM math** via Redis Functions — `FCALL` per bucket on the owning shard, slot-local, map-reduce.
 - **Auto Tiering** (RAM + NVMe in one logical DB) for the 450M scale story. Enterprise-exclusive.
 - **Active-Active CRDTs** for local-write latency in London, Hong Kong, New York.
-- **Deployed inside HSBC's perimeter** — your VPCs, your on-prem, your controls.
+- **Deployed inside the bank's perimeter** — your VPCs, your on-prem, your controls.
 
 ## What today's demo proved
 - Live ingest of 10M synthetic sensitivities into a 3-shard cluster.
@@ -29,4 +29,4 @@ FRTB-SA goes live in January. Your incumbent stack (Oracle + Spark + JVM risk en
 - 24×7 support from the team that builds the product.
 
 ## The ask
-Two-week scoped POC on one risk class with HSBC's own data. Acceptance: live SBM charge reproduces your incumbent oracle to within 0.01%, sub-2-second wall-clock. The path from POC to production is 14–18 weeks via the K8s Operator.
+Two-week scoped POC on one risk class with the bank's own data. Acceptance: live SBM charge reproduces your incumbent oracle to within 0.01%, sub-2-second wall-clock. The path from POC to production is 14–18 weeks via the K8s Operator.

@@ -1,11 +1,11 @@
-# Next Steps — HSBC FRTB-SA on Redis Enterprise
+# Next Steps — Tier-1 bank FRTB-SA on Redis Enterprise
 
 After today's demo, the recommended path to value.
 
 ## 1. Two-week scoped POC
 
 - Pick one risk class (suggested: GIRR Delta) and one desk.
-- HSBC supplies one day of real sensitivities (anonymised if needed) plus the desk's incumbent SBM oracle output.
+- The bank supplies one day of real sensitivities (anonymised if needed) plus the desk's incumbent SBM oracle output.
 - Redis SA + Professional Services co-builds the schema YAML and the Function library binding.
 - Acceptance: live calc reproduces the incumbent oracle to within 0.01% over the sample, sub-2-second wall-clock.
 
@@ -13,7 +13,7 @@ After today's demo, the recommended path to value.
 
 - **K8s Operator** (preferred for GKE / EKS / OpenShift) — official Operator + BDB CRDs, GitOps-native.
 - **Ansible roles** for VM-based (on-prem VMware, bare metal). Same product, same modules.
-- All installs run **inside HSBC's perimeter**. No data egress. No SaaS dependency.
+- All installs run **inside the bank's perimeter**. No data egress. No SaaS dependency.
 
 ## 3. Procurement contacts
 
