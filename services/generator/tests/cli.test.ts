@@ -195,7 +195,9 @@ describe("generator CLI", () => {
       );
       const payload = JSON.parse(map.payload as string);
       expect(payload).toHaveProperty("spread");           // new schema field
-      expect(typeof payload.risk_value).toBe("number");   // was array under multi-class
+      // Wave 5.17a — swap-schema NUMERIC risk_value is now `{ spot }`.
+      expect(typeof payload.risk_value).toBe("object");
+      expect(typeof payload.risk_value.spot).toBe("number");
     }
   });
 });

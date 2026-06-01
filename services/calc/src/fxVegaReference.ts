@@ -34,9 +34,13 @@ export function computeKbFxVega(
   let count = 0;
   for (const row of rows) {
     if (!row || row.sensitivity_type !== "Vega") continue;
+    // Wave 5.17a — `{ spot }` in production, bare number tolerated for legacy.
     const rv = row.risk_value;
-    if (typeof rv !== "number" || !Number.isFinite(rv)) continue;
-    const ws = weight * rv;
+    let v: unknown;
+    if (typeof rv === "number") v = rv;
+    else if (rv && typeof rv === "object") v = (rv as { spot?: unknown }).spot;
+    if (typeof v !== "number" || !Number.isFinite(v)) continue;
+    const ws = weight * v;
     sumWs += ws;
     sumWsSq += ws * ws;
     count += 1;

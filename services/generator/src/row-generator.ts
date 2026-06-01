@@ -20,6 +20,19 @@ export interface RowGeneratorOptions {
    * factor (mirrors the Delta scalar-vs-array convention per risk class).
    */
   sensitivityTypes?: readonly string[];
+  /**
+   * Wave 5.17a — HSBC reshape. Trade-id pool size for the post-loop aux-RNG
+   * draw. Defaults to 200 (matches the smoke-run-16 canonical 2000-row / 10
+   * trades-per-id ratio). Aux-RNG is seeded with `seed + ':aux'` so the
+   * main value-RNG sequence is unchanged — pre/post-reshape numeric outputs
+   * are bit-identical.
+   */
+  tradePoolSize?: number;
+  /**
+   * Wave 5.17a — HSBC reshape. Risk-factor pool size per class (default 16).
+   * Emitted as `RF_<CLASS>_<NN>` via the aux RNG.
+   */
+  factorPoolSize?: number;
 }
 
 export interface RowGenerator {
@@ -27,6 +40,8 @@ export interface RowGenerator {
 }
 
 const DEFAULT_SENSITIVITY_TYPES = ["Delta", "Vega"] as const;
+const DEFAULT_TRADE_POOL_SIZE = 200;
+const DEFAULT_FACTOR_POOL_SIZE = 16;
 
 // Per-dimension op codes — resolved once per schema, then executed per row.
 type Op =
@@ -54,7 +69,16 @@ export function createRowGenerator(
   schema: Schema,
   opts: RowGeneratorOptions = {}
 ): RowGenerator {
-  const rng = seedrandom(String(opts.seed ?? 0));
+  const seedStr = String(opts.seed ?? 0);
+  const rng = seedrandom(seedStr);
+  // Wave 5.17a — aux RNG for HSBC fields (trade_id, risk_factor). Seeded
+  // with `<seed>:aux` so it cannot collide with or perturb the main value
+  // RNG. CRITICAL: never call rng() (the main stream) from the HSBC-field
+  // path — that would shift every downstream numeric draw and break the
+  // pre-reshape vs post-reshape byte-equivalence invariant.
+  const auxRng = seedrandom(seedStr + ":aux");
+  const tradePoolSize = Math.max(1, Math.floor(opts.tradePoolSize ?? DEFAULT_TRADE_POOL_SIZE));
+  const factorPoolSize = Math.max(1, Math.floor(opts.factorPoolSize ?? DEFAULT_FACTOR_POOL_SIZE));
   const ulid = monotonicFactory();
   const sensTypes = opts.sensitivityTypes && opts.sensitivityTypes.length > 0
     ? opts.sensitivityTypes
@@ -158,9 +182,22 @@ export function createRowGenerator(
               }
               row[op.name] = { cvr_up: up, cvr_down: down };
             } else {
+              // Wave 5.17a — Delta/Vega array values wrapped as a tenor-keyed
+              // object so HSBC can FT.SEARCH per-tenor without unpacking. The
+              // rng() draw order and the resulting numeric values are
+              // bit-identical to the prior array shape — only the container
+              // changes. When tenor metadata is missing (defensive), fall
+              // back to the legacy array so the row is still well-formed.
               const arr = new Array(op.len);
               for (let j = 0; j < op.len; j++) arr[j] = Math.round((rng() * 2 - 1) * 1e6) / 1e6;
-              row[op.name] = arr;
+              const nodes = plan.tenorNodes;
+              if (nodes && nodes.length === op.len) {
+                const obj: Record<string, number> = {};
+                for (let j = 0; j < op.len; j++) obj[nodes[j]!] = arr[j]!;
+                row[op.name] = obj;
+              } else {
+                row[op.name] = arr;
+              }
             }
             break;
           }
@@ -173,7 +210,12 @@ export function createRowGenerator(
               const cvr_down = Math.round((v * 15 - 10) * 1e4) / 1e4;
               row[op.name] = { cvr_up, cvr_down };
             } else {
-              row[op.name] = Math.round((rng() * 2 - 1) * 1e6) / 1e6;
+              // Wave 5.17a — Equity/FX Delta/Vega scalar wrapped as { spot }
+              // so all Delta/Vega risk_value payloads are uniform objects
+              // (per-tenor for GIRR, single-key for Equity/FX). Numeric value
+              // and rng() consumption are unchanged.
+              const v = Math.round((rng() * 2 - 1) * 1e6) / 1e6;
+              row[op.name] = { spot: v };
             }
             break;
           }
@@ -189,6 +231,15 @@ export function createRowGenerator(
           }
         }
       }
+      // Wave 5.17a — HSBC fields drawn from an isolated aux RNG so the main
+      // value-RNG sequence above is unchanged across the reshape. trade_id
+      // overwrites any value the generic TAG branch may have set (preserves
+      // the original main-rng tick count for classes that listed trade_id in
+      // their dimensions). risk_factor is new on every row.
+      const tradeIdx = (auxRng() * tradePoolSize) | 0;
+      row.trade_id = `T${String(tradeIdx + 1).padStart(4, "0")}`;
+      const factorIdx = (auxRng() * factorPoolSize) | 0;
+      row.risk_factor = `RF_${riskClass}_${String(factorIdx + 1).padStart(2, "0")}`;
       return row;
     },
   };

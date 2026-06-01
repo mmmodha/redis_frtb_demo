@@ -31,6 +31,12 @@ export function computeKbDelta(
   rows: ReadonlyArray<DeltaRow>,
   weights: ReadonlyArray<number>,
   rho: number,
+  /**
+   * Wave 5.17a — Tenor labels in the same order as `weights`. Required when
+   * any input row has a per-tenor object `risk_value = { "3M": v0, ... }`;
+   * optional when callers only pass array-shaped fixtures (legacy / tests).
+   */
+  tenors?: ReadonlyArray<string>,
 ): DeltaKbResult {
   const T = weights.length;
   const sumS = new Array<number>(T).fill(0); // raw sensi totals per tenor
@@ -38,14 +44,26 @@ export function computeKbDelta(
   for (const row of rows) {
     if (!row || row.sensitivity_type !== "Delta") continue;
     const rv = row.risk_value;
-    if (!Array.isArray(rv)) continue;
-    for (let k = 0; k < T && k < rv.length; k++) {
-      const s = rv[k];
-      if (typeof s === "number" && Number.isFinite(s)) {
-        sumS[k] = (sumS[k] ?? 0) + s;
+    if (Array.isArray(rv)) {
+      for (let k = 0; k < T && k < rv.length; k++) {
+        const s = rv[k];
+        if (typeof s === "number" && Number.isFinite(s)) {
+          sumS[k] = (sumS[k] ?? 0) + s;
+        }
       }
+      count += 1;
+    } else if (rv && typeof rv === "object" && tenors && tenors.length >= T) {
+      const obj = rv as Record<string, unknown>;
+      for (let k = 0; k < T; k++) {
+        const s = obj[tenors[k]!];
+        if (typeof s === "number" && Number.isFinite(s)) {
+          sumS[k] = (sumS[k] ?? 0) + s;
+        }
+      }
+      count += 1;
+    } else {
+      continue;
     }
-    count += 1;
   }
   const WS = new Array<number>(T).fill(0);
   let sumWs = 0;

@@ -1,4 +1,4 @@
-import type { Dimension, RiskClassId, Schema, Sensitivity } from "./types.ts";
+import type { Dimension, RiskClassId, Schema, Sensitivity, SensitivityRiskValue } from "./types.ts";
 
 const SENSITIVITY_TYPES = ["DELTA", "VEGA", "CURVATURE"] as const;
 
@@ -12,13 +12,15 @@ export function sampleRowFor(riskClass: RiskClassId, schema: Schema): Sensitivit
 
   const bucket = cfg.buckets.values[0] ?? "B1";
   const tenor = cfg.tenor?.nodes[0];
-  const tenorCount = cfg.tenor?.count ?? 1;
+  const tenorNodes = cfg.tenor?.nodes ?? [];
 
   const riskValueDim = dimsByName.get(schema.frtb_binding.risk_value);
-  const riskValue: number | number[] =
-    riskValueDim?.type === "ARRAY_NUMERIC"
-      ? Array.from({ length: tenorCount }, (_, i) => 1000 + i * 10)
-      : 12345.67;
+  // Wave 5.17a — DELTA sample uses the per-(class × sens_type) object shape:
+  //   GIRR Delta/Vega → keyed by tenor labels; Equity/FX Delta/Vega → { spot }.
+  const riskValue: SensitivityRiskValue =
+    riskValueDim?.type === "ARRAY_NUMERIC" && tenorNodes.length > 1
+      ? Object.fromEntries(tenorNodes.map((t, i) => [t, 1000 + i * 10]))
+      : { spot: 12345.67 };
 
   const row: Sensitivity = {
     risk_class: riskClass,
@@ -26,6 +28,8 @@ export function sampleRowFor(riskClass: RiskClassId, schema: Schema): Sensitivit
     risk_value: riskValue,
     weight: 0.017,
     sensitivity_type: SENSITIVITY_TYPES[0],
+    trade_id: "T0001",
+    risk_factor: `RF_${riskClass}_01`,
   };
   if (tenor) row.tenor = tenor;
 

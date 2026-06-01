@@ -21,6 +21,16 @@ const LUA_PATH = resolve(HERE, "..", "lib", "girr_delta.lua");
 export interface GirrDeltaParams {
   weights: ReadonlyArray<number>;
   rho: number;
+  /**
+   * Wave 5.17a — Tenor labels in the same order as `weights`. Substituted as
+   * `__GIRR_TENORS__` into the Lua kernel so the per-tenor object form
+   * (`risk_value = { "3M": v0, ... }`) can be iterated in declared order.
+   * Defaults to `["1","2",...,"<T>"]` for legacy callers that pass weights
+   * without a corresponding tenor list — the kernel never matches those
+   * synthetic keys against object-shape rows, so production paths must pass
+   * the real tenor labels.
+   */
+  tenors?: ReadonlyArray<string>;
 }
 
 function luaNumber(n: number): string {
@@ -38,10 +48,24 @@ function luaNumberTable(xs: ReadonlyArray<number>): string {
   return "{" + xs.map(luaNumber).join(", ") + "}";
 }
 
+function luaStringTable(xs: ReadonlyArray<string>): string {
+  if (xs.length === 0) {
+    throw new Error("GirrDeltaParams: tenor list must be non-empty");
+  }
+  for (const t of xs) {
+    if (/['\n\r\\]/.test(t)) {
+      throw new Error(`GirrDeltaParams: unsupported tenor label ${JSON.stringify(t)}`);
+    }
+  }
+  return "{" + xs.map((t) => "'" + t + "'").join(", ") + "}";
+}
+
 export function buildGirrDeltaSnippet(params: GirrDeltaParams): FrtbLibrarySnippet {
   const template = readFileSync(LUA_PATH, "utf8");
+  const tenors = params.tenors ?? params.weights.map((_, i) => String(i + 1));
   const code = template
     .replaceAll("__GIRR_DELTA_WEIGHTS__", luaNumberTable(params.weights))
-    .replaceAll("__GIRR_DELTA_RHO__", luaNumber(params.rho));
+    .replaceAll("__GIRR_DELTA_RHO__", luaNumber(params.rho))
+    .replaceAll("__GIRR_TENORS__", luaStringTable(tenors));
   return { name: "sbm_delta_bucket", code };
 }

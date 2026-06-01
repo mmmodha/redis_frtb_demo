@@ -38,9 +38,14 @@ export function computeKbEquityDelta(
   let count = 0;
   for (const row of rows) {
     if (!row || row.sensitivity_type !== "Delta") continue;
+    // Wave 5.17a — risk_value reshape: production rows emit `{ spot }`,
+    // legacy / test fixtures may still emit a bare number. Accept both.
     const rv = row.risk_value;
-    if (typeof rv !== "number" || !Number.isFinite(rv)) continue;
-    const ws = weight * rv;
+    let v: unknown;
+    if (typeof rv === "number") v = rv;
+    else if (rv && typeof rv === "object") v = (rv as { spot?: unknown }).spot;
+    if (typeof v !== "number" || !Number.isFinite(v)) continue;
+    const ws = weight * v;
     WS.push(ws);
     sumWs += ws;
     sumWsSq += ws * ws;

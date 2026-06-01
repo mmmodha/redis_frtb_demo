@@ -20,6 +20,13 @@ const LUA_PATH = resolve(HERE, "..", "lib", "girr_vega.lua");
 export interface GirrVegaParams {
   weight: number;
   rho: number;
+  /**
+   * Wave 5.17a — Tenor labels for the per-tenor object iteration. See
+   * GirrDeltaParams.tenors for the rationale. Defaults to a synthetic list
+   * (`["1","2",...]`) of length matching the production GIRR tenor count if
+   * omitted — tests that hand-seed bare numbers or arrays still work.
+   */
+  tenors?: ReadonlyArray<string>;
 }
 
 function luaNumber(n: number): string {
@@ -32,10 +39,26 @@ function luaNumber(n: number): string {
   return s.includes(".") || s.includes("e") || s.includes("E") ? s : s + ".0";
 }
 
+function luaStringTable(xs: ReadonlyArray<string>): string {
+  if (xs.length === 0) {
+    throw new Error("GirrVegaParams: tenor list must be non-empty");
+  }
+  for (const t of xs) {
+    if (/['\n\r\\]/.test(t)) {
+      throw new Error(`GirrVegaParams: unsupported tenor label ${JSON.stringify(t)}`);
+    }
+  }
+  return "{" + xs.map((t) => "'" + t + "'").join(", ") + "}";
+}
+
+const DEFAULT_TENORS = ["3M", "6M", "1Y", "2Y", "3Y", "5Y", "10Y", "15Y", "20Y", "30Y"];
+
 export function buildGirrVegaSnippet(params: GirrVegaParams): FrtbLibrarySnippet {
   const template = readFileSync(LUA_PATH, "utf8");
+  const tenors = params.tenors ?? DEFAULT_TENORS;
   const code = template
     .replaceAll("__GIRR_VEGA_WEIGHT__", luaNumber(params.weight))
-    .replaceAll("__GIRR_VEGA_RHO__", luaNumber(params.rho));
+    .replaceAll("__GIRR_VEGA_RHO__", luaNumber(params.rho))
+    .replaceAll("__GIRR_TENORS__", luaStringTable(tenors));
   return { name: "sbm_vega_bucket", code };
 }

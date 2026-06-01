@@ -67,8 +67,10 @@ export function buildFrtbSnippets(schema: Schema): FrtbLibrarySnippet[] {
   // Lua kernels stay arithmetic-only and mirror the delta snippet substitution
   // scheme exactly.
   return [
-    buildGirrDeltaSnippet({ weights: girrDeltaWeights, rho: girrRho.value }),
-    buildGirrVegaSnippet({ weight: girrVegaW.constant, rho: girrVegaRho.value }),
+    // Wave 5.17a — pass tenor labels so the GIRR Lua kernels can iterate the
+    // new per-tenor object risk_value shape in declared order.
+    buildGirrDeltaSnippet({ weights: girrDeltaWeights, rho: girrRho.value, tenors: tenorNodes }),
+    buildGirrVegaSnippet({ weight: girrVegaW.constant, rho: girrVegaRho.value, tenors: tenorNodes }),
     buildEquityDeltaSnippet({ weights: equityW.by_bucket, rho: equityRho.value }),
     buildEquityVegaSnippet({ weight: 1.0, rho: equityRho.value }),
     buildFxDeltaSnippet({ weight: fxW.constant }),

@@ -24,12 +24,16 @@ export const IDX_PREFIX = "sens:";
 
 // Schema, in declaration order. Add fields here by appending; the FT.CREATE
 // command is built from this array so additions are mechanical.
+//
+// Wave 5.17a — added `risk_factor` (HSBC tag dimension; pool of 16 per
+// class). `trade_id` was already indexed and stays indexed.
 export const IDX_SCHEMA_FIELDS = Object.freeze([
   { path: "$.risk_class", as: "risk_class", type: "TAG" },
   { path: "$.bucket", as: "bucket", type: "TAG" },
   { path: "$.sensitivity_type", as: "sensitivity_type", type: "TAG" },
   { path: "$.book", as: "book", type: "TAG" },
   { path: "$.trade_id", as: "trade_id", type: "TAG" },
+  { path: "$.risk_factor", as: "risk_factor", type: "TAG" },
 ]);
 
 // Builds the FT.CREATE argv (everything after the command name). Exposed so

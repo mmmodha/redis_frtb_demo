@@ -11,12 +11,17 @@
 --   S_b  = Σ_k WS_k
 -- Constant-ρ specialisation used here (ρ_kk=1, ρ_kl=ρ k≠l):
 --   K_b² = ΣWS² + ρ · ((ΣWS)² − ΣWS²)
--- The loader substitutes __GIRR_DELTA_WEIGHTS__ (Lua array literal) and
--- __GIRR_DELTA_RHO__ with numeric literals derived from
--- config/schema/frtb-default.yaml.
+-- The loader substitutes __GIRR_DELTA_WEIGHTS__ (Lua array literal),
+-- __GIRR_DELTA_RHO__, and __GIRR_TENORS__ (Lua array of tenor label strings)
+-- with literals derived from config/schema/frtb-default.yaml.
 -- Only rows with sensitivity_type == "Delta" contribute; other types skipped.
+--
+-- Wave 5.17a — risk_value reshape: production rows emit `{ "3M": v0, "6M":
+-- v1, ..., "30Y": v9 }` keyed by the GIRR tenor labels. Legacy / test
+-- fixtures may still emit a plain `[v0, v1, ...]` array. Both shapes
+-- iterate in declared tenor order so floating-point summation is identical.
 
-local function _delta_iter_bucket(risk_class, bucket, weights)
+local function _delta_iter_bucket(risk_class, bucket, weights, tenors)
   local pattern = 'sens:{' .. risk_class .. ':' .. bucket .. '}:*'
   local cursor = '0'
   local T = #weights
@@ -38,11 +43,20 @@ local function _delta_iter_bucket(risk_class, bucket, weights)
         if ok and type(doc) == 'table' and doc.sensitivity_type == 'Delta' then
           local rv = doc.risk_value
           if type(rv) == 'table' then
-            local kmax = #rv
-            if kmax > T then kmax = T end
-            for k = 1, kmax do
-              local s = tonumber(rv[k])
-              if s then sum_s[k] = sum_s[k] + s end
+            if rv[1] ~= nil then
+              -- Array form (legacy / hand-seeded test fixtures).
+              local kmax = #rv
+              if kmax > T then kmax = T end
+              for k = 1, kmax do
+                local s = tonumber(rv[k])
+                if s then sum_s[k] = sum_s[k] + s end
+              end
+            else
+              -- Object form keyed by tenor labels (Wave 5.17a production).
+              for k = 1, T do
+                local s = tonumber(rv[tenors[k]])
+                if s then sum_s[k] = sum_s[k] + s end
+              end
             end
           end
           row_count = row_count + 1
@@ -61,9 +75,10 @@ redis.register_function('sbm_delta_bucket', function(keys, args)
   end
   local weights = __GIRR_DELTA_WEIGHTS__
   local rho = __GIRR_DELTA_RHO__
+  local tenors = __GIRR_TENORS__
   local T = #weights
   local t0 = redis.call('TIME')
-  local sum_s, count = _delta_iter_bucket(risk_class, bucket, weights)
+  local sum_s, count = _delta_iter_bucket(risk_class, bucket, weights, tenors)
   local sum_ws = 0.0
   local sum_ws_sq = 0.0
   for k = 1, T do

@@ -17,23 +17,53 @@ export interface VegaKbResult {
   count: number;
 }
 
+/**
+ * Wave 5.17a — `rows` accepts the three shapes the production / test paths
+ * emit: `number[]` (legacy array), `Record<string, number>` (per-tenor
+ * object), and `{ risk_value: ... }` wrappers (oracle-style input mirroring
+ * the Lua kernel). `tenors` is required when any per-tenor object is
+ * present so iteration order matches the Lua kernel.
+ */
 export function computeKbVega(
-  rows: number[][],
+  rows: ReadonlyArray<unknown>,
   weight: number,
   rho: number,
+  tenors?: ReadonlyArray<string>,
 ): VegaKbResult {
   let sumWs = 0;
   let sumWsSq = 0;
   let count = 0;
-  for (const row of rows) {
-    if (!Array.isArray(row)) continue;
-    for (const s of row) {
-      if (typeof s !== "number" || !Number.isFinite(s)) continue;
-      const ws = weight * s;
+  for (const r of rows) {
+    let rv: unknown = r;
+    // Unwrap { risk_value } if a row object was passed instead of a value.
+    if (r && typeof r === "object" && !Array.isArray(r)) {
+      const maybe = (r as { risk_value?: unknown }).risk_value;
+      if (maybe !== undefined) rv = maybe;
+    }
+    if (Array.isArray(rv)) {
+      for (const s of rv) {
+        if (typeof s !== "number" || !Number.isFinite(s)) continue;
+        const ws = weight * s;
+        sumWs += ws;
+        sumWsSq += ws * ws;
+      }
+      count += 1;
+    } else if (rv && typeof rv === "object" && tenors && tenors.length > 0) {
+      const obj = rv as Record<string, unknown>;
+      for (const t of tenors) {
+        const s = obj[t];
+        if (typeof s !== "number" || !Number.isFinite(s)) continue;
+        const ws = weight * s;
+        sumWs += ws;
+        sumWsSq += ws * ws;
+      }
+      count += 1;
+    } else if (typeof rv === "number" && Number.isFinite(rv)) {
+      const ws = weight * rv;
       sumWs += ws;
       sumWsSq += ws * ws;
+      count += 1;
     }
-    count += 1;
   }
   const cross = Math.max(0, sumWs * sumWs - sumWsSq);
   const kbSq = Math.max(0, sumWsSq + rho * cross);

@@ -36,7 +36,15 @@ dimensions:
   - { name: portfolio, type: TAG, indexed: false, sortable: false }
   - { name: legal_entity, type: TAG, indexed: false, sortable: false }
   - { name: trader, type: TAG, indexed: false, sortable: false }
-  - { name: trade_id, type: TAG, indexed: false, sortable: false }
+  # Wave 5.17a — trade_id flipped to indexed:true so HSBC can FT.SEARCH by trade.
+  # Emitted on every row by the generator (aux-RNG isolated; not in any
+  # class.dimensions list — handled out-of-band so main-rng byte-equivalence is
+  # preserved across the reshape).
+  - { name: trade_id, type: TAG, indexed: true, sortable: false, cardinality_hint: 200 }
+  # Wave 5.17a — risk_factor is a NEW TAG dimension added by the HSBC reshape.
+  # Aux-RNG seeded; one of a pool of 16 per class. Not in any class.dimensions
+  # list (intentional — keeps main-rng draw sequence unchanged).
+  - { name: risk_factor, type: TAG, indexed: true, sortable: false, cardinality_hint: 16 }
   - { name: position_id, type: TAG, indexed: false, sortable: false }
   - { name: instrument_id, type: TAG, indexed: false, sortable: false }
   - { name: instrument_type, type: TAG, indexed: false, sortable: false }

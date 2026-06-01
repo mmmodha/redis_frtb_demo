@@ -16,13 +16,15 @@ describe("sampleRowFor", () => {
     expect(["DELTA", "VEGA", "CURVATURE"]).toContain(row.sensitivity_type);
   });
 
-  it("uses a JSON array for risk_value when the bound dimension is ARRAY_NUMERIC", () => {
+  it("uses a per-tenor object for risk_value when the bound dimension is ARRAY_NUMERIC [Wave 5.17a]", () => {
     const schema = loadSchema(tiny);
     const row = sampleRowFor("GIRR", schema);
-    expect(Array.isArray(row.risk_value)).toBe(true);
-    const arr = row.risk_value as number[];
-    expect(arr).toHaveLength(schema.risk_classes.GIRR!.tenor!.count);
-    for (const v of arr) expect(typeof v).toBe("number");
+    const rv = row.risk_value as Record<string, number>;
+    expect(rv).toBeTypeOf("object");
+    expect(Array.isArray(rv)).toBe(false);
+    const tenorNodes = schema.risk_classes.GIRR!.tenor!.nodes;
+    expect(Object.keys(rv).sort()).toEqual([...tenorNodes].sort());
+    for (const t of tenorNodes) expect(typeof rv[t]).toBe("number");
   });
 
   it("picks the bucket value from the configured bucket list", () => {

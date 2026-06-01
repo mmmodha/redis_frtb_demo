@@ -88,6 +88,22 @@ export const RISK_CLASSES = [
 ] as const;
 export type RiskClassId = (typeof RISK_CLASSES)[number];
 
+// Risk-value shape is discriminated by (risk_class, sensitivity_type):
+//   - GIRR Delta/Vega → `{ <tenor>: number }` (object keyed by tenor labels from
+//     schema.risk_classes.GIRR.tenor.nodes, e.g. `{ "3M": v0, "6M": v1, ... }`).
+//   - Equity/FX Delta/Vega → `{ spot: number }`.
+//   - GIRR Curvature → `{ cvr_up: number[], cvr_down: number[] }` (per-tenor).
+//   - Equity/FX Curvature → `{ cvr_up: number, cvr_down: number }` (scalar).
+//   - Bare `number` / `number[]` are accepted by downstream readers for legacy
+//     test fixtures, but the production generator emits the object shapes above.
+export type SensitivityRiskValue =
+  | number
+  | number[]
+  | { spot: number }
+  | { [tenorLabel: string]: number }
+  | { cvr_up: number; cvr_down: number }
+  | { cvr_up: number[]; cvr_down: number[] };
+
 // A single FRTB sensitivity row as stored in Redis JSON.
 // Dimension keys are open-ended because the schema is hot-swappable;
 // the generated.ts file produced by tools/schema-cli narrows this per-class.
@@ -95,8 +111,12 @@ export interface Sensitivity {
   risk_class: RiskClassId;
   bucket: string;
   tenor?: string;
-  risk_value: number | number[];
+  risk_value: SensitivityRiskValue;
   weight?: number;
   sensitivity_type: "DELTA" | "VEGA" | "CURVATURE";
+  /** HSBC trade identifier (e.g. `T0001`); pool size controlled by generator. */
+  trade_id?: string;
+  /** HSBC risk-factor tag (e.g. `RF_GIRR_01`); 16 per class by default. */
+  risk_factor?: string;
   [field: string]: unknown;
 }

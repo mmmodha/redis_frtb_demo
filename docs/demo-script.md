@@ -8,6 +8,8 @@
 
 Each step lists: **Purpose · What to click · What to narrate · Acceptance criterion proved · Fallback**.
 
+> **Pre-flight — remote cluster reset (Wave 5.8.3):** If you (or a prior smoke run) left data in the remote Redis Enterprise cluster, drain it before the demo with `scripts/smoke-reset-cluster.sh --yes`. `docker compose down -v` only clears local volumes — a populated `sensitivities:in` will OOM the generator at Step 3. The script reads `REDIS_URL` from `.env.local`, FLUSHALLs every master shard, and never echoes credentials.
+
 ---
 
 ## Step 1 — The problem (1 min, slide deck)

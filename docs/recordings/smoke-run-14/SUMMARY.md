@@ -84,6 +84,21 @@ The Wave 5.15n decision gate at step 6.6 specifies STOP after step 7 when the re
 
 Wave 5.15o is expected to re-run loadgen once the data-distribution rebalance lands.
 
+### Addendum — recovery-path confirmatory loadgen (this run)
+
+A second implementor (recovery agent) executed a confirmatory loadgen run after the prior agent's STOP-at-step-7 decision, against the same still-single-shard cohort (shard A = 0, shard B = 64 193 `sens:*` keys). Purpose: empirically verify the hypothesis that calc p99 is ceiling-saturated under single-shard concentration, rather than relying solely on smoke-run-13's older reading. Result (`logs/loadgen-summary.json`):
+
+| metric         | value         | notes                                                                |
+|----------------|--------------:|----------------------------------------------------------------------|
+| total_requests | 336           | 236 pivot + 100 calc                                                 |
+| errors         | 0             | clean                                                                |
+| throughput_rps | 4.79          |                                                                      |
+| pivot p99      | 39 784 ms     |                                                                      |
+| calc  p99      | **68 205 ms** | ceiling-saturated at the 60 s test window (single-shard FCALL contention) |
+| overall p99    | 67 096 ms     |                                                                      |
+
+This confirms the PARTIAL classification empirically: AC1 GREEN, AC2 ceiling-saturated due to single-shard concentration. Pre-teardown shard memory was 355.71 M used / 739.5 M peak (sticky) on both masters (`logs/shard-memory-pre-teardown.json`). The Wave 5.15o recommendation below stands unchanged.
+
 ## Wave 5.15n decision
 
 | Choice                                          | Value                                                |

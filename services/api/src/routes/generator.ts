@@ -22,6 +22,10 @@ interface GeneratorStartBody {
   classes?: string[];
   sensitivity_types?: string[];
   seed?: string | number;
+  // Wave 5.17a — HSBC reshape: optional pool sizes for aux-RNG trade_id and
+  // risk_factor fields. Defaults preserve smoke-run-16 byte-equivalence.
+  trade_pool_size?: number;
+  factor_pool_size?: number;
 }
 
 export interface GeneratorRoutesOpts {
@@ -99,9 +103,27 @@ export function registerGeneratorRoutes(
     const redis = getRedis();
     const target_label = getActiveTarget().label;
 
+    // Wave 5.17a — validate pool sizes if provided (1..10000 / 1..256).
+    const tradePool = body.trade_pool_size;
+    if (tradePool !== undefined) {
+      if (typeof tradePool !== "number" || !Number.isFinite(tradePool) || tradePool < 1 || tradePool > 10000) {
+        reply.code(400);
+        return { error: "trade_pool_size must be a number in 1..10000" };
+      }
+    }
+    const factorPool = body.factor_pool_size;
+    if (factorPool !== undefined) {
+      if (typeof factorPool !== "number" || !Number.isFinite(factorPool) || factorPool < 1 || factorPool > 256) {
+        reply.code(400);
+        return { error: "factor_pool_size must be a number in 1..256" };
+      }
+    }
+
     const generator = createRowGenerator(schema, {
       seed: body.seed,
       sensitivityTypes: sensitivity_types,
+      tradePoolSize: tradePool,
+      factorPoolSize: factorPool,
     });
     const producer = createStreamProducer(
       redis as unknown as Parameters<typeof createStreamProducer>[0],

@@ -18,15 +18,21 @@ beforeAll(() => {
 });
 
 describe("createRowGenerator (schema-driven, per-risk-class)", () => {
-  it("emits GIRR rows with risk_value as a 10-element JSON array (no row explosion)", () => {
+  it("emits GIRR rows with risk_value as a per-tenor JSON object (Wave 5.17a HSBC reshape)", () => {
     const gen = createRowGenerator(schema, { seed: 1 });
     const row = gen.generate("GIRR");
-    expect(Array.isArray(row.risk_value)).toBe(true);
-    expect((row.risk_value as number[]).length).toBe(10);
-    for (const v of row.risk_value as number[]) {
-      expect(typeof v).toBe("number");
-      expect(Number.isFinite(v)).toBe(true);
+    const tenorNodes = schema.risk_classes.GIRR!.tenor!.nodes;
+    const rv = row.risk_value as Record<string, number>;
+    expect(rv).toBeTypeOf("object");
+    expect(Array.isArray(rv)).toBe(false);
+    for (const t of tenorNodes) {
+      expect(typeof rv[t]).toBe("number");
+      expect(Number.isFinite(rv[t])).toBe(true);
     }
+    // Object keys cover the full tenor list (order doesn't matter for object
+    // membership; iteration order is preserved by both Lua and TS oracles
+    // via the explicit `tenors` substitution).
+    expect(Object.keys(rv).sort()).toEqual([...tenorNodes].sort());
   });
 
   it("emits GIRR rows whose tenor matches the schema's tenor.nodes (when ARRAY shape)", () => {
@@ -36,20 +42,50 @@ describe("createRowGenerator (schema-driven, per-risk-class)", () => {
     expect(Array.isArray(row.tenor) ? row.tenor : [row.tenor]).toEqual(tenorNodes);
   });
 
-  it("emits EQUITY rows with scalar risk_value and bucket from the EQUITY bucket scheme", () => {
+  it("emits EQUITY rows with { spot } risk_value object and bucket from the EQUITY bucket scheme", () => {
     const gen = createRowGenerator(schema, { seed: 7 });
     const row = gen.generate("EQUITY");
-    expect(typeof row.risk_value).toBe("number");
+    const rv = row.risk_value as { spot: number };
+    expect(rv).toBeTypeOf("object");
+    expect(typeof rv.spot).toBe("number");
+    expect(Number.isFinite(rv.spot)).toBe(true);
     expect(schema.risk_classes.EQUITY!.buckets.values).toContain(row.bucket);
     expect(row.issuer).toBeTypeOf("string");
   });
 
-  it("emits FX rows whose bucket comes from the FX bucket-pair list", () => {
+  it("emits FX rows whose bucket comes from the FX bucket-pair list and risk_value is { spot }", () => {
     const gen = createRowGenerator(schema, { seed: 13 });
     const row = gen.generate("FX");
     expect(["USDEUR", "USDGBP", "USDJPY"]).toContain(row.bucket);
-    expect(typeof row.risk_value).toBe("number");
+    const rv = row.risk_value as { spot: number };
+    expect(rv).toBeTypeOf("object");
+    expect(typeof rv.spot).toBe("number");
     expect(row.pair).toBeTypeOf("string");
+  });
+
+  it("emits HSBC trade_id (T0001-style) and risk_factor (RF_<CLASS>_NN) on every row [Wave 5.17a]", () => {
+    const gen = createRowGenerator(schema, { seed: 5 });
+    for (const cls of ["GIRR", "EQUITY", "FX"] as const) {
+      const row = gen.generate(cls);
+      expect(String(row.trade_id)).toMatch(/^T\d{4,}$/);
+      expect(String(row.risk_factor)).toMatch(/^RF_(GIRR|EQUITY|FX)_[A-Z0-9_]+$/);
+    }
+  });
+
+  it("aux-RNG isolation: changing trade_pool_size / factor_pool_size does NOT shift risk_value numbers [Wave 5.17a]", () => {
+    const a = createRowGenerator(schema, { seed: 99 });
+    const b = createRowGenerator(schema, { seed: 99, tradePoolSize: 1, factorPoolSize: 1 });
+    for (let i = 0; i < 30; i++) {
+      const ra = a.generate("GIRR");
+      const rb = b.generate("GIRR");
+      // risk_value, weight, bucket, sensitivity_type must all be identical —
+      // only trade_id / risk_factor may differ because they draw from a
+      // separate aux RNG seeded with `<seed>:aux`.
+      expect(rb.risk_value).toEqual(ra.risk_value);
+      expect(rb.bucket).toEqual(ra.bucket);
+      expect(rb.sensitivity_type).toEqual(ra.sensitivity_type);
+      expect(rb.weight).toEqual(ra.weight);
+    }
   });
 
   it("includes every dimension named in the risk class's dimensions list (and excludes others)", () => {
@@ -99,8 +135,10 @@ describe("createRowGenerator (schema-driven, per-risk-class)", () => {
   it("re-binds to a swapped schema with zero code changes — proves schema-driven contract", () => {
     const gen = createRowGenerator(swapSchema, { seed: 1 });
     const row = gen.generate("FX");
-    // swap-schema gives FX a `spread` field and a NUMERIC (not array) risk_value
-    expect(typeof row.risk_value).toBe("number");
+    // Wave 5.17a — swap-schema's NUMERIC risk_value is now wrapped as { spot }.
+    const rv = row.risk_value as { spot: number };
+    expect(rv).toBeTypeOf("object");
+    expect(typeof rv.spot).toBe("number");
     expect(row).toHaveProperty("spread");
     expect(typeof row.spread).toBe("number");
     // and removes `pair`-only behaviour — only bucket scheme dictates pair-naming
@@ -229,8 +267,13 @@ describe("createRowGenerator — Curvature shape A (Wave 5.16d)", () => {
     for (let i = 0; i < 200; i++) {
       const row = gen.generate("GIRR");
       expect(row.sensitivity_type).not.toBe("Curvature");
-      // And risk_value stays the legacy array shape (NOT { cvr_up, cvr_down }).
-      expect(Array.isArray(row.risk_value)).toBe(true);
+      // Wave 5.17a — Delta/Vega risk_value is now a per-tenor object (NOT
+      // `{ cvr_up, cvr_down }` Curvature shape). Verify the per-tenor object
+      // form rather than the legacy array form.
+      const rv = row.risk_value as Record<string, unknown>;
+      expect(rv).toBeTypeOf("object");
+      expect(Array.isArray(rv)).toBe(false);
+      expect((rv as { cvr_up?: unknown }).cvr_up).toBeUndefined();
     }
   });
 });

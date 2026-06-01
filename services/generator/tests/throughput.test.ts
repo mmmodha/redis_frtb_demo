@@ -21,13 +21,17 @@ describe("row generation throughput", () => {
     const classes = ["GIRR", "EQUITY", "FX"];
     const N = 100_000;
     const start = process.hrtime.bigint();
-    let girrArrays = 0;
+    let girrPerTenor = 0;
     for (let i = 0; i < N; i++) {
       const row = gen.generate(classes[i % classes.length]!);
-      if (Array.isArray(row.risk_value)) girrArrays += 1;
+      // Wave 5.17a — GIRR risk_value is now a per-tenor object (was array).
+      const rv = row.risk_value;
+      if (rv && typeof rv === "object" && !Array.isArray(rv) && "3M" in rv) {
+        girrPerTenor += 1;
+      }
     }
     const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
-    expect(girrArrays).toBeGreaterThan(N / 4); // ~1/3 of rows are GIRR (array)
+    expect(girrPerTenor).toBeGreaterThan(N / 4); // ~1/3 of rows are GIRR (per-tenor object)
     expect(elapsedMs).toBeLessThan(1000);
   });
 });

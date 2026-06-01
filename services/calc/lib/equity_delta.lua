@@ -34,7 +34,17 @@ local function _eq_delta_iter_bucket(risk_class, bucket, w)
       if raw then
         local ok, doc = pcall(cjson.decode, raw)
         if ok and type(doc) == 'table' and doc.sensitivity_type == 'Delta' then
-          local s = tonumber(doc.risk_value)
+          -- Wave 5.17a — Equity Delta risk_value reshape: production rows
+          -- emit `{ spot: number }`; legacy / test fixtures may still emit a
+          -- bare number. Read both shapes; rng-isolated reshape preserves
+          -- the underlying numeric value byte-for-byte.
+          local rv = doc.risk_value
+          local s
+          if type(rv) == 'number' then
+            s = rv
+          elseif type(rv) == 'table' then
+            s = tonumber(rv.spot)
+          end
           if s then
             local ws = w * s
             sum_ws = sum_ws + ws

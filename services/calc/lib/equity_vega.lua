@@ -31,7 +31,15 @@ local function _eq_vega_iter_bucket(risk_class, bucket, w)
       if raw then
         local ok, doc = pcall(cjson.decode, raw)
         if ok and type(doc) == 'table' and doc.sensitivity_type == 'Vega' then
-          local s = tonumber(doc.risk_value)
+          -- Wave 5.17a — see equity_delta.lua note. risk_value is `{ spot }`
+          -- in production; bare number tolerated for legacy / test fixtures.
+          local rv = doc.risk_value
+          local s
+          if type(rv) == 'number' then
+            s = rv
+          elseif type(rv) == 'table' then
+            s = tonumber(rv.spot)
+          end
           if s then
             local ws = w * s
             sum_ws = sum_ws + ws
