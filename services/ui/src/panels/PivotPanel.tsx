@@ -34,6 +34,8 @@ export function PivotPanel(): JSX.Element {
   const [result, setResult] = useState<PivotResp | null>(null);
   const [serverMs, setServerMs] = useState<number[]>([]);
   const [clientMs, setClientMs] = useState<number[]>([]);
+  // Wave 5.21d — Run 100x progress. Non-null only while a burst is in flight.
+  const [burst, setBurst] = useState<{ done: number; total: number } | null>(null);
 
   const buckets = useMemo<string[]>(() => BUCKETS_BY_RISK_CLASS[riskClass] ?? [], [riskClass]);
 
@@ -42,7 +44,7 @@ export function PivotPanel(): JSX.Element {
     setBucket("");
   }
 
-  async function runAt(nextOffset: number): Promise<void> {
+  async function runAt(nextOffset: number): Promise<boolean> {
     setError(null);
     setEmptyError(null);
     setLoading(true);
@@ -70,6 +72,7 @@ export function PivotPanel(): JSX.Element {
       setOffset(nextOffset);
       setServerMs((prev) => [...prev.slice(-(HIST_WINDOW - 1)), body.ms]);
       setClientMs((prev) => [...prev.slice(-(HIST_WINDOW - 1)), Math.round((t1 - t0) * 1000) / 1000]);
+      return true;
     } catch (e) {
       if (e instanceof EmptyTargetError) {
         setEmptyError(e);
@@ -78,6 +81,7 @@ export function PivotPanel(): JSX.Element {
         setError(msg);
       }
       setResult(null);
+      return false;
     } finally {
       setLoading(false);
     }
@@ -89,9 +93,18 @@ export function PivotPanel(): JSX.Element {
   }
 
   async function runBurst(n: number): Promise<void> {
+    setBurst({ done: 0, total: n });
     for (let i = 0; i < n; i++) {
-      await runAt(0);
+      const ok = await runAt(0);
+      if (!ok) {
+        // Wave 5.21d — bar disappears on failure; the existing error banner
+        // (or empty-target callout) takes over.
+        setBurst(null);
+        return;
+      }
+      setBurst({ done: i + 1, total: n });
     }
+    setBurst(null);
   }
 
   const hasPrev = result !== null && offset > 0;
@@ -108,11 +121,11 @@ export function PivotPanel(): JSX.Element {
         title="Filters"
         actions={
           <>
-            <button type="button" onClick={() => void runAt(0)} disabled={loading}>
-              {loading ? "Running…" : "Run query"}
+            <button type="button" onClick={() => void runAt(0)} disabled={loading || burst !== null}>
+              {loading || burst !== null ? "Running…" : "Run query"}
             </button>
-            <button type="button" onClick={() => void runBurst(100)} disabled={loading}>
-              Run 100x
+            <button type="button" onClick={() => void runBurst(100)} disabled={loading || burst !== null}>
+              {burst !== null ? `Running ${burst.done} / ${burst.total}…` : "Run 100x"}
             </button>
           </>
         }
@@ -165,6 +178,27 @@ export function PivotPanel(): JSX.Element {
           />
         </form>
       </PanelCard>
+
+      {burst !== null && (
+        <div className="pivot-burst" data-testid="pivot-burst-progress">
+          <div
+            className="pivot-burst__bar"
+            role="progressbar"
+            aria-label="Burst progress"
+            aria-valuemin={0}
+            aria-valuemax={burst.total}
+            aria-valuenow={burst.done}
+          >
+            <div
+              className="pivot-burst__fill"
+              style={{ width: `${burst.total > 0 ? (burst.done / burst.total) * 100 : 0}%` }}
+            />
+          </div>
+          <span className="pivot-burst__label" aria-live="polite">
+            Running {burst.done} / {burst.total}…
+          </span>
+        </div>
+      )}
 
       {result !== null && result.ms < 100 && (
         <div data-testid="sub-100ms-callout" className="pivot-sub100" role="status">

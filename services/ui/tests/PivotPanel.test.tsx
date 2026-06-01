@@ -266,6 +266,63 @@ describe("PivotPanel", () => {
     await waitFor(() => expect(burst).toBeEnabled());
   });
 
+  it("Run 100x shows a progressbar that advances and disappears on completion", async () => {
+    // Wave 5.21d — burst progress feedback. A small per-call delay keeps the
+    // 100-iteration loop wider than waitFor's polling window so intermediate
+    // aria-valuenow snapshots are observable.
+    fetchMock.mockImplementation(
+      () =>
+        new Promise((r) =>
+          setTimeout(() => r({ ok: true, json: async () => pivotResponse({ ms: 5 }) }), 1),
+        ),
+    );
+    renderPanel();
+    const burstBtn = screen.getByRole("button", { name: /run 100x/i });
+    fireEvent.click(burstBtn);
+    const bar = await screen.findByRole("progressbar", { name: /burst progress/i });
+    expect(bar).toHaveAttribute("aria-valuemin", "0");
+    expect(bar).toHaveAttribute("aria-valuemax", "100");
+    // both action buttons stay disabled while the burst is running
+    expect(burstBtn).toBeDisabled();
+    expect(screen.getByRole("button", { name: /running…/i })).toBeDisabled();
+    // aria-valuenow advances as iterations complete; numeric label tracks it
+    await waitFor(() => {
+      const v = Number(bar.getAttribute("aria-valuenow"));
+      expect(v).toBeGreaterThan(0);
+      const progress = screen.getByTestId("pivot-burst-progress");
+      expect(within(progress).getByText(new RegExp(`Running ${v} \\/ 100…`))).toBeInTheDocument();
+    });
+    // bar disappears once the burst completes
+    await waitFor(
+      () => expect(screen.queryByRole("progressbar", { name: /burst progress/i })).toBeNull(),
+      { timeout: 5000 },
+    );
+    await waitFor(() => expect(burstBtn).toBeEnabled());
+  });
+
+  it("Run 100x burst stops and hides the progressbar when an iteration returns HTTP 500", async () => {
+    // Wave 5.21d — mid-burst failure: iterations 1 and 2 succeed, iteration 3
+    // returns 500. The burst halts, the bar disappears, and the existing error
+    // banner takes over.
+    fetchMock
+      .mockResolvedValueOnce({ ok: true, json: async () => pivotResponse({ ms: 5 }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => pivotResponse({ ms: 5 }) })
+      .mockResolvedValueOnce({ ok: false, status: 500, json: async () => ({ error: "boom" }) });
+    renderPanel();
+    fireEvent.click(screen.getByRole("button", { name: /run 100x/i }));
+    const err = await screen.findByRole("alert");
+    expect(err).toHaveTextContent(/500|failed/i);
+    await waitFor(() =>
+      expect(screen.queryByRole("progressbar", { name: /burst progress/i })).toBeNull(),
+    );
+    // Loop halted on the failing iteration — no further pivot requests fire.
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    // Both buttons are re-enabled so the user can retry.
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /run 100x/i })).toBeEnabled(),
+    );
+  });
+
   it("renders a <100ms 'sub-100ms' callout on the first successful run when server ms < 100", async () => {
     fetchMock.mockResolvedValueOnce({ ok: true, json: async () => pivotResponse({ ms: 7.5 }) });
     renderPanel();

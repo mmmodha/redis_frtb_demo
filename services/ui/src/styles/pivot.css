@@ -1,2 +1,27 @@
 /* Pivot panel styles. Reserved for panel-specific rules; shared primitives
    (panel-card, metric-tile, btn) live in shell.css. */
+
+/* Wave 5.21d — Run 100x burst progress. Thin bar that sits below the Filters
+   card while a burst is in flight; mirrors the generator-form progress look. */
+.pivot-burst {
+  display: grid;
+  gap: 0.4rem;
+  margin: 0.25rem 0 0.5rem;
+}
+.pivot-burst__bar {
+  position: relative;
+  width: 100%;
+  height: 8px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.pivot-burst__fill {
+  height: 100%;
+  background: var(--redis-hyper, #ff4438);
+  transition: width 120ms linear;
+}
+.pivot-burst__label {
+  font-size: 0.85em;
+  color: var(--redis-text-secondary);
+}
