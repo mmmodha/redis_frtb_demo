@@ -7,3 +7,5 @@ export { ActiveTargetPill } from "./ActiveTargetPill";
 export type { ActiveTargetState, ActiveTargetPillProps } from "./ActiveTargetPill";
 export { ShardMetricsStrip } from "./ShardMetricsStrip";
 export type { Shard as ShardMetric, ShardMetricsStripProps } from "./ShardMetricsStrip";
+export { Sparkline } from "./Sparkline";
+export type { SparklineProps } from "./Sparkline";

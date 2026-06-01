@@ -8,6 +8,7 @@ import {
   checkEmptyTargetError,
   readErrorBody,
 } from "../lib/empty-target";
+import type { PivotResp } from "../lib/pivot";
 
 const RISK_CLASSES = [
   "GIRR",
@@ -32,9 +33,6 @@ const BUCKETS_BY_RISK_CLASS: Record<string, string[]> = {
 const SENSITIVITY_TYPES = ["", "Delta", "Vega", "Curvature"] as const;
 const DEFAULT_LIMIT = 100;
 const HIST_WINDOW = 100;
-
-type PivotRow = { key: string; doc: Record<string, unknown> };
-type PivotResp = { total: number; limit: number; offset: number; ms: number; rows: PivotRow[] };
 
 function percentile(values: number[], p: number): number {
   if (values.length === 0) return 0;

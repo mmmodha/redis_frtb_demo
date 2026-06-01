@@ -6,7 +6,7 @@
 import { apiBase } from "./api";
 import { buildApiError } from "./empty-target";
 
-export type SensitivityType = "Delta" | "Vega";
+export type SensitivityType = "Delta" | "Vega" | "Curvature";
 
 export interface CalcSbmRequest {
   risk_class: string;
