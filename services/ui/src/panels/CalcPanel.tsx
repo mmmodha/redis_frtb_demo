@@ -44,6 +44,62 @@ function shardsFromResponse(r: CalcSbmResponse): ShardTiming[] {
   }));
 }
 
+// Wave 5.16n: on standalone Redis (single shard, sub-ms FCALL) the per-shard
+// panel is all-zero noise — suppress unless there's something to look at.
+function hasMeaningfulShardTiming(r: CalcSbmResponse): boolean {
+  if (r.shard_breakdown.length <= 1) return false;
+  return r.shard_breakdown.some((s) => (s.ms ?? 0) > 0);
+}
+
+function bucketToneFor(share: number): Tone {
+  if (share > 0.4) return "red";
+  if (share >= 0.2) return "amber";
+  return "green";
+}
+
+// Wave 5.16n: at-a-glance capital-concentration chart. K_b descending,
+// per-bucket horizontal bars mirroring TimingStrip's scaleX pattern.
+function BucketChargeChart({ buckets }: { buckets: BucketResult[] }) {
+  if (buckets.length === 0) {
+    return <div className="bucket-chart__empty">no buckets yet</div>;
+  }
+  const sorted = [...buckets].sort((a, b) => b.K_b - a.K_b);
+  const maxK = Math.max(...sorted.map((b) => b.K_b), 1);
+  const totalK = sorted.reduce((acc, b) => acc + b.K_b, 0);
+  return (
+    <div className="bucket-chart" role="list" data-testid="bucket-chart">
+      {sorted.map((b) => {
+        const share = totalK > 0 ? b.K_b / totalK : 0;
+        const tone = bucketToneFor(share);
+        const sBSign = b.S_b >= 0 ? "+" : "";
+        return (
+          <div
+            className="bucket-chart__row"
+            role="listitem"
+            key={b.bucket}
+            data-testid="bucket-chart-row"
+            data-bucket={b.bucket}
+          >
+            <span className="bucket-chart__label">{b.bucket}</span>
+            <div className="bucket-chart__bar" aria-hidden="true">
+              <div
+                className="bucket-chart__bar-fill"
+                data-tone={tone}
+                style={{ transform: `scaleX(${Math.max(b.K_b / maxK, 0.02)})` }}
+              />
+            </div>
+            <span className="bucket-chart__value">{formatCharge(b.K_b)}</span>
+            <span className="bucket-chart__meta">
+              {b.count} sens · S_b {sBSign}
+              {b.S_b.toFixed(2)}
+            </span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 export function CalcPanel() {
   const [riskClass, setRiskClass] = useState<RiskClass>("GIRR");
   const [sensitivityType, setSensitivityType] = useState<SensitivityType>("Delta");
@@ -187,11 +243,17 @@ function CalcResult({
         </div>
       </PanelCard>
 
-      <PanelCard title="Per-shard timing">
-        <TimingStrip shards={shardsFromResponse(result)} />
-      </PanelCard>
+      {hasMeaningfulShardTiming(result) ? (
+        <PanelCard title="Per-shard timing">
+          <TimingStrip shards={shardsFromResponse(result)} />
+        </PanelCard>
+      ) : null}
 
       {result.commands ? <CommandsPanel commands={result.commands} /> : null}
+
+      <PanelCard title="Per-bucket K_b (capital concentration)">
+        <BucketChargeChart buckets={result.per_bucket} />
+      </PanelCard>
 
       <PanelCard title="Per-bucket breakdown">
         <table aria-label="per-bucket K_b breakdown" className="calc-panel__table">

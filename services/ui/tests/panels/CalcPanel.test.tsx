@@ -196,4 +196,74 @@ describe("<CalcPanel />", () => {
     expect(screen.queryByRole("heading", { name: /redis commands executed/i })).toBeNull();
     expect(screen.queryByTestId("redis-commands")).toBeNull();
   });
+
+  // Wave 5.16n: standalone Redis has a single shard with sub-ms FCALL, so
+  // per-shard timing is noise — suppress the panel entirely in that case.
+  it("Wave 5.16n: suppresses the per-shard timing panel on standalone (single shard / all zero ms)", async () => {
+    const standalone: CalcSbmResponse = {
+      ...baseResponse,
+      shard_breakdown: [{ shard: "shard-1", buckets: ["USD-IRS", "EUR-IRS", "JPY-IRS"], ms: 0 }],
+    };
+    mockCalcResponse(standalone);
+    render(<CalcPanel />);
+    fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
+    await waitFor(() => expect(screen.getByTestId("calc-charge")).toBeInTheDocument());
+    expect(screen.queryByText(/per-shard timing/i)).toBeNull();
+  });
+
+  it("Wave 5.16n: still renders the per-shard timing panel on multi-shard cluster with non-zero ms", async () => {
+    mockCalcResponse(baseResponse);
+    render(<CalcPanel />);
+    fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
+    await waitFor(() => expect(screen.getByTestId("calc-charge")).toBeInTheDocument());
+    expect(screen.getByText(/per-shard timing/i)).toBeInTheDocument();
+  });
+
+  it("Wave 5.16n: renders the per-bucket K_b chart sorted by K_b descending alongside the table", async () => {
+    const varied: CalcSbmResponse = {
+      ...baseResponse,
+      per_bucket: [
+        { bucket: "EUR-IRS", K_b: 100, S_b: 90, count: 2500, ms: 7 },
+        { bucket: "USD-IRS", K_b: 200, S_b: 180, count: 5000, ms: 12 },
+        { bucket: "JPY-IRS", K_b: 50, S_b: 45, count: 1000, ms: 5 },
+      ],
+    };
+    mockCalcResponse(varied);
+    render(<CalcPanel />);
+    fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
+    await waitFor(() => expect(screen.getByTestId("bucket-chart")).toBeInTheDocument());
+    const chart = screen.getByTestId("bucket-chart");
+    const table = screen.getByRole("table", { name: /per-bucket/i });
+    for (const name of ["USD-IRS", "EUR-IRS", "JPY-IRS"]) {
+      expect(within(chart).getByText(name)).toBeInTheDocument();
+      expect(within(table).getByText(name)).toBeInTheDocument();
+    }
+    const chartOrder = within(chart)
+      .getAllByTestId("bucket-chart-row")
+      .map((r) => r.getAttribute("data-bucket"));
+    expect(chartOrder[0]).toBe("USD-IRS");
+    expect(chartOrder).toEqual(["USD-IRS", "EUR-IRS", "JPY-IRS"]);
+  });
+
+  it("Wave 5.16n: tones the dominant bucket bar red when its K_b share exceeds 40%", async () => {
+    const skewed: CalcSbmResponse = {
+      ...baseResponse,
+      per_bucket: [
+        { bucket: "USD-IRS", K_b: 100, S_b: 90, count: 5000, ms: 12 },
+        { bucket: "EUR-IRS", K_b: 60, S_b: 50, count: 2500, ms: 7 },
+        { bucket: "JPY-IRS", K_b: 40, S_b: 30, count: 1000, ms: 5 },
+      ],
+    };
+    mockCalcResponse(skewed);
+    render(<CalcPanel />);
+    fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
+    await waitFor(() => expect(screen.getByTestId("bucket-chart")).toBeInTheDocument());
+    const chart = screen.getByTestId("bucket-chart");
+    const rows = within(chart).getAllByTestId("bucket-chart-row");
+    const usdRow = rows.find((r) => r.getAttribute("data-bucket") === "USD-IRS");
+    expect(usdRow).toBeDefined();
+    const fill = usdRow!.querySelector(".bucket-chart__bar-fill");
+    expect(fill).not.toBeNull();
+    expect(fill!.getAttribute("data-tone")).toBe("red");
+  });
 });
