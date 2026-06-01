@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { NavLink } from "react-router-dom";
 import { ActiveTargetPill, type ActiveTargetState } from "./ActiveTargetPill";
+import { LockoutBanner } from "./LockoutBanner";
 import { getActiveTarget, type ActiveTarget } from "../lib/connections";
 
 const SECTIONS = [
@@ -64,7 +65,10 @@ export function AppShell({ children }: AppShellProps) {
           <img src="/redis-logo.svg" alt="Redis" />
         </div>
       </nav>
-      <main className="app-shell__main">{children}</main>
+      <main className="app-shell__main">
+        <LockoutBanner />
+        {children}
+      </main>
     </div>
   );
 }

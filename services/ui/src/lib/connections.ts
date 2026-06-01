@@ -109,7 +109,39 @@ export async function testConnection(id: string): Promise<ConnectionTestResult> 
   return r as ConnectionTestResult;
 }
 
+// Wave 5.16z2 — typed error raised when the api refuses activation with a
+// 409 because the inflight registry is non-empty. The panel reads .inflight
+// to render a per-row "Cannot activate: N runs still in flight (…)" message.
+export interface InflightConflictItem {
+  id: string;
+  kind: string;
+  label: string;
+  started_at: number;
+}
+export class InflightConflictError extends Error {
+  inflight: InflightConflictItem[];
+  stale: InflightConflictItem[];
+  constructor(inflight: InflightConflictItem[], stale: InflightConflictItem[] = []) {
+    super(`inflight: ${JSON.stringify(inflight)}`);
+    this.name = "InflightConflictError";
+    this.inflight = inflight;
+    this.stale = stale;
+  }
+}
+
 export async function activateConnection(id: string): Promise<ConnectionProfile> {
-  const r = await sendJson<ConnectionProfile>(`/connections/${id}/activate`, "POST", {});
-  return r as ConnectionProfile;
+  const res = await fetch(`${apiBase()}/connections/${id}/activate`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  if (res.status === 409) {
+    let body: { inflight?: unknown; stale?: unknown } = {};
+    try { body = (await res.json()) as typeof body; } catch { /* ignore */ }
+    const inflight = Array.isArray(body.inflight) ? (body.inflight as InflightConflictItem[]) : [];
+    const stale = Array.isArray(body.stale) ? (body.stale as InflightConflictItem[]) : [];
+    throw new InflightConflictError(inflight, stale);
+  }
+  if (!res.ok) throw new Error(`api /connections/${id}/activate ${res.status}`);
+  return (await res.json()) as ConnectionProfile;
 }

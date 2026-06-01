@@ -8,11 +8,13 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { EnterpriseCallout } from "../components/EnterpriseCallout";
 import { PanelCard } from "../components/PanelCard";
+import { useInflight } from "../hooks/useInflight";
 import {
   activateConnection,
   createConnection,
   deleteConnection,
   getActiveTarget,
+  InflightConflictError,
   listConnections,
   testConnection,
   updateConnection,
@@ -21,6 +23,8 @@ import {
   type ConnectionProfile,
   type ConnectionTestResult,
 } from "../lib/connections";
+
+const LOCKOUT_TITLE = "Cannot switch targets while runs are in flight";
 
 type LoadState = "loading" | "data" | "error";
 type DialogMode = { kind: "closed" } | { kind: "add" } | { kind: "edit"; profile: ConnectionProfile };
@@ -61,6 +65,9 @@ export function ConnectionsPanel() {
   const [dialog, setDialog] = useState<DialogMode>({ kind: "closed" });
   const [testResults, setTestResults] = useState<Record<string, ConnectionTestResult | "pending">>({});
   const [actionBusy, setActionBusy] = useState<Record<string, boolean>>({});
+  const [rowError, setRowError] = useState<Record<string, string | null>>({});
+  const inflight = useInflight();
+  const lockedOut = inflight.count > 0;
 
   const refresh = useCallback(async (opts?: { autoTest?: boolean }) => {
     setState("loading");
@@ -144,6 +151,7 @@ export function ConnectionsPanel() {
 
   async function onActivate(id: string) {
     setActionBusy((s) => ({ ...s, [id]: true }));
+    setRowError((s) => ({ ...s, [id]: null }));
     try {
       await activateConnection(id);
       const t = await getActiveTarget().catch(() => null);
@@ -151,7 +159,14 @@ export function ConnectionsPanel() {
       // Notify the shell so the ActiveTargetPill can re-fetch.
       window.dispatchEvent(new CustomEvent("connections:active-changed"));
     } catch (e) {
-      setErrorMsg(`Activate failed: ${(e as Error).message}`);
+      if (e instanceof InflightConflictError) {
+        const labels = e.inflight.map((it) => it.label).join(", ");
+        const n = e.inflight.length;
+        const msg = `Cannot activate: ${n} run${n === 1 ? "" : "s"} still in flight${labels ? ` (${labels})` : ""}`;
+        setRowError((s) => ({ ...s, [id]: msg }));
+      } else {
+        setErrorMsg(`Activate failed: ${(e as Error).message}`);
+      }
     } finally {
       setActionBusy((s) => ({ ...s, [id]: false }));
     }
@@ -293,20 +308,23 @@ export function ConnectionsPanel() {
                       const unreachableReason = !active && !isReachable(tr)
                         ? (tr === "pending" ? "Testing connection…" : "Test the connection first")
                         : null;
-                      const hintId = unreachableReason ? `activate-hint-${p.id}` : undefined;
+                      const titleText = !active && lockedOut
+                        ? LOCKOUT_TITLE
+                        : unreachableReason;
+                      const hintId = titleText ? `activate-hint-${p.id}` : undefined;
                       return (
                         <>
                           <button
                             type="button"
                             onClick={() => void onActivate(p.id)}
-                            disabled={active || !!actionBusy[p.id] || !isReachable(tr)}
+                            disabled={active || !!actionBusy[p.id] || !isReachable(tr) || (!active && lockedOut)}
                             className={active ? "" : "btn--primary"}
-                            {...(unreachableReason ? { title: unreachableReason, "aria-describedby": hintId } : {})}
+                            {...(titleText ? { title: titleText, "aria-describedby": hintId } : {})}
                           >
                             {active ? "Activated" : "Activate"}
                           </button>
-                          {unreachableReason ? (
-                            <span id={hintId} className="visually-hidden">{unreachableReason}</span>
+                          {titleText ? (
+                            <span id={hintId} className="visually-hidden">{titleText}</span>
                           ) : null}
                         </>
                       );
@@ -320,6 +338,15 @@ export function ConnectionsPanel() {
                       Delete
                     </button>
                   </div>
+                  {rowError[p.id] ? (
+                    <p
+                      className="profile-card__row-error"
+                      role="alert"
+                      data-testid={`activate-error-${p.id}`}
+                    >
+                      {rowError[p.id]}
+                    </p>
+                  ) : null}
                 </li>
               );
             })}

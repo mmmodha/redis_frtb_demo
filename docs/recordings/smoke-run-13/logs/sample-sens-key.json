@@ -1,0 +1,27 @@
+{
+  "samples": {
+    "16.59.25.183:10395": [],
+    "18.117.107.213:10395": [
+      {
+        "key": "sens:{FX:GBPJPY}:01KSSH8EAC218HA3J4SPBEJJ1N",
+        "body": "{\"risk_class\":\"FX\",\"bucket\":\"GBPJPY\",\"risk_value\":0.980314,\"weight\":0.075,\"sensitivity_type\":\"Vega\",\"ccy_pair\":\"ccy_pair_fx_6\",\"desk\":\"desk_fx_57\",\"book\":\"book_fx_11\",\"fx_base_currency\":\"fx_base_currency_fx_8\",\"fx_quote_currency\":\"fx_quote_currency_fx_9\",\"fx_vol_type\":\"fx_vol_type_fx_1\",\"fx_moneyness\":90.2089,\"fx_option_maturity\":\"fx_option_maturity_fx_15\",\"fx_smile_dim\":\"fx_smile_dim_fx_14\"}"
+      },
+      {
+        "key": "sens:{FX:EURJPY}:01KSSH8GY5HQ1K9MDQ65QR6NQX",
+        "body": "{\"risk_class\":\"FX\",\"bucket\":\"EURJPY\",\"risk_value\":0.974161,\"weight\":0.075,\"sensitivity_type\":\"Delta\",\"ccy_pair\":\"ccy_pair_fx_7\",\"desk\":\"desk_fx_152\",\"book\":\"book_fx_10\",\"fx_base_currency\":\"fx_base_currency_fx_0\",\"fx_quote_currency\":\"fx_quote_currency_fx_14\",\"fx_vol_type\":\"fx_vol_type_fx_9\",\"fx_moneyness\":56.8693,\"fx_option_maturity\":\"fx_option_maturity_fx_4\",\"fx_smile_dim\":\"fx_smile_dim_fx_1\"}"
+      },
+      {
+        "key": "sens:{FX:USDCHF}:01KSSH80S2AZHREWS16FFPF1BZ",
+        "body": "{\"risk_class\":\"FX\",\"bucket\":\"USDCHF\",\"risk_value\":-0.127957,\"weight\":0.075,\"sensitivity_type\":\"Vega\",\"ccy_pair\":\"ccy_pair_fx_3\",\"desk\":\"desk_fx_152\",\"book\":\"book_fx_13\",\"fx_base_currency\":\"fx_base_currency_fx_7\",\"fx_quote_currency\":\"fx_quote_currency_fx_10\",\"fx_vol_type\":\"fx_vol_type_fx_4\",\"fx_moneyness\":22.0725,\"fx_option_maturity\":\"fx_option_maturity_fx_15\",\"fx_smile_dim\":\"fx_smile_dim_fx_7\"}"
+      }
+    ]
+  },
+  "scan_patterns": {
+    "16.59.25.183:10395|sens:{GIRR:JPY}:*": 0,
+    "16.59.25.183:10395|sens:{EQUITY:13}:*": 0,
+    "16.59.25.183:10395|sens:{FX:USDCHF}:*": 0,
+    "18.117.107.213:10395|sens:{GIRR:JPY}:*": 8173,
+    "18.117.107.213:10395|sens:{EQUITY:13}:*": 6968,
+    "18.117.107.213:10395|sens:{FX:USDCHF}:*": 8197
+  }
+}

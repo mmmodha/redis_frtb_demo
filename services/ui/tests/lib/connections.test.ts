@@ -14,6 +14,7 @@ import {
   deleteConnection,
   testConnection,
   activateConnection,
+  InflightConflictError,
 } from "../../src/lib/connections";
 
 const originalFetch = globalThis.fetch;
@@ -121,6 +122,28 @@ describe("lib/connections api client", () => {
     expect(p.id).toBe("01N");
     expect(calls[0]!.url).toMatch(/\/connections\/01N\/activate$/);
     expect(calls[0]!.init?.method).toBe("POST");
+  });
+
+  it("activateConnection throws InflightConflictError on 409 with parsed inflight+stale lists", async () => {
+    // Wave 5.16z2 — api refuses activation while runs are in flight; the
+    // client must surface the typed error so the panel can render a per-row
+    // \"N runs still in flight (…)\" message.
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      error: "in flight",
+      inflight: [
+        { id: "lg1", kind: "loadgen", label: "loadgen-1", started_at: 1 },
+        { id: "in3", kind: "ingest", label: "ingest-3", started_at: 2 },
+      ],
+      stale: [{ id: "stale-9", kind: "loadgen", label: "old", started_at: 0 }],
+    }), { status: 409, headers: { "content-type": "application/json" } })) as typeof fetch;
+    let caught: unknown = null;
+    try { await activateConnection("01N"); } catch (e) { caught = e; }
+    expect(caught).toBeInstanceOf(InflightConflictError);
+    const err = caught as InflightConflictError;
+    expect(err.inflight).toHaveLength(2);
+    expect(err.inflight.map((i) => i.label)).toEqual(["loadgen-1", "ingest-3"]);
+    expect(err.stale).toHaveLength(1);
+    expect(err.stale[0]!.label).toBe("old");
   });
 
   it("throws on non-2xx responses (so the panel can show its error state)", async () => {

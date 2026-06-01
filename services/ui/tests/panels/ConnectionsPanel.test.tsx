@@ -27,6 +27,15 @@ vi.mock("../../src/components/EnterpriseCallout", () => ({
   ),
 }));
 
+// Wave 5.16z2 — control the useInflight hook from tests. Default snapshot is
+// count=0 so unrelated tests stay green; lockout tests mutate `mockInflight`
+// before rendering to drive the panel into the lockout state.
+let mockInflight: { count: number; items: any[]; stale: any[]; ready: boolean } =
+  { count: 0, items: [], stale: [], ready: true };
+vi.mock("../../src/hooks/useInflight", () => ({
+  useInflight: () => mockInflight,
+}));
+
 function profile(over: Partial<Record<string, unknown>> = {}) {
   return {
     id: "01J", name: "demo-cluster", host: "redis-1.lab", port: 12000,
@@ -49,6 +58,7 @@ describe("<ConnectionsPanel/>", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
+    mockInflight = { count: 0, items: [], stale: [], ready: true };
   });
 
   function routeJson(url: string | RegExp, method: string, body: unknown, status = 200) {
@@ -419,5 +429,61 @@ describe("<ConnectionsPanel/>", () => {
     expect(names[0]).toBe("zeta-cluster"); // ok:true → rank 0
     // Both remaining are unreachable (ok:false) → rank 2, tie-break by name
     expect(names.slice(1)).toEqual(["alpha-cluster", "mid-cluster"]);
+  });
+
+  it("Wave 5.16z2: disables non-active Activate when useInflight reports count>0", async () => {
+    mockInflight = {
+      count: 1,
+      items: [{ id: "lg1", kind: "loadgen", label: "loadgen-1", started_at: Date.now() }],
+      stale: [],
+      ready: true,
+    };
+    setRoutes(
+      routeJson(/\/redis\/active-target$/, "GET", { host: "other", port: 9, tls: false, db: 0, label: "other" }),
+      routeJson(/\/connections$/, "GET", [profile()]),
+      routeJson(/\/connections\/01J\/test$/, "POST", { ok: true, latency_ms: 4, modules: [], errors: [] }),
+    );
+    renderPanel();
+    await waitFor(() => expect(screen.getByTestId("test-result-01J")).toBeInTheDocument());
+    const btn = screen.getByRole("button", { name: /^Activate$/ }) as HTMLButtonElement;
+    // Even though the profile is reachable, the in-flight lockout keeps Activate disabled.
+    await waitFor(() => expect(btn.disabled).toBe(true));
+    expect(btn.title).toMatch(/in flight|target switching/i);
+  });
+
+  it("Wave 5.16z2: a 409 from activate surfaces a per-row error listing inflight items", async () => {
+    fetchMock.mockImplementation(async (input: RequestInfo, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      if (url.match(/\/redis\/active-target$/)) {
+        return new Response(JSON.stringify({ host: "other", port: 9, tls: false, db: 0, label: "other" }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (url.match(/\/connections$/) && method === "GET") {
+        return new Response(JSON.stringify([profile()]), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (url.match(/\/connections\/01J\/test$/) && method === "POST") {
+        return new Response(JSON.stringify({ ok: true, latency_ms: 4, modules: [], errors: [] }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (url.match(/\/connections\/01J\/activate$/) && method === "POST") {
+        return new Response(JSON.stringify({
+          error: "in flight",
+          inflight: [
+            { id: "lg1", kind: "loadgen", label: "loadgen-1", started_at: 1 },
+            { id: "in3", kind: "ingest", label: "ingest-3", started_at: 2 },
+          ],
+          stale: [],
+        }), { status: 409, headers: { "content-type": "application/json" } });
+      }
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    });
+    renderPanel();
+    const btn = await screen.findByRole("button", { name: /^Activate$/ }) as HTMLButtonElement;
+    await waitFor(() => expect(btn.disabled).toBe(false));
+    fireEvent.click(btn);
+    const errEl = await screen.findByTestId("activate-error-01J");
+    expect(errEl).toHaveTextContent(/cannot activate/i);
+    expect(errEl).toHaveTextContent(/2 runs still in flight/i);
+    expect(errEl).toHaveTextContent(/loadgen-1/);
+    expect(errEl).toHaveTextContent(/ingest-3/);
   });
 });
