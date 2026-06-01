@@ -56,3 +56,11 @@
 .profile-card__test-error { color: var(--redis-hyper); margin: 0; font-size: 0.8125rem; }
 .profile-card__actions { display: flex; gap: var(--grid); flex-wrap: wrap; }
 .profile-card__actions button { min-height: 36px; padding: 0 calc(var(--grid) * 1.5); border-radius: var(--radius); }
+.profile-card__warn {
+  display: flex; align-items: center; gap: var(--grid);
+  padding: var(--grid) calc(var(--grid) * 1.5);
+  background: #f0b429; color: var(--redis-bg-primary);
+  border-radius: var(--radius);
+  font-size: 0.875rem; font-weight: 500;
+}
+.profile-card__warn-icon { font-size: 1rem; line-height: 1; }

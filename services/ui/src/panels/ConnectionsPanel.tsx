@@ -271,6 +271,17 @@ export function ConnectionsPanel() {
                     </div>
                   ) : null}
 
+                  {!active && isConfirmedUnreachable(tr) ? (
+                    <div
+                      className="profile-card__warn"
+                      role="alert"
+                      data-testid={`activate-hint-${p.id}`}
+                    >
+                      <span className="profile-card__warn-icon" aria-hidden="true">⚠</span>
+                      <span>Unreachable — fix connection to activate</span>
+                    </div>
+                  ) : null}
+
                   <div className="profile-card__actions">
                     <button type="button" onClick={() => void onTest(p.id)} disabled={tr === "pending"}>
                       {tr === "pending" ? "Testing…" : "Test"}
@@ -278,16 +289,7 @@ export function ConnectionsPanel() {
                     <button type="button" onClick={() => setDialog({ kind: "edit", profile: p })}>
                       Edit
                     </button>
-                    {(() => {
-                      // Confirmed-unreachable (and not already active) hides the Activate button
-                      // entirely — a greyed-out button on a known-broken cluster is noisy UX.
-                      if (!active && isConfirmedUnreachable(tr)) {
-                        return (
-                          <span className="profile-card__activate-hint" data-testid={`activate-hint-${p.id}`}>
-                            Unreachable — fix connection to activate
-                          </span>
-                        );
-                      }
+                    {!active && isConfirmedUnreachable(tr) ? null : (() => {
                       const unreachableReason = !active && !isReachable(tr)
                         ? (tr === "pending" ? "Testing connection…" : "Test the connection first")
                         : null;

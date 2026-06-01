@@ -335,8 +335,15 @@ describe("<ConnectionsPanel/>", () => {
     await waitFor(() => expect(screen.getByTestId("test-result-01J")).toBeInTheDocument());
     // Confirmed-unreachable profiles render no Activate button at all.
     expect(screen.queryByRole("button", { name: /^Activate$/ })).toBeNull();
-    // A small muted hint takes its place.
-    expect(screen.getByTestId("activate-hint-01J")).toHaveTextContent(/unreachable/i);
+    // An amber warning banner (role=alert) sits ABOVE the action row and
+    // explains why activation is unavailable.
+    const banner = screen.getByTestId("activate-hint-01J");
+    expect(banner).toHaveTextContent(/unreachable/i);
+    expect(banner.getAttribute("role")).toBe("alert");
+    const card = screen.getAllByTestId("profile-card")[0]!;
+    const actions = card.querySelector(".profile-card__actions");
+    expect(actions).not.toBeNull();
+    expect(banner.compareDocumentPosition(actions!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
   it("hides the Activate button when a profile transitions from untested/pending to ok:false", async () => {
