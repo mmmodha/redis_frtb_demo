@@ -355,6 +355,63 @@
 .shard-tile__value { font-family: var(--font-mono); color: var(--redis-text-primary); font-weight: 600; }
 
 
+/* Wave 5.16z1: bootstrap overlay — full-width sticky banner at the top of
+   <main> while a target is bootstrapping (amber) or its bootstrap failed
+   (red). Renders nothing for idle/ready. Sits ABOVE .lockout-banner. */
+.bootstrap-overlay {
+  position: sticky;
+  top: 0;
+  z-index: 95;
+  display: flex;
+  align-items: center;
+  gap: var(--grid);
+  margin: 0 0 calc(var(--grid) * 2);
+  padding: calc(var(--grid) * 1.5) calc(var(--grid) * 2);
+  border-radius: var(--radius);
+  color: var(--redis-text-primary);
+  font-size: 0.9375rem;
+}
+.bootstrap-overlay--running {
+  background: rgba(240, 180, 41, 0.12);
+  border: 1px solid rgba(240, 180, 41, 0.55);
+  border-left: 3px solid #f0b429;
+}
+.bootstrap-overlay--running strong { color: #f0b429; }
+.bootstrap-overlay--failed {
+  background: rgba(220, 56, 45, 0.12);
+  border: 1px solid rgba(220, 56, 45, 0.55);
+  border-left: 3px solid #dc382d;
+}
+.bootstrap-overlay--failed strong { color: #dc382d; }
+.bootstrap-overlay__text { flex: 1; line-height: 1.4; }
+.bootstrap-overlay__retry-error {
+  margin-top: 4px;
+  font-size: 0.8125rem;
+  color: var(--redis-text-secondary);
+}
+
+/* Wave 5.16z1: small per-pill bootstrap phase dot, rendered next to the
+   ActiveTargetPill body while bootstrap is running/failed. */
+.active-target-pill__bootstrap-dot {
+  display: inline-block;
+  width: 8px; height: 8px; border-radius: 50%;
+  margin-left: 2px;
+  background: var(--redis-text-muted);
+}
+.active-target-pill__bootstrap-dot[data-phase="running"] {
+  background: #f0b429;
+  box-shadow: 0 0 0 3px rgba(240, 180, 41, 0.18);
+  animation: bootstrap-pulse 1200ms ease-in-out infinite;
+}
+.active-target-pill__bootstrap-dot[data-phase="failed"] { background: #dc382d; }
+@keyframes bootstrap-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .active-target-pill__bootstrap-dot { animation: none; }
+}
+
 /* Wave 5.16z2: in-flight lockout banner — amber tone sits below the
    bootstrap overlay slot and stays visible across panels while runs are in
    flight (sourced from /inflight). */

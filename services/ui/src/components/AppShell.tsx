@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { NavLink } from "react-router-dom";
 import { ActiveTargetPill, type ActiveTargetState } from "./ActiveTargetPill";
+import { BootstrapStatusOverlay } from "./BootstrapStatusOverlay";
 import { LockoutBanner } from "./LockoutBanner";
+import { useBootstrapStatus } from "../hooks/useBootstrapStatus";
 import { getActiveTarget, type ActiveTarget } from "../lib/connections";
 
 const SECTIONS = [
@@ -20,6 +22,7 @@ export interface AppShellProps {
 export function AppShell({ children }: AppShellProps) {
   const [target, setTarget] = useState<ActiveTarget | null>(null);
   const [state, setState] = useState<ActiveTargetState>("disconnected");
+  const { phase: bootstrapPhase } = useBootstrapStatus();
 
   const refreshTarget = useCallback(async () => {
     try {
@@ -46,7 +49,7 @@ export function AppShell({ children }: AppShellProps) {
         <span className="app-shell__brand">FRTB SBM</span>
         <span className="app-shell__brand-sub">· on Redis Enterprise</span>
         <div className="app-shell__header-spacer" />
-        <ActiveTargetPill target={target} state={state} />
+        <ActiveTargetPill target={target} state={state} bootstrapPhase={bootstrapPhase} />
       </header>
       <nav className="app-shell__nav" aria-label="Primary">
         <ul>
@@ -66,6 +69,7 @@ export function AppShell({ children }: AppShellProps) {
         </div>
       </nav>
       <main className="app-shell__main">
+        <BootstrapStatusOverlay />
         <LockoutBanner />
         {children}
       </main>

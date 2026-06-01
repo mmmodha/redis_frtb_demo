@@ -41,4 +41,42 @@ describe("<ActiveTargetPill/>", () => {
     const pill = screen.getByRole("status", { name: /active cluster/i });
     expect(pill).toHaveTextContent(/TLS/);
   });
+
+  // Wave 5.16z1 — small phase dot reflects bootstrap state.
+  it("renders an amber bootstrap dot when bootstrap is running", () => {
+    render(
+      <ActiveTargetPill
+        target={{ host: "redis-1.lab", port: 12000, tls: false, db: 0, label: "demo-cluster" }}
+        state="live"
+        bootstrapPhase="running"
+      />,
+    );
+    const dot = screen.getByTestId("active-target-pill-bootstrap-dot");
+    expect(dot.getAttribute("data-phase")).toBe("running");
+    expect(dot.getAttribute("aria-label")).toMatch(/bootstrap status: running/i);
+  });
+
+  it("renders a red bootstrap dot when bootstrap failed", () => {
+    render(
+      <ActiveTargetPill
+        target={{ host: "redis-1.lab", port: 12000, tls: false, db: 0, label: "demo-cluster" }}
+        state="live"
+        bootstrapPhase="failed"
+      />,
+    );
+    const dot = screen.getByTestId("active-target-pill-bootstrap-dot");
+    expect(dot.getAttribute("data-phase")).toBe("failed");
+    expect(dot.getAttribute("aria-label")).toMatch(/bootstrap status: failed/i);
+  });
+
+  it.each(["idle", "ready"] as const)("hides the bootstrap dot when phase=%s", (phase) => {
+    render(
+      <ActiveTargetPill
+        target={{ host: "redis-1.lab", port: 12000, tls: false, db: 0, label: "demo-cluster" }}
+        state="live"
+        bootstrapPhase={phase}
+      />,
+    );
+    expect(screen.queryByTestId("active-target-pill-bootstrap-dot")).toBeNull();
+  });
 });
