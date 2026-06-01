@@ -177,7 +177,8 @@ describe("IngestPanel", () => {
     });
   });
 
-  it("renders the synthetic generator card with a Generate button that POSTs /generator/start (Wave 5.17b)", async () => {
+  it("renders the synthetic generator card with a Generate button that POSTs /generator/start/stream (Wave 5.20c)", async () => {
+    const enc = new TextEncoder();
     fetchMock.mockImplementation(async (input: RequestInfo, init?: RequestInit) => {
       const url = String(input);
       const method = init?.method ?? "GET";
@@ -185,8 +186,15 @@ describe("IngestPanel", () => {
         return { ok: true, json: async () => [] };
       if (url.includes("/observability/keys")) return { ok: true, json: async () => keysResponse(0) };
       if (url.includes("/observability/memory")) return { ok: true, json: async () => memoryResponse(0) };
-      if (url.endsWith("/generator/start") && method === "POST")
-        return { ok: true, json: async () => ({ ok: true, rows_queued: 200, ms: 12, run_id: "01HX" }) };
+      if (url.endsWith("/generator/start/stream") && method === "POST") {
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(enc.encode(`data: ${JSON.stringify({ run_id: "01HX", done: true, rows_queued: 200, ms: 12, cancelled: false })}\n\n`));
+            controller.close();
+          },
+        });
+        return { ok: true, body };
+      }
       return { ok: true, json: async () => ({}) };
     });
     renderPanel();
@@ -194,7 +202,7 @@ describe("IngestPanel", () => {
     fireEvent.click(generateBtn);
     await waitFor(() => {
       const posted = fetchMock.mock.calls.find(
-        (c) => /\/generator\/start$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",
+        (c) => /\/generator\/start\/stream$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",
       );
       expect(posted).toBeDefined();
     });

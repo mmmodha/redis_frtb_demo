@@ -10,11 +10,13 @@ import {
 } from "../lib/api";
 import {
   listSources,
-  startGenerator,
+  startGeneratorStream,
   startIngest,
   type GeneratorConfig,
-  type GeneratorStartResponse,
+  type GeneratorStreamHandle,
+  type ProgressFrame,
   type Source,
+  type TerminalFrame,
 } from "../lib/ingest";
 
 // Wave 5.20a — defensive fallback when dbsize=0 (no rows yet) so the sanity
@@ -328,6 +330,19 @@ function fmtMB(n: number): string {
 // Wave 5.20a — adds a primary "Generate 200 rows" button (empty-body post,
 // api applies its DEFAULT_ROWS / DEFAULT_CLASSES / DEFAULT_SENSITIVITY_TYPES)
 // and a pre-submit sanity-check modal that prevents OOMs.
+// Wave 5.20c — generator run progress + terminal state. Drives the
+// progress bar (running / cancelling) and the post-run success/cancelled
+// summary line.
+interface RunState {
+  rowsTotal: number;
+  rowsDone: number;
+  elapsedMs: number;
+  rowsPerSec: number;
+  runId: string | null;
+  status: "running" | "cancelling" | "done" | "cancelled" | "error";
+  terminalMs?: number;
+}
+
 function SyntheticGeneratorCard() {
   const [rows, setRows] = useState<number>(DEFAULT_GEN_ROWS);
   const [classes, setClasses] = useState<Set<string>>(() => new Set(GENERATOR_CLASSES));
@@ -337,7 +352,8 @@ function SyntheticGeneratorCard() {
   const [factorPool, setFactorPool] = useState<number>(DEFAULT_GEN_FACTOR_POOL);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [result, setResult] = useState<GeneratorStartResponse | null>(null);
+  const [run, setRun] = useState<RunState | null>(null);
+  const streamRef = useRef<GeneratorStreamHandle | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [pending, setPending] = useState<PendingSubmit | null>(null);
 
@@ -365,32 +381,73 @@ function SyntheticGeneratorCard() {
     return cfg;
   }
 
-  async function postGenerator(cfg: GeneratorConfig | null) {
+  // Wave 5.20c — streaming generator run. Drives the live progress bar and
+  // the post-run summary line via SSE frames. setBusy is flipped off only
+  // when the terminal frame (or an error) arrives.
+  function postGenerator(cfg: GeneratorConfig | null): void {
     setBusy(true);
-    try {
-      const r = await startGenerator(cfg ?? undefined);
-      setResult(r);
-    } catch (err) {
-      setError((err as Error).message);
-    } finally {
-      setBusy(false);
-    }
+    setError(null);
+    const initialRows = cfg?.rows ?? DEFAULT_GEN_ROWS;
+    setRun({
+      rowsTotal: initialRows,
+      rowsDone: 0,
+      elapsedMs: 0,
+      rowsPerSec: 0,
+      runId: null,
+      status: "running",
+    });
+    const handle = startGeneratorStream(cfg ?? undefined, {
+      onProgress: (f: ProgressFrame) => {
+        setRun((prev) => {
+          if (!prev || prev.status === "done" || prev.status === "cancelled" || prev.status === "error") return prev;
+          return {
+            rowsTotal: f.rows_total,
+            rowsDone: f.rows_done,
+            elapsedMs: f.elapsed_ms,
+            rowsPerSec: f.rows_per_sec,
+            runId: f.run_id,
+            status: prev.status, // preserve "cancelling" if user already clicked cancel
+          };
+        });
+      },
+      onTerminal: (f: TerminalFrame) => {
+        setRun({
+          rowsTotal: f.rows_queued,
+          rowsDone: f.rows_queued,
+          elapsedMs: f.ms,
+          rowsPerSec: 0,
+          runId: f.run_id,
+          status: f.cancelled ? "cancelled" : "done",
+          terminalMs: f.ms,
+        });
+        if (f.error) setError(f.error);
+        streamRef.current = null;
+        setBusy(false);
+      },
+      onError: (e: Error) => {
+        setError(e.message);
+        setRun((prev) => (prev ? { ...prev, status: "error" } : prev));
+        streamRef.current = null;
+        setBusy(false);
+      },
+    });
+    streamRef.current = handle;
   }
 
   async function runWithSanityCheck(cfg: GeneratorConfig | null, rowsForCheck: number) {
     setError(null);
-    setResult(null);
+    setRun(null);
     let mem: ObservabilityMemoryResponse | null = null;
     try { mem = await getObservabilityMemory(); } catch { mem = null; }
     const est = mem ? computeSanity(rowsForCheck, mem) : null;
-    if (!est) { await postGenerator(cfg); return; }
+    if (!est) { postGenerator(cfg); return; }
     setPending({ cfg, rows: rowsForCheck, est });
   }
 
   async function onSubmit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     setError(null);
-    setResult(null);
+    setRun(null);
     const built = buildAdvancedConfig();
     if (typeof built === "string") { setError(built); return; }
     await runWithSanityCheck(built, built.rows ?? DEFAULT_GEN_ROWS);
@@ -404,18 +461,23 @@ function SyntheticGeneratorCard() {
     setSeed(String(Math.floor(Math.random() * 1_000_000_000)));
   }
 
-  function onModalCancel() { setPending(null); }
-  async function onModalProceed() {
-    const p = pending; setPending(null);
-    if (p) await postGenerator(p.cfg);
+  function onCancelRun(): void {
+    setRun((prev) => (prev && prev.status === "running" ? { ...prev, status: "cancelling" } : prev));
+    void streamRef.current?.cancel();
   }
-  async function onModalUseSuggested() {
+
+  function onModalCancel() { setPending(null); }
+  function onModalProceed() {
+    const p = pending; setPending(null);
+    if (p) postGenerator(p.cfg);
+  }
+  function onModalUseSuggested() {
     const p = pending; setPending(null);
     if (!p) return;
     const cfg: GeneratorConfig = p.cfg
       ? { ...p.cfg, rows: p.est.suggestedRows }
       : { rows: p.est.suggestedRows };
-    await postGenerator(cfg);
+    postGenerator(cfg);
   }
 
   return (
@@ -429,14 +491,7 @@ function SyntheticGeneratorCard() {
             onClick={onGenerateDefaults}
             data-testid="generator-defaults-btn"
           >
-            {busy ? (
-              <>
-                <span className="generator-form__spinner" aria-hidden="true">⟳</span>
-                Generating…
-              </>
-            ) : (
-              "Generate 200 rows"
-            )}
+            {busy ? "Generating…" : "Generate 200 rows"}
           </button>
           <span className="generator-form__hint">uses api defaults (200 rows · all classes · Delta+Vega)</span>
         </div>
@@ -540,25 +595,27 @@ function SyntheticGeneratorCard() {
 
           <div className="generator-form__actions">
             <button type="submit" className="btn btn--secondary" disabled={busy}>
-              {busy ? (
-                <>
-                  <span className="generator-form__spinner" aria-hidden="true">⟳</span>
-                  Generating…
-                </>
-              ) : (
-                "Generate"
-              )}
+              {busy ? "Generating…" : "Generate"}
             </button>
           </div>
         </div>
 
+        {run && (run.status === "running" || run.status === "cancelling") ? (
+          <GeneratorProgress run={run} onCancel={onCancelRun} />
+        ) : null}
         {error ? (
           <div className="generator-form__error" role="alert">{error}</div>
         ) : null}
-        {result && !error ? (
+        {run && run.status === "done" && !error ? (
           <div className="generator-form__status" data-testid="generator-status">
-            Generated {result.rows_queued} rows in {result.ms}ms
-            {result.run_id ? <> · run_id <code>{result.run_id}</code></> : null}
+            Done — {run.rowsDone} rows queued in {run.terminalMs ?? run.elapsedMs}ms
+            {run.runId ? <> · run_id <code>{run.runId}</code></> : null}
+          </div>
+        ) : null}
+        {run && run.status === "cancelled" ? (
+          <div className="generator-form__status generator-form__status--cancelled" data-testid="generator-status">
+            Cancelled — {run.rowsDone} rows queued in {run.terminalMs ?? run.elapsedMs}ms
+            {run.runId ? <> · run_id <code>{run.runId}</code></> : null}
           </div>
         ) : null}
       </form>
@@ -573,6 +630,50 @@ function SyntheticGeneratorCard() {
         />
       ) : null}
     </PanelCard>
+  );
+}
+
+// Wave 5.20c — live progress bar for a streaming generator run. Renders the
+// percentage, rows-done / rows-total, throughput, elapsed time, plus the
+// cancel button. The bar caps at 100% and switches to a "Cancelling…" label
+// once the user clicks cancel.
+function GeneratorProgress(props: { run: RunState; onCancel: () => void }) {
+  const { run, onCancel } = props;
+  const pct = run.rowsTotal > 0
+    ? Math.max(0, Math.min(100, (run.rowsDone / run.rowsTotal) * 100))
+    : 0;
+  const elapsedSec = (run.elapsedMs / 1000).toFixed(1);
+  const rps = Math.round(run.rowsPerSec);
+  const cancelling = run.status === "cancelling";
+  return (
+    <div className="generator-form__progress" data-testid="generator-progress" role="status" aria-live="polite">
+      <div
+        className="generator-form__progress-bar"
+        role="progressbar"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={Math.round(pct)}
+      >
+        <div className="generator-form__progress-fill" style={{ width: `${pct}%` }} />
+      </div>
+      <div className="generator-form__progress-meta">
+        <span data-testid="generator-progress-text">
+          {run.rowsDone.toLocaleString()} / {run.rowsTotal.toLocaleString()} rows ({Math.round(pct)}%)
+        </span>
+        <span className="generator-form__progress-stats">
+          {rps.toLocaleString()} rows/s · {elapsedSec}s
+        </span>
+        <button
+          type="button"
+          className="btn btn--secondary"
+          onClick={onCancel}
+          disabled={cancelling}
+          data-testid="generator-cancel-btn"
+        >
+          {cancelling ? "Cancelling…" : "Cancel"}
+        </button>
+      </div>
+    </div>
   );
 }
 

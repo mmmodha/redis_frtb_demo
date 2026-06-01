@@ -93,6 +93,10 @@ export interface CreateServerOpts {
   // SSE tick interval for /observability/shards/stream (default 1000ms). The
   // tests dial this down so the suite stays fast.
   sseIntervalMs?: number;
+  // Wave 5.20c — SSE progress-frame cadence for /generator/start/stream
+  // (default 200ms). Tests dial this down so cancellation lands before a
+  // small synthetic batch completes.
+  generatorSseProgressIntervalMs?: number;
   // Wave 5.16g — explicit override for the CORS allow-list. When unset the
   // server reads `ALLOWED_ORIGINS` from the environment (comma-separated, or
   // `*` for any origin) and falls back to http://localhost:3000 — the nginx
@@ -173,7 +177,9 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
   registerPivotRoute(app, getRedis);
   registerCalcRoute(app, getRedis, { correlations: opts.correlations ?? {} });
   registerObservabilityRoutes(app, getRedis, { sseIntervalMs: opts.sseIntervalMs });
-  registerGeneratorRoutes(app, getRedis, opts.schema);
+  registerGeneratorRoutes(app, getRedis, opts.schema, {
+    sseProgressIntervalMs: opts.generatorSseProgressIntervalMs,
+  });
 
   // Wave 5.16t — auto-bootstrap on every active-target change. The hook is
   // registered before the connections store so the very first profile-switch

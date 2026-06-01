@@ -36,6 +36,19 @@ function generatorCard() {
   return screen.getAllByTestId("panel-card").find((el) => el.getAttribute("data-title") === "Synthetic generator")!;
 }
 
+// Wave 5.20c — generator endpoint switched from POST /generator/start (JSON)
+// to POST /generator/start/stream (SSE). Mock returns a single terminal frame
+// so the streaming client resolves immediately.
+function sseBody(frames: unknown[]): ReadableStream<Uint8Array> {
+  const enc = new TextEncoder();
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const f of frames) controller.enqueue(enc.encode(`data: ${JSON.stringify(f)}\n\n`));
+      controller.close();
+    },
+  });
+}
+
 function mockFetch(memBody: Record<string, number> = {}, dbsize = 0) {
   const fetchMock = vi.fn();
   fetchMock.mockImplementation(async (input: RequestInfo, init?: RequestInit) => {
@@ -44,8 +57,8 @@ function mockFetch(memBody: Record<string, number> = {}, dbsize = 0) {
     if (url.endsWith("/sources") && method === "GET") return { ok: true, json: async () => [] };
     if (url.includes("/observability/keys")) return { ok: true, json: async () => keysResponse(dbsize) };
     if (url.includes("/observability/memory")) return { ok: true, json: async () => memoryResponse(memBody) };
-    if (url.endsWith("/generator/start") && method === "POST")
-      return { ok: true, json: async () => ({ ok: true, rows_queued: 200, ms: 5, run_id: "01HX" }) };
+    if (url.endsWith("/generator/start/stream") && method === "POST")
+      return { ok: true, body: sseBody([{ run_id: "01HX", done: true, rows_queued: 200, ms: 5, cancelled: false }]) };
     return { ok: true, json: async () => ({}) };
   });
   vi.stubGlobal("fetch", fetchMock);
@@ -107,19 +120,19 @@ describe("<IngestPanel /> synthetic generator (Wave 5.20a)", () => {
     expect(within(card).getByRole("button", { name: /generate 200 rows/i })).toBeInTheDocument();
   });
 
-  it("'Generate 200 rows' POSTs an empty body to /generator/start", async () => {
+  it("'Generate 200 rows' POSTs an empty body to /generator/start/stream", async () => {
     fetchMock = mockFetch();
     renderPanel();
     const card = await waitFor(() => generatorCard());
     fireEvent.click(within(card).getByRole("button", { name: /generate 200 rows/i }));
     await waitFor(() => {
       const posted = fetchMock.mock.calls.find(
-        (c) => /\/generator\/start$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",
+        (c) => /\/generator\/start\/stream$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",
       );
       expect(posted).toBeDefined();
     });
     const posted = fetchMock.mock.calls.find(
-      (c) => /\/generator\/start$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",
+      (c) => /\/generator\/start\/stream$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",
     )!;
     expect((posted[1] as RequestInit).body).toBe("{}");
   });
@@ -159,7 +172,7 @@ describe("<IngestPanel /> synthetic generator (Wave 5.20a)", () => {
     fireEvent.click(within(modal).getByRole("button", { name: /proceed/i }));
     await waitFor(() => {
       const posted = fetchMock.mock.calls.find(
-        (c) => /\/generator\/start$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",
+        (c) => /\/generator\/start\/stream$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",
       );
       expect(posted).toBeDefined();
     });
@@ -177,7 +190,7 @@ describe("<IngestPanel /> synthetic generator (Wave 5.20a)", () => {
     fireEvent.click(within(modal).getByRole("button", { name: /override/i }));
     await waitFor(() => {
       const posted = fetchMock.mock.calls.find(
-        (c) => /\/generator\/start$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",
+        (c) => /\/generator\/start\/stream$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",
       );
       expect(posted).toBeDefined();
     });
@@ -192,7 +205,7 @@ describe("<IngestPanel /> synthetic generator (Wave 5.20a)", () => {
     fireEvent.click(within(modal).getByRole("button", { name: /cancel/i }));
     await waitFor(() => expect(screen.queryByTestId("sanity-modal-block")).not.toBeInTheDocument());
     const posted = fetchMock.mock.calls.find(
-      (c) => /\/generator\/start$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",
+      (c) => /\/generator\/start(\/stream)?$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",
     );
     expect(posted).toBeUndefined();
   });
@@ -205,7 +218,7 @@ describe("<IngestPanel /> synthetic generator (Wave 5.20a)", () => {
     fireEvent.click(within(card).getByRole("button", { name: /generate 200 rows/i }));
     await waitFor(() => {
       const posted = fetchMock.mock.calls.find(
-        (c) => /\/generator\/start$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",
+        (c) => /\/generator\/start\/stream$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",
       );
       expect(posted).toBeDefined();
     });

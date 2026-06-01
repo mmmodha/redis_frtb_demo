@@ -71,3 +71,109 @@ export async function startGenerator(config?: GeneratorConfig): Promise<Generato
   }
   return (await res.json()) as GeneratorStartResponse;
 }
+
+// Wave 5.20c — streaming variant. Posts to /generator/start/stream, parses
+// SSE `data:` frames, and surfaces per-batch progress + a terminal frame to
+// the caller. Returns a handle whose .cancel() flips the server-side cancel
+// flag (via POST /generator/cancel/{run_id}) and aborts the fetch.
+export interface ProgressFrame {
+  run_id: string;
+  rows_done: number;
+  rows_total: number;
+  elapsed_ms: number;
+  rows_per_sec: number;
+}
+export interface TerminalFrame {
+  run_id: string;
+  done: true;
+  rows_queued: number;
+  ms: number;
+  cancelled: boolean;
+  error?: string;
+}
+export interface GeneratorStreamHandlers {
+  onProgress: (frame: ProgressFrame) => void;
+  onTerminal: (frame: TerminalFrame) => void;
+  onError: (err: Error) => void;
+}
+export interface GeneratorStreamHandle {
+  cancel: () => Promise<void>;
+}
+
+export function startGeneratorStream(
+  config: GeneratorConfig | undefined,
+  handlers: GeneratorStreamHandlers,
+): GeneratorStreamHandle {
+  const body = config ? JSON.stringify(config) : "{}";
+  const controller = new AbortController();
+  let runId: string | null = null;
+  let cancelledByClient = false;
+
+  void (async () => {
+    try {
+      const res = await fetch(`${apiBase()}/generator/start/stream`, {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "text/event-stream" },
+        body,
+        signal: controller.signal,
+      });
+      if (!res.ok || !res.body) {
+        let detail = `${res.status}`;
+        try {
+          const errBody = (await res.json()) as { error?: string };
+          if (errBody?.error) detail = `${res.status}: ${errBody.error}`;
+        } catch { /* not json */ }
+        throw new Error(`api /generator/start/stream ${detail}`);
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let idx: number;
+        while ((idx = buffer.indexOf("\n\n")) >= 0) {
+          const chunk = buffer.slice(0, idx);
+          buffer = buffer.slice(idx + 2);
+          for (const line of chunk.split("\n")) {
+            const m = /^data:\s?(.*)$/.exec(line);
+            if (!m) continue;
+            try {
+              const parsed = JSON.parse(m[1]!) as Record<string, unknown>;
+              if (typeof parsed.run_id === "string") runId = parsed.run_id;
+              if (parsed.done === true) handlers.onTerminal(parsed as unknown as TerminalFrame);
+              else handlers.onProgress(parsed as unknown as ProgressFrame);
+            } catch { /* skip malformed frame */ }
+          }
+        }
+      }
+    } catch (err) {
+      if (cancelledByClient) return;
+      const e = err as Error;
+      if (e?.name === "AbortError") return;
+      handlers.onError(e);
+    }
+  })();
+
+  return {
+    async cancel(): Promise<void> {
+      cancelledByClient = true;
+      if (runId) {
+        try { await cancelGenerator(runId); } catch { /* swallow — server may have already ended */ }
+      }
+      try { controller.abort(); } catch { /* noop */ }
+    },
+  };
+}
+
+export async function cancelGenerator(runId: string): Promise<void> {
+  const res = await fetch(`${apiBase()}/generator/cancel/${encodeURIComponent(runId)}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+  });
+  if (!res.ok && res.status !== 404) {
+    throw new Error(`api /generator/cancel/${runId} ${res.status}`);
+  }
+}
