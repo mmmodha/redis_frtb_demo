@@ -7,11 +7,14 @@
 import { apiBase } from "./api";
 import { buildApiError } from "./empty-target";
 
-// Sensitivity document body. Fields differ across risk classes / types:
-//   GIRR Delta|Vega: risk_value is number[] of 10 tenor weights.
+// Sensitivity document body. Fields differ across risk classes / types
+// (post-Wave 5.17a reshape — risk_value containers are objects, not arrays):
+//   GIRR Delta|Vega: risk_value is { "3M": n, "6M": n, ..., "30Y": n }
+//                    (tenor-keyed object; legacy number[] still accepted when
+//                    the generator falls back to its no-tenor-metadata path).
 //   GIRR Curvature:  risk_value is { cvr_up: number[]; cvr_down: number[] }.
-//   Equity|FX Delta|Vega:    risk_value is { spot: number } or scalar number.
-//   Equity|FX Curvature:     risk_value is { up: number; down: number }.
+//   Equity|FX Delta|Vega: risk_value is { spot: number } or scalar number.
+//   Equity|FX Curvature:  risk_value is { cvr_up: number; cvr_down: number }.
 // Treat everything optional; consumers branch on shape.
 export interface PivotDoc {
   trade_id?: string;

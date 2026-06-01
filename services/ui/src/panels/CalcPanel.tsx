@@ -618,6 +618,24 @@ function toFiniteArray(input: unknown): number[] {
   return input.map((v) => (typeof v === "number" && Number.isFinite(v) ? v : 0));
 }
 
+// Wave 5.21a: GIRR Delta/Vega risk_value is a tenor-keyed object since 5.17a
+// (`{ "3M": n, ..., "30Y": n }`). Drilldown sparklines need a positional array
+// in canonical tenor order. We also keep the legacy `number[]` fallback so the
+// generator's defensive array branch (missing tenor metadata) still renders.
+function extractTenorArray(rv: unknown, tenors: string[]): number[] {
+  if (rv && typeof rv === "object" && !Array.isArray(rv)) {
+    const obj = rv as Record<string, unknown>;
+    if (tenors.some((t) => t in obj)) {
+      return tenors.map((t) => {
+        const v = obj[t];
+        return typeof v === "number" && Number.isFinite(v) ? v : 0;
+      });
+    }
+    return [];
+  }
+  return toFiniteArray(rv);
+}
+
 function readScalar(rv: unknown, key: string): number | null {
   if (rv && typeof rv === "object" && key in (rv as Record<string, unknown>)) {
     const v = (rv as Record<string, unknown>)[key];
@@ -638,16 +656,10 @@ function DrilldownValueCell({
   const rv = doc.risk_value;
   if (riskClass === "GIRR") {
     if (sensitivityType === "Curvature") {
-      const up = toFiniteArray(
-        rv && typeof rv === "object" && "cvr_up" in (rv as Record<string, unknown>)
-          ? (rv as Record<string, unknown>).cvr_up
-          : [],
-      );
-      const down = toFiniteArray(
-        rv && typeof rv === "object" && "cvr_down" in (rv as Record<string, unknown>)
-          ? (rv as Record<string, unknown>).cvr_down
-          : [],
-      );
+      const rvObj =
+        rv && typeof rv === "object" && !Array.isArray(rv) ? (rv as Record<string, unknown>) : null;
+      const up = extractTenorArray(rvObj?.cvr_up ?? [], GIRR_TENORS);
+      const down = extractTenorArray(rvObj?.cvr_down ?? [], GIRR_TENORS);
       return (
         <Sparkline
           points={up}
@@ -658,7 +670,7 @@ function DrilldownValueCell({
         />
       );
     }
-    const pts = toFiniteArray(rv);
+    const pts = extractTenorArray(rv, GIRR_TENORS);
     return (
       <Sparkline
         points={pts}
@@ -669,8 +681,8 @@ function DrilldownValueCell({
   }
   // Equity / FX
   if (sensitivityType === "Curvature") {
-    const up = readScalar(rv, "up");
-    const down = readScalar(rv, "down");
+    const up = readScalar(rv, "cvr_up");
+    const down = readScalar(rv, "cvr_down");
     return (
       <span className="drilldown-curv-pill" data-testid="drilldown-curv-pill">
         <span className="drilldown-curv-pill__up">↑{up !== null ? formatCharge(up) : "—"}</span>

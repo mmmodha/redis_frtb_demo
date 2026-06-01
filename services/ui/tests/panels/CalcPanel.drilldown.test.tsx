@@ -174,6 +174,171 @@ describe("CalcPanel Wave 5.18 polish + drill-down", () => {
     expect(screen.getByTestId("bucket-drilldown-load-more")).toBeDisabled();
   });
 
+  // Wave 5.21a: post-5.17a, GIRR Delta/Vega risk_value is a tenor-keyed object.
+  // The drilldown must reshape that into a positional 10-tenor array so the
+  // sparkline renders values instead of falling back to the "—" empty state.
+  it("Wave 5.21a: GIRR Delta drill-down renders sparkline from tenor-keyed risk_value", async () => {
+    const rv = { "3M": 0.063515, "6M": 0.12, "1Y": 0.25, "2Y": 0.4, "3Y": 0.55,
+                 "5Y": 0.7, "10Y": 0.85, "15Y": 0.9, "20Y": 0.95, "30Y": 1.0 };
+    const rows: PivotRowFixture[] = [
+      { key: "sens:{GIRR:USD}:t-k1", doc: { trade_id: "t-k1", risk_factor: "USD-IRS", risk_value: rv, weight: 1.5 } },
+    ];
+    fetchRouter({
+      pivot: () =>
+        new Response(JSON.stringify({ rows, total: 1, limit: 20, offset: 0, ms: 1 }), {
+          headers: { "content-type": "application/json" },
+        }),
+    });
+    render(<CalcPanel />);
+    await runCalc(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
+    fireEvent.click(
+      within(screen.getByTestId("bucket-chart"))
+        .getAllByTestId("bucket-chart-row")
+        .find((r) => r.getAttribute("data-bucket") === "USD")!,
+    );
+    await waitFor(() => expect(screen.getByTestId("drilldown-row")).toBeInTheDocument());
+    const sp = screen.getByTestId("sparkline");
+    expect(sp.classList.contains("sparkline--empty")).toBe(false);
+    expect(sp.getAttribute("aria-label")).toMatch(/Delta 10-tenor curve/);
+    // No "—" placeholder in the rendered cell.
+    expect(within(screen.getByTestId("drilldown-row")).queryByText("—")).toBeNull();
+  });
+
+  it("Wave 5.21a: GIRR Vega drill-down renders sparkline from tenor-keyed risk_value", async () => {
+    const rv = { "3M": -0.1, "6M": -0.05, "1Y": 0.0, "2Y": 0.05, "3Y": 0.1,
+                 "5Y": 0.15, "10Y": 0.2, "15Y": 0.25, "20Y": 0.3, "30Y": 0.35 };
+    const rows: PivotRowFixture[] = [
+      { key: "sens:{GIRR:USD}:t-v1", doc: { trade_id: "t-v1", risk_factor: "USD-IRSVOL", risk_value: rv, weight: 1.0 } },
+    ];
+    fetchRouter({
+      pivot: () =>
+        new Response(JSON.stringify({ rows, total: 1, limit: 20, offset: 0, ms: 1 }), {
+          headers: { "content-type": "application/json" },
+        }),
+    });
+    render(<CalcPanel />);
+    fireEvent.change(screen.getByLabelText(/sensitivity type/i), { target: { value: "Vega" } });
+    await runCalc(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
+    fireEvent.click(
+      within(screen.getByTestId("bucket-chart"))
+        .getAllByTestId("bucket-chart-row")
+        .find((r) => r.getAttribute("data-bucket") === "USD")!,
+    );
+    await waitFor(() => expect(screen.getByTestId("drilldown-row")).toBeInTheDocument());
+    const sp = screen.getByTestId("sparkline");
+    expect(sp.classList.contains("sparkline--empty")).toBe(false);
+    expect(sp.getAttribute("aria-label")).toMatch(/Vega 10-tenor curve/);
+  });
+
+  it("Wave 5.21a: GIRR Curvature drill-down renders 2-series sparkline from cvr_up/cvr_down arrays", async () => {
+    const rv = {
+      cvr_up: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+      cvr_down: [-0.1, -0.2, -0.3, -0.4, -0.5, -0.6, -0.7, -0.8, -0.9, -1.0],
+    };
+    const rows: PivotRowFixture[] = [
+      { key: "sens:{GIRR:USD}:t-c1", doc: { trade_id: "t-c1", risk_factor: "USD-CURV", risk_value: rv, weight: 1.0 } },
+    ];
+    fetchRouter({
+      pivot: () =>
+        new Response(JSON.stringify({ rows, total: 1, limit: 20, offset: 0, ms: 1 }), {
+          headers: { "content-type": "application/json" },
+        }),
+    });
+    render(<CalcPanel />);
+    fireEvent.change(screen.getByLabelText(/sensitivity type/i), { target: { value: "Curvature" } });
+    await runCalc(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
+    fireEvent.click(
+      within(screen.getByTestId("bucket-chart"))
+        .getAllByTestId("bucket-chart-row")
+        .find((r) => r.getAttribute("data-bucket") === "USD")!,
+    );
+    await waitFor(() => expect(screen.getByTestId("drilldown-row")).toBeInTheDocument());
+    const sp = screen.getByTestId("sparkline");
+    expect(sp.classList.contains("sparkline--empty")).toBe(false);
+    expect(sp.getAttribute("data-series")).toBe("2");
+  });
+
+  it("Wave 5.21a: Equity Curvature drill-down reads cvr_up/cvr_down scalars (not up/down)", async () => {
+    const rows: PivotRowFixture[] = [
+      { key: "sens:{Equity:6}:e-c1", doc: { trade_id: "e-c1", risk_factor: "AAPL", risk_value: { cvr_up: 3.21, cvr_down: -2.15 }, weight: 0.75 } },
+    ];
+    fetchRouter({
+      calc: () =>
+        new Response(
+          JSON.stringify({
+            ...calcResponse,
+            per_bucket: [{ bucket: "6", K_b: 50, S_b: 40, count: 100, ms: 2 }],
+          }),
+          { headers: { "content-type": "application/json" } },
+        ),
+      pivot: () =>
+        new Response(JSON.stringify({ rows, total: 1, limit: 20, offset: 0, ms: 1 }), {
+          headers: { "content-type": "application/json" },
+        }),
+    });
+    render(<CalcPanel />);
+    fireEvent.change(screen.getByLabelText(/risk class/i), { target: { value: "Equity" } });
+    fireEvent.change(screen.getByLabelText(/sensitivity type/i), { target: { value: "Curvature" } });
+    await runCalc(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
+    const chart = screen.getByTestId("bucket-chart");
+    fireEvent.click(within(chart).getAllByTestId("bucket-chart-row")[0]!);
+    await waitFor(() => expect(screen.getByTestId("drilldown-row")).toBeInTheDocument());
+    const pill = screen.getByTestId("drilldown-curv-pill");
+    expect(pill.textContent ?? "").toMatch(/3\.21/);
+    expect(pill.textContent ?? "").toMatch(/2\.15/);
+    expect(pill.textContent ?? "").not.toMatch(/—/);
+  });
+
+  it("Wave 5.21a: FX Delta drill-down renders {spot} scalar cell with no placeholder", async () => {
+    const rows: PivotRowFixture[] = [
+      { key: "sens:{FX:EURUSD}:f-1", doc: { trade_id: "f-1", risk_factor: "EURUSD", risk_value: { spot: 0.4321 }, weight: 1.0 } },
+    ];
+    fetchRouter({
+      calc: () =>
+        new Response(
+          JSON.stringify({
+            ...calcResponse,
+            per_bucket: [{ bucket: "EURUSD", K_b: 50, S_b: 40, count: 100, ms: 2 }],
+          }),
+          { headers: { "content-type": "application/json" } },
+        ),
+      pivot: () =>
+        new Response(JSON.stringify({ rows, total: 1, limit: 20, offset: 0, ms: 1 }), {
+          headers: { "content-type": "application/json" },
+        }),
+    });
+    render(<CalcPanel />);
+    fireEvent.change(screen.getByLabelText(/risk class/i), { target: { value: "FX" } });
+    await runCalc(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
+    fireEvent.click(within(screen.getByTestId("bucket-chart")).getAllByTestId("bucket-chart-row")[0]!);
+    await waitFor(() => expect(screen.getByTestId("drilldown-row")).toBeInTheDocument());
+    const scalar = screen.getByTestId("drilldown-scalar");
+    expect(scalar.textContent ?? "").toMatch(/0\.4321/);
+    expect(scalar.textContent ?? "").not.toMatch(/^—$/);
+  });
+
+  it("Wave 5.21a: legacy GIRR Delta number[] risk_value still renders (backwards-compat fallback)", async () => {
+    const rows: PivotRowFixture[] = [
+      { key: "sens:{GIRR:USD}:t-legacy", doc: { trade_id: "t-legacy", risk_factor: "USD-IRS", risk_value: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0], weight: 1.5 } },
+    ];
+    fetchRouter({
+      pivot: () =>
+        new Response(JSON.stringify({ rows, total: 1, limit: 20, offset: 0, ms: 1 }), {
+          headers: { "content-type": "application/json" },
+        }),
+    });
+    render(<CalcPanel />);
+    await runCalc(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
+    fireEvent.click(
+      within(screen.getByTestId("bucket-chart"))
+        .getAllByTestId("bucket-chart-row")
+        .find((r) => r.getAttribute("data-bucket") === "USD")!,
+    );
+    await waitFor(() => expect(screen.getByTestId("drilldown-row")).toBeInTheDocument());
+    const sp = screen.getByTestId("sparkline");
+    expect(sp.classList.contains("sparkline--empty")).toBe(false);
+  });
+
   it("Drill-down with /pivot 503 renders empty-target banner, panel stays alive", async () => {
     fetchRouter({
       pivot: () =>
