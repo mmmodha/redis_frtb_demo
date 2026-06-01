@@ -67,7 +67,7 @@ Workaround used this wave (docs-scoped, no src/ change): `docs/recordings/smoke-
 | FX         | Vega      | 200  |   333 ms  | 12.891396385264315      | 11 | 11 / 11 | 270.456 | 148.266 |
 | FX         | Curvature | 200  |   372 ms  | **1 095.1081812019447** | 11 | 11 / 11 | 276.181 | 149.055 |
 
-L2 risk-class totals (`√(Delta² + Vega² + Curvature²)`): **GIRR = 9 597.27**, EQUITY = 344.51, FX = 1 095.18 (see `aggregate.json` for the canonical figures). Grand-total L2 across risk classes = **9 665.70**. Curvature charges dwarf Delta/Vega because the §21.5(2) CVR shift uses the price-impact PnL — bp-scale shocks revalued at portfolio bp/bp — so the absolute scale is ~3 orders of magnitude larger than the Delta charge per row, as expected. Per-variant wallclock 312–411 ms; fanout 144–191 ms; total_ms 264–314 ms.
+L2 risk-class totals (`√(Delta² + Vega² + Curvature²)`): **GIRR = 9 597.27**, EQUITY = 344.78, FX = 1 095.18 (see `aggregate.json` for the canonical figures). Grand-total L2 across risk classes = **9 665.70**. Curvature charges dwarf Delta/Vega because the §21.5(2) CVR shift uses the price-impact PnL — bp-scale shocks revalued at portfolio bp/bp — so the absolute scale is ~3 orders of magnitude larger than the Delta charge per row, as expected. Per-variant wallclock 312–411 ms; fanout 144–191 ms; total_ms 264–314 ms.
 
 ## Repo hygiene
 
