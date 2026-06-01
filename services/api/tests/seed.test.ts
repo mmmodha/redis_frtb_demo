@@ -11,6 +11,7 @@ const RS_ENV_KEYS = [
   "RS_DEMO_HOST", "RS_DEMO_PORT", "RS_DEMO_PASSWORD", "RS_DEMO_TLS",
   "RS_LARGE_HOST", "RS_LARGE_PORT", "RS_LARGE_PASSWORD", "RS_LARGE_TLS",
   "SEED_CONNECTIONS_FILE",
+  "REDIS_URL", "REDIS_CLUSTER", "REDIS_TLS",
 ];
 
 function clearEnv() {
@@ -109,5 +110,57 @@ describe("seedConnections", () => {
     } finally {
       warnSpy.mockRestore();
     }
+  });
+
+  it("seeds live-standalone from REDIS_URL when REDIS_CLUSTER is unset", async () => {
+    process.env.REDIS_URL = "redis://:pw@host:6379";
+    const store = await createStore({ filePath, masterKey: KEY });
+    await seedConnections(store);
+    const profiles = await store.list();
+    expect(profiles.map((p) => p.name)).toEqual(["live-standalone"]);
+    const live = await store.getRaw(profiles[0].id);
+    expect(live!.host).toBe("host");
+    expect(live!.port).toBe(6379);
+    expect(live!.password).toBe("pw");
+    expect(live!.tls).toBeUndefined();
+    expect(live!.clusterMode).toBe(false);
+    expect(live!.username).toBeUndefined();
+    expect(live!.db).toBeUndefined();
+  });
+
+  it("seeds live-cluster with tls (rediss://), db, username from REDIS_URL", async () => {
+    process.env.REDIS_URL = "rediss://user:pw@host:6380/1";
+    process.env.REDIS_CLUSTER = "true";
+    process.env.REDIS_TLS = "false";
+    const store = await createStore({ filePath, masterKey: KEY });
+    await seedConnections(store);
+    const profiles = await store.list();
+    expect(profiles.map((p) => p.name)).toEqual(["live-cluster"]);
+    const live = await store.getRaw(profiles[0].id);
+    expect(live!.host).toBe("host");
+    expect(live!.port).toBe(6380);
+    expect(live!.tls).toEqual({ enabled: true });
+    expect(live!.clusterMode).toBe(true);
+    expect(live!.db).toBe(1);
+    expect(live!.username).toBe("user");
+    expect(live!.password).toBe("pw");
+  });
+
+  it("URL-decodes percent-encoded REDIS_URL password", async () => {
+    process.env.REDIS_URL = "redis://:p%25w@host:6379";
+    const store = await createStore({ filePath, masterKey: KEY });
+    await seedConnections(store);
+    const profiles = await store.list();
+    const live = await store.getRaw(profiles[0].id);
+    expect(live!.password).toBe("p%w");
+  });
+
+  it("does not duplicate live-standalone on repeated seedConnections() calls", async () => {
+    process.env.REDIS_URL = "redis://:pw@host:6379";
+    const store = await createStore({ filePath, masterKey: KEY });
+    await seedConnections(store);
+    await seedConnections(store);
+    const profiles = await store.list();
+    expect(profiles.filter((p) => p.name === "live-standalone")).toHaveLength(1);
   });
 });

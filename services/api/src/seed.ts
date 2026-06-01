@@ -1,21 +1,28 @@
 // Boot-time seeding of the connections store.
 //
-// Two paths:
+// Three paths:
 //   1. SEED_CONNECTIONS_FILE — points at a JSON array of CreateInput objects.
 //      Loaded verbatim. Intended for headless / CI / demo prep.
 //   2. RS_DEMO_* and RS_LARGE_* env vars — populate the two well-known PoV
 //      cluster profiles (`rs-demo-cluster`, `rs-large-cluster`). No plaintext
 //      defaults in code; only seeded when the env says so.
+//   3. REDIS_URL — auto-seed a single live profile (`live-standalone` or
+//      `live-cluster` per REDIS_CLUSTER) so the operator can click "Test"
+//      in the UI against the same target the api itself is talking to.
 //
 // Idempotent: skips any profile whose `name` already exists in the store.
 
 import { readFileSync } from "node:fs";
 import type { ConnectionsStore, CreateInput, TlsConfig } from "./store.ts";
 
+function parseBool(raw: string | undefined): boolean {
+  if (!raw) return false;
+  const v = raw.toLowerCase();
+  return v === "1" || v === "true" || v === "yes";
+}
+
 function parseTls(raw: string | undefined): TlsConfig | undefined {
-  if (!raw) return undefined;
-  const enabled = raw === "1" || raw.toLowerCase() === "true" || raw.toLowerCase() === "yes";
-  if (!enabled) return undefined;
+  if (!parseBool(raw)) return undefined;
   return { enabled: true };
 }
 
@@ -35,6 +42,47 @@ function envProfile(prefix: string, name: string): CreateInput | null {
   };
 }
 
+function liveProfileFromUrl(): CreateInput | null {
+  const raw = process.env.REDIS_URL;
+  if (!raw) return null;
+  const clusterMode = parseBool(process.env.REDIS_CLUSTER);
+  const name = clusterMode ? "live-cluster" : "live-standalone";
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    // Never echo the raw URL — it carries the password.
+    console.warn(JSON.stringify({
+      service: "api",
+      warn: "seed-connections-failed",
+      name,
+      err: "invalid REDIS_URL",
+    }));
+    return null;
+  }
+  const port = url.port ? Number(url.port) : 6379;
+  const password = url.password ? decodeURIComponent(url.password) : undefined;
+  const username = url.username ? decodeURIComponent(url.username) : undefined;
+  const tlsEnabled = parseBool(process.env.REDIS_TLS) || url.protocol === "rediss:";
+  const tls: TlsConfig | undefined = tlsEnabled ? { enabled: true } : undefined;
+  let db: number | undefined;
+  const pathDb = url.pathname.replace(/^\//, "");
+  if (pathDb) {
+    const n = Number(pathDb);
+    if (Number.isFinite(n) && Number.isInteger(n)) db = n;
+  }
+  return {
+    name,
+    host: url.hostname,
+    port,
+    username,
+    password,
+    tls,
+    db,
+    clusterMode,
+  };
+}
+
 export async function seedConnections(store: ConnectionsStore): Promise<void> {
   const existing = new Set((await store.list()).map((p) => p.name));
   const inputs: CreateInput[] = [];
@@ -50,6 +98,9 @@ export async function seedConnections(store: ConnectionsStore): Promise<void> {
   if (demo) inputs.push(demo);
   const large = envProfile("RS_LARGE", "rs-large-cluster");
   if (large) inputs.push(large);
+
+  const live = liveProfileFromUrl();
+  if (live) inputs.push(live);
 
   for (const input of inputs) {
     if (existing.has(input.name)) continue;
