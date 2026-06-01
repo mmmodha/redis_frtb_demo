@@ -2,6 +2,10 @@ import { describe, it, expect } from "vitest";
 import { render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { AppShell } from "../../src/components/AppShell";
+import {
+  PivotBurstContext,
+  type PivotBurstContextValue,
+} from "../../src/context/PivotBurstContext";
 
 function renderShell(initialPath = "/observability") {
   return render(
@@ -10,6 +14,21 @@ function renderShell(initialPath = "/observability") {
         <div data-testid="slot">slot-content</div>
       </AppShell>
     </MemoryRouter>,
+  );
+}
+
+function renderShellWithBurst(
+  burstValue: PivotBurstContextValue,
+  initialPath = "/calc",
+) {
+  return render(
+    <PivotBurstContext.Provider value={burstValue}>
+      <MemoryRouter initialEntries={[initialPath]}>
+        <AppShell>
+          <div data-testid="slot">slot-content</div>
+        </AppShell>
+      </MemoryRouter>
+    </PivotBurstContext.Provider>,
   );
 }
 
@@ -32,5 +51,28 @@ describe("<AppShell />", () => {
     renderShell();
     expect(screen.getByRole("banner")).toHaveTextContent(/FRTB SBM/i);
     expect(screen.getByRole("banner")).toHaveTextContent(/Redis Enterprise/i);
+  });
+
+  it("Wave 5.21g — renders the pivot burst nav pill on non-pivot routes when burst is active, and hides it when burst is null", () => {
+    const active: PivotBurstContextValue = {
+      burst: { done: 42, total: 100 },
+      startBurst: () => {},
+      cancelBurst: () => {},
+    };
+    const { unmount } = renderShellWithBurst(active, "/calc");
+    const pill = screen.getByTestId("pivot-burst-nav-pill");
+    expect(pill).toHaveTextContent("42 / 100");
+    expect(pill).toHaveAttribute("role", "status");
+    expect(pill).toHaveAttribute("aria-live", "polite");
+    expect(pill).toHaveAttribute("aria-label", "Pivot burst running, 42 of 100");
+    unmount();
+
+    const idle: PivotBurstContextValue = {
+      burst: null,
+      startBurst: () => {},
+      cancelBurst: () => {},
+    };
+    renderShellWithBurst(idle, "/calc");
+    expect(screen.queryByTestId("pivot-burst-nav-pill")).toBeNull();
   });
 });

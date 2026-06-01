@@ -10,6 +10,7 @@ import {
 } from "../lib/empty-target";
 import type { PivotResp } from "../lib/pivot";
 import { BUCKETS_BY_RISK_CLASS, RISK_CLASSES, SENSITIVITY_TYPES } from "../lib/buckets";
+import { usePivotBurst } from "../context/PivotBurstContext";
 
 const DEFAULT_LIMIT = 100;
 const HIST_WINDOW = 100;
@@ -34,8 +35,9 @@ export function PivotPanel(): JSX.Element {
   const [result, setResult] = useState<PivotResp | null>(null);
   const [serverMs, setServerMs] = useState<number[]>([]);
   const [clientMs, setClientMs] = useState<number[]>([]);
-  // Wave 5.21d — Run 100x progress. Non-null only while a burst is in flight.
-  const [burst, setBurst] = useState<{ done: number; total: number } | null>(null);
+  // Wave 5.21g — burst lives in the global PivotBurstContext so the loop
+  // survives route changes (and AppShell can render a nav pill).
+  const { burst, startBurst } = usePivotBurst();
 
   const buckets = useMemo<string[]>(() => BUCKETS_BY_RISK_CLASS[riskClass] ?? [], [riskClass]);
 
@@ -92,19 +94,36 @@ export function PivotPanel(): JSX.Element {
     void runAt(0);
   }
 
-  async function runBurst(n: number): Promise<void> {
-    setBurst({ done: 0, total: n });
-    for (let i = 0; i < n; i++) {
-      const ok = await runAt(0);
-      if (!ok) {
-        // Wave 5.21d — bar disappears on failure; the existing error banner
-        // (or empty-target callout) takes over.
-        setBurst(null);
-        return;
-      }
-      setBurst({ done: i + 1, total: n });
-    }
-    setBurst(null);
+  function runBurst(n: number): void {
+    setError(null);
+    setEmptyError(null);
+    // Snapshot filter values at click time so mid-burst edits don't leak in.
+    const filters = {
+      risk_class: riskClass,
+      bucket,
+      sensitivity_type: sensType,
+      book,
+      limit,
+      offset: 0,
+    };
+    startBurst({
+      total: n,
+      filters,
+      onIteration: (body, ms) => {
+        setResult(body);
+        setOffset(0);
+        setServerMs((prev) => [...prev.slice(-(HIST_WINDOW - 1)), body.ms]);
+        setClientMs((prev) => [...prev.slice(-(HIST_WINDOW - 1)), ms]);
+      },
+      onError: (err) => {
+        if (err instanceof EmptyTargetError) {
+          setEmptyError(err);
+        } else {
+          setError(err.message || "Failed to load pivot");
+        }
+        setResult(null);
+      },
+    });
   }
 
   const hasPrev = result !== null && offset > 0;
@@ -124,7 +143,7 @@ export function PivotPanel(): JSX.Element {
             <button type="button" onClick={() => void runAt(0)} disabled={loading || burst !== null}>
               {loading || burst !== null ? "Running…" : "Run query"}
             </button>
-            <button type="button" onClick={() => void runBurst(100)} disabled={loading || burst !== null}>
+            <button type="button" onClick={() => runBurst(100)} disabled={loading || burst !== null}>
               {burst !== null ? `Running ${burst.done} / ${burst.total}…` : "Run 100x"}
             </button>
           </>

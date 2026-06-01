@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { PivotPanel } from "../src/panels/PivotPanel";
+import { PivotBurstProvider } from "../src/context/PivotBurstContext";
 
 // Shell components (owned by task 1) are mocked so this unit test runs in
 // isolation. Production composition is asserted by the Playwright e2e suite.
@@ -33,9 +34,11 @@ vi.mock("../src/components/MetricTile", () => ({
 
 function renderPanel() {
   return render(
-    <MemoryRouter>
-      <PivotPanel />
-    </MemoryRouter>
+    <PivotBurstProvider>
+      <MemoryRouter>
+        <PivotPanel />
+      </MemoryRouter>
+    </PivotBurstProvider>
   );
 }
 
@@ -330,6 +333,48 @@ describe("PivotPanel", () => {
     const callout = await screen.findByTestId("sub-100ms-callout");
     expect(callout).toHaveTextContent(/sub.?100/i);
     expect(callout).toHaveTextContent(/7\.5\s*ms/);
+  });
+
+  it("Wave 5.21g — burst loop survives PivotPanel unmount and the in-panel bar shows progress on remount", async () => {
+    // Slow each iteration enough that several complete during the unmount window.
+    fetchMock.mockImplementation(
+      () =>
+        new Promise((r) =>
+          setTimeout(() => r({ ok: true, json: async () => pivotResponse({ ms: 5 }) }), 5),
+        ),
+    );
+    const { rerender } = render(
+      <PivotBurstProvider>
+        <MemoryRouter>
+          <PivotPanel />
+        </MemoryRouter>
+      </PivotBurstProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /run 100x/i }));
+    // Replace the panel with a different route element — provider stays mounted.
+    rerender(
+      <PivotBurstProvider>
+        <MemoryRouter>
+          <div data-testid="other-route">other</div>
+        </MemoryRouter>
+      </PivotBurstProvider>,
+    );
+    expect(screen.getByTestId("other-route")).toBeInTheDocument();
+    // Wait two ticks so the loop advances a few iterations while unmounted.
+    await new Promise((r) => setTimeout(r, 40));
+    // Remount the panel — bar should show the latest done value from context.
+    rerender(
+      <PivotBurstProvider>
+        <MemoryRouter>
+          <PivotPanel />
+        </MemoryRouter>
+      </PivotBurstProvider>,
+    );
+    const bar = await screen.findByRole("progressbar", { name: /burst progress/i });
+    await waitFor(() => {
+      const v = Number(bar.getAttribute("aria-valuenow"));
+      expect(v).toBeGreaterThan(0);
+    });
   });
 });
 

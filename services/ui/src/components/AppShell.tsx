@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useState, type ReactNode } from "react";
-import { NavLink } from "react-router-dom";
+import { useCallback, useContext, useEffect, useState, type ReactNode } from "react";
+import { NavLink, useLocation } from "react-router-dom";
 import { ActiveTargetPill, type ActiveTargetState } from "./ActiveTargetPill";
 import { BootstrapStatusOverlay } from "./BootstrapStatusOverlay";
 import { LockoutBanner } from "./LockoutBanner";
 import { useBootstrapStatus } from "../hooks/useBootstrapStatus";
 import { getActiveTarget, type ActiveTarget } from "../lib/connections";
+import { PivotBurstContext } from "../context/PivotBurstContext";
 
 const SECTIONS = [
   { to: "/connections", label: "Connections" },
@@ -24,6 +25,10 @@ export function AppShell({ children }: AppShellProps) {
   const [target, setTarget] = useState<ActiveTarget | null>(null);
   const [state, setState] = useState<ActiveTargetState>("disconnected");
   const { phase: bootstrapPhase } = useBootstrapStatus();
+  const burstCtx = useContext(PivotBurstContext);
+  const location = useLocation();
+  const burst = burstCtx?.burst ?? null;
+  const showBurstPill = burst !== null && location.pathname !== "/pivot";
 
   const refreshTarget = useCallback(async () => {
     try {
@@ -62,6 +67,17 @@ export function AppShell({ children }: AppShellProps) {
               >
                 {s.label}
               </NavLink>
+              {s.to === "/pivot" && showBurstPill && burst !== null && (
+                <span
+                  className="app-shell__nav-pill"
+                  data-testid="pivot-burst-nav-pill"
+                  role="status"
+                  aria-live="polite"
+                  aria-label={`Pivot burst running, ${burst.done} of ${burst.total}`}
+                >
+                  {burst.done} / {burst.total}
+                </span>
+              )}
             </li>
           ))}
         </ul>

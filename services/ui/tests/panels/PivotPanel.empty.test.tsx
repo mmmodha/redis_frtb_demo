@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { PivotPanel } from "../../src/panels/PivotPanel";
+import { PivotBurstProvider } from "../../src/context/PivotBurstContext";
 
 vi.mock("../../src/components/PanelCard", () => ({
   PanelCard: ({ title, children, actions }: any) => (
@@ -31,9 +32,11 @@ vi.mock("../../src/components/MetricTile", () => ({
 
 function renderPanel() {
   return render(
-    <MemoryRouter>
-      <PivotPanel />
-    </MemoryRouter>,
+    <PivotBurstProvider>
+      <MemoryRouter>
+        <PivotPanel />
+      </MemoryRouter>
+    </PivotBurstProvider>,
   );
 }
 
