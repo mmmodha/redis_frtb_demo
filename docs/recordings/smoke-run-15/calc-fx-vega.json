@@ -1,0 +1,169 @@
+{
+  "risk_class": "fx",
+  "sensitivity_type": "vega",
+  "http_status": 200,
+  "wallclock_ms": 324,
+  "body": {
+    "charge": 12.727534389007097,
+    "per_bucket": [
+      {
+        "bucket": "EURGBP",
+        "K_b": 3.3317915866271,
+        "S_b": -4.843915,
+        "count": 35,
+        "ms": 0
+      },
+      {
+        "bucket": "USDCHF",
+        "K_b": 2.858849089508,
+        "S_b": -1.713827,
+        "count": 24,
+        "ms": 0
+      },
+      {
+        "bucket": "NZDUSD",
+        "K_b": 2.8550406351184,
+        "S_b": -3.152041,
+        "count": 30,
+        "ms": 0
+      },
+      {
+        "bucket": "EURUSD",
+        "K_b": 2.953514889666,
+        "S_b": -0.300051,
+        "count": 27,
+        "ms": 0
+      },
+      {
+        "bucket": "USDJPY",
+        "K_b": 3.4905722120333,
+        "S_b": 0.471319,
+        "count": 40,
+        "ms": 0
+      },
+      {
+        "bucket": "OTHER",
+        "K_b": 2.7644399955067,
+        "S_b": 1.251031,
+        "count": 32,
+        "ms": 0
+      },
+      {
+        "bucket": "EURJPY",
+        "K_b": 3.1082134286252,
+        "S_b": 0.731216,
+        "count": 34,
+        "ms": 0
+      },
+      {
+        "bucket": "GBPJPY",
+        "K_b": 2.9948604025477,
+        "S_b": 0.867608,
+        "count": 35,
+        "ms": 0
+      },
+      {
+        "bucket": "USDCAD",
+        "K_b": 3.1288313494495,
+        "S_b": -3.184094,
+        "count": 23,
+        "ms": 0
+      },
+      {
+        "bucket": "AUDUSD",
+        "K_b": 3.0070044253306,
+        "S_b": -1.665102,
+        "count": 28,
+        "ms": 0
+      },
+      {
+        "bucket": "GBPUSD",
+        "K_b": 2.8631761047526,
+        "S_b": -0.861636,
+        "count": 28,
+        "ms": 0
+      }
+    ],
+    "total_ms": 237.649,
+    "shard_breakdown": [
+      {
+        "shard": "EURGBP",
+        "buckets": [
+          "EURGBP"
+        ],
+        "ms": 0
+      },
+      {
+        "shard": "USDCHF",
+        "buckets": [
+          "USDCHF"
+        ],
+        "ms": 0
+      },
+      {
+        "shard": "NZDUSD",
+        "buckets": [
+          "NZDUSD"
+        ],
+        "ms": 0
+      },
+      {
+        "shard": "EURUSD",
+        "buckets": [
+          "EURUSD"
+        ],
+        "ms": 0
+      },
+      {
+        "shard": "USDJPY",
+        "buckets": [
+          "USDJPY"
+        ],
+        "ms": 0
+      },
+      {
+        "shard": "OTHER",
+        "buckets": [
+          "OTHER"
+        ],
+        "ms": 0
+      },
+      {
+        "shard": "EURJPY",
+        "buckets": [
+          "EURJPY"
+        ],
+        "ms": 0
+      },
+      {
+        "shard": "GBPJPY",
+        "buckets": [
+          "GBPJPY"
+        ],
+        "ms": 0
+      },
+      {
+        "shard": "USDCAD",
+        "buckets": [
+          "USDCAD"
+        ],
+        "ms": 0
+      },
+      {
+        "shard": "AUDUSD",
+        "buckets": [
+          "AUDUSD"
+        ],
+        "ms": 0
+      },
+      {
+        "shard": "GBPUSD",
+        "buckets": [
+          "GBPUSD"
+        ],
+        "ms": 0
+      }
+    ],
+    "fanout_ms": 124.933
+  }
+}
