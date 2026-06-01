@@ -1,16 +1,16 @@
 # FRTB SBM on Redis — HSBC PoV Executive Summary
 
-**Audience**: Market-risk leadership. **Basis**: Live evidence from smoke-run-16 (Wave 5.16e2, 2026-06-01T09:00Z, 6,000 rows = 2,000 each Delta / Vega / Curvature on a standalone Redis Cloud DB).
+**Audience**: Market-risk leadership. **Basis**: Live evidence from smoke-run-17 (Wave 5.17d, 2026-06-01T17:10Z, 6,000 rows = 2,000 each Delta / Vega / Curvature on a standalone Redis Cloud DB).
 
 ## 1. Executive summary
 
-This MVP demonstrates a Basel-faithful Sensitivities-Based Method (SBM) capital calculation under MAR21 §21.4 clauses 3, 4, 5 (with the §21.4(7) negative-interior fallback) and **MAR21 §21.5 Curvature clauses (2), (3), (5) (with the §21.5(5)(b) fallback)**, executed against a 6 000-row sensitivities dataset spanning GIRR, Equity, and FX across the full Delta / Vega / Curvature triad. All nine risk-class × leg variants returned HTTP 200 with strictly positive charges; the storage footprint is **22.59 MB Δ-over-baseline = 75.32 %** of a 30 MB Δ-cap on a 2.5 GB Redis Cloud DB. Per-variant wallclock sits between **263 and 314 ms**. The grand L2 across the three risk classes is **9,665.70**.
+This MVP demonstrates a Basel-faithful Sensitivities-Based Method (SBM) capital calculation under MAR21 §21.4 clauses 3, 4, 5 (with the §21.4(7) negative-interior fallback) and **MAR21 §21.5 Curvature clauses (2), (3), (5) (with the §21.5(5)(b) fallback)**, executed against a 6 000-row sensitivities dataset spanning GIRR, Equity, and FX across the full Delta / Vega / Curvature triad. All nine risk-class × leg variants returned HTTP 200 with strictly positive charges; the storage footprint is **23.99 MB Δ-over-baseline = 79.96 %** of a 30 MB Δ-cap on a 2.5 GB Redis Cloud DB. Per-variant wallclock sits between **263 and 301 ms**. The grand L2 across the three risk classes is **9,558.91** (reproduces bit-for-bit across two consecutive runs).
 
 ## 2. Scope
 
 | What this MVP demonstrates | What it does NOT yet cover |
 |---|---|
-| MAR21 §21.4(3) — risk-weighting of net sensitivities (WS_k = RW_k · s_k) | MAR21 §21.6 — cross-risk-class total capital aggregation (rolling the 9,665.70 grand L2 into a single trading-book number, including CSR + Commodity) |
+| MAR21 §21.4(3) — risk-weighting of net sensitivities (WS_k = RW_k · s_k) | MAR21 §21.6 — cross-risk-class total capital aggregation (rolling the 9,558.91 grand L2 into a single trading-book number, including CSR + Commodity) |
 | MAR21 §21.4(4) — within-bucket aggregation under prescribed ρ_kl correlations producing K_b | Default Risk Charge (DRC) — non-securitisation / securitisation / CTP add-on under MAR22 |
 | MAR21 §21.4(5) — cross-bucket aggregation under γ_bc correlations producing the risk-class charge | Residual Risk Add-On (RRAO) — gap / exotic / digital under MAR23 |
 | MAR21 §21.4(7) — negative-interior alternative with S_b* = clip(S_b, ±K_b) (code-reachable, exercised on synthetic negatives) | Curvature × Vega-shock interaction (§21.5 Curvature is run against Delta risk factors here; the Vega-shock Curvature variant is out of scope) |
@@ -20,38 +20,38 @@ This MVP demonstrates a Basel-faithful Sensitivities-Based Method (SBM) capital 
 | Per-bucket evidence surfaced as `per_bucket[*].{K_b, S_b, count}` in the response for all 9 variants, traceable line-by-line to Lua + TypeScript source | Bootstrap wiring of the three `*_curvature` Redis Functions (named gap in `services/api/src/bootstrap.ts:buildFrtbSnippets`; loaded for this run via a docs-scoped helper — see SUMMARY.md) |
 | Live calc matrix verified on standalone Redis Cloud DB; 100 % FT index density, zero `hash_indexing_failures` | Curvature library bootstrap parity with Delta / Vega (one-line bootstrap extension) |
 
-## 3. Headline numbers (smoke-run-16, live)
+## 3. Headline numbers (smoke-run-17, live)
 
 | Metric | Value |
 |---|---|
 | Database topology | Standalone Redis Cloud, 1 primary + 1 replica, 2.5 GB cap, `maxmemory_policy=noeviction` |
 | Dataset | 6,000 rows (2,000 Delta + 2,000 Vega + 2,000 Curvature); per leg GIRR 667 / Equity 667 / FX 666 |
-| Memory footprint | Δ-over-baseline = **22.59 MB** = **75.32 %** of the 30 MB Δ-cap (peak P − B' = 23,686,944 B); blended per-row cost = **3.86 KB / row** |
+| Memory footprint | Δ-over-baseline = **23.99 MB** = **79.96 %** of the 30 MB Δ-cap (peak P − B' = 25,158,032 B); blended per-row cost = **4.10 KB / row** |
 | Index density | `FT.INFO idx:sens` → `num_docs=6000`, 100 % density, zero `hash_indexing_failures`; per `sensitivity_type` → Delta = 2,000, Vega = 2,000, Curvature = 2,000 |
 | Calc matrix | **9 / 9** variants HTTP 200, all charges strictly positive, every populated bucket reports `count > 0` |
 
-**3 × 3 charge matrix** (raw values from [`docs/recordings/smoke-run-16/aggregate.json`](../recordings/smoke-run-16/aggregate.json); displayed values rounded for readability):
+**3 × 3 charge matrix** (raw values from [`docs/recordings/smoke-run-17/aggregate.json`](../recordings/smoke-run-17/aggregate.json); displayed values rounded for readability):
 
 | Risk class | Delta | Vega | Curvature | Per-class L2 (√(Δ² + V² + Curv²)) |
 |---|---:|---:|---:|---:|
-| **GIRR** | 0.6965 | 66.9574 | 9,597.0317 | **9,597.27** |
-| **EQUITY** | 7.4316 | 15.9924 | 344.3317 | **344.78** |
-| **FX** | 1.4256 | 12.8914 | 1,095.1082 | **1,095.18** |
-| **Grand L2 across risk classes** | | | | **9,665.70** |
+| **GIRR** | 0.6846 | 52.0601 | 9,495.2341 | **9,495.38** |
+| **EQUITY** | 6.9244 | 15.3017 | 367.2947 | **367.68** |
+| **FX** | 1.1553 | 15.4037 | 1,036.9389 | **1,037.05** |
+| **Grand L2 across risk classes** | | | | **9,558.91** |
 
 | Metric | Value |
 |---|---|
-| Math sanity (MAR21 §21.4(5) bounds, GIRR Delta) | GIRR Delta charge `0.6965` ∈ `[max(K_b), Σ K_b]` envelope — inside the prescribed bounds (CAD K_b = 0.4087 is the per-bucket max) |
+| Math sanity (MAR21 §21.4(5) bounds, GIRR Delta) | GIRR Delta charge `0.6846` ∈ `[max(K_b), Σ K_b]` envelope — inside the prescribed bounds (NOK K_b = 0.2845 is the per-bucket max, Σ K_b = 2.184) |
 | Math sanity (MAR21 §21.5(5) branch) | All three Curvature variants took the positive-interior branch at `curvatureCommon.ts:126`; §21.5(5)(b) fallback at lines 128–139 not exercised on this dataset |
-| Per-variant wallclock | 263 – 314 ms `total_ms`; 144 – 191 ms `fanout_ms` |
+| Per-variant wallclock | 263 – 301 ms `total_ms`; 149 – 181 ms `fanout_ms` |
 
-**30 MB cap rationale.** Wave 5.16e1 pre-flight measured the per-Curvature-row cost at **9.47 KB / row** on this standalone DB (50-row probe, `Δ_data = 484,672 B`). Extrapolated to 2,000 Curvature rows × 3 legs that projects to ≈ 18.5 MB for Curvature plus ≈ 7.3 MB carry-over from the Delta + Vega smoke-run-15 footprint, landing in the low-20s MB range. The 30 MB cap is sized to give ≈ 25 % headroom over that projection; the live run came in at **22.59 MB = 75.32 %** of the cap, with **7.41 MB headroom** to spare.
+**30 MB cap rationale.** Wave 5.16e1 pre-flight measured the per-Curvature-row cost at **9.47 KB / row** on this standalone DB (50-row probe, `Δ_data = 484,672 B`). Extrapolated to 2,000 Curvature rows × 3 legs that projects to ≈ 18.5 MB for Curvature plus ≈ 7.3 MB carry-over from the Delta + Vega smoke-run-15 footprint, landing in the low-20s MB range. The 30 MB cap is sized to give ≈ 25 % headroom over that projection; the live run came in at **23.99 MB = 79.96 %** of the cap, with **6.01 MB headroom** to spare.
 
 **§21.5(5)(b) text-fidelity caveat.** The negative-interior Curvature fallback is implemented with a clip-to-±K_b shape (`S_b* = max(min(S_b, K_b), −K_b)` at [`services/calc/src/curvatureCommon.ts:128-139`](../../services/calc/src/curvatureCommon.ts)), mirroring the §21.4(7) Delta/Vega fallback at `services/api/src/sbm/reduce.ts:51-62`; a strict Curvature-only reading of §21.5(5)(b) would clip negatives to 0 instead. The choice is flagged inline at [`services/calc/src/curvatureCommon.ts:99`](../../services/calc/src/curvatureCommon.ts) and is queued for HSBC business sign-off before production cut-over.
 
 ## 4. Compliance evidence
 
-The traceability pack at [`docs/demo/mar21-traceability.md`](./mar21-traceability.md) maps **MAR21 §21.4 clauses 3, 4, 5 plus §21.4(7)** and **MAR21 §21.5 clauses (2), (3), (5) plus §21.5(5)(b)** to specific source lines. For §21.4: Lua FCALL kernels for clauses 3 + 4 at `services/calc/lib/girr_delta.lua:66-78`; TypeScript reducer for clause 5 and §21.4(7) at `services/api/src/sbm/reduce.ts:36-62`; live per-bucket K_b / S_b for all 11 GIRR Delta buckets. For **§21.5** (extended in Wave 5.16e2; the pack now carries 20 §21.5 citations across the (2) / (3) / (5) / (5)(b) clauses): Lua FCALL kernels for clauses (2) + (3) at `services/calc/lib/girr_curvature.lua:48-71` (with `equity_curvature.lua` and `fx_curvature.lua` for the scalar-shape variants); shared TypeScript kernel for clauses (5) + (5)(b) at `services/calc/src/curvatureCommon.ts:103-139`; live per-bucket K_b / S_b for all 11 GIRR Curvature buckets (CAD K_b = 1,991.89 top).
+The traceability pack at [`docs/demo/mar21-traceability.md`](./mar21-traceability.md) maps **MAR21 §21.4 clauses 3, 4, 5 plus §21.4(7)** and **MAR21 §21.5 clauses (2), (3), (5) plus §21.5(5)(b)** to specific source lines. For §21.4: Lua FCALL kernels for clauses 3 + 4 at `services/calc/lib/girr_delta.lua:66-78`; TypeScript reducer for clause 5 and §21.4(7) at `services/api/src/sbm/reduce.ts:36-62`; live per-bucket K_b / S_b for all 11 GIRR Delta buckets. For **§21.5** (extended in Wave 5.16e2; the pack now carries 20 §21.5 citations across the (2) / (3) / (5) / (5)(b) clauses): Lua FCALL kernels for clauses (2) + (3) at `services/calc/lib/girr_curvature.lua:48-71` (with `equity_curvature.lua` and `fx_curvature.lua` for the scalar-shape variants); shared TypeScript kernel for clauses (5) + (5)(b) at `services/calc/src/curvatureCommon.ts:103-139`; live per-bucket K_b / S_b for all 11 GIRR Curvature buckets (AUD K_b = 1,841.30 top).
 
 **Not covered by the traceability pack**: §21.6 cross-risk-class total capital, the DRC default-risk charge (MAR22), and the RRAO residual-risk add-on (MAR23).
 
@@ -78,7 +78,7 @@ The traceability pack at [`docs/demo/mar21-traceability.md`](./mar21-traceabilit
 
 - [`docs/demo/mar21-traceability.md`](./mar21-traceability.md) — Basel clause → code mapping for both §21.4 and §21.5, with live per-bucket values from this run.
 - [`docs/demo/storyboard.md`](./storyboard.md) — presenter walkthrough across the full 9-variant matrix (delivered in parallel; see that file for the live-demo script).
-- [`docs/recordings/smoke-run-16/SUMMARY.md`](../recordings/smoke-run-16/SUMMARY.md) — full per-step verdict table, memory timeline, 9-variant calc matrix, cost-cap evidence, and the named bootstrap gap.
-- [`docs/recordings/smoke-run-16/aggregate.json`](../recordings/smoke-run-16/aggregate.json) — rolled-up 3 × 3 charge matrix, per-class L2, and grand L2.
-- [`docs/recordings/smoke-run-16/calc/`](../recordings/smoke-run-16/calc/) — nine raw calc response bodies: `calc-GIRR-Delta.json`, `calc-GIRR-Vega.json`, `calc-GIRR-Curvature.json`, `calc-EQUITY-Delta.json`, `calc-EQUITY-Vega.json`, `calc-EQUITY-Curvature.json`, `calc-FX-Delta.json`, `calc-FX-Vega.json`, `calc-FX-Curvature.json`.
-- [`docs/recordings/smoke-run-16/preflight.md`](../recordings/smoke-run-16/preflight.md) — Wave 5.16e1 per-row cost measurement underpinning the 30 MB cap rationale.
+- [`docs/recordings/smoke-run-17/SUMMARY.md`](../recordings/smoke-run-17/SUMMARY.md) — full per-step verdict table, memory timeline, 9-variant calc matrix, cost-cap evidence, and the run-2 reproducibility table.
+- [`docs/recordings/smoke-run-17/aggregate.json`](../recordings/smoke-run-17/aggregate.json) — rolled-up 3 × 3 charge matrix, per-class L2, and grand L2.
+- [`docs/recordings/smoke-run-17/calc/`](../recordings/smoke-run-17/calc/) — nine raw calc response bodies: `calc-GIRR-Delta.json`, `calc-GIRR-Vega.json`, `calc-GIRR-Curvature.json`, `calc-EQUITY-Delta.json`, `calc-EQUITY-Vega.json`, `calc-EQUITY-Curvature.json`, `calc-FX-Delta.json`, `calc-FX-Vega.json`, `calc-FX-Curvature.json`.
+- [`docs/recordings/smoke-run-16/preflight.md`](../recordings/smoke-run-16/preflight.md) — Wave 5.16e1 per-row cost measurement underpinning the 30 MB cap rationale (carried over; not re-measured in smoke-run-17).
