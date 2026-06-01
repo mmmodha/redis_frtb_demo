@@ -43,18 +43,33 @@ async function main(): Promise<void> {
   const store = await createStore({ filePath: STORE_FILE, masterKey: MASTER_KEY });
   await seedConnections(store);
 
+  // Wave 5.16y — if nothing was activated before this boot but the store has
+  // at least one profile (seeded or persisted), auto-activate the first one
+  // so `GET /redis/active-target` and `GET /internal/redis/active-target/full`
+  // agree on a stable identity without requiring operator intervention.
+  if (!store.getActiveRaw()) {
+    const list = await store.list();
+    const first = list[0];
+    if (first) await store.setActive(first.id);
+  }
+
   // If a profile was already active when the process started, publish it to
   // the active-target singleton so /redis/active-target and the Redis client
-  // below both pick up the persisted choice.
+  // below both pick up the persisted choice. Wave 5.16y — also thread the
+  // stored username/password so getActiveRedisClient() authenticates.
   const activeRaw = store.getActiveRaw();
   if (activeRaw) {
-    setActiveTarget({
-      host: activeRaw.host,
-      port: activeRaw.port,
-      tls: !!activeRaw.tls?.enabled,
-      db: activeRaw.db ?? 0,
-      label: activeRaw.name,
-    });
+    setActiveTarget(
+      {
+        host: activeRaw.host,
+        port: activeRaw.port,
+        tls: !!activeRaw.tls?.enabled,
+        db: activeRaw.db ?? 0,
+        label: activeRaw.name,
+        ...(activeRaw.clusterMode ? { clusterMode: true } : {}),
+      },
+      { username: activeRaw.username, password: activeRaw.password },
+    );
   }
 
   const target = getActiveTarget();
@@ -71,6 +86,13 @@ async function main(): Promise<void> {
       port: target.port,
       db: target.db,
       tls: target.tls ? {} : undefined,
+      // Wave 5.16y — when no REDIS_URL is set, fall back to the activeRaw
+      // credentials (if any) so the boot-time bootstrapFrtb() call below
+      // authenticates against profiles that require username/password. The
+      // active-target singleton's getActiveRedisClient() handles all per-
+      // request traffic separately and also includes these creds.
+      ...(activeRaw?.username ? { username: activeRaw.username } : {}),
+      ...(activeRaw?.password ? { password: activeRaw.password } : {}),
       lazyConnect: true,
       maxRetriesPerRequest: 3,
     });

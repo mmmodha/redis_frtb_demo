@@ -14,6 +14,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("../src/store.ts", () => ({
   createStore: vi.fn(async () => ({
     getActiveRaw: () => undefined,
+    // Wave 5.16y — index.ts auto-activates the first stored profile when
+    // none is active. The boot-smoke flow has no profiles, so `list()`
+    // returns empty and `setActive` is never invoked, but both must exist
+    // as functions so the static reference check passes.
+    list: async () => [],
+    setActive: async () => null,
   })),
 }));
 

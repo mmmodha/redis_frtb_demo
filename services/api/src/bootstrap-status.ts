@@ -92,11 +92,17 @@ export function scheduleBootstrap(
   if (status.phase === "ready" && status.target_label === target.label) return;
 
   if (debounceTimer) clearTimeout(debounceTimer);
+  // Wave 5.16y — synchronously bump generation and flip to "running" so a
+  // stale "failed" snapshot from a prior target doesn't linger during the
+  // debounce window. The setTimeout below still gates the actual runner
+  // invocation so rapid switch-clicks coalesce.
+  generation += 1;
+  const myGen = generation;
+  status = { phase: "running", target_label: target.label, started_at: new Date().toISOString() };
   debounceTimer = setTimeout(() => {
     debounceTimer = null;
-    generation += 1;
-    const myGen = generation;
-    status = { phase: "running", target_label: target.label, started_at: new Date().toISOString() };
+    // Skip if a newer schedule call superseded us during debounce.
+    if (myGen !== generation) return;
     runner(client, schema)
       .then(() => {
         if (myGen !== generation) return;

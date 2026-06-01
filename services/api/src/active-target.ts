@@ -22,18 +22,34 @@ export interface ActiveTarget {
 
 export type ActiveTargetListener = (t: ActiveTarget) => void;
 
+// Wave 5.16y — private credentials accompanying the active target. Kept
+// strictly separate from the public ActiveTarget type so `getActiveTarget()`
+// (and therefore `GET /redis/active-target`) cannot leak secrets. Only
+// `getActiveRedisClient()` reads these to authenticate the ioredis client.
+export interface ActiveTargetCreds {
+  username?: string;
+  password?: string;
+}
+
 let override: ActiveTarget | undefined;
+let overrideCreds: ActiveTargetCreds = {};
+// Monotonic per-set counter folded into the cache key so any setActiveTarget
+// call invalidates the cached client — even a credentials-only rotation that
+// keeps host/port/db unchanged. Avoids embedding the password itself in the
+// cache key string.
+let credsGeneration = 0;
 const listeners = new Set<ActiveTargetListener>();
 let cachedClient: Redis | null = null;
 let cachedClientKey = "";
 
 function targetKey(t: ActiveTarget): string {
-  return `${t.host}|${t.port}|${t.tls ? 1 : 0}|${t.db}|${t.clusterMode ? 1 : 0}`;
+  return `${t.host}|${t.port}|${t.tls ? 1 : 0}|${t.db}|${t.clusterMode ? 1 : 0}|${credsGeneration}`;
 }
 
-export function setActiveTarget(t: ActiveTarget): void {
+export function setActiveTarget(t: ActiveTarget, creds?: ActiveTargetCreds): void {
   // Strip any stray fields (notably `password`) — the public type is intentionally
-  // password-free; secrets live only in the encrypted Connections store.
+  // password-free; secrets live only in the encrypted Connections store and in
+  // the private `overrideCreds` slot below.
   override = {
     host: t.host,
     port: t.port,
@@ -42,6 +58,11 @@ export function setActiveTarget(t: ActiveTarget): void {
     label: t.label,
     ...(t.clusterMode ? { clusterMode: true } : {}),
   };
+  // Wave 5.16y — store creds privately so getActiveRedisClient() can
+  // authenticate. Callers that don't pass creds (legacy tests, env-only flow)
+  // get an empty record and the client is built without username/password.
+  overrideCreds = creds ? { username: creds.username, password: creds.password } : {};
+  credsGeneration += 1;
   for (const fn of listeners) {
     try { fn(override); } catch { /* listener errors must not break the setter */ }
   }
@@ -49,6 +70,7 @@ export function setActiveTarget(t: ActiveTarget): void {
 
 export function resetActiveTarget(): void {
   override = undefined;
+  overrideCreds = {};
   if (cachedClient) {
     try { cachedClient.disconnect(); } catch { /* ignore */ }
   }
@@ -62,10 +84,12 @@ export function onActiveTargetChange(fn: ActiveTargetListener): () => void {
 }
 
 // Returns a lazyConnect ioredis client bound to the current active target.
-// Cached and rebuilt when the target identity (host/port/tls/db) changes so
-// callers (router, observability) get a stable instance between switches.
+// Cached and rebuilt when the target identity (host/port/tls/db) OR the
+// stored credentials change so callers (router, observability) get a stable
+// instance between switches but authenticated targets don't trip NOAUTH.
 export function getActiveRedisClient(): Redis | null {
   const t = getActiveTarget();
+  const c = overrideCreds;
   const key = targetKey(t);
   if (cachedClient && key === cachedClientKey) return cachedClient;
   if (cachedClient) {
@@ -76,6 +100,8 @@ export function getActiveRedisClient(): Redis | null {
     port: t.port,
     db: t.db,
     tls: t.tls ? {} : undefined,
+    ...(c.username ? { username: c.username } : {}),
+    ...(c.password ? { password: c.password } : {}),
     lazyConnect: true,
     maxRetriesPerRequest: 3,
   });

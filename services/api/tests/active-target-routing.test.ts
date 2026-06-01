@@ -187,6 +187,50 @@ describe("Wave 5.16t — api routes follow active-target per-request", () => {
     expect(body.phase).toBe("idle");
   });
 
+  // Wave 5.16y — Test C: when an earlier bootstrap attempt failed against an
+  // unreachable/unauthenticated target, a subsequent activation of an
+  // authenticated reachable target must transition the bootstrap-status
+  // from "failed" → "running" → "ready" — not stay stuck at "failed".
+  it("bootstrap-status: failed (target A) → running → ready (target B) on re-activation", async () => {
+    setDebounceMsForTests(5);
+
+    // Runner #1 rejects (simulating NOAUTH against an unauthenticated target).
+    let resolveB: (() => void) | null = null;
+    let callCount = 0;
+    setBootstrapRunnerForTests(() => {
+      callCount += 1;
+      if (callCount === 1) return Promise.reject(new Error("NOAUTH Authentication required"));
+      return new Promise<void>((r) => { resolveB = r; });
+    });
+
+    const fakeSchema = { risk_classes: [] } as unknown as Parameters<typeof createServer>[0]["schema"];
+    app = await createServer({ redis: fakeRedis(), schema: fakeSchema });
+
+    setActiveTarget(TARGET_A);
+    await new Promise((r) => setTimeout(r, 30));
+    const failed = await app.inject({ method: "GET", url: "/redis/active-target/bootstrap-status" });
+    expect(failed.json().phase).toBe("failed");
+    expect(failed.json().target_label).toBe("target-A");
+
+    // Activate target B. Synchronously the status should flip to "running"
+    // (Wave 5.16y: scheduleBootstrap no longer waits for the debounce to
+    // clear stale "failed" state).
+    setActiveTarget(TARGET_B);
+    const afterSwitch = await app.inject({ method: "GET", url: "/redis/active-target/bootstrap-status" });
+    expect(afterSwitch.json().phase).toBe("running");
+    expect(afterSwitch.json().target_label).toBe("target-B");
+
+    // Wait past the debounce so the runner actually fires, then resolve it
+    // and verify the final "ready" state for target-B.
+    await new Promise((r) => setTimeout(r, 30));
+    expect(callCount).toBe(2);
+    resolveB!();
+    await new Promise((r) => setTimeout(r, 10));
+    const ready = await app.inject({ method: "GET", url: "/redis/active-target/bootstrap-status" });
+    expect(ready.json().phase).toBe("ready");
+    expect(ready.json().target_label).toBe("target-B");
+  });
+
   it("scheduleBootstrap fires on setActiveTarget and bootstrap-status reflects running → ready", async () => {
     setDebounceMsForTests(5);
     let runnerCalls = 0;

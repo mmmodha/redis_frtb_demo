@@ -108,6 +108,54 @@ describe("GET /internal/redis/active-target/full", () => {
     expect(res.statusCode).toBe(401);
   });
 
+  // Wave 5.16y — Test B: after `/connections/:id/activate`, the public
+  // `/redis/active-target` and the internal `/internal/redis/active-target/full`
+  // endpoints must agree on label/host/port/tls/db. Public never carries the
+  // password; internal does. Drift between the two was the primary symptom
+  // that motivated this wave.
+  it("public + internal endpoints return the same identity after activate", async () => {
+    const created = await app.inject({
+      method: "POST",
+      url: "/connections",
+      payload: {
+        name: "live-standalone",
+        host: "rs.live",
+        port: 6390,
+        password: "PW-LIVE",
+        tls: { enabled: false },
+        db: 0,
+      },
+    });
+    const id = created.json().id;
+    const act = await app.inject({ method: "POST", url: `/connections/${id}/activate` });
+    expect(act.statusCode).toBe(200);
+
+    const pub = await app.inject({ method: "GET", url: "/redis/active-target" });
+    expect(pub.statusCode).toBe(200);
+    const publicBody = pub.json();
+
+    const internal = await app.inject({
+      method: "GET",
+      url: "/internal/redis/active-target/full",
+      headers: { authorization: "Bearer test-internal-token" },
+    });
+    expect(internal.statusCode).toBe(200);
+    const internalBody = internal.json();
+
+    // Identity fields must match across both endpoints.
+    expect(publicBody.label).toBe(internalBody.label);
+    expect(publicBody.host).toBe(internalBody.host);
+    expect(publicBody.port).toBe(internalBody.port);
+    expect(publicBody.tls).toBe(internalBody.tls);
+    expect(publicBody.db).toBe(internalBody.db);
+    expect(publicBody.label).toBe("live-standalone");
+
+    // Public must NOT leak the password under any key. Internal must include it.
+    expect(publicBody.password).toBeUndefined();
+    expect(JSON.stringify(publicBody)).not.toContain("PW-LIVE");
+    expect(internalBody.password).toBe("PW-LIVE");
+  });
+
   it("returns 503 when INTERNAL_API_TOKEN is not configured", async () => {
     await app.close();
     delete process.env.INTERNAL_API_TOKEN;

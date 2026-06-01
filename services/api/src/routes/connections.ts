@@ -27,13 +27,22 @@ function publicProfile(p: RedactedProfile): RedactedProfile {
 }
 
 function activateProfileTarget(p: ConnectionProfile): void {
-  setActiveTarget({
-    host: p.host,
-    port: p.port,
-    tls: !!p.tls?.enabled,
-    db: p.db ?? 0,
-    label: p.name,
-  });
+  // Wave 5.16y — pass stored credentials alongside identity so the per-request
+  // ioredis client built by getActiveRedisClient() can AUTH against the
+  // selected profile (NOAUTH on /calc/sbm was the symptom). The creds payload
+  // is held privately in active-target.ts and never exposed via
+  // GET /redis/active-target.
+  setActiveTarget(
+    {
+      host: p.host,
+      port: p.port,
+      tls: !!p.tls?.enabled,
+      db: p.db ?? 0,
+      label: p.name,
+      ...(p.clusterMode ? { clusterMode: true } : {}),
+    },
+    { username: p.username, password: p.password },
+  );
 }
 
 export function registerConnectionsRoutes(
