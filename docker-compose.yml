@@ -72,6 +72,12 @@ services:
       <<: *app-env
       HEALTH_PORT: 8080
       CONN_STORE_KEY: ${CONN_STORE_KEY:-dev-only-change-in-prod}
+      # Wave 5.16g: CORS allow-list for the browser-facing api. The ui
+      # container fetches the api cross-origin from the host's nginx port
+      # (http://localhost:3000 → http://localhost:8080); without this every
+      # call surfaces in the browser as "Failed to fetch". Comma-separated
+      # list supported; `*` allowed for local dev only.
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000}
       # Wave 5.8.5: point seedConnections() at the bind-mounted fixture so the
       # `demo-cluster` / `scale-cluster` profiles auto-appear in the Connections
       # panel on api boot — required by the live e2e (e2e/full-demo.spec.ts).

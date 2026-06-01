@@ -1,4 +1,5 @@
 import Fastify, { type FastifyInstance } from "fastify";
+import fastifyCors from "@fastify/cors";
 import type { RedisLike } from "./redis-like.ts";
 import type { CorrelationSpec } from "./sbm/reduce.ts";
 import { getActiveTarget, setActiveTarget, type ActiveTarget } from "./active-target.ts";
@@ -63,10 +64,42 @@ export interface CreateServerOpts {
   // SSE tick interval for /observability/shards/stream (default 1000ms). The
   // tests dial this down so the suite stays fast.
   sseIntervalMs?: number;
+  // Wave 5.16g — explicit override for the CORS allow-list. When unset the
+  // server reads `ALLOWED_ORIGINS` from the environment (comma-separated, or
+  // `*` for any origin) and falls back to http://localhost:3000 — the nginx
+  // ui container's host-mapped port. Threaded as an option so tests can
+  // exercise restrictive and permissive lists without poking process.env.
+  allowedOrigins?: string;
+}
+
+// Wave 5.16g — parse the ALLOWED_ORIGINS env-var pattern used by the demo
+// compose stack. Returns the value to pass to @fastify/cors's `origin`
+// option: `true` for "*" (echo any origin), an array for a comma-separated
+// list (exact match), or a single string for the default single-origin
+// case. The api uses no cookies, so credentialed CORS is intentionally off.
+function parseAllowedOrigins(raw: string | undefined): true | string | string[] {
+  const value = (raw ?? "http://localhost:3000").trim();
+  if (value === "*") return true;
+  const list = value.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+  if (list.length === 0) return "http://localhost:3000";
+  const [first] = list;
+  if (list.length === 1 && first !== undefined) return first;
+  return list;
 }
 
 export async function createServer(opts: CreateServerOpts): Promise<FastifyInstance> {
   const app = Fastify({ logger: opts.logger ?? false });
+
+  // Wave 5.16g — register CORS before any route so OPTIONS preflight is
+  // handled for every endpoint (including the dynamically-loaded
+  // connections routes). The ui container fetches the api cross-origin
+  // from http://localhost:3000 → http://localhost:8080; without this every
+  // browser call surfaces as "Failed to fetch".
+  await app.register(fastifyCors, {
+    origin: parseAllowedOrigins(opts.allowedOrigins ?? process.env.ALLOWED_ORIGINS),
+    methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  });
 
   if (opts.activeTarget) setActiveTarget(opts.activeTarget);
 
