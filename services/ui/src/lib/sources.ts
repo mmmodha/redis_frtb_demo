@@ -5,6 +5,7 @@
 // across Wave 3.5 A/B/C agents.
 
 import { apiBase } from "./api";
+import { buildApiError } from "./empty-target";
 
 export type SourceFormat = "csv" | "jsonl" | "parquet";
 export type SourceOrigin = "upload" | "synthetic";
@@ -68,12 +69,7 @@ export const FRTB_BINDING_KEYS: readonly string[] = [
 ] as const;
 
 async function asError(res: Response, fallback: string): Promise<Error> {
-  try {
-    const body = await res.json() as { error?: string };
-    return new Error(body.error ?? fallback);
-  } catch {
-    return new Error(fallback);
-  }
+  return await buildApiError(res, fallback);
 }
 
 export async function listSources(): Promise<SourceRecord[]> {

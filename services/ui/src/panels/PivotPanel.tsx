@@ -3,6 +3,11 @@ import { PanelCard } from "../components/PanelCard";
 import { EnterpriseCallout } from "../components/EnterpriseCallout";
 import { MetricTile } from "../components/MetricTile";
 import { apiBase } from "../lib/api";
+import {
+  EmptyTargetError,
+  checkEmptyTargetError,
+  readErrorBody,
+} from "../lib/empty-target";
 
 const RISK_CLASSES = [
   "GIRR",
@@ -47,6 +52,7 @@ export function PivotPanel(): JSX.Element {
   const limit = DEFAULT_LIMIT;
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
+  const [emptyError, setEmptyError] = useState<EmptyTargetError | null>(null);
   const [result, setResult] = useState<PivotResp | null>(null);
   const [serverMs, setServerMs] = useState<number[]>([]);
   const [clientMs, setClientMs] = useState<number[]>([]);
@@ -60,6 +66,7 @@ export function PivotPanel(): JSX.Element {
 
   async function runAt(nextOffset: number): Promise<void> {
     setError(null);
+    setEmptyError(null);
     setLoading(true);
     const params = new URLSearchParams();
     if (riskClass) params.set("risk_class", riskClass);
@@ -74,6 +81,10 @@ export function PivotPanel(): JSX.Element {
       const res = await fetch(url);
       const t1 = performance.now();
       if (!res.ok) {
+        // Wave 5.16z3: 412/503 with the api's friendly empty-data shape are
+        // not real failures — surface them as an amber banner instead.
+        const friendly = checkEmptyTargetError(res.status, await readErrorBody(res));
+        if (friendly) throw friendly;
         throw new Error(`Pivot failed (HTTP ${res.status})`);
       }
       const body = (await res.json()) as PivotResp;
@@ -82,8 +93,12 @@ export function PivotPanel(): JSX.Element {
       setServerMs((prev) => [...prev.slice(-(HIST_WINDOW - 1)), body.ms]);
       setClientMs((prev) => [...prev.slice(-(HIST_WINDOW - 1)), Math.round((t1 - t0) * 1000) / 1000]);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : "Failed to load pivot";
-      setError(msg);
+      if (e instanceof EmptyTargetError) {
+        setEmptyError(e);
+      } else {
+        const msg = e instanceof Error ? e.message : "Failed to load pivot";
+        setError(msg);
+      }
       setResult(null);
     } finally {
       setLoading(false);
@@ -194,6 +209,28 @@ export function PivotPanel(): JSX.Element {
           </div>
         </div>
       </PanelCard>
+
+      {emptyError !== null && (
+        <div
+          role="status"
+          className="panel-callout panel-callout--amber"
+          data-testid="empty-target-banner"
+          data-kind={emptyError.status === 412 ? "bootstrap" : "no-data"}
+        >
+          {emptyError.status === 412 ? (
+            <>
+              Bootstrapping <strong>{emptyError.target_label ?? "this target"}</strong>
+              {emptyError.bootstrap_phase ? <> — {emptyError.bootstrap_phase}</> : null}.
+              Pivot will be available once it's ready.
+            </>
+          ) : (
+            <>
+              No sensitivities indexed yet — head to Sources to ingest
+              {emptyError.hint ? <> ({emptyError.hint})</> : null}.
+            </>
+          )}
+        </div>
+      )}
 
       {error !== null && (
         <div role="alert" className="pivot-error">{error}</div>

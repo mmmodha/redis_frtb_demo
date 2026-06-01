@@ -4,6 +4,7 @@
 //   response: { charge, per_bucket[], total_ms, shard_breakdown[], fanout_ms }
 
 import { apiBase } from "./api";
+import { buildApiError } from "./empty-target";
 
 export type SensitivityType = "Delta" | "Vega";
 
@@ -62,14 +63,7 @@ export async function postCalcSbm(body: CalcSbmRequest): Promise<CalcSbmResponse
     body: JSON.stringify(body),
   });
   if (!res.ok) {
-    let msg = `api /calc/sbm ${res.status}`;
-    try {
-      const parsed = (await res.json()) as { error?: string };
-      if (parsed?.error) msg = parsed.error;
-    } catch {
-      /* non-json body */
-    }
-    throw new Error(msg);
+    throw await buildApiError(res, `api /calc/sbm ${res.status}`);
   }
   return (await res.json()) as CalcSbmResponse;
 }

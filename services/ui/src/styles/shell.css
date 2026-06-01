@@ -355,6 +355,71 @@
 .shard-tile__value { font-family: var(--font-mono); color: var(--redis-text-primary); font-weight: 600; }
 
 
+/* Wave 5.16z2: in-flight lockout banner — amber tone sits below the
+   bootstrap overlay slot and stays visible across panels while runs are in
+   flight (sourced from /inflight). */
+.lockout-banner {
+  position: sticky;
+  top: 0;
+  z-index: 90;
+  display: grid;
+  gap: 4px;
+  margin: 0 0 calc(var(--grid) * 2);
+  padding: calc(var(--grid) * 1.5) calc(var(--grid) * 2);
+  background: rgba(240, 180, 41, 0.12);
+  border: 1px solid rgba(240, 180, 41, 0.55);
+  border-left: 3px solid #f0b429;
+  border-radius: var(--radius);
+  color: var(--redis-text-primary);
+}
+.lockout-banner__title { font-size: 0.9375rem; color: #f0b429; }
+.lockout-banner__items {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--grid);
+}
+.lockout-banner__item {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  color: var(--redis-text-secondary);
+  background: rgba(240, 180, 41, 0.08);
+  border-radius: var(--radius);
+  padding: 2px 8px;
+}
+
+.profile-card__row-error {
+  margin: calc(var(--grid)) 0 0;
+  padding: calc(var(--grid)) calc(var(--grid) * 1.5);
+  border-radius: var(--radius);
+  background: rgba(240, 180, 41, 0.10);
+  border-left: 3px solid #f0b429;
+  color: var(--redis-text-primary);
+  font-size: 0.8125rem;
+}
+
+/* Wave 5.16z3: shared amber callout for friendly empty-data states
+   (412 bootstrap pending / 503 no-data-or-index). Panels render this in
+   place of the red role="alert" error when the api returns a known
+   "data isn't ready yet" shape rather than a real fault. */
+.panel-callout {
+  padding: calc(var(--grid) * 2);
+  border-radius: var(--radius);
+  border: 1px solid var(--redis-border-primary);
+  margin-bottom: calc(var(--grid) * 2);
+  line-height: 1.45;
+  font-size: 0.9375rem;
+}
+.panel-callout--amber {
+  background: rgba(240, 180, 41, 0.08);
+  border-color: rgba(240, 180, 41, 0.45);
+  border-left: 3px solid #f0b429;
+  color: var(--redis-text-primary);
+}
+.panel-callout--amber strong { color: #f0b429; }
+
 /* Wave 5.16n: per-bucket K_b capital-concentration chart (sibling of timing-strip). */
 .bucket-chart { display: grid; gap: 0.25rem; }
 .bucket-chart__row { display: grid; grid-template-columns: 6rem 1fr auto auto; align-items: center; gap: 0.75rem; }

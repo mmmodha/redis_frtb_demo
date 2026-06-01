@@ -12,6 +12,7 @@ import {
   type InferredColumn,
   type SourceRecord,
 } from "../lib/sources";
+import { EmptyTargetError } from "../lib/empty-target";
 import { MappingWizard } from "./SourcesPanel/MappingWizard";
 
 const READY_TO_INGEST = new Set(["mapped", "ingested", "error"]);
@@ -34,6 +35,7 @@ interface WizardState {
 export function SourcesPanel() {
   const [sources, setSources] = useState<SourceRecord[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [emptyError, setEmptyError] = useState<EmptyTargetError | null>(null);
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [wizard, setWizard] = useState<WizardState | null>(null);
@@ -44,12 +46,18 @@ export function SourcesPanel() {
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
+    setEmptyError(null);
     try {
       const s = await listSources();
       setSources(s);
     } catch (e) {
-      setError(`Failed to load sources: ${(e as Error).message}`);
-      setSources(null);
+      if (e instanceof EmptyTargetError) {
+        setEmptyError(e);
+        setSources(null);
+      } else {
+        setError(`Failed to load sources: ${(e as Error).message}`);
+        setSources(null);
+      }
     } finally {
       setLoading(false);
     }
@@ -189,6 +197,19 @@ export function SourcesPanel() {
         <PanelCard title="Sources">
           <p>Loading sources…</p>
         </PanelCard>
+      ) : null}
+
+      {emptyError ? (
+        <div
+          role="status"
+          className="panel-callout panel-callout--amber"
+          data-testid="empty-target-banner"
+          data-kind={emptyError.status === 412 ? "bootstrap" : "no-data"}
+        >
+          Bootstrapping <strong>{emptyError.target_label ?? "this target"}</strong>
+          {emptyError.bootstrap_phase ? <> — {emptyError.bootstrap_phase}</> : null}.
+          Sources will be available once it's ready.
+        </div>
       ) : null}
 
       {error ? (

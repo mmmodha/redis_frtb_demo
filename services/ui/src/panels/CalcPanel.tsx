@@ -8,6 +8,7 @@ import {
   type CalcSbmResponse,
   type SensitivityType,
 } from "../lib/calc";
+import { EmptyTargetError } from "../lib/empty-target";
 
 type RiskClass = "GIRR" | "Equity" | "FX";
 type SortKey = "bucket" | "K_b" | "S_b" | "count" | "ms";
@@ -106,6 +107,7 @@ export function CalcPanel() {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<CalcSbmResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [emptyError, setEmptyError] = useState<EmptyTargetError | null>(null);
   const [sortKey, setSortKey] = useState<SortKey | null>(null);
 
   const isWave4 = riskClass !== "GIRR";
@@ -113,13 +115,18 @@ export function CalcPanel() {
   async function onCalculate() {
     setLoading(true);
     setError(null);
+    setEmptyError(null);
     setResult(null);
     setSortKey(null);
     try {
       const r = await postCalcSbm({ risk_class: riskClass, sensitivity_type: sensitivityType });
       setResult(r);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (e instanceof EmptyTargetError) {
+        setEmptyError(e);
+      } else {
+        setError(e instanceof Error ? e.message : String(e));
+      }
     } finally {
       setLoading(false);
     }
@@ -195,19 +202,54 @@ export function CalcPanel() {
         </div>
       </PanelCard>
 
+      {emptyError ? <CalcEmptyBanner err={emptyError} /> : null}
+
       {error ? (
         <div role="alert" className="calc-panel__error">
           {error}
         </div>
       ) : null}
 
-      {!result && !error && !loading ? (
+      {!result && !error && !emptyError && !loading ? (
         <PanelCard title="Result">
           <p className="calc-panel__empty">Press Calculate to fan out a slot-local FCALL per bucket.</p>
         </PanelCard>
       ) : null}
 
       {result ? <CalcResult result={result} sortKey={sortKey} setSortKey={setSortKey} sortedBuckets={sortedBuckets} /> : null}
+    </div>
+  );
+}
+
+// Wave 5.16z3: friendly amber banner shown in place of the red error when
+// the api signals "your target just has no data yet" (412 bootstrap pending
+// or 503 no-data-or-index) rather than a real fault.
+function CalcEmptyBanner({ err }: { err: EmptyTargetError }) {
+  const kind = err.status === 412 ? "bootstrap" : "no-data";
+  return (
+    <div
+      role="status"
+      className="panel-callout panel-callout--amber"
+      data-testid="empty-target-banner"
+      data-kind={kind}
+    >
+      {err.status === 412 ? (
+        <>
+          Bootstrapping <strong>{err.target_label ?? "this target"}</strong>
+          {err.bootstrap_phase ? <> — {err.bootstrap_phase}</> : null}. Calc will
+          be available once it's ready.
+        </>
+      ) : (
+        <>
+          <strong>
+            {err.risk_class ?? "This target"}
+            {err.measure ? ` / ${err.measure}` : ""}
+          </strong>{" "}
+          has indexes but no FRTB data yet
+          {err.hint ? <> — {err.hint}</> : null}. Go to the Sources tab to
+          ingest.
+        </>
+      )}
     </div>
   );
 }
