@@ -1,0 +1,13 @@
+{
+  "rowsSent": 2000,
+  "elapsed": 1.562,
+  "rps": 1280,
+  "byClass": {
+    "GIRR": 667,
+    "EQUITY": 667,
+    "FX": 666
+  },
+  "sensitivityTypes": [
+    "Curvature"
+  ]
+}

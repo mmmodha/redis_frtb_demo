@@ -1,0 +1,18 @@
+[smoke-reset] querying cluster topology
+[smoke-reset] XLEN sensitivities:in before: 300000
+[smoke-reset] discovered 2 master shard(s)
+[smoke-reset] used_memory_human (before):
+  shard@10395: 674.16M
+  shard@10395: 674.16M
+[smoke-reset] running FLUSHALL on each master
+  shard@10395: OK
+  shard@10395: OK
+[smoke-reset] used_memory_human (after):
+  shard@10395: 674.13M
+  shard@10395: 674.13M
+[smoke-reset] XLEN sensitivities:in after:  0
+[smoke-reset] FT._LIST sanity: asserting no indexes survive FLUSHALL
+  shard@10395: 0 indexes
+  shard@10395: 0 indexes
+[smoke-reset] FT._LIST sanity: OK
+[smoke-reset] done

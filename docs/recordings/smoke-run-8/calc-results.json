@@ -1,0 +1,74 @@
+[
+  {
+    "risk_class": "girr",
+    "sensitivity_type": "delta",
+    "status": 503,
+    "wallclock_ms": 301,
+    "body": {
+      "error": "no-data-or-index",
+      "risk_class": "girr",
+      "measure": "delta",
+      "hint": "ensure idx:sens exists on all masters and stream has been ingested"
+    }
+  },
+  {
+    "risk_class": "girr",
+    "sensitivity_type": "vega",
+    "status": 503,
+    "wallclock_ms": 323,
+    "body": {
+      "error": "no-data-or-index",
+      "risk_class": "girr",
+      "measure": "vega",
+      "hint": "ensure idx:sens exists on all masters and stream has been ingested"
+    }
+  },
+  {
+    "risk_class": "equity",
+    "sensitivity_type": "delta",
+    "status": 503,
+    "wallclock_ms": 306,
+    "body": {
+      "error": "no-data-or-index",
+      "risk_class": "equity",
+      "measure": "delta",
+      "hint": "ensure idx:sens exists on all masters and stream has been ingested"
+    }
+  },
+  {
+    "risk_class": "equity",
+    "sensitivity_type": "vega",
+    "status": 503,
+    "wallclock_ms": 318,
+    "body": {
+      "error": "no-data-or-index",
+      "risk_class": "equity",
+      "measure": "vega",
+      "hint": "ensure idx:sens exists on all masters and stream has been ingested"
+    }
+  },
+  {
+    "risk_class": "fx",
+    "sensitivity_type": "delta",
+    "status": 503,
+    "wallclock_ms": 333,
+    "body": {
+      "error": "no-data-or-index",
+      "risk_class": "fx",
+      "measure": "delta",
+      "hint": "ensure idx:sens exists on all masters and stream has been ingested"
+    }
+  },
+  {
+    "risk_class": "fx",
+    "sensitivity_type": "vega",
+    "status": 503,
+    "wallclock_ms": 316,
+    "body": {
+      "error": "no-data-or-index",
+      "risk_class": "fx",
+      "measure": "vega",
+      "hint": "ensure idx:sens exists on all masters and stream has been ingested"
+    }
+  }
+]

@@ -1,0 +1,10 @@
+{
+  "mode": "standalone",
+  "per_master": {
+    "lip-veil-spring-32424.db.redis.io:14596": {
+      "used_memory_bytes": 8250592,
+      "used_memory_human": "7.86M"
+    }
+  },
+  "used_memory_bytes": 8250592
+}

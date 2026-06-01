@@ -1,0 +1,18 @@
+{
+  "18.117.107.213:10395": {
+    "used_memory_human": "736.59M",
+    "used_memory_peak_human": "737.84M",
+    "maxmemory": null,
+    "maxmemory_human": null,
+    "maxmemory_policy": "volatile-lru",
+    "mem_fragmentation_ratio": "1"
+  },
+  "16.59.25.183:10395": {
+    "used_memory_human": "736.35M",
+    "used_memory_peak_human": "737.84M",
+    "maxmemory": null,
+    "maxmemory_human": null,
+    "maxmemory_policy": "volatile-lru",
+    "mem_fragmentation_ratio": "1"
+  }
+}

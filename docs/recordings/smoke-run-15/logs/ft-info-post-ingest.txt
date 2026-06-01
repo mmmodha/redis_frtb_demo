@@ -1,0 +1,20 @@
+[ioredis] Unhandled error event: ClusterAllFailedError: Failed to refresh slots cache.
+    at tryNode (/Users/mehul.modha/intent/workspaces/column-type/repo/node_modules/ioredis/built/cluster/index.js:335:31)
+    at /Users/mehul.modha/intent/workspaces/column-type/repo/node_modules/ioredis/built/cluster/index.js:352:21
+    at /Users/mehul.modha/intent/workspaces/column-type/repo/node_modules/ioredis/built/cluster/index.js:721:24
+    at run (/Users/mehul.modha/intent/workspaces/column-type/repo/node_modules/ioredis/built/utils/index.js:119:22)
+    at tryCatcher (/Users/mehul.modha/intent/workspaces/column-type/repo/node_modules/standard-as-callback/built/utils.js:12:23)
+    at /Users/mehul.modha/intent/workspaces/column-type/repo/node_modules/standard-as-callback/built/index.js:33:51
+    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+/Users/mehul.modha/intent/workspaces/column-type/repo/node_modules/ioredis/built/cluster/index.js:173
+                    const error = new Error("None of startup nodes is available");
+                                  ^
+
+Error: None of startup nodes is available
+    at EventEmitter.closeListener (/Users/mehul.modha/intent/workspaces/column-type/repo/node_modules/ioredis/built/cluster/index.js:173:35)
+    at Object.onceWrapper (node:events:630:28)
+    at EventEmitter.emit (node:events:521:24)
+    at /Users/mehul.modha/intent/workspaces/column-type/repo/node_modules/ioredis/built/cluster/index.js:628:18
+    at process.processTicksAndRejections (node:internal/process/task_queues:85:11)
+
+Node.js v25.9.0

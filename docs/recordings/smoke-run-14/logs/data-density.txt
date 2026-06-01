@@ -1,0 +1,13 @@
+sent_rows=150000  (Wave 5.15n retry after 200k single-shard finding)
+ft_info_num_docs_per_shard_reply={'16.59.25.183:10395': 64193, '18.117.107.213:10395': 64193}
+cluster_total_indexed=64193
+density_pct=42.80
+xlen_stream=150000
+
+per-shard sens:* key counts (SCAN — authoritative):
+  18.117.107.213:10395  sens_keys_total=64193
+  16.59.25.183:10395  sens_keys_total=0
+
+density_verdict=LOW  (gate: 50%)
+shard_balance=SINGLE_SHARD_ONLY
+classification_route=PARTIAL (single-shard recurs at 150k -> cluster maxmemory escalation per Wave 5.15o)

@@ -1,0 +1,169 @@
+{
+  "risk_class": "girr",
+  "sensitivity_type": "vega",
+  "http_status": 200,
+  "wallclock_ms": 302,
+  "body": {
+    "charge": 35.59281830123902,
+    "per_bucket": [
+      {
+        "bucket": "CHF",
+        "K_b": 13.396345145625,
+        "S_b": -16.316269,
+        "count": 27,
+        "ms": 0
+      },
+      {
+        "bucket": "USD",
+        "K_b": 8.56730607935,
+        "S_b": 7.977918,
+        "count": 22,
+        "ms": 0
+      },
+      {
+        "bucket": "AUD",
+        "K_b": 11.399073059168,
+        "S_b": -9.84496,
+        "count": 39,
+        "ms": 0
+      },
+      {
+        "bucket": "EUR",
+        "K_b": 9.9570190330032,
+        "S_b": -4.131465,
+        "count": 33,
+        "ms": 0
+      },
+      {
+        "bucket": "CAD",
+        "K_b": 9.2689612540929,
+        "S_b": 6.955654,
+        "count": 27,
+        "ms": 0
+      },
+      {
+        "bucket": "OTHER",
+        "K_b": 10.579565482019,
+        "S_b": 2.122184,
+        "count": 33,
+        "ms": 0
+      },
+      {
+        "bucket": "JPY",
+        "K_b": 9.3654712503538,
+        "S_b": 4.639835,
+        "count": 27,
+        "ms": 0
+      },
+      {
+        "bucket": "NOK",
+        "K_b": 7.6937142272402,
+        "S_b": 1.927429,
+        "count": 18,
+        "ms": 0
+      },
+      {
+        "bucket": "NZD",
+        "K_b": 10.461456020881,
+        "S_b": -11.028875,
+        "count": 28,
+        "ms": 0
+      },
+      {
+        "bucket": "SEK",
+        "K_b": 10.360014621321,
+        "S_b": -0.65895,
+        "count": 34,
+        "ms": 0
+      },
+      {
+        "bucket": "GBP",
+        "K_b": 11.474045859154,
+        "S_b": -13.360491,
+        "count": 24,
+        "ms": 0
+      }
+    ],
+    "total_ms": 242.913,
+    "shard_breakdown": [
+      {
+        "shard": "CHF",
+        "buckets": [
+          "CHF"
+        ],
+        "ms": 0
+      },
+      {
+        "shard": "USD",
+        "buckets": [
+          "USD"
+        ],
+        "ms": 0
+      },
+      {
+        "shard": "AUD",
+        "buckets": [
+          "AUD"
+        ],
+        "ms": 0
+      },
+      {
+        "shard": "EUR",
+        "buckets": [
+          "EUR"
+        ],
+        "ms": 0
+      },
+      {
+        "shard": "CAD",
+        "buckets": [
+          "CAD"
+        ],
+        "ms": 0
+      },
+      {
+        "shard": "OTHER",
+        "buckets": [
+          "OTHER"
+        ],
+        "ms": 0
+      },
+      {
+        "shard": "JPY",
+        "buckets": [
+          "JPY"
+        ],
+        "ms": 0
+      },
+      {
+        "shard": "NOK",
+        "buckets": [
+          "NOK"
+        ],
+        "ms": 0
+      },
+      {
+        "shard": "NZD",
+        "buckets": [
+          "NZD"
+        ],
+        "ms": 0
+      },
+      {
+        "shard": "SEK",
+        "buckets": [
+          "SEK"
+        ],
+        "ms": 0
+      },
+      {
+        "shard": "GBP",
+        "buckets": [
+          "GBP"
+        ],
+        "ms": 0
+      }
+    ],
+    "fanout_ms": 129.504
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "invoked": false,
+  "reason": "AC1 prerequisite not met \u2014 every calc variant returned charge=0; loadgen target intentionally restricted to AC1-passing variants only per runbook DoD #13.",
+  "config_intended": {
+    "concurrency": 200,
+    "duration_sec": 60,
+    "target": "POST /calc/sbm (GIRR/Delta)"
+  },
+  "ac2_verdict": "vacuous_fail"
+}

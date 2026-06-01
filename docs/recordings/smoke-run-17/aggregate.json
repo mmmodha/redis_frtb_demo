@@ -1,0 +1,101 @@
+{
+  "run": "smoke-run-17",
+  "generated_at": "2026-06-01T17:11:38.684Z",
+  "variants": {
+    "EQUITY.Curvature": {
+      "risk_class": "EQUITY",
+      "sensitivity_type": "Curvature",
+      "charge": 367.294736712442,
+      "total_ms": 283.289,
+      "fanout_ms": 164.171,
+      "bucket_count": 13
+    },
+    "EQUITY.Delta": {
+      "risk_class": "EQUITY",
+      "sensitivity_type": "Delta",
+      "charge": 6.924412067037891,
+      "total_ms": 271.287,
+      "fanout_ms": 154.191,
+      "bucket_count": 13
+    },
+    "EQUITY.Vega": {
+      "risk_class": "EQUITY",
+      "sensitivity_type": "Vega",
+      "charge": 15.301745210544523,
+      "total_ms": 277.693,
+      "fanout_ms": 157.389,
+      "bucket_count": 13
+    },
+    "FX.Curvature": {
+      "risk_class": "FX",
+      "sensitivity_type": "Curvature",
+      "charge": 1036.9389159739594,
+      "total_ms": 272.115,
+      "fanout_ms": 153.378,
+      "bucket_count": 11
+    },
+    "FX.Delta": {
+      "risk_class": "FX",
+      "sensitivity_type": "Delta",
+      "charge": 1.1552805689882315,
+      "total_ms": 263.989,
+      "fanout_ms": 148.836,
+      "bucket_count": 11
+    },
+    "FX.Vega": {
+      "risk_class": "FX",
+      "sensitivity_type": "Vega",
+      "charge": 15.403740919843086,
+      "total_ms": 283.308,
+      "fanout_ms": 161.469,
+      "bucket_count": 11
+    },
+    "GIRR.Curvature": {
+      "risk_class": "GIRR",
+      "sensitivity_type": "Curvature",
+      "charge": 9495.234078557116,
+      "total_ms": 300.762,
+      "fanout_ms": 180.78,
+      "bucket_count": 11
+    },
+    "GIRR.Delta": {
+      "risk_class": "GIRR",
+      "sensitivity_type": "Delta",
+      "charge": 0.6846307166088303,
+      "total_ms": 300.829,
+      "fanout_ms": 177.317,
+      "bucket_count": 11
+    },
+    "GIRR.Vega": {
+      "risk_class": "GIRR",
+      "sensitivity_type": "Vega",
+      "charge": 52.06012591155659,
+      "total_ms": 286.053,
+      "fanout_ms": 167.355,
+      "bucket_count": 11
+    }
+  },
+  "by_risk_class_legs": {
+    "EQUITY": {
+      "Delta": 6.924412067037891,
+      "Vega": 15.301745210544523,
+      "Curvature": 367.294736712442
+    },
+    "FX": {
+      "Delta": 1.1552805689882315,
+      "Vega": 15.403740919843086,
+      "Curvature": 1036.9389159739594
+    },
+    "GIRR": {
+      "Delta": 0.6846307166088303,
+      "Vega": 52.06012591155659,
+      "Curvature": 9495.234078557116
+    }
+  },
+  "risk_class_total_l2": {
+    "EQUITY": 367.6785477908993,
+    "FX": 1037.0539645403073,
+    "GIRR": 9495.37681885356
+  },
+  "grand_total_l2": 9558.91465449378
+}

@@ -1,0 +1,512 @@
+[
+  {
+    "risk_class": "girr",
+    "sensitivity_type": "delta",
+    "status": 200,
+    "wallclock_ms": 475,
+    "body": {
+      "charge": 0,
+      "per_bucket": [
+        {
+          "bucket": "JPY",
+          "K_b": 0,
+          "S_b": 0,
+          "count": 0,
+          "ms": 0
+        },
+        {
+          "bucket": "AUD",
+          "K_b": 0,
+          "S_b": 0,
+          "count": 0,
+          "ms": 0
+        },
+        {
+          "bucket": "SEK",
+          "K_b": 0,
+          "S_b": 0,
+          "count": 0,
+          "ms": 0
+        },
+        {
+          "bucket": "OTHER",
+          "K_b": 0,
+          "S_b": 0,
+          "count": 0,
+          "ms": 0
+        }
+      ],
+      "total_ms": 382.536,
+      "shard_breakdown": [
+        {
+          "shard": "JPY",
+          "buckets": [
+            "JPY"
+          ],
+          "ms": 0
+        },
+        {
+          "shard": "AUD",
+          "buckets": [
+            "AUD"
+          ],
+          "ms": 0
+        },
+        {
+          "shard": "SEK",
+          "buckets": [
+            "SEK"
+          ],
+          "ms": 0
+        },
+        {
+          "shard": "OTHER",
+          "buckets": [
+            "OTHER"
+          ],
+          "ms": 0
+        }
+      ],
+      "fanout_ms": 151.359
+    }
+  },
+  {
+    "risk_class": "girr",
+    "sensitivity_type": "vega",
+    "status": 200,
+    "wallclock_ms": 541,
+    "body": {
+      "charge": 0,
+      "per_bucket": [
+        {
+          "bucket": "JPY",
+          "K_b": 0,
+          "S_b": 0,
+          "count": 0,
+          "ms": 0
+        },
+        {
+          "bucket": "AUD",
+          "K_b": 0,
+          "S_b": 0,
+          "count": 0,
+          "ms": 0
+        },
+        {
+          "bucket": "SEK",
+          "K_b": 0,
+          "S_b": 0,
+          "count": 0,
+          "ms": 0
+        },
+        {
+          "bucket": "OTHER",
+          "K_b": 0,
+          "S_b": 0,
+          "count": 0,
+          "ms": 0
+        }
+      ],
+      "total_ms": 478.255,
+      "shard_breakdown": [
+        {
+          "shard": "JPY",
+          "buckets": [
+            "JPY"
+          ],
+          "ms": 0
+        },
+        {
+          "shard": "AUD",
+          "buckets": [
+            "AUD"
+          ],
+          "ms": 0
+        },
+        {
+          "shard": "SEK",
+          "buckets": [
+            "SEK"
+          ],
+          "ms": 0
+        },
+        {
+          "shard": "OTHER",
+          "buckets": [
+            "OTHER"
+          ],
+          "ms": 0
+        }
+      ],
+      "fanout_ms": 260.859
+    }
+  },
+  {
+    "risk_class": "equity",
+    "sensitivity_type": "delta",
+    "status": 200,
+    "wallclock_ms": 539,
+    "body": {
+      "charge": 0,
+      "per_bucket": [
+        {
+          "bucket": "13",
+          "K_b": 0,
+          "S_b": 0,
+          "count": 0,
+          "ms": 0
+        },
+        {
+          "bucket": "3",
+          "K_b": 0,
+          "S_b": 0,
+          "count": 0,
+          "ms": 0
+        },
+        {
+          "bucket": "6",
+          "K_b": 0,
+          "S_b": 0,
+          "count": 0,
+          "ms": 0
+        },
+        {
+          "bucket": "12",
+          "K_b": 0,
+          "S_b": 0,
+          "count": 0,
+          "ms": 0
+        },
+        {
+          "bucket": "7",
+          "K_b": 0,
+          "S_b": 0,
+          "count": 0,
+          "ms": 0
+        },
+        {
+          "bucket": "2",
+          "K_b": 0,
+          "S_b": 0,
+          "count": 0,
+          "ms": 0
+        }
+      ],
+      "total_ms": 455.211,
+      "shard_breakdown": [
+        {
+          "shard": "13",
+          "buckets": [
+            "13"
+          ],
+          "ms": 0
+        },
+        {
+          "shard": "3",
+          "buckets": [
+            "3"
+          ],
+          "ms": 0
+        },
+        {
+          "shard": "6",
+          "buckets": [
+            "6"
+          ],
+          "ms": 0
+        },
+        {
+          "shard": "12",
+          "buckets": [
+            "12"
+          ],
+          "ms": 0
+        },
+        {
+          "shard": "7",
+          "buckets": [
+            "7"
+          ],
+          "ms": 0
+        },
+        {
+          "shard": "2",
+          "buckets": [
+            "2"
+          ],
+          "ms": 0
+        }
+      ],
+      "fanout_ms": 213.274
+    }
+  },
+  {
+    "risk_class": "equity",
+    "sensitivity_type": "vega",
+    "status": 200,
+    "wallclock_ms": 552,
+    "body": {
+      "charge": 0,
+      "per_bucket": [
+        {
+          "bucket": "13",
+          "K_b": 0,
+          "S_b": 0,
+          "count": 0,
+          "ms": 0
+        },
+        {
+          "bucket": "3",
+          "K_b": 0,
+          "S_b": 0,
+          "count": 0,
+          "ms": 0
+        },
+        {
+          "bucket": "6",
+          "K_b": 0,
+          "S_b": 0,
+          "count": 0,
+          "ms": 0
+        },
+        {
+          "bucket": "12",
+          "K_b": 0,
+          "S_b": 0,
+          "count": 0,
+          "ms": 0
+        },
+        {
+          "bucket": "7",
+          "K_b": 0,
+          "S_b": 0,
+          "count": 0,
+          "ms": 0
+        },
+        {
+          "bucket": "2",
+          "K_b": 0,
+          "S_b": 0,
+          "count": 0,
+          "ms": 0
+        }
+      ],
+      "total_ms": 469.073,
+      "shard_breakdown": [
+        {
+          "shard": "13",
+          "buckets": [
+            "13"
+          ],
+          "ms": 0
+        },
+        {
+          "shard": "3",
+          "buckets": [
+            "3"
+          ],
+          "ms": 0
+        },
+        {
+          "shard": "6",
+          "buckets": [
+            "6"
+          ],
+          "ms": 0
+        },
+        {
+          "shard": "12",
+          "buckets": [
+            "12"
+          ],
+          "ms": 0
+        },
+        {
+          "shard": "7",
+          "buckets": [
+            "7"
+          ],
+          "ms": 0
+        },
+        {
+          "shard": "2",
+          "buckets": [
+            "2"
+          ],
+          "ms": 0
+        }
+      ],
+      "fanout_ms": 216.765
+    }
+  },
+  {
+    "risk_class": "fx",
+    "sensitivity_type": "delta",
+    "status": 200,
+    "wallclock_ms": 553,
+    "body": {
+      "charge": 0,
+      "per_bucket": [
+        {
+          "bucket": "USDCHF",
+          "K_b": 0,
+          "S_b": 0,
+          "count": 0,
+          "ms": 0
+        },
+        {
+          "bucket": "EURJPY",
+          "K_b": 0,
+          "S_b": 0,
+          "count": 0,
+          "ms": 0
+        },
+        {
+          "bucket": "GBPJPY",
+          "K_b": 0,
+          "S_b": 0,
+          "count": 0,
+          "ms": 0
+        },
+        {
+          "bucket": "USDCAD",
+          "K_b": 0,
+          "S_b": 0,
+          "count": 0,
+          "ms": 0
+        },
+        {
+          "bucket": "AUDUSD",
+          "K_b": 0,
+          "S_b": 0,
+          "count": 0,
+          "ms": 0
+        }
+      ],
+      "total_ms": 463.545,
+      "shard_breakdown": [
+        {
+          "shard": "USDCHF",
+          "buckets": [
+            "USDCHF"
+          ],
+          "ms": 0
+        },
+        {
+          "shard": "EURJPY",
+          "buckets": [
+            "EURJPY"
+          ],
+          "ms": 0
+        },
+        {
+          "shard": "GBPJPY",
+          "buckets": [
+            "GBPJPY"
+          ],
+          "ms": 0
+        },
+        {
+          "shard": "USDCAD",
+          "buckets": [
+            "USDCAD"
+          ],
+          "ms": 0
+        },
+        {
+          "shard": "AUDUSD",
+          "buckets": [
+            "AUDUSD"
+          ],
+          "ms": 0
+        }
+      ],
+      "fanout_ms": 227.404
+    }
+  },
+  {
+    "risk_class": "fx",
+    "sensitivity_type": "vega",
+    "status": 200,
+    "wallclock_ms": 569,
+    "body": {
+      "charge": 0,
+      "per_bucket": [
+        {
+          "bucket": "USDCHF",
+          "K_b": 0,
+          "S_b": 0,
+          "count": 0,
+          "ms": 0
+        },
+        {
+          "bucket": "EURJPY",
+          "K_b": 0,
+          "S_b": 0,
+          "count": 0,
+          "ms": 0
+        },
+        {
+          "bucket": "GBPJPY",
+          "K_b": 0,
+          "S_b": 0,
+          "count": 0,
+          "ms": 0
+        },
+        {
+          "bucket": "USDCAD",
+          "K_b": 0,
+          "S_b": 0,
+          "count": 0,
+          "ms": 0
+        },
+        {
+          "bucket": "AUDUSD",
+          "K_b": 0,
+          "S_b": 0,
+          "count": 0,
+          "ms": 0
+        }
+      ],
+      "total_ms": 480.128,
+      "shard_breakdown": [
+        {
+          "shard": "USDCHF",
+          "buckets": [
+            "USDCHF"
+          ],
+          "ms": 0
+        },
+        {
+          "shard": "EURJPY",
+          "buckets": [
+            "EURJPY"
+          ],
+          "ms": 0
+        },
+        {
+          "shard": "GBPJPY",
+          "buckets": [
+            "GBPJPY"
+          ],
+          "ms": 0
+        },
+        {
+          "shard": "USDCAD",
+          "buckets": [
+            "USDCAD"
+          ],
+          "ms": 0
+        },
+        {
+          "shard": "AUDUSD",
+          "buckets": [
+            "AUDUSD"
+          ],
+          "ms": 0
+        }
+      ],
+      "fanout_ms": 241.203
+    }
+  }
+]

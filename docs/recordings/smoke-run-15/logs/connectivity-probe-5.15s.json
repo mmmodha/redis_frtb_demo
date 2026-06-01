@@ -1,0 +1,45 @@
+{
+  "probe": "wave-5.15o smoke-run-15 connectivity",
+  "started_at_ms": 1780094726980,
+  "mode": "standalone",
+  "tls_used": false,
+  "connect": {
+    "ok": true,
+    "cluster_attempt_error": "None of startup nodes is available",
+    "elapsed_ms": 785
+  },
+  "ping": {
+    "ok": true,
+    "reply": "PONG",
+    "latency_ms": 118
+  },
+  "cluster": {
+    "error": "ERR command is not allowed",
+    "master_count": 1
+  },
+  "per_master": {
+    "lip-veil-spring-32424.db.redis.io:14596": {
+      "slot_ranges": [
+        [
+          0,
+          16383
+        ]
+      ],
+      "maxmemory_bytes": null,
+      "used_memory_bytes": 16952944,
+      "used_memory_human": "16.16M",
+      "maxmemory_policy": "noeviction",
+      "role": "master",
+      "connected_replicas": 1,
+      "redis_version": "8.4.0",
+      "redis_mode": "standalone"
+    }
+  },
+  "write_path": {
+    "ok": true,
+    "reply": "OK",
+    "key": "probe:{ping}:034525804508b1cb",
+    "ttl_s": 5
+  },
+  "elapsed_ms": 1477
+}

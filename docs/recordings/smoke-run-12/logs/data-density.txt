@@ -1,0 +1,17 @@
+ingest_consumed: 300000
+FT.INFO num_docs: 120246
+SCAN sens:* total across shards: 120246
+density: 40.082%  (gate: >=80% green)
+per-shard sens key counts: {
+  "18.117.107.213:10395": {
+    "sens_keys_on_this_shard": 120246
+  },
+  "16.59.25.183:10395": {
+    "sens_keys_on_this_shard": 0
+  }
+}
+hash_indexing_failures both shards: 0  (no indexing failure)
+
+classification: data-density-low (no indexing failures; below 80% gate)
+
+Note per runbook DoD #9: density < 80% is recorded but does NOT block AC1.

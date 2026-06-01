@@ -1,0 +1,166 @@
+{
+  "cluster_view": {
+    "master_count": 2,
+    "slots_by_master": {
+      "16.59.25.183:10395": [
+        [
+          0,
+          8191
+        ]
+      ],
+      "18.117.107.213:10395": [
+        [
+          8192,
+          16383
+        ]
+      ]
+    },
+    "hashtags_per_master": {
+      "16.59.25.183:10395": 7,
+      "18.117.107.213:10395": 15
+    }
+  },
+  "per_master": {
+    "18.117.107.213:10395": {
+      "sens_keys_total": 85428,
+      "sample_keys": [
+        {
+          "key": "sens:{GIRR:JPY}:01KSSK65APK63TFG90FMV7N6YN",
+          "slot": 14016
+        },
+        {
+          "key": "sens:{FX:EURJPY}:01KSSK4WQPQ0ZZ13X87X665SYR",
+          "slot": 8708
+        },
+        {
+          "key": "sens:{EQUITY:2}:01KSSK46JBMC6X9W2TS5VSA3Y8",
+          "slot": 9667
+        },
+        {
+          "key": "sens:{EQUITY:3}:01KSSK5PRMKYCTBWMQMK6N1X1Q",
+          "slot": 13794
+        },
+        {
+          "key": "sens:{FX:USDCAD}:01KSSK4XKC7WDB36BDDYPWTYP8",
+          "slot": 9332
+        }
+      ]
+    },
+    "16.59.25.183:10395": {
+      "sens_keys_total": 0,
+      "sample_keys": []
+    }
+  },
+  "hashtag_to_slot": {
+    "GIRR:USD": {
+      "probe_key": "sens:{GIRR:USD}:_route",
+      "slot": 3933,
+      "owner": "16.59.25.183:10395"
+    },
+    "GIRR:EUR": {
+      "probe_key": "sens:{GIRR:EUR}:_route",
+      "slot": 5231,
+      "owner": "16.59.25.183:10395"
+    },
+    "GIRR:GBP": {
+      "probe_key": "sens:{GIRR:GBP}:_route",
+      "slot": 169,
+      "owner": "16.59.25.183:10395"
+    },
+    "GIRR:JPY": {
+      "probe_key": "sens:{GIRR:JPY}:_route",
+      "slot": 14016,
+      "owner": "18.117.107.213:10395"
+    },
+    "GIRR:AUD": {
+      "probe_key": "sens:{GIRR:AUD}:_route",
+      "slot": 14936,
+      "owner": "18.117.107.213:10395"
+    },
+    "GIRR:CAD": {
+      "probe_key": "sens:{GIRR:CAD}:_route",
+      "slot": 7055,
+      "owner": "16.59.25.183:10395"
+    },
+    "GIRR:CHF": {
+      "probe_key": "sens:{GIRR:CHF}:_route",
+      "slot": 341,
+      "owner": "16.59.25.183:10395"
+    },
+    "GIRR:SEK": {
+      "probe_key": "sens:{GIRR:SEK}:_route",
+      "slot": 9671,
+      "owner": "18.117.107.213:10395"
+    },
+    "GIRR:NOK": {
+      "probe_key": "sens:{GIRR:NOK}:_route",
+      "slot": 2878,
+      "owner": "16.59.25.183:10395"
+    },
+    "GIRR:OTHER": {
+      "probe_key": "sens:{GIRR:OTHER}:_route",
+      "slot": 8964,
+      "owner": "18.117.107.213:10395"
+    },
+    "EQUITY:1": {
+      "probe_key": "sens:{EQUITY:1}:_route",
+      "slot": 5536,
+      "owner": "16.59.25.183:10395"
+    },
+    "EQUITY:2": {
+      "probe_key": "sens:{EQUITY:2}:_route",
+      "slot": 9667,
+      "owner": "18.117.107.213:10395"
+    },
+    "EQUITY:3": {
+      "probe_key": "sens:{EQUITY:3}:_route",
+      "slot": 13794,
+      "owner": "18.117.107.213:10395"
+    },
+    "EQUITY:6": {
+      "probe_key": "sens:{EQUITY:6}:_route",
+      "slot": 9543,
+      "owner": "18.117.107.213:10395"
+    },
+    "EQUITY:7": {
+      "probe_key": "sens:{EQUITY:7}:_route",
+      "slot": 13670,
+      "owner": "18.117.107.213:10395"
+    },
+    "EQUITY:12": {
+      "probe_key": "sens:{EQUITY:12}:_route",
+      "slot": 11721,
+      "owner": "18.117.107.213:10395"
+    },
+    "EQUITY:13": {
+      "probe_key": "sens:{EQUITY:13}:_route",
+      "slot": 15848,
+      "owner": "18.117.107.213:10395"
+    },
+    "FX:USDCHF": {
+      "probe_key": "sens:{FX:USDCHF}:_route",
+      "slot": 16046,
+      "owner": "18.117.107.213:10395"
+    },
+    "FX:EURJPY": {
+      "probe_key": "sens:{FX:EURJPY}:_route",
+      "slot": 8708,
+      "owner": "18.117.107.213:10395"
+    },
+    "FX:GBPJPY": {
+      "probe_key": "sens:{FX:GBPJPY}:_route",
+      "slot": 10146,
+      "owner": "18.117.107.213:10395"
+    },
+    "FX:USDCAD": {
+      "probe_key": "sens:{FX:USDCAD}:_route",
+      "slot": 9332,
+      "owner": "18.117.107.213:10395"
+    },
+    "FX:AUDUSD": {
+      "probe_key": "sens:{FX:AUDUSD}:_route",
+      "slot": 8454,
+      "owner": "18.117.107.213:10395"
+    }
+  }
+}

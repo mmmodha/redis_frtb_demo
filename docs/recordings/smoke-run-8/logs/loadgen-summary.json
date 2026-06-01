@@ -1,0 +1,8 @@
+{
+  "note": "vacuously skipped \u2014 AC1 failed (all 6 calc variants returned 503 no-data-or-index). Per task: AC2 reported against a working calc path; no working path exists.",
+  "invoked": false,
+  "concurrency_target": 200,
+  "duration_s_target": 60,
+  "measured_p99_ms": null,
+  "reason": "AC1 prerequisite not met"
+}

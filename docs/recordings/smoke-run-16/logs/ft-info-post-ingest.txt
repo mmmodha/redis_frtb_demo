@@ -1,0 +1,202 @@
+index_name
+idx:sens
+index_options
+
+index_definition
+key_type
+JSON
+prefixes
+sens:
+default_score
+1
+indexes_all
+false
+attributes
+identifier
+$.risk_class
+attribute
+risk_class
+type
+TAG
+SEPARATOR
+
+identifier
+$.bucket
+attribute
+bucket
+type
+TAG
+SEPARATOR
+
+identifier
+$.sensitivity_type
+attribute
+sensitivity_type
+type
+TAG
+SEPARATOR
+
+identifier
+$.book
+attribute
+book
+type
+TAG
+SEPARATOR
+
+identifier
+$.trade_id
+attribute
+trade_id
+type
+TAG
+SEPARATOR
+
+num_docs
+6000
+max_doc_id
+6000
+num_terms
+0
+num_records
+26001
+inverted_sz_mb
+0.03587532043457031
+vector_index_sz_mb
+0
+total_inverted_index_blocks
+112
+offset_vectors_sz_mb
+0
+doc_table_size_mb
+0.7482070922851563
+sortable_values_size_mb
+0
+key_table_size_mb
+0.30403900146484375
+tag_overhead_sz_mb
+0.0037689208984375
+text_overhead_sz_mb
+0
+total_index_memory_sz_mb
+1.0918903350830078
+geoshapes_sz_mb
+0
+records_per_doc_avg
+4.333499908447266
+bytes_per_record_avg
+1.4467904567718506
+offsets_per_term_avg
+0
+offset_bits_per_record_avg
+nan
+hash_indexing_failures
+0
+total_indexing_time
+114.883866
+indexing
+0
+percent_indexed
+1
+number_of_uses
+2
+cleaning
+0
+gc_stats
+bytes_collected
+0
+total_ms_run
+0
+total_cycles
+0
+average_cycle_time_ms
+nan
+last_run_time_ms
+0
+gc_numeric_trees_missed
+0
+gc_blocks_denied
+0
+cursor_stats
+global_idle
+0
+global_total
+0
+index_capacity
+128
+index_total
+0
+dialect_stats
+dialect_1
+0
+dialect_2
+0
+dialect_3
+0
+dialect_4
+0
+Index Errors
+indexing failures
+0
+last indexing error
+N/A
+last indexing error key
+N/A
+background indexing status
+OK
+field statistics
+identifier
+$.risk_class
+attribute
+risk_class
+Index Errors
+indexing failures
+0
+last indexing error
+N/A
+last indexing error key
+N/A
+identifier
+$.bucket
+attribute
+bucket
+Index Errors
+indexing failures
+0
+last indexing error
+N/A
+last indexing error key
+N/A
+identifier
+$.sensitivity_type
+attribute
+sensitivity_type
+Index Errors
+indexing failures
+0
+last indexing error
+N/A
+last indexing error key
+N/A
+identifier
+$.book
+attribute
+book
+Index Errors
+indexing failures
+0
+last indexing error
+N/A
+last indexing error key
+N/A
+identifier
+$.trade_id
+attribute
+trade_id
+Index Errors
+indexing failures
+0
+last indexing error
+N/A
+last indexing error key
+N/A

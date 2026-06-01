@@ -1,0 +1,20 @@
+=== IN-TREE SOURCE: services/generator/src/row-generator.ts ===
+21:const SENSITIVITY_TYPES = ["Delta", "Vega"];
+22-
+23-// Per-dimension op codes — resolved once per schema, then executed per row.
+--
+127:          case "sens_type": row[op.name] = SENSITIVITY_TYPES[(rng() * 2) | 0]!; break;
+128-          case "tenor_array": row[op.name] = plan.tenorNodes ?? []; break;
+129-          case "tenor_pick": row[op.name] = plan.tenorNodes ? plan.tenorNodes[(rng() * plan.tenorNodes.length) | 0]! : ""; break;
+
+=== INSIDE RUNNING IMAGE: /app/services/generator/src/row-generator.ts ===
+21:const SENSITIVITY_TYPES = ["DELTA", "VEGA"];
+22-
+23-// Per-dimension op codes — resolved once per schema, then executed per row.
+--
+127:          case "sens_type": row[op.name] = SENSITIVITY_TYPES[(rng() * 2) | 0]!; break;
+128-          case "tenor_array": row[op.name] = plan.tenorNodes ?? []; break;
+129-          case "tenor_pick": row[op.name] = plan.tenorNodes ? plan.tenorNodes[(rng() * plan.tenorNodes.length) | 0]! : ""; break;
+
+=== generator image label / built ===
+2026-05-27T12:20:58.807158792Z sha256:603b95231893549ca851def814c3f5a4e451ba4b693b518113e81dcc97f95441

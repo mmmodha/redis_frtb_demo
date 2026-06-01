@@ -1,0 +1,12 @@
+{
+  "mode": "standalone",
+  "per_master": {
+    "lip-veil-spring-32424.db.redis.io:14596": {
+      "num_docs": 6000,
+      "hash_indexing_failures": 0,
+      "indexing": 0,
+      "total_indexing_time": "125.149747"
+    }
+  },
+  "xlen_stream": 6000
+}
