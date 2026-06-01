@@ -110,12 +110,12 @@
 
 | Risk class | Delta | Vega | Curvature | Per-class L2 |
 |---|---:|---:|---:|---:|
-| **GIRR** | 0.6965 | 66.957 | 9,597.032 | **9,597.27** |
-| **EQUITY** | 7.4316 | 15.992 | 344.332 | **344.78** |
-| **FX** | 1.4256 | 12.891 | 1,095.108 | **1,095.18** |
-| **Grand L2** | — | — | — | **9,665.70** |
+| **GIRR** | 0.6846 | 52.060 | 9495.234 | **9,495.38** |
+| **EQUITY** | 6.9244 | 15.302 | 367.295 | **367.72** |
+| **FX** | 1.1553 | 15.404 | 1036.939 | **1,037.05** |
+| **Grand L2** | — | — | — | **9,558.91** |
 
-- **Presenter says.** "Same math path, nine variants. Every call HTTP 200, every per-bucket count strictly positive, every charge strictly positive. Per-class L2 across the three legs gives GIRR = 9,597.27, EQUITY = 344.78, FX = 1,095.18; the grand L2 across the three risk classes is **9,665.70**. We never breached 76 % of the memory cap."
+- **Presenter says.** "Same math path, nine variants. Every call HTTP 200, every per-bucket count strictly positive, every charge strictly positive. Per-class L2 across the three legs gives GIRR = 9,495.38, EQUITY = 367.72, FX = 1,037.05; the grand L2 across the three risk classes is **9,558.91**. We never breached 80 % of the memory cap."
 - **Basel anchor.** Same MAR21 §21.4(3)–(5) path per Delta/Vega; §21.5(2)–(5) path per Curvature; per-class γ matrix sourced via [`services/api/src/sbm/correlations.ts:9-27`](../../services/api/src/sbm/correlations.ts) from the schema YAML.
 - **Live value to point at.** Nine-variant total HTTP-200 hit rate `9/9`; per-variant wallclock `263–314 ms`, fanout `144–191 ms`; cap utilisation `22.59 / 30 MB = 75.32 %`. Source: [`docs/recordings/smoke-run-16/aggregate.json`](../recordings/smoke-run-16/aggregate.json).
 - **Time budget.** 45 s.
@@ -158,7 +158,7 @@
 
 ## What this demo deliberately leaves out
 
-- **§21.6 cross-risk-class total capital.** Today we show per-risk-class charges and the grand L2 across GIRR + EQUITY + FX (`9,665.70`); the full §21.6 trading-book total — folding in CSR and Commodity and rolling Delta + Vega + Curvature into one regulator-facing number — is a one-screen extension we have not lit up.
+- **§21.6 cross-risk-class total capital.** Today we show per-risk-class charges and the grand L2 across GIRR + EQUITY + FX (`9,558.91`); the full §21.6 trading-book total — folding in CSR and Commodity and rolling Delta + Vega + Curvature into one regulator-facing number — is a one-screen extension we have not lit up.
 - **Default Risk Charge (DRC).** The non-securitisation / securitisation / CTP default-risk add-on under MAR22 is part of FRTB-SA but outside SBM; not touched here.
 - **Residual Risk Add-On (RRAO).** The MAR23 residual-risk add-on (gap / exotic / digital) is similarly outside SBM and not in this demo.
 - **Curvature × Vega interaction.** Vega is included as its own leg and Curvature is included as its own leg; the §21.5 Curvature-on-Vega-shock interaction (where Curvature is run against the Vega risk factor rather than the Delta risk factor) is not in this scope.
