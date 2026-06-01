@@ -1,0 +1,203 @@
+=== Wave 5.15k smoke-run-12 — Image freshness check ===
+
+=== IN-TREE SOURCE: services/generator/src/row-generator.ts ===
+21:const SENSITIVITY_TYPES = ["Delta", "Vega"];
+127:          case "sens_type": row[op.name] = SENSITIVITY_TYPES[(rng() * 2) | 0]!; break;
+
+=== Pre-rebuild generator image (if any) ===
+2026-05-27T12:20:58.807158792Z sha256:603b95231893549ca851def814c3f5a4e451ba4b693b518113e81dcc97f95441
+
+=== docker compose run --build --rm generator (rebuild + inspect compiled SENSITIVITY_TYPES) ===
+ Image frtb-sbm-redis-pov-api Building 
+#1 [internal] load local bake definitions
+#1 reading from stdin 581B done
+#1 DONE 0.0s
+
+#2 [internal] load build definition from Dockerfile
+#2 transferring dockerfile: 2.06kB done
+#2 DONE 0.0s
+
+#3 [internal] load metadata for docker.io/library/node:20-alpine
+#3 DONE 0.5s
+
+#4 [internal] load .dockerignore
+#4 transferring context: 213B done
+#4 DONE 0.0s
+
+#5 [ 1/17] FROM docker.io/library/node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293
+#5 resolve docker.io/library/node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 done
+#5 DONE 0.0s
+
+#6 [internal] load build context
+#6 transferring context: 3.94kB 0.2s done
+#6 DONE 0.2s
+
+#7 [ 7/17] COPY shared/rqe ./shared/rqe
+#7 CACHED
+
+#8 [ 6/17] COPY shared/schema ./shared/schema
+#8 CACHED
+
+#9 [ 5/17] COPY services/api/package.json ./services/api/package.json
+#9 CACHED
+
+#10 [ 4/17] COPY package.json package-lock.json* ./
+#10 CACHED
+
+#11 [10/17] COPY services/calc/src ./services/calc/src
+#11 CACHED
+
+#12 [13/17] COPY services/api/tsconfig.json ./services/api/tsconfig.json
+#12 CACHED
+
+#13 [ 3/17] RUN apk add --no-cache curl
+#13 CACHED
+
+#14 [11/17] COPY services/calc/lib ./services/calc/lib
+#14 CACHED
+
+#15 [ 2/17] WORKDIR /app
+#15 CACHED
+
+#16 [ 9/17] COPY services/calc/package.json ./services/calc/package.json
+#16 CACHED
+
+#17 [16/17] RUN mkdir -p /data && chown node:node /data
+#17 CACHED
+
+#18 [12/17] RUN npm install --workspaces --include-workspace-root --omit=dev=false
+#18 CACHED
+
+#19 [14/17] COPY services/api/src ./services/api/src
+#19 CACHED
+
+#20 [ 8/17] COPY shared/redis-client ./shared/redis-client
+#20 CACHED
+
+#21 [15/17] COPY config/schema ./config/schema
+#21 CACHED
+
+#22 [17/17] WORKDIR /app/services/api
+#22 CACHED
+
+#23 exporting to image
+#23 exporting layers done
+#23 exporting manifest sha256:1b2aedb50472273c19440ee635ebb1df17a241f7b7a0ed06e83fee9258e6f4bd done
+#23 exporting config sha256:5670b629177c53edaad6ef4a4e03c630e5ec243ae00ddfcda9f207c81b7c458c done
+#23 exporting attestation manifest sha256:55106b2c8952aa0b2df5e93b4e6af4bd686f9948a008708aaaacdec392677755 done
+#23 exporting manifest list sha256:1e34df56a50ce691c696899c05cfcb59a184ed7cd06bb8984d00b94de5ea24d7 done
+#23 naming to docker.io/library/frtb-sbm-redis-pov-api:latest done
+#23 unpacking to docker.io/library/frtb-sbm-redis-pov-api:latest done
+#23 DONE 0.0s
+
+#24 resolving provenance for metadata file
+#24 DONE 0.0s
+ Image frtb-sbm-redis-pov-api Built 
+ Container frtb-sbm-redis-pov-api-1 Recreate 
+ Container frtb-sbm-redis-pov-api-1 Recreated 
+ Container frtb-sbm-redis-pov-api-1 Starting 
+ Container frtb-sbm-redis-pov-api-1 Started 
+ Image frtb-sbm-redis-pov-api Building 
+ Image frtb-sbm-redis-pov-generator Building 
+#1 [internal] load local bake definitions
+#1 reading from stdin 1.09kB done
+#1 DONE 0.0s
+
+#2 [internal] load build definition from Dockerfile
+#2 transferring dockerfile: 3.27kB done
+#2 DONE 0.0s
+
+#3 [internal] load metadata for docker.io/library/node:20-alpine
+#3 DONE 0.2s
+
+#4 [internal] load .dockerignore
+#4 transferring context: 213B done
+#4 DONE 0.0s
+
+#5 [builder 1/7] FROM docker.io/library/node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293
+#5 resolve docker.io/library/node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 done
+#5 DONE 0.0s
+
+#6 [internal] load build context
+#6 transferring context: 17.37kB 0.1s done
+#6 DONE 0.1s
+
+#7 [runtime  6/13] COPY --from=builder /app/services/generator/node_modules ./services/generator/node_modules
+#7 CACHED
+
+#8 [builder 6/7] COPY shared/redis-client ./shared/redis-client
+#8 CACHED
+
+#9 [runtime  9/13] COPY services/generator/package.json ./services/generator/package.json
+#9 CACHED
+
+#10 [runtime  4/13] COPY --from=builder /usr/local/lib/node_modules /usr/local/lib/node_modules
+#10 CACHED
+
+#11 [builder 2/7] WORKDIR /app
+#11 CACHED
+
+#12 [runtime  5/13] COPY --from=builder /app/node_modules ./node_modules
+#12 CACHED
+
+#13 [builder 7/7] RUN npm install --workspace=@frtb/generator --include-workspace-root     --omit=dev --no-audit --no-fund  && npm install -g --no-audit --no-fund tsx@4.19.2
+#13 CACHED
+
+#14 [builder 3/7] COPY package.json package-lock.json* ./
+#14 CACHED
+
+#15 [runtime  8/13] COPY --from=builder /app/shared/redis-client ./shared/redis-client
+#15 CACHED
+
+#16 [builder 4/7] COPY services/generator/package.json ./services/generator/package.json
+#16 CACHED
+
+#17 [runtime  3/13] RUN apk add --no-cache curl
+#17 CACHED
+
+#18 [builder 5/7] COPY shared/schema ./shared/schema
+#18 CACHED
+
+#19 [runtime  7/13] COPY --from=builder /app/shared/schema ./shared/schema
+#19 CACHED
+
+#20 [runtime 10/13] COPY services/generator/tsconfig.json ./services/generator/tsconfig.json
+#20 CACHED
+
+#21 [runtime 11/13] COPY services/generator/src ./services/generator/src
+#21 DONE 0.0s
+
+#22 [runtime 12/13] COPY config/schema ./config/schema
+#22 DONE 0.0s
+
+#23 [runtime 13/13] WORKDIR /app/services/generator
+#23 DONE 0.0s
+
+#24 exporting to image
+#24 exporting layers 0.0s done
+#24 exporting manifest sha256:df27abb50c3acc98e00f7ab43a96fc171fac585aed554d5651d0661caa4cbcaa done
+#24 exporting config sha256:1f8a50d4b6c7203da2ebdfd8d85c2ab30e1ed95ec9fe1c75335f80f45b2aa7bf done
+#24 exporting attestation manifest sha256:9a1a95eefe6e98335d8148eec8f6a50d718fb4cf55b2e603768ce6b7274e7bb7 done
+#24 exporting manifest list sha256:07ebf9db1693a030f4682615232d1da0893ff317d2ae33bd969aa1f51f628256 done
+#24 naming to docker.io/library/frtb-sbm-redis-pov-generator:latest done
+#24 unpacking to docker.io/library/frtb-sbm-redis-pov-generator:latest 0.0s done
+#24 DONE 0.1s
+
+#25 resolving provenance for metadata file
+#25 DONE 0.0s
+ Image frtb-sbm-redis-pov-generator Built 
+ Container frtb-sbm-redis-pov-api-1 Waiting 
+ Container frtb-sbm-redis-pov-api-1 Healthy 
+ Container frtb-sbm-redis-pov-generator-run-f833f9319514 Creating 
+ Container frtb-sbm-redis-pov-generator-run-f833f9319514 Created 
+--- dist/row-generator.js SENSITIVITY_TYPES ---
+grep: /app/dist/row-generator.js: No such file or directory
+--- src/row-generator.ts SENSITIVITY_TYPES ---
+grep: /app/src/row-generator.ts: No such file or directory
+/app/services/generator/src/row-generator.ts:21:const SENSITIVITY_TYPES = ["Delta", "Vega"];
+/app/services/generator/src/row-generator.ts:127:          case "sens_type": row[op.name] = SENSITIVITY_TYPES[(rng() * 2) | 0]!; break;
+
+=== Post-rebuild image metadata ===
+2026-05-28T23:38:07.598792592Z sha256:07ebf9db1693a030f4682615232d1da0893ff317d2ae33bd969aa1f51f628256
+
+=== Reference smoke-run-11 stale build was: 2026-05-27T12:20:58Z sha256:603b9523... ===
