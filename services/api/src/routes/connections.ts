@@ -9,6 +9,7 @@
 import type { FastifyInstance } from "fastify";
 import type { ConnectionsStore, ConnectionProfile, RedactedProfile, TestResult, CreateInput } from "../store.ts";
 import { setActiveTarget } from "../active-target.ts";
+import * as inflight from "../inflight-registry.ts";
 
 export type ConnectionTester = (profile: ConnectionProfile) => Promise<TestResult>;
 
@@ -97,6 +98,23 @@ export function registerConnectionsRoutes(
   });
 
   app.post<{ Params: { id: string } }>("/connections/:id/activate", async (req, reply) => {
+    // Wave 5.16w — refuse to switch active target while long-running ops are
+    // in flight. Stale entries (older than INFLIGHT_STALE_MS) are excluded
+    // from the lockout count but surfaced in `stale` so the UI can render a
+    // "force switch" affordance later. Do NOT mutate active-target state.
+    const items = inflight.list();
+    const stale = inflight.listStale();
+    if (stale.length > 0) {
+      req.log.warn({ stale }, "inflight registry: stale entries excluded from lockout");
+    }
+    if (items.length > 0) {
+      reply.code(409);
+      return {
+        error: "Cannot switch active target — operations in flight. Wait for them to complete or stop them first.",
+        inflight: items,
+        stale,
+      };
+    }
     const p = await store.setActive(req.params.id);
     if (!p) { reply.code(404); return { error: "not found" }; }
     const raw = store.getActiveRaw();

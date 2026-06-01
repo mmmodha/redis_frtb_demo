@@ -14,9 +14,13 @@ import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { URL } from "node:url";
+import * as inflight from "../inflight-registry.ts";
 
 export interface LoadgenProxyOpts {
   loadgenBase?: string;
+  // Wave 5.16w — poll interval for /loadgen/status while loadgen handles are
+  // registered. Tests dial this down. Default 5000ms per the spec.
+  loadgenPollMs?: number;
 }
 
 const HOP_BY_HOP = new Set([
@@ -110,8 +114,112 @@ function streamProxy(
   });
 }
 
+// Buffered upstream request — reads the request body into memory, issues an
+// http request, and resolves with status+body+headers. Returns null on
+// connect/transport failure. Used for /loadgen/start and /loadgen/stop so we
+// can register/release the inflight handle based on the upstream's response
+// (the streaming streamProxy hijacks the reply before we can inspect status).
+function bufferedRequest(
+  req: FastifyRequest,
+  base: string,
+  upstreamPath: string,
+): Promise<{ status: number; body: Buffer; headers: import("http").IncomingHttpHeaders; reqBody: Buffer } | null> {
+  return new Promise((resolveDone) => {
+    const upstreamUrl = new URL(upstreamPath, base);
+    const isHttps = upstreamUrl.protocol === "https:";
+    const transport = isHttps ? httpsRequest : httpRequest;
+    const reqChunks: Buffer[] = [];
+    req.raw.on("data", (c: Buffer | string) => {
+      reqChunks.push(typeof c === "string" ? Buffer.from(c) : c);
+    });
+    req.raw.on("error", () => { /* upstream.error handler resolves null */ });
+    const upstream = transport(
+      {
+        protocol: upstreamUrl.protocol,
+        hostname: upstreamUrl.hostname,
+        port: upstreamUrl.port || (isHttps ? 443 : 80),
+        path: upstreamUrl.pathname + upstreamUrl.search,
+        method: req.method,
+        headers: filterRequestHeaders(req.headers),
+      },
+      (upRes) => {
+        const chunks: Buffer[] = [];
+        upRes.on("data", (c: Buffer) => chunks.push(c));
+        upRes.on("end", () => resolveDone({
+          status: upRes.statusCode ?? 502,
+          body: Buffer.concat(chunks),
+          headers: upRes.headers,
+          reqBody: Buffer.concat(reqChunks),
+        }));
+        upRes.on("error", () => resolveDone(null));
+      },
+    );
+    upstream.on("error", () => resolveDone(null));
+    req.raw.pipe(upstream);
+  });
+}
+
+function parseLabel(buf: Buffer): string {
+  try {
+    const j = JSON.parse(buf.toString("utf-8")) as { label?: unknown };
+    if (typeof j?.label === "string" && j.label.length > 0) return j.label;
+  } catch { /* ignore — best-effort label extraction */ }
+  return "loadgen-run";
+}
+
 export function registerLoadgenProxyRoutes(app: FastifyInstance, opts: LoadgenProxyOpts = {}): void {
   const base = opts.loadgenBase ?? process.env.LOADGEN_BASE ?? "http://loadgen:8085";
+  const pollMs = opts.loadgenPollMs ?? (Number(process.env.LOADGEN_POLL_MS) || 5_000);
+  const handles = new Set<inflight.InflightHandle>();
+  let pollTimer: ReturnType<typeof setTimeout> | null = null;
+  let closed = false;
+
+  // Best-effort polling: while loadgen handles exist, hit /loadgen/status; if
+  // upstream reports running:false, release all loadgen handles. A single
+  // timer is shared across registrations and re-arms itself on completion.
+  const probe = (): void => {
+    pollTimer = null;
+    if (closed || handles.size === 0) return;
+    const upstreamUrl = new URL("/loadgen/status", base);
+    const isHttps = upstreamUrl.protocol === "https:";
+    const transport = isHttps ? httpsRequest : httpRequest;
+    const reschedule = (): void => {
+      if (!closed && handles.size > 0 && !pollTimer) pollTimer = setTimeout(probe, pollMs);
+    };
+    const r = transport(
+      {
+        protocol: upstreamUrl.protocol,
+        hostname: upstreamUrl.hostname,
+        port: upstreamUrl.port || (isHttps ? 443 : 80),
+        path: upstreamUrl.pathname,
+        method: "GET",
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (c: Buffer) => chunks.push(c));
+        res.on("end", () => {
+          try {
+            const j = JSON.parse(Buffer.concat(chunks).toString("utf-8")) as { running?: boolean };
+            if (j && j.running === false) {
+              for (const h of Array.from(handles)) { h.release(); handles.delete(h); }
+            }
+          } catch { /* ignore parse errors — try again next tick */ }
+          reschedule();
+        });
+        res.on("error", reschedule);
+      },
+    );
+    r.on("error", reschedule);
+    r.end();
+  };
+  const armPoller = (): void => {
+    if (closed || pollTimer || handles.size === 0) return;
+    pollTimer = setTimeout(probe, pollMs);
+  };
+  app.addHook("onClose", async () => {
+    closed = true;
+    if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+  });
 
   app.register(async (scope) => {
     scope.removeAllContentTypeParsers();
@@ -125,7 +233,38 @@ export function registerLoadgenProxyRoutes(app: FastifyInstance, opts: LoadgenPr
       const path = qs ? `/loadgen/metrics?${qs}` : "/loadgen/metrics";
       return streamProxy(req, reply, base, path);
     });
-    scope.post("/loadgen/start", (req, reply) => streamProxy(req, reply, base, "/loadgen/start"));
-    scope.post("/loadgen/stop", (req, reply) => streamProxy(req, reply, base, "/loadgen/stop"));
+
+    scope.post("/loadgen/start", async (req, reply) => {
+      const resp = await bufferedRequest(req, base, "/loadgen/start");
+      if (!resp || (resp.status >= 500 && resp.status <= 599)) {
+        reply.code(502).type("application/json");
+        return { error: "loadgen service unreachable" };
+      }
+      if (resp.status >= 200 && resp.status < 300) {
+        const label = parseLabel(resp.reqBody);
+        const handle = inflight.register("loadgen", label);
+        handles.add(handle);
+        armPoller();
+      }
+      const ct = resp.headers["content-type"];
+      if (typeof ct === "string") reply.header("content-type", ct);
+      reply.code(resp.status);
+      return resp.body;
+    });
+
+    scope.post("/loadgen/stop", async (req, reply) => {
+      const resp = await bufferedRequest(req, base, "/loadgen/stop");
+      if (!resp || (resp.status >= 500 && resp.status <= 599)) {
+        reply.code(502).type("application/json");
+        return { error: "loadgen service unreachable" };
+      }
+      if (resp.status >= 200 && resp.status < 300) {
+        for (const h of Array.from(handles)) { h.release(); handles.delete(h); }
+      }
+      const ct = resp.headers["content-type"];
+      if (typeof ct === "string") reply.header("content-type", ct);
+      reply.code(resp.status);
+      return resp.body;
+    });
   });
 }

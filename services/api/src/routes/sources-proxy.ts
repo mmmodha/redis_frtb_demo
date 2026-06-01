@@ -14,9 +14,17 @@ import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { URL } from "node:url";
+import * as inflight from "../inflight-registry.ts";
 
 export interface SourcesProxyOpts {
   sourceBase?: string;
+  // Wave 5.16w — poll interval for GET /sources/:id while ingest handles are
+  // registered. Tests dial this down. Default 5000ms per the spec.
+  ingestPollMs?: number;
+  // Wave 5.16w — best-effort release timeout for ingest handles in case the
+  // poll never observes a terminal status (default 60000ms). TODO: replace
+  // with a tighter signal once source-service exposes a run-completion event.
+  ingestTimeoutMs?: number;
 }
 
 // Hop-by-hop headers per RFC 7230 §6.1 plus `host` (we rewrite it for the
@@ -118,8 +126,101 @@ function streamProxy(
   });
 }
 
+// Wave 5.16w — buffered upstream request used by /sources/:id/ingest so we
+// can register the inflight handle based on a successful 2xx response. The
+// streaming streamProxy hijacks the reply before we can read the status, so
+// the ingest endpoint takes a small buffered detour. Bodies are tiny JSON
+// here (just `{source_id, status}`), so memory cost is negligible.
+function bufferedRequest(
+  req: FastifyRequest,
+  base: string,
+  upstreamPath: string,
+): Promise<{ status: number; body: Buffer; headers: import("http").IncomingHttpHeaders } | null> {
+  return new Promise((resolveDone) => {
+    const upstreamUrl = new URL(upstreamPath, base);
+    const isHttps = upstreamUrl.protocol === "https:";
+    const transport = isHttps ? httpsRequest : httpRequest;
+    const upstream = transport(
+      {
+        protocol: upstreamUrl.protocol,
+        hostname: upstreamUrl.hostname,
+        port: upstreamUrl.port || (isHttps ? 443 : 80),
+        path: upstreamUrl.pathname + upstreamUrl.search,
+        method: req.method,
+        headers: filterRequestHeaders(req.headers),
+      },
+      (upRes) => {
+        const chunks: Buffer[] = [];
+        upRes.on("data", (c: Buffer) => chunks.push(c));
+        upRes.on("end", () => resolveDone({
+          status: upRes.statusCode ?? 502,
+          body: Buffer.concat(chunks),
+          headers: upRes.headers,
+        }));
+        upRes.on("error", () => resolveDone(null));
+      },
+    );
+    upstream.on("error", () => resolveDone(null));
+    req.raw.pipe(upstream);
+  });
+}
+
+// Best-effort ingest completion poller. Hits GET /sources/:id every pollMs
+// while the handle is live; releases when the upstream status is anything
+// other than "ingesting" (terminal: "ingested" / "error" / etc.). Also
+// releases after `timeoutMs` even if the upstream never reports terminal —
+// TODO: replace with a tighter signal once source-service exposes a
+// run-completion event surface.
+function trackIngest(
+  base: string,
+  sourceId: string,
+  handle: inflight.InflightHandle,
+  pollMs: number,
+  timeoutMs: number,
+): void {
+  let released = false;
+  const release = (): void => {
+    if (released) return;
+    released = true;
+    handle.release();
+  };
+  const timeout = setTimeout(release, timeoutMs);
+  const path = `/sources/${encodeURIComponent(sourceId)}`;
+  const probe = (): void => {
+    if (released) return;
+    const u = new URL(path, base);
+    const isHttps = u.protocol === "https:";
+    const tr = isHttps ? httpsRequest : httpRequest;
+    const r = tr(
+      { protocol: u.protocol, hostname: u.hostname, port: u.port || (isHttps ? 443 : 80), path: u.pathname, method: "GET" },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (c: Buffer) => chunks.push(c));
+        res.on("end", () => {
+          if (released) return;
+          try {
+            const j = JSON.parse(Buffer.concat(chunks).toString("utf-8")) as { status?: unknown };
+            if (typeof j?.status === "string" && j.status !== "ingesting") {
+              clearTimeout(timeout);
+              release();
+              return;
+            }
+          } catch { /* ignore parse errors */ }
+          setTimeout(probe, pollMs);
+        });
+        res.on("error", () => { if (!released) setTimeout(probe, pollMs); });
+      },
+    );
+    r.on("error", () => { if (!released) setTimeout(probe, pollMs); });
+    r.end();
+  };
+  setTimeout(probe, pollMs);
+}
+
 export function registerSourcesProxyRoutes(app: FastifyInstance, opts: SourcesProxyOpts = {}): void {
   const base = opts.sourceBase ?? process.env.SOURCE_BASE ?? "http://source:3002";
+  const ingestPollMs = opts.ingestPollMs ?? (Number(process.env.INGEST_POLL_MS) || 5_000);
+  const ingestTimeoutMs = opts.ingestTimeoutMs ?? (Number(process.env.INFLIGHT_INGEST_TIMEOUT_MS) || 60_000);
 
   // Encapsulate: inside this register scope we don't want Fastify's body
   // parsers to consume the request body — we hand `request.raw` straight to
@@ -146,8 +247,22 @@ export function registerSourcesProxyRoutes(app: FastifyInstance, opts: SourcesPr
     scope.post<{ Params: { id: string } }>("/sources/:id/mapping", (req, reply) =>
       streamProxy(req, reply, base, `/sources/${encodeURIComponent(req.params.id)}/mapping`),
     );
-    scope.post<{ Params: { id: string } }>("/sources/:id/ingest", (req, reply) =>
-      streamProxy(req, reply, base, `/sources/${encodeURIComponent(req.params.id)}/ingest`),
-    );
+
+    scope.post<{ Params: { id: string } }>("/sources/:id/ingest", async (req, reply) => {
+      const id = req.params.id;
+      const resp = await bufferedRequest(req, base, `/sources/${encodeURIComponent(id)}/ingest`);
+      if (!resp || (resp.status >= 500 && resp.status <= 599)) {
+        reply.code(502).type("application/json");
+        return { error: "source service unreachable" };
+      }
+      if (resp.status >= 200 && resp.status < 300) {
+        const handle = inflight.register("ingest", id);
+        trackIngest(base, id, handle, ingestPollMs, ingestTimeoutMs);
+      }
+      const ct = resp.headers["content-type"];
+      if (typeof ct === "string") reply.header("content-type", ct);
+      reply.code(resp.status);
+      return resp.body;
+    });
   });
 }

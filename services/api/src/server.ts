@@ -21,6 +21,7 @@ import { registerSourcesProxyRoutes } from "./routes/sources-proxy.ts";
 import { registerLoadgenProxyRoutes } from "./routes/loadgen-proxy.ts";
 import { registerGeneratorRoutes } from "./routes/generator.ts";
 import { registerInternalTargetRoutes } from "./routes/internal-target.ts";
+import * as inflight from "./inflight-registry.ts";
 import type { ConnectionsStore as RealConnectionsStore } from "./store.ts";
 
 // Wave 5.14b.1 — bootstrap-status flag. Compose healthchecks already curl
@@ -190,6 +191,41 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
 
   registerSourcesProxyRoutes(app, { sourceBase: opts.sourceBase });
   registerLoadgenProxyRoutes(app, { loadgenBase: opts.loadgenBase });
+
+  // Wave 5.16w — in-flight registry surface. Polled by the UI every 2s for
+  // the lockout banner; SSE channel pushes immediate updates so the banner
+  // appears/disappears without poll lag.
+  app.get("/inflight", async () => inflight.snapshot());
+  app.get("/inflight/stream", async (req, reply) => {
+    reply.raw.writeHead(200, {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache, no-transform",
+      connection: "keep-alive",
+      "x-accel-buffering": "no",
+    });
+    reply.hijack();
+    let stopped = false;
+    const send = (): void => {
+      if (stopped) return;
+      try { reply.raw.write(`event: change\ndata: ${JSON.stringify(inflight.snapshot())}\n\n`); }
+      catch { /* socket closed */ }
+    };
+    send();
+    const unsub = inflight.onChange(send);
+    const ping = setInterval(() => {
+      if (stopped) return;
+      try { reply.raw.write(`: ping\n\n`); } catch { /* socket closed */ }
+    }, 15_000);
+    const cleanup = (): void => {
+      if (stopped) return;
+      stopped = true;
+      unsub();
+      clearInterval(ping);
+      try { reply.raw.end(); } catch { /* socket already closed */ }
+    };
+    req.raw.on("close", cleanup);
+    req.raw.on("error", cleanup);
+  });
 
   if (opts.store) {
     const mod = await import("./routes/connections.ts").catch(() => null);
