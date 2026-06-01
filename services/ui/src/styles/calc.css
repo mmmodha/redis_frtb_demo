@@ -188,6 +188,103 @@
 .drilldown-pill--trade { color: var(--redis-text-primary, #e6e7eb); }
 .drilldown-pill--rf { color: var(--redis-text-secondary, #8a8f99); }
 
+/* Wave 5.21e: trade_id pill is now a <button>. Reset native button chrome so
+   it reads as the same pill, but keep cursor + focus ring for affordance. */
+button.drilldown-pill {
+  border: 0;
+  font: inherit;
+  line-height: inherit;
+  cursor: pointer;
+}
+button.drilldown-pill:hover { background: rgba(255, 255, 255, 0.08); }
+button.drilldown-pill:focus-visible {
+  outline: 2px solid var(--redis-red, #dc382d);
+  outline-offset: 1px;
+}
+
+/* Wave 5.21e: side drawer for the trade JSON drilldown. Non-modal — backdrop
+   dims the page but keeps it scrollable. Slides in from the right. */
+.trade-json-drawer__backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.32);
+  z-index: 40;
+}
+.trade-json-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(520px, 92vw);
+  background: var(--surface-elevated, #1e2027);
+  border-left: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: -8px 0 24px rgba(0, 0, 0, 0.40);
+  z-index: 41;
+  display: flex;
+  flex-direction: column;
+  animation: trade-json-drawer-slide-in 180ms ease-out;
+}
+@keyframes trade-json-drawer-slide-in {
+  from { transform: translateX(100%); }
+  to { transform: translateX(0); }
+}
+.trade-json-drawer__header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+.trade-json-drawer__title {
+  flex: 1;
+  margin: 0;
+  font-size: 0.9375rem;
+  font-weight: 600;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  color: var(--redis-text-primary, #e6e7eb);
+  overflow-wrap: anywhere;
+}
+.trade-json-drawer__actions {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+}
+.trade-json-drawer__copy,
+.trade-json-drawer__close {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: transparent;
+  color: var(--redis-text-primary, #e6e7eb);
+  border-radius: 4px;
+  cursor: pointer;
+  font: inherit;
+}
+.trade-json-drawer__copy {
+  padding: 0.25rem 0.625rem;
+  font-size: 0.8125rem;
+}
+.trade-json-drawer__close {
+  width: 1.75rem;
+  height: 1.75rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.875rem;
+}
+.trade-json-drawer__copy:hover,
+.trade-json-drawer__close:hover { background: rgba(255, 255, 255, 0.06); }
+.trade-json-drawer__body {
+  flex: 1;
+  margin: 0;
+  padding: 0.875rem 1rem;
+  overflow: auto;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.8125rem;
+  line-height: 1.45;
+  color: var(--redis-text-primary, #e6e7eb);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 /* Equity/FX Curvature up/down two-cell pill. */
 .drilldown-curv-pill { display: inline-flex; gap: 0.25rem; align-items: center; font-variant-numeric: tabular-nums; }
 .drilldown-curv-pill__up { color: #5BD37B; }

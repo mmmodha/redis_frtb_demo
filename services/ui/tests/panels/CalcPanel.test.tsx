@@ -14,6 +14,19 @@ function mockCalcResponse(body: CalcSbmResponse | { error: string }, status = 20
   ) as typeof fetch;
 }
 
+// Wave 5.21e: helper for tests that need to exercise both the /calc/sbm POST
+// and the /pivot GET (drill-down). Routes per-URL so the drill-down body and
+// the calc body don't have to share a shape.
+function mockCalcAndPivotResponses(calcBody: CalcSbmResponse, pivotBody: unknown) {
+  globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    const body = url.includes("/pivot") ? pivotBody : calcBody;
+    return new Response(JSON.stringify(body), {
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+}
+
 function deferredCalcResponse(body: CalcSbmResponse) {
   let resolveFn: () => void = () => {};
   const released = new Promise<void>((resolve) => {
@@ -314,5 +327,94 @@ describe("<CalcPanel />", () => {
     const fill = usdRow!.querySelector(".bucket-chart__bar-fill");
     expect(fill).not.toBeNull();
     expect(fill!.getAttribute("data-tone")).toBe("red");
+  });
+
+  // Wave 5.21e: clicking a trade_id pill in the bucket drill-down opens a
+  // side drawer with the full row JSON, supports Escape + Copy JSON, and
+  // restores focus to the originating pill on close.
+  describe("Wave 5.21e: trade_id → JSON drilldown drawer", () => {
+    const pivotDoc = {
+      trade_id: "T-42",
+      risk_class: "GIRR",
+      bucket: "USD-IRS",
+      sensitivity_type: "Delta",
+      risk_factor: "USD-OIS",
+      weight: 0.5,
+      risk_value: {
+        "3M": 1, "6M": 2, "1Y": 3, "2Y": 4, "3Y": 5,
+        "5Y": 6, "10Y": 7, "15Y": 8, "20Y": 9, "30Y": 10,
+      },
+    };
+    const pivotBody = {
+      rows: [{ key: "sens:T-42", doc: pivotDoc }],
+      total: 1,
+      limit: 20,
+      offset: 0,
+      ms: 5,
+    };
+
+    async function openDrilldownAndGetPill() {
+      mockCalcAndPivotResponses(baseResponse, pivotBody);
+      render(<CalcPanel />);
+      fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
+      await waitFor(() => expect(screen.getByTestId("calc-charge")).toBeInTheDocument());
+      const usdRow = screen
+        .getAllByTestId("bucket-row")
+        .find((r) => r.getAttribute("data-bucket") === "USD-IRS")!;
+      fireEvent.click(usdRow);
+      const pill = await screen.findByTestId("drilldown-pill-trade");
+      return pill as HTMLButtonElement;
+    }
+
+    it("clicking the trade_id pill opens the drawer with trade_id title and JSON body", async () => {
+      const pill = await openDrilldownAndGetPill();
+      expect(pill.tagName).toBe("BUTTON");
+      expect(pill).toHaveAttribute("aria-label", "View JSON for trade T-42");
+      fireEvent.click(pill);
+      const drawer = await screen.findByTestId("trade-json-drawer");
+      expect(drawer).toHaveAttribute("role", "dialog");
+      expect(drawer).toHaveAttribute("aria-modal", "false");
+      expect(drawer).toHaveAttribute("aria-label", "Trade T-42 JSON");
+      expect(screen.getByTestId("trade-json-drawer-title").textContent).toBe("T-42");
+      const body = screen.getByTestId("trade-json-drawer-body");
+      expect(body.textContent).toBe(JSON.stringify(pivotDoc, null, 2));
+    });
+
+    it("pressing Escape closes the drawer", async () => {
+      const pill = await openDrilldownAndGetPill();
+      fireEvent.click(pill);
+      const drawer = await screen.findByTestId("trade-json-drawer");
+      fireEvent.keyDown(drawer, { key: "Escape" });
+      await waitFor(() => expect(screen.queryByTestId("trade-json-drawer")).toBeNull());
+    });
+
+    it("Copy JSON button calls navigator.clipboard.writeText with the pretty-printed JSON", async () => {
+      const writeText = vi.fn().mockResolvedValue(undefined);
+      Object.defineProperty(navigator, "clipboard", {
+        value: { writeText },
+        writable: true,
+        configurable: true,
+      });
+      const pill = await openDrilldownAndGetPill();
+      fireEvent.click(pill);
+      await screen.findByTestId("trade-json-drawer");
+      fireEvent.click(screen.getByTestId("trade-json-drawer-copy"));
+      await waitFor(() => expect(writeText).toHaveBeenCalledTimes(1));
+      expect(writeText).toHaveBeenCalledWith(JSON.stringify(pivotDoc, null, 2));
+      // Transient "Copied" affordance.
+      await waitFor(() =>
+        expect(screen.getByTestId("trade-json-drawer-copy").textContent).toBe("Copied"),
+      );
+    });
+
+    it("after closing, focus returns to the originating pill button", async () => {
+      const pill = await openDrilldownAndGetPill();
+      fireEvent.click(pill);
+      const closeBtn = await screen.findByTestId("trade-json-drawer-close");
+      expect(document.activeElement).toBe(closeBtn);
+      fireEvent.click(closeBtn);
+      await waitFor(() => expect(screen.queryByTestId("trade-json-drawer")).toBeNull());
+      expect(document.activeElement).toBe(pill);
+    });
   });
 });
