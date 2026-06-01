@@ -1,0 +1,4 @@
+{
+  "invoked": false,
+  "reason": "AC1 prerequisite not met — all 6 calc variants returned HTTP 200 but charge=0 (per-bucket K_b=0, S_b=0, count=0 in every per_bucket entry)."
+}
