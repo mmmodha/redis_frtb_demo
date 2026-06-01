@@ -420,4 +420,42 @@ describe("POST /calc/sbm — MVP endpoint", () => {
     expect(res.statusCode).toBe(200);
     expect(fr.calls.filter((c) => c.command === "FT.AGGREGATE")).toHaveLength(1);
   });
+
+  // Wave 5.16m: observability — the response surfaces the FT.AGGREGATE
+  // discovery query and the FCALL fan-out shape so the UI can render the
+  // exact Redis commands the route already executed. Read-only mirror.
+  it("Wave 5.16m: response includes commands.{discovery,fcall} mirroring the dispatched calls", async () => {
+    const fr = fakeRedis();
+    fr.setResponse("FT.AGGREGATE", ftAggregateReply(["USD-IRS", "EUR-IRS", "JPY-IRS"]));
+    fr.setResponse("FCALL", ["K_b", "1", "S_b", "1", "count", "10", "ms", "1"]);
+    app = await createServer({
+      redis: fr,
+      correlations: { GIRR: { kind: "constant", value: 0 } },
+    });
+    const res = await app.inject({
+      method: "POST",
+      url: "/calc/sbm",
+      payload: { risk_class: "GIRR", sensitivity_type: "Delta" },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.commands).toBeDefined();
+    expect(body.commands.discovery.command).toBe("FT.AGGREGATE");
+    expect(body.commands.discovery.index).toBe("idx:sens");
+    expect(body.commands.discovery.query).toContain("@risk_class:{GIRR}");
+    expect(body.commands.discovery.groupby).toEqual(["@bucket"]);
+    expect(Array.isArray(body.commands.discovery.reducers)).toBe(true);
+    expect(body.commands.fcall.command).toBe("FCALL");
+    expect(typeof body.commands.fcall.function).toBe("string");
+    expect(body.commands.fcall.function.length).toBeGreaterThan(0);
+    expect(body.commands.fcall.function).toBe("sbm_delta_bucket");
+    expect(body.commands.fcall.library).toBe("frtb");
+    expect(typeof body.commands.fcall.arg_template).toBe("string");
+    expect(body.commands.fcall.arg_template).toContain("FCALL");
+    // One routing key per bucket the api fanned out to.
+    expect(body.commands.fcall.dispatched_keys).toHaveLength(body.per_bucket.length);
+    for (const k of body.commands.fcall.dispatched_keys) {
+      expect(k).toMatch(/^sens:\{GIRR:[^}]+\}:_route$/);
+    }
+  });
 });

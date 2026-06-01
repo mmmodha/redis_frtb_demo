@@ -143,4 +143,57 @@ describe("<CalcPanel />", () => {
     const byCount = screen.getAllByTestId("bucket-row").map((r) => r.getAttribute("data-bucket"));
     expect(byCount[0]).toBe("USD-IRS");
   });
+
+  // Wave 5.16m: surfaces the Redis commands the api dispatched.
+  it("Wave 5.16m: renders the Redis commands panel with FT.AGGREGATE query and FCALL function verbatim when commands are present", async () => {
+    const responseWithCommands: CalcSbmResponse = {
+      ...baseResponse,
+      commands: {
+        discovery: {
+          command: "FT.AGGREGATE",
+          index: "idx:sens",
+          query: "@risk_class:{GIRR}",
+          groupby: ["@bucket"],
+          reducers: ["COUNT 0 AS n"],
+        },
+        fcall: {
+          command: "FCALL",
+          function: "sbm_delta_bucket",
+          library: "frtb",
+          arg_template: "FCALL sbm_delta_bucket 1 sens:{GIRR:<bucket>}:_route GIRR <bucket>",
+          dispatched_keys: [
+            "sens:{GIRR:USD-IRS}:_route",
+            "sens:{GIRR:EUR-IRS}:_route",
+            "sens:{GIRR:JPY-IRS}:_route",
+          ],
+        },
+      },
+    };
+    mockCalcResponse(responseWithCommands);
+    render(<CalcPanel />);
+    fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: /redis commands executed/i })).toBeInTheDocument(),
+    );
+    const region = screen.getByTestId("redis-commands");
+    expect(region).toHaveAttribute("aria-live", "polite");
+    expect(screen.getByTestId("discovery-command").textContent).toContain("@risk_class:{GIRR}");
+    expect(screen.getByTestId("discovery-command").textContent).toContain("FT.AGGREGATE idx:sens");
+    expect(screen.getByTestId("fcall-function").textContent).toBe("sbm_delta_bucket");
+    expect(screen.getByTestId("fcall-library").textContent).toBe("frtb");
+    expect(screen.getByTestId("fcall-command").textContent).toContain("sbm_delta_bucket");
+    // Collapsible details lists the dispatched routing keys.
+    const details = screen.getByTestId("fcall-dispatched-keys");
+    expect(details.textContent).toContain("sens:{GIRR:USD-IRS}:_route");
+    expect(details.textContent).toContain("sens:{GIRR:EUR-IRS}:_route");
+  });
+
+  it("Wave 5.16m: does NOT render the Redis commands panel when commands are absent (back-compat)", async () => {
+    mockCalcResponse(baseResponse);
+    render(<CalcPanel />);
+    fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
+    await waitFor(() => expect(screen.getByTestId("calc-charge")).toBeInTheDocument());
+    expect(screen.queryByRole("heading", { name: /redis commands executed/i })).toBeNull();
+    expect(screen.queryByTestId("redis-commands")).toBeNull();
+  });
 });

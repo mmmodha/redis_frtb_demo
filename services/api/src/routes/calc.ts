@@ -248,10 +248,14 @@ export function registerCalcRoute(app: FastifyInstance, redis: RedisLike, opts: 
 
     // 2) Fan out one FCALL per bucket — runs slot-local on the owning shard
     //    because the routing key carries the {risk_class:bucket} hash-tag.
+    //    Build dispatchedKeys synchronously off `buckets` so the order matches
+    //    `results` (Promise.all preserves input order) for the Wave 5.16m
+    //    observability response.
     const fanoutStart = process.hrtime.bigint();
+    const dispatchedKeys = buckets.map((b) => `sens:{${risk_class}:${b}}:_route`);
     const results = await Promise.all(
-      buckets.map(async (b): Promise<BucketResult> => {
-        const routeKey = `sens:{${risk_class}:${b}}:_route`;
+      buckets.map(async (b, i): Promise<BucketResult> => {
+        const routeKey = dispatchedKeys[i]!;
         const r = (await redis.call(
           "FCALL",
           funcName,
@@ -277,6 +281,27 @@ export function registerCalcRoute(app: FastifyInstance, redis: RedisLike, opts: 
         : reduceRiskClassCharge(results, corr);
     const total_ms = Number(process.hrtime.bigint() - t0) / 1e6;
 
+    // Wave 5.16m: observability — surface the exact Redis commands the route
+    // dispatched (FT.AGGREGATE for discovery, FCALL per bucket for fan-out)
+    // so the UI can render them verbatim for the demo. Read-only mirror of
+    // what was already executed; nothing extra is computed or invoked here.
+    const commands = {
+      discovery: {
+        command: "FT.AGGREGATE" as const,
+        index: "idx:sens",
+        query: `@risk_class:{${risk_class}}`,
+        groupby: ["@bucket"],
+        reducers: ["COUNT 0 AS n"],
+      },
+      fcall: {
+        command: "FCALL" as const,
+        function: funcName,
+        library: "frtb",
+        arg_template: `FCALL ${funcName} 1 sens:{${risk_class}:<bucket>}:_route ${risk_class} <bucket>`,
+        dispatched_keys: dispatchedKeys,
+      },
+    };
+
     return {
       charge,
       per_bucket: results,
@@ -284,6 +309,7 @@ export function registerCalcRoute(app: FastifyInstance, redis: RedisLike, opts: 
       shard_breakdown: results.map((r) => ({ shard: r.bucket, buckets: [r.bucket], ms: r.ms })),
       // diagnostic — useful for the demo "look how parallel we are" callout
       fanout_ms: Math.round(fanoutMs * 1000) / 1000,
+      commands,
     };
   });
 }

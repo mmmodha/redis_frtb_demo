@@ -1,9 +1,10 @@
-import { useState } from "react";
+import { useState, type CSSProperties } from "react";
 import { EnterpriseCallout, PanelCard, TimingStrip } from "../components";
 import type { ShardTiming } from "../components/TimingStrip";
 import {
   postCalcSbm,
   type BucketResult,
+  type CalcCommands,
   type CalcSbmResponse,
   type SensitivityType,
 } from "../lib/calc";
@@ -190,6 +191,8 @@ function CalcResult({
         <TimingStrip shards={shardsFromResponse(result)} />
       </PanelCard>
 
+      {result.commands ? <CommandsPanel commands={result.commands} /> : null}
+
       <PanelCard title="Per-bucket breakdown">
         <table aria-label="per-bucket K_b breakdown" className="calc-panel__table">
           <thead>
@@ -235,5 +238,63 @@ function CalcResult({
         </table>
       </PanelCard>
     </>
+  );
+}
+
+// Wave 5.16m: read-only observability panel that renders the exact Redis
+// commands the api dispatched. Surfaces the Redis Enterprise primitives
+// (RediSearch FT.AGGREGATE for discovery, Redis Functions FCALL for the
+// slot-local fan-out) in plain view for the HSBC demo. Display-only — no
+// re-execution, no logging beyond the api response.
+function CommandsPanel({ commands }: { commands: CalcCommands }) {
+  const codeStyle: CSSProperties = {
+    fontFamily: "var(--font-mono, ui-monospace, monospace)",
+    whiteSpace: "pre-wrap",
+    wordBreak: "break-all",
+    margin: 0,
+  };
+  const captionStyle: CSSProperties = {
+    marginTop: "0.25rem",
+    fontSize: "0.8125rem",
+    color: "var(--redis-text-secondary, #666)",
+  };
+
+  const d = commands.discovery;
+  const discoveryOneLiner = `${d.command} ${d.index} "${d.query}" GROUPBY ${d.groupby.length} ${d.groupby.join(" ")} REDUCE ${d.reducers.join(" ")} LIMIT 0 10000 DIALECT 2`;
+  const f = commands.fcall;
+
+  return (
+    <PanelCard title="Redis commands executed">
+      <div aria-live="polite" data-testid="redis-commands">
+        <h3 style={{ margin: "0 0 0.5rem", fontSize: "0.9375rem" }}>Discovery (FT.AGGREGATE)</h3>
+        <pre style={codeStyle}>
+          <code data-testid="discovery-command">{discoveryOneLiner}</code>
+        </pre>
+        <p style={captionStyle}>
+          Counts how many sensitivities exist per bucket so we know which shards to fan out to.
+        </p>
+
+        <h3 style={{ margin: "1rem 0 0.5rem", fontSize: "0.9375rem" }}>
+          Per-bucket fanout (FCALL)
+        </h3>
+        <p style={{ margin: "0 0 0.5rem", fontSize: "0.8125rem" }}>
+          Function: <strong data-testid="fcall-function">{f.function}</strong> · Library:{" "}
+          <strong data-testid="fcall-library">{f.library}</strong>
+        </p>
+        <pre style={codeStyle}>
+          <code data-testid="fcall-command">{f.arg_template}</code>
+        </pre>
+        <p style={captionStyle}>
+          Runs the SBM K_b reduction inside Redis, slot-local per bucket via the hash-tagged
+          routing key.
+        </p>
+        <details style={{ marginTop: "0.5rem" }} data-testid="fcall-dispatched-keys">
+          <summary>Dispatched keys ({f.dispatched_keys.length})</summary>
+          <pre style={codeStyle}>
+            <code>{f.dispatched_keys.join("\n")}</code>
+          </pre>
+        </details>
+      </div>
+    </PanelCard>
   );
 }
