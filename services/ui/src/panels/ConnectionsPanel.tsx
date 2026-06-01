@@ -54,7 +54,7 @@ export function ConnectionsPanel() {
   const [testResults, setTestResults] = useState<Record<string, ConnectionTestResult | "pending">>({});
   const [actionBusy, setActionBusy] = useState<Record<string, boolean>>({});
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (opts?: { autoTest?: boolean }) => {
     setState("loading");
     setErrorMsg(null);
     try {
@@ -65,13 +65,36 @@ export function ConnectionsPanel() {
       setTarget(t);
       setProfiles(ps);
       setState("data");
+      if (opts?.autoTest && ps.length > 0) {
+        setTestResults((s) => {
+          const next = { ...s };
+          for (const p of ps) next[p.id] = "pending";
+          return next;
+        });
+        void Promise.allSettled(
+          ps.map((p) =>
+            testConnection(p.id).then(
+              (r) => setTestResults((s) => ({ ...s, [p.id]: r })),
+              (reason) =>
+                setTestResults((s) => ({
+                  ...s,
+                  [p.id]: {
+                    ok: false,
+                    errors: [(reason as Error)?.message ?? String(reason)],
+                    modules: [],
+                  },
+                })),
+            ),
+          ),
+        );
+      }
     } catch (e) {
       setErrorMsg(`Failed to load connections: ${(e as Error).message}`);
       setState("error");
     }
   }, []);
 
-  useEffect(() => { void refresh(); }, [refresh]);
+  useEffect(() => { void refresh({ autoTest: true }); }, [refresh]);
 
   const sortedProfiles = useMemo(
     () => [...profiles].sort((a, b) => a.name.localeCompare(b.name)),
@@ -276,7 +299,7 @@ export function ConnectionsPanel() {
 
 function ProfileStatusPill({ result }: { result: ConnectionTestResult | "pending" | undefined }) {
   if (result === undefined) {
-    return <span className="state-pill" data-status="pending"><span className="state-pill__dot" /> pending</span>;
+    return <span className="state-pill" data-status="untested"><span className="state-pill__dot" /> untested</span>;
   }
   if (result === "pending") {
     return <span className="state-pill" data-status="testing"><span className="state-pill__dot" data-state="loading" /> testing…</span>;
