@@ -12,7 +12,9 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@fastify/cors": "^11.2.0",
     "@frtb/calc": "*",
+    "@frtb/generator": "*",
     "@frtb/redis-client": "^0.0.1",
     "@frtb/rqe": "*",
     "@frtb/schema": "*",

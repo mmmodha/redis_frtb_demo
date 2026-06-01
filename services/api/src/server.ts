@@ -1,5 +1,6 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import fastifyCors from "@fastify/cors";
+import type { Schema } from "@frtb/schema";
 import type { RedisLike } from "./redis-like.ts";
 import type { CorrelationSpec } from "./sbm/reduce.ts";
 import { getActiveTarget, setActiveTarget, type ActiveTarget } from "./active-target.ts";
@@ -8,6 +9,7 @@ import { registerCalcRoute } from "./routes/calc.ts";
 import { registerObservabilityRoutes } from "./routes/observability.ts";
 import { registerSourcesProxyRoutes } from "./routes/sources-proxy.ts";
 import { registerLoadgenProxyRoutes } from "./routes/loadgen-proxy.ts";
+import { registerGeneratorRoutes } from "./routes/generator.ts";
 
 // Wave 5.14b.1 — bootstrap-status flag. Compose healthchecks already curl
 // /healthz; flipping this from {ok:false} → {ok:true} only after
@@ -52,6 +54,11 @@ export interface CreateServerOpts {
   redis?: RedisLike;
   activeTarget?: ActiveTarget;
   correlations?: Record<string, CorrelationSpec>;
+  // Loaded once at boot from $SCHEMA_FILE (see index.ts). Threaded through so
+  // POST /generator/start can build per-class row generators without
+  // re-reading the YAML per request. Optional so unit tests that don't
+  // exercise the generator route can omit it.
+  schema?: Schema;
   logger?: boolean;
   store?: ConnectionsStore;
   tester?: ConnectionTester;
@@ -120,6 +127,7 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
     registerPivotRoute(app, opts.redis);
     registerCalcRoute(app, opts.redis, { correlations: opts.correlations ?? {} });
     registerObservabilityRoutes(app, opts.redis, { sseIntervalMs: opts.sseIntervalMs });
+    registerGeneratorRoutes(app, opts.redis, opts.schema);
   }
 
   registerSourcesProxyRoutes(app, { sourceBase: opts.sourceBase });

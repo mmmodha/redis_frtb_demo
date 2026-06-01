@@ -126,7 +126,7 @@ async function main(): Promise<void> {
     markBootstrapSkipped("redis-unreachable");
   }
 
-  const app = await createServer({ redis, correlations, store, logger: true });
+  const app = await createServer({ redis, correlations, schema, store, logger: true });
   await app.listen({ port: PORT, host: "0.0.0.0" });
   console.log(JSON.stringify({ service: "api", status: "ready", port: PORT, target: target.label }));
 
