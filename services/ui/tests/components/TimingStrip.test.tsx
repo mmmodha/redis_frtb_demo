@@ -22,4 +22,19 @@ describe("<TimingStrip />", () => {
     render(<TimingStrip shards={[]} />);
     expect(screen.getByText(/no shard timings/i)).toBeInTheDocument();
   });
+
+  it("defaults to the 'ms' unit when no unit prop is supplied", () => {
+    render(<TimingStrip shards={[{ id: "s1", label: "s1", ms: 42 }]} />);
+    expect(screen.getByText("42 ms")).toBeInTheDocument();
+  });
+
+  it("renders a custom unit when the unit prop is supplied", () => {
+    render(
+      <TimingStrip
+        shards={[{ id: "s1", label: "s1", ms: 42 }]}
+        unit="ops/s"
+      />,
+    );
+    expect(screen.getByText("42 ops/s")).toBeInTheDocument();
+  });
 });

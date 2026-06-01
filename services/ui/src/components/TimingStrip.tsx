@@ -6,9 +6,10 @@ export interface ShardTiming {
 
 export interface TimingStripProps {
   shards: ShardTiming[];
+  unit?: string;
 }
 
-export function TimingStrip({ shards }: TimingStripProps) {
+export function TimingStrip({ shards, unit = "ms" }: TimingStripProps) {
   if (shards.length === 0) {
     return <div className="timing-strip__empty">no shard timings yet</div>;
   }
@@ -24,7 +25,7 @@ export function TimingStrip({ shards }: TimingStripProps) {
               style={{ transform: `scaleX(${Math.max(s.ms / max, 0.02)})` }}
             />
           </div>
-          <span className="timing-strip__ms">{s.ms} ms</span>
+          <span className="timing-strip__ms">{s.ms} {unit}</span>
         </div>
       ))}
     </div>

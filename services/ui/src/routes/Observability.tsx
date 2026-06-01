@@ -106,13 +106,14 @@ function ObservabilityReady({ data }: { data: ObservabilityData }) {
           <MetricTile label="Ops / sec" value={formatNumber(totalOps)} unit="ops/s" status="live" />
         </div>
       </PanelCard>
-      <PanelCard title="Per-shard breakdown">
+      <PanelCard title="Per-shard ops/sec">
         <TimingStrip
           shards={shards.map((s) => ({
             id: s.shardId,
             label: s.shardId,
             ms: s.opsPerSec ?? 0,
           }))}
+          unit="ops/s"
         />
       </PanelCard>
       <PanelCard title="Live shard metrics">
