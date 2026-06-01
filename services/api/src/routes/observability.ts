@@ -86,28 +86,96 @@ export function parseClusterNodes(text: string): ParsedNode[] {
   return out;
 }
 
-export async function readShards(redis: RedisLike): Promise<Shard[]> {
-  const [nodesText, infoText] = await Promise.all([
-    redis.call("CLUSTER", "NODES") as Promise<string>,
-    redis.info(),
+// Wave 5.16i — Synthesise a single-element Shard[] for non-clustered targets
+// (standalone Redis, Redis Cloud shared tiers, etc. where CLUSTER NODES is
+// blocked with `ERR command is not allowed`). The UI's ObservabilityShard
+// shape is the contract; slotCount=0 conveys "no slots" without claiming the
+// full 16384.
+async function buildStandaloneShards(redis: RedisLike): Promise<Shard[]> {
+  const [memText, statsText] = await Promise.all([
+    redis.info("memory"),
+    redis.info("stats"),
   ]);
-  const parsed = parseClusterNodes(typeof nodesText === "string" ? nodesText : "");
-  const info = parseInfo(infoText);
-  const usedMemoryBytes = Number(info.used_memory ?? 0);
-  const netInBytes = Number(info.total_net_input_bytes ?? 0);
-  const netOutBytes = Number(info.total_net_output_bytes ?? 0);
-  const opsPerSec = Number(info.instantaneous_ops_per_sec ?? 0);
-  return parsed
-    .filter((n) => n.role === "master")
-    .map((n) => ({
-      shardId: n.id.slice(0, 8),
-      role: n.role,
-      opsPerSec,
-      slotCount: n.slotCount,
-      usedMemoryBytes,
-      netInBytes,
-      netOutBytes,
-    }));
+  const mem = parseInfo(memText);
+  const stats = parseInfo(statsText);
+  return [
+    {
+      shardId: "standalone",
+      role: "master",
+      opsPerSec: Number(stats.instantaneous_ops_per_sec ?? 0),
+      slotCount: 0,
+      usedMemoryBytes: Number(mem.used_memory ?? 0),
+      netInBytes: Number(stats.total_net_input_bytes ?? 0),
+      netOutBytes: Number(stats.total_net_output_bytes ?? 0),
+    },
+  ];
+}
+
+// Minimal logger surface — Fastify's `req.log` (pino) satisfies this; tests
+// can pass a stub or nothing at all.
+export interface ShardLogger {
+  warn: (obj: Record<string, unknown>) => void;
+}
+
+export async function readShards(
+  redis: RedisLike,
+  log?: ShardLogger,
+): Promise<Shard[]> {
+  // Detect topology BEFORE calling CLUSTER NODES so standalone tiers (Redis
+  // Cloud shared, etc.) don't surface as a 500. `INFO cluster` is permitted
+  // on every tier. When `cluster_enabled` is missing from INFO we default to
+  // the cluster path so the pre-5.16i contract is preserved verbatim for the
+  // Wave 5.5 cluster-mode demos.
+  let clusterEnabled: string | undefined;
+  try {
+    const text = await redis.info("cluster");
+    const parsed = parseInfo(text);
+    const ce = parsed.cluster_enabled;
+    clusterEnabled = ce === undefined ? undefined : String(ce);
+  } catch {
+    clusterEnabled = undefined;
+  }
+  if (clusterEnabled === "0") {
+    return buildStandaloneShards(redis);
+  }
+
+  try {
+    const [nodesText, infoText] = await Promise.all([
+      redis.call("CLUSTER", "NODES") as Promise<string>,
+      redis.info(),
+    ]);
+    const parsed = parseClusterNodes(typeof nodesText === "string" ? nodesText : "");
+    const info = parseInfo(infoText);
+    const usedMemoryBytes = Number(info.used_memory ?? 0);
+    const netInBytes = Number(info.total_net_input_bytes ?? 0);
+    const netOutBytes = Number(info.total_net_output_bytes ?? 0);
+    const opsPerSec = Number(info.instantaneous_ops_per_sec ?? 0);
+    return parsed
+      .filter((n) => n.role === "master")
+      .map((n) => ({
+        shardId: n.id.slice(0, 8),
+        role: n.role,
+        opsPerSec,
+        slotCount: n.slotCount,
+        usedMemoryBytes,
+        netInBytes,
+        netOutBytes,
+      }));
+  } catch (err) {
+    // Defensive fallback: managed DBs that report `cluster_enabled:1` but
+    // still block the CLUSTER command (some Redis Cloud configurations) hit
+    // this branch. Case-insensitive substring match because the exact wording
+    // ("ERR command is not allowed") may shift across versions.
+    const reason = String(err);
+    if (reason.toLowerCase().includes("not allowed")) {
+      log?.warn?.({
+        warn: "observability-shards-standalone-fallback",
+        reason,
+      });
+      return buildStandaloneShards(redis);
+    }
+    throw err;
+  }
 }
 
 export interface RegisterObservabilityOpts {
@@ -143,7 +211,7 @@ export function registerObservabilityRoutes(
     return { ...parsed, ms: Math.round(ms * 1000) / 1000 };
   });
 
-  app.get("/observability/shards", async () => readShards(redis));
+  app.get("/observability/shards", async (req) => readShards(redis, req.log));
 
   // SSE: write one frame immediately, then every `sseIntervalMs` until the
   // client disconnects. We hijack the reply so Fastify doesn't try to send a
@@ -160,7 +228,7 @@ export function registerObservabilityRoutes(
     const send = async (): Promise<void> => {
       if (stopped) return;
       try {
-        const shards = await readShards(redis);
+        const shards = await readShards(redis, req.log);
         reply.raw.write(`data: ${JSON.stringify(shards)}\n\n`);
       } catch {
         // Swallow transient errors; the next tick may recover.

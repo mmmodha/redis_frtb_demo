@@ -100,10 +100,140 @@ describe("GET /observability/shards", () => {
   });
 });
 
+// Wave 5.16i — standalone / managed Redis where CLUSTER is blocked.
+// INFO blobs used here include `cluster_enabled` + memory/stats fields so the
+// fake-redis stub (which returns the same INFO for every section) satisfies
+// both the topology probe and the synthetic-shard build.
+const INFO_STANDALONE = [
+  "# Cluster",
+  "cluster_enabled:0",
+  "",
+  "# Memory",
+  "used_memory:67108864",
+  "used_memory_human:64.00M",
+  "",
+  "# Stats",
+  "total_net_input_bytes:111222333",
+  "total_net_output_bytes:444555666",
+  "instantaneous_ops_per_sec:77",
+].join("\r\n");
+
+const INFO_CLUSTER_ENABLED_BUT_BLOCKED = [
+  "# Cluster",
+  "cluster_enabled:1",
+  "",
+  "# Memory",
+  "used_memory:33554432",
+  "",
+  "# Stats",
+  "total_net_input_bytes:1000",
+  "total_net_output_bytes:2000",
+  "instantaneous_ops_per_sec:9",
+].join("\r\n");
+
+describe("GET /observability/shards — standalone / CLUSTER-blocked fallback (Wave 5.16i)", () => {
+  let app: Awaited<ReturnType<typeof createServer>>;
+  afterEach(async () => {
+    if (app) await app.close();
+  });
+
+  it("returns a single synthetic standalone shard when INFO cluster reports cluster_enabled:0", async () => {
+    const fr = fakeRedis();
+    fr.setInfo(INFO_STANDALONE);
+    // No CLUSTER response stubbed — the route must NOT call CLUSTER on a
+    // confirmed-standalone target.
+    app = await createServer({ redis: fr });
+
+    const res = await app.inject({ method: "GET", url: "/observability/shards" });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(Array.isArray(body)).toBe(true);
+    expect(body).toHaveLength(1);
+    expect(body[0].shardId).toBe("standalone");
+    expect(body[0].role).toBe("master");
+    expect(body[0].slotCount).toBe(0);
+    expect(body[0].usedMemoryBytes).toBe(67108864);
+    expect(body[0].netInBytes).toBe(111222333);
+    expect(body[0].netOutBytes).toBe(444555666);
+    expect(body[0].opsPerSec).toBe(77);
+
+    const clusterCall = fr.calls.find((c) => c.command === "CLUSTER");
+    expect(clusterCall).toBeUndefined();
+  });
+
+  it("falls back to a synthetic standalone shard when CLUSTER NODES throws `ERR command is not allowed` (managed Redis tiers)", async () => {
+    const fr = fakeRedis();
+    fr.setInfo(INFO_CLUSTER_ENABLED_BUT_BLOCKED);
+    fr.setResponse("CLUSTER", () => {
+      throw new Error("ERR command is not allowed");
+    });
+    app = await createServer({ redis: fr });
+
+    const res = await app.inject({ method: "GET", url: "/observability/shards" });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body).toHaveLength(1);
+    expect(body[0].shardId).toBe("standalone");
+    expect(body[0].role).toBe("master");
+    expect(body[0].slotCount).toBe(0);
+    expect(body[0].usedMemoryBytes).toBe(33554432);
+    expect(body[0].netInBytes).toBe(1000);
+    expect(body[0].netOutBytes).toBe(2000);
+    expect(body[0].opsPerSec).toBe(9);
+
+    // CLUSTER NODES was attempted (the topology probe said cluster_enabled:1)
+    // and then the fallback kicked in on the "not allowed" error.
+    const clusterCall = fr.calls.find((c) => c.command === "CLUSTER");
+    expect(clusterCall).toBeDefined();
+    expect(clusterCall!.args[0]).toBe("NODES");
+  });
+});
+
 describe("GET /observability/shards/stream (SSE)", () => {
   let app: Awaited<ReturnType<typeof createServer>>;
   afterEach(async () => {
     if (app) await app.close();
+  });
+
+  it("emits synthetic single-shard frames on a standalone target (no 500)", async () => {
+    const fr = fakeRedis();
+    fr.setInfo(INFO_STANDALONE);
+    app = await createServer({ redis: fr, sseIntervalMs: 20 });
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/observability/shards/stream",
+      headers: { accept: "text/event-stream" },
+      payloadAsStream: true,
+    });
+    expect(res.statusCode).toBe(200);
+    expect(String(res.headers["content-type"])).toMatch(/^text\/event-stream/);
+
+    let buf = "";
+    const stream = res.stream() as unknown as NodeJS.ReadableStream;
+    const got = await new Promise<string>((resolveDone) => {
+      const onData = (chunk: Buffer | string): void => {
+        buf += chunk.toString();
+        if (buf.split("\n\n").length >= 2) {
+          stream.removeListener?.("data", onData);
+          resolveDone(buf);
+        }
+      };
+      stream.on("data", onData);
+      setTimeout(() => {
+        stream.removeListener?.("data", onData);
+        resolveDone(buf);
+      }, 200);
+    });
+
+    const frames = got.split("\n\n").filter((s) => s.startsWith("data:"));
+    expect(frames.length).toBeGreaterThanOrEqual(1);
+    const payload = JSON.parse(frames[0].replace(/^data: ?/, "").trim());
+    expect(Array.isArray(payload)).toBe(true);
+    expect(payload).toHaveLength(1);
+    expect(payload[0].shardId).toBe("standalone");
+    expect(payload[0].role).toBe("master");
+    expect(payload[0].slotCount).toBe(0);
   });
 
   it("streams data: events containing the same shard payload (text/event-stream)", async () => {
