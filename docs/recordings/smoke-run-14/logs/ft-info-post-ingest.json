@@ -1,0 +1,15 @@
+{
+  "16.59.25.183:10395": {
+    "num_docs": 64193,
+    "hash_indexing_failures": 0,
+    "indexing": 0,
+    "total_indexing_time": null
+  },
+  "18.117.107.213:10395": {
+    "num_docs": 64193,
+    "hash_indexing_failures": 0,
+    "indexing": 0,
+    "total_indexing_time": null
+  },
+  "xlen_stream": 150000
+}
