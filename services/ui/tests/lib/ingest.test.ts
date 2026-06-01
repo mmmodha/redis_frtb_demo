@@ -47,6 +47,22 @@ describe("ingest api client", () => {
     expect(calls[0]!.init?.method).toBe("POST");
   });
 
+  it("startGenerator sends an empty JSON object body so Fastify does not 400 with FST_ERR_CTP_EMPTY_JSON_BODY", async () => {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: typeof input === "string" ? input : input.toString(), init });
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+    await startGenerator();
+    const init = calls[0]!.init!;
+    const headers = (init.headers ?? {}) as Record<string, string>;
+    expect(headers["content-type"]).toBe("application/json");
+    expect(typeof init.body).toBe("string");
+    expect(JSON.parse(init.body as string)).toEqual({});
+  });
+
   it("startIngest throws on non-2xx response", async () => {
     globalThis.fetch = (async () => new Response("boom", { status: 500 })) as typeof fetch;
     await expect(startIngest("nope")).rejects.toThrow();

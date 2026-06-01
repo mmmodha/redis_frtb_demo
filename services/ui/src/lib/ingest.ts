@@ -40,6 +40,7 @@ export async function startGenerator(): Promise<IngestRunResponse> {
   const res = await fetch(`${apiBase()}/generator/start`, {
     method: "POST",
     headers: { "content-type": "application/json" },
+    body: "{}",
   });
   if (!res.ok) throw new Error(`api /generator/start ${res.status}`);
   return (await res.json()) as IngestRunResponse;
