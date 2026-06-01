@@ -106,18 +106,18 @@
 
 ## Beat 10 — The full 9-variant sweep (GIRR / EQUITY / FX × Δ / V / Curvature)
 
-- **On-screen.** Presenter runs the matrix sweep button; nine rows populate in under three seconds wall-clock. The cost-cap tile shows `Δ-over-baseline = 22.59 MB = 75.32 % of the 30 MB cap`. A 3 × 3 charge matrix renders on the right:
+- **On-screen.** Presenter runs the matrix sweep button; nine rows populate in under three seconds wall-clock. The cost-cap tile shows `Δ-over-baseline = 23.99 MB = 79.96 % of the 30 MB cap`. A 3 × 3 charge matrix renders on the right:
 
 | Risk class | Delta | Vega | Curvature | Per-class L2 |
 |---|---:|---:|---:|---:|
 | **GIRR** | 0.6846 | 52.060 | 9495.234 | **9,495.38** |
-| **EQUITY** | 6.9244 | 15.302 | 367.295 | **367.72** |
+| **EQUITY** | 6.9244 | 15.302 | 367.295 | **367.68** |
 | **FX** | 1.1553 | 15.404 | 1036.939 | **1,037.05** |
 | **Grand L2** | — | — | — | **9,558.91** |
 
-- **Presenter says.** "Same math path, nine variants. Every call HTTP 200, every per-bucket count strictly positive, every charge strictly positive. Per-class L2 across the three legs gives GIRR = 9,495.38, EQUITY = 367.72, FX = 1,037.05; the grand L2 across the three risk classes is **9,558.91**. We never breached 80 % of the memory cap."
+- **Presenter says.** "Same math path, nine variants. Every call HTTP 200, every per-bucket count strictly positive, every charge strictly positive. Per-class L2 across the three legs gives GIRR = 9,495.38, EQUITY = 367.68, FX = 1,037.05; the grand L2 across the three risk classes is **9,558.91**. We never breached 79.96 % of the memory cap."
 - **Basel anchor.** Same MAR21 §21.4(3)–(5) path per Delta/Vega; §21.5(2)–(5) path per Curvature; per-class γ matrix sourced via [`services/api/src/sbm/correlations.ts:9-27`](../../services/api/src/sbm/correlations.ts) from the schema YAML.
-- **Live value to point at.** Nine-variant total HTTP-200 hit rate `9/9`; per-variant wallclock `263–314 ms`, fanout `144–191 ms`; cap utilisation `22.59 / 30 MB = 75.32 %`. Source: [`docs/recordings/smoke-run-16/aggregate.json`](../recordings/smoke-run-16/aggregate.json).
+- **Live value to point at.** Nine-variant total HTTP-200 hit rate `9/9`; per-variant wallclock `263–301 ms`, fanout `149–181 ms`; cap utilisation `23.99 / 30 MB = 79.96 %`. Source: [`docs/recordings/smoke-run-17/aggregate.json`](../recordings/smoke-run-17/aggregate.json).
 - **Time budget.** 45 s.
 
 ---
