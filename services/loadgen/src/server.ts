@@ -13,6 +13,14 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import { Runner, type RunnerConfig, type RunnerSnapshot } from "./runner.ts";
 
+declare module "fastify" {
+  interface FastifyInstance {
+    // Wave 5.16v decorator: lets the active-target watcher read run state
+    // without coupling to the Runner instance.
+    loadgenIsRunning(): boolean;
+  }
+}
+
 export interface CreateServerOpts {
   apiBase?: string;
   fetch?: typeof fetch;
@@ -124,6 +132,12 @@ export async function createServer(opts: CreateServerOpts = {}): Promise<Fastify
   });
 
   app.addHook("onClose", async () => { await runner.stop(); });
+
+  // Wave 5.16v: expose the runner's run state so the active-target watcher
+  // (wired in index.ts) can record `running=<bool>` on every swap. The api's
+  // 5.16w in-flight registry already polls /loadgen/status for the same flag;
+  // this decorator is the in-process equivalent for the watcher.
+  app.decorate("loadgenIsRunning", () => runner.snapshot().running);
 
   return app;
 }
