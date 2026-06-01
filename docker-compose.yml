@@ -28,6 +28,12 @@ x-app-env: &app-env
   NODE_ENV: ${NODE_ENV:-development}
   LOG_LEVEL: ${LOG_LEVEL:-info}
   API_URL: http://api:8080
+  # Wave 5.16u: shared static bearer for the api's internal full-credential
+  # endpoint (/internal/redis/active-target/full). source and loadgen poll
+  # this to follow profile switches without re-encoding the connection store.
+  # Override via .env.local; the dev default is fine for local docker-compose
+  # but MUST be replaced for any reachable demo.
+  INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-dev-internal-token}
 
 # Redis connection env (REDIS_URL / REDIS_TLS / REDIS_CLUSTER) is sourced
 # from the host's `.env.local` (gitignored) via the `env_file` directive on

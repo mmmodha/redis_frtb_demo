@@ -10,6 +10,8 @@ import { registerObservabilityRoutes } from "./routes/observability.ts";
 import { registerSourcesProxyRoutes } from "./routes/sources-proxy.ts";
 import { registerLoadgenProxyRoutes } from "./routes/loadgen-proxy.ts";
 import { registerGeneratorRoutes } from "./routes/generator.ts";
+import { registerInternalTargetRoutes } from "./routes/internal-target.ts";
+import type { ConnectionsStore as RealConnectionsStore } from "./store.ts";
 
 // Wave 5.14b.1 — bootstrap-status flag. Compose healthchecks already curl
 // /healthz; flipping this from {ok:false} → {ok:true} only after
@@ -122,6 +124,7 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
     return { service: "api", status: "ok", bootstrap: "ready" };
   });
   app.get("/redis/active-target", async () => getActiveTarget());
+  registerInternalTargetRoutes(app, opts.store as RealConnectionsStore | undefined);
 
   if (opts.redis) {
     registerPivotRoute(app, opts.redis);
