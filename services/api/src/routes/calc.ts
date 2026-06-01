@@ -1,5 +1,8 @@
 import type { FastifyInstance } from "fastify";
 import type { RedisLike } from "../redis-like.ts";
+import { getActiveTarget } from "../active-target.ts";
+import { getBootstrapStatus } from "../bootstrap-status.ts";
+import { translateRedisError } from "../redis-errors.ts";
 import {
   reduceCurvatureCharge,
   reduceRiskClassCharge,
@@ -170,7 +173,11 @@ function resolveQueryNodes(client: RedisLike): RedisLike[] {
  * full re-ingest. See smoke-run-12 SUMMARY "Named root cause" for the
  * end-to-end evidence chain.
  */
-export function registerCalcRoute(app: FastifyInstance, redis: RedisLike, opts: CalcOpts): void {
+export function registerCalcRoute(
+  app: FastifyInstance,
+  getRedis: () => RedisLike,
+  opts: CalcOpts,
+): void {
   app.post<{ Body: CalcBody }>("/calc/sbm", async (req, reply) => {
     const risk_class_raw = req.body?.risk_class;
     const legRaw = req.body?.sensitivity_type;
@@ -190,6 +197,11 @@ export function registerCalcRoute(app: FastifyInstance, redis: RedisLike, opts: 
     const funcName = funcNameFor(risk_class, leg as Leg);
     const corr: CorrelationSpec = opts.correlations[risk_class] ?? { kind: "constant", value: 0 };
 
+    // Wave 5.16t — resolve the active redis client once per request so a
+    // mid-flight target switch is picked up by the very next call.
+    const redis = getRedis();
+    const target_label = getActiveTarget().label;
+
     const t0 = process.hrtime.bigint();
 
     // 1) Discover buckets present for this risk_class — per-master fan-out.
@@ -201,21 +213,30 @@ export function registerCalcRoute(app: FastifyInstance, redis: RedisLike, opts: 
     //    single call exactly as before.
     const queryNodes = resolveQueryNodes(redis);
     const bucketSet = new Set<string>();
-    for (const node of queryNodes) {
-      const aggReply = await node.call(
-        "FT.AGGREGATE",
-        "idx:sens",
-        `@risk_class:{${risk_class}}`,
-        "GROUPBY",
-        "1",
-        "@bucket",
-        "LIMIT",
-        "0",
-        "10000",
-        "DIALECT",
-        "2"
-      );
-      for (const b of parseBucketsFromAggregate(aggReply)) bucketSet.add(b);
+    try {
+      for (const node of queryNodes) {
+        const aggReply = await node.call(
+          "FT.AGGREGATE",
+          "idx:sens",
+          `@risk_class:{${risk_class}}`,
+          "GROUPBY",
+          "1",
+          "@bucket",
+          "LIMIT",
+          "0",
+          "10000",
+          "DIALECT",
+          "2"
+        );
+        for (const b of parseBucketsFromAggregate(aggReply)) bucketSet.add(b);
+      }
+    } catch (err) {
+      const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
+      if (translated) {
+        reply.code(translated.status);
+        return translated.body;
+      }
+      throw err;
     }
     const buckets = Array.from(bucketSet);
 
@@ -253,22 +274,32 @@ export function registerCalcRoute(app: FastifyInstance, redis: RedisLike, opts: 
     //    observability response.
     const fanoutStart = process.hrtime.bigint();
     const dispatchedKeys = buckets.map((b) => `sens:{${risk_class}:${b}}:_route`);
-    const results = await Promise.all(
-      buckets.map(async (b, i): Promise<BucketResult> => {
-        const routeKey = dispatchedKeys[i]!;
-        const r = (await redis.call(
-          "FCALL",
-          funcName,
-          "1",
-          routeKey,
-          risk_class,
-          b
-        )) as unknown;
-        const parsed = parseBucketReply(r) ?? { bucket: "", K_b: 0, S_b: 0, count: 0, ms: 0 };
-        parsed.bucket = b;
-        return parsed;
-      })
-    );
+    let results: BucketResult[];
+    try {
+      results = await Promise.all(
+        buckets.map(async (b, i): Promise<BucketResult> => {
+          const routeKey = dispatchedKeys[i]!;
+          const r = (await redis.call(
+            "FCALL",
+            funcName,
+            "1",
+            routeKey,
+            risk_class,
+            b
+          )) as unknown;
+          const parsed = parseBucketReply(r) ?? { bucket: "", K_b: 0, S_b: 0, count: 0, ms: 0 };
+          parsed.bucket = b;
+          return parsed;
+        })
+      );
+    } catch (err) {
+      const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
+      if (translated) {
+        reply.code(translated.status);
+        return translated.body;
+      }
+      throw err;
+    }
     const fanoutMs = Number(process.hrtime.bigint() - fanoutStart) / 1e6;
 
     // 3) Reduce per-bucket K_b/S_b → risk-class charge. Curvature follows the
@@ -302,6 +333,14 @@ export function registerCalcRoute(app: FastifyInstance, redis: RedisLike, opts: 
       },
     };
 
+    // Wave 5.16t — empty-result hint: discovery returned zero buckets but
+    // the populated-index probe above let us through (num_docs > 0, so other
+    // risk classes have data on the target). Surface a friendly note so the
+    // UI can prompt "ingest data" instead of rendering charge=0 silently.
+    const note = results.length === 0 && buckets.length === 0
+      ? `No sensitivities on '${target_label}' — ingest data to run calculations.`
+      : undefined;
+
     return {
       charge,
       per_bucket: results,
@@ -310,6 +349,7 @@ export function registerCalcRoute(app: FastifyInstance, redis: RedisLike, opts: 
       // diagnostic — useful for the demo "look how parallel we are" callout
       fanout_ms: Math.round(fanoutMs * 1000) / 1000,
       commands,
+      ...(note ? { ok: true, note } : {}),
     };
   });
 }

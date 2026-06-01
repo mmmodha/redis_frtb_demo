@@ -1,5 +1,8 @@
 import type { FastifyInstance } from "fastify";
 import type { RedisLike } from "../redis-like.ts";
+import { getActiveTarget } from "../active-target.ts";
+import { getBootstrapStatus } from "../bootstrap-status.ts";
+import { translateRedisError } from "../redis-errors.ts";
 
 // Escape RediSearch TAG punctuation per dialect 2 — colon, dash, brace, etc.
 // are token separators and must be backslash-escaped to match literally.
@@ -18,7 +21,10 @@ interface PivotQuery {
   offset?: string;
 }
 
-export function registerPivotRoute(app: FastifyInstance, redis: RedisLike): void {
+export function registerPivotRoute(
+  app: FastifyInstance,
+  getRedis: () => RedisLike,
+): void {
   app.get<{ Querystring: PivotQuery }>("/pivot", async (req, reply) => {
     const q = req.query;
     const limit = Math.min(1000, Math.max(0, parseInt(q.limit ?? "100", 10) || 100));
@@ -36,17 +42,32 @@ export function registerPivotRoute(app: FastifyInstance, redis: RedisLike): void
     if (q.trade_id) parts.push(`@trade_id:{${escapeTag(q.trade_id)}}`);
     const query = parts.length === 0 ? "*" : parts.join(" ");
 
+    // Wave 5.16t — resolve active redis per-request so a profile switch is
+    // picked up on the very next /pivot call.
+    const redis = getRedis();
+    const target_label = getActiveTarget().label;
+
     const t0 = process.hrtime.bigint();
-    const raw = (await redis.call(
-      "FT.SEARCH",
-      "idx:sens",
-      query,
-      "LIMIT",
-      String(offset),
-      String(limit),
-      "DIALECT",
-      "2"
-    )) as unknown[];
+    let raw: unknown[];
+    try {
+      raw = (await redis.call(
+        "FT.SEARCH",
+        "idx:sens",
+        query,
+        "LIMIT",
+        String(offset),
+        String(limit),
+        "DIALECT",
+        "2"
+      )) as unknown[];
+    } catch (err) {
+      const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
+      if (translated) {
+        reply.code(translated.status);
+        return translated.body;
+      }
+      throw err;
+    }
     const ms = Number(process.hrtime.bigint() - t0) / 1e6;
 
     const total = Number(raw[0] ?? 0);

@@ -3,7 +3,17 @@ import fastifyCors from "@fastify/cors";
 import type { Schema } from "@frtb/schema";
 import type { RedisLike } from "./redis-like.ts";
 import type { CorrelationSpec } from "./sbm/reduce.ts";
-import { getActiveTarget, setActiveTarget, type ActiveTarget } from "./active-target.ts";
+import {
+  getActiveTarget,
+  setActiveTarget,
+  onActiveTargetChange,
+  getActiveRedisClient,
+  type ActiveTarget,
+} from "./active-target.ts";
+import {
+  getBootstrapStatus as getBootstrapPhaseStatus,
+  scheduleBootstrap,
+} from "./bootstrap-status.ts";
 import { registerPivotRoute } from "./routes/pivot.ts";
 import { registerCalcRoute } from "./routes/calc.ts";
 import { registerObservabilityRoutes } from "./routes/observability.ts";
@@ -53,7 +63,16 @@ export type ConnectionTester = (profile: unknown) => Promise<unknown>;
 export type ConnectionsStore = unknown;
 
 export interface CreateServerOpts {
+  // Wave 5.16t — fallback Redis client used ONLY when getActiveRedisClient()
+  // returns null (i.e. no active profile has been set). Production wires the
+  // accessor in `getRedis` below to follow the active-target singleton
+  // per-request; this field is retained as a back-compat seam for unit tests
+  // that inject a fakeRedis without touching the active-target state.
   redis?: RedisLike;
+  // Wave 5.16t — explicit per-request accessor. Takes precedence over
+  // `opts.redis`; production wires this to `() => getActiveRedisClient()` so
+  // a profile switch retargets the very next route call without restarting.
+  getRedis?: () => RedisLike;
   activeTarget?: ActiveTarget;
   correlations?: Record<string, CorrelationSpec>;
   // Loaded once at boot from $SCHEMA_FILE (see index.ts). Threaded through so
@@ -126,12 +145,48 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
   app.get("/redis/active-target", async () => getActiveTarget());
   registerInternalTargetRoutes(app, opts.store as RealConnectionsStore | undefined);
 
-  if (opts.redis) {
-    registerPivotRoute(app, opts.redis);
-    registerCalcRoute(app, opts.redis, { correlations: opts.correlations ?? {} });
-    registerObservabilityRoutes(app, opts.redis, { sseIntervalMs: opts.sseIntervalMs });
-    registerGeneratorRoutes(app, opts.redis, opts.schema);
-  }
+  // Wave 5.16t — surface bootstrap progress to the UI so a freshly-activated
+  // profile that's still loading idx:sens / the frtb library renders a
+  // friendly "bootstrapping…" badge instead of opaque 500s on the first
+  // calc/pivot call.
+  app.get("/redis/active-target/bootstrap-status", async () => getBootstrapPhaseStatus());
+
+  // Wave 5.16t — per-request accessor.
+  //
+  // Priority order:
+  //   1. opts.getRedis — explicit accessor (production wires this in index.ts
+  //      to follow the active-target singleton; tests use it to exercise
+  //      per-request retargeting with a mutable fake).
+  //   2. opts.redis — back-compat test seam: existing unit tests inject a
+  //      single fakeRedis instance and expect it for the whole server life.
+  //   3. getActiveRedisClient() — fall-back when nothing else is supplied.
+  const getRedis = (): RedisLike => {
+    if (opts.getRedis) return opts.getRedis();
+    if (opts.redis) return opts.redis;
+    const active = getActiveRedisClient();
+    if (active) return active as unknown as RedisLike;
+    // Last-resort: surface a clear error when nothing resolved.
+    throw new Error("no active redis client and no fallback opts.redis provided");
+  };
+
+  registerPivotRoute(app, getRedis);
+  registerCalcRoute(app, getRedis, { correlations: opts.correlations ?? {} });
+  registerObservabilityRoutes(app, getRedis, { sseIntervalMs: opts.sseIntervalMs });
+  registerGeneratorRoutes(app, getRedis, opts.schema);
+
+  // Wave 5.16t — auto-bootstrap on every active-target change. The hook is
+  // registered before the connections store so the very first profile-switch
+  // dispatched by the UI triggers a background bootstrap; the route returns
+  // 412 with friendly progress text via translateRedisError until ready.
+  onActiveTargetChange((target) => {
+    const client = getActiveRedisClient();
+    scheduleBootstrap(
+      target,
+      // ioredis Redis|Cluster satisfies the bootstrap RedisLike surface.
+      client as unknown as Parameters<typeof scheduleBootstrap>[1],
+      opts.schema,
+    );
+  });
 
   registerSourcesProxyRoutes(app, { sourceBase: opts.sourceBase });
   registerLoadgenProxyRoutes(app, { loadgenBase: opts.loadgenBase });

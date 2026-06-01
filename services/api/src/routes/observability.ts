@@ -1,5 +1,8 @@
 import type { FastifyInstance } from "fastify";
 import type { RedisLike } from "../redis-like.ts";
+import { getActiveTarget } from "../active-target.ts";
+import { getBootstrapStatus } from "../bootstrap-status.ts";
+import { translateRedisError } from "../redis-errors.ts";
 
 const NUMERIC_INFO_FIELDS = new Set([
   "used_memory",
@@ -184,34 +187,71 @@ export interface RegisterObservabilityOpts {
 
 export function registerObservabilityRoutes(
   app: FastifyInstance,
-  redis: RedisLike,
+  getRedis: () => RedisLike,
   opts: RegisterObservabilityOpts = {},
 ): void {
   const sseIntervalMs = opts.sseIntervalMs ?? 1000;
-  app.get<{ Querystring: KeysQuery }>("/observability/keys", async (req) => {
+  app.get<{ Querystring: KeysQuery }>("/observability/keys", async (req, reply) => {
     const prefix = req.query.prefix ?? "sens:";
+    // Wave 5.16t — resolve active redis per-request so a profile switch is
+    // picked up on the very next observability call.
+    const redis = getRedis();
+    const target_label = getActiveTarget().label;
     const t0 = process.hrtime.bigint();
-    const [, keys] = await redis.scan("0", "MATCH", `${prefix}*`, "COUNT", "1000");
-    const dbsize = await redis.dbsize();
-    const ms = Number(process.hrtime.bigint() - t0) / 1e6;
-    return {
-      prefix,
-      dbsize,
-      sample: keys.slice(0, 50),
-      sample_size: Math.min(keys.length, 50),
-      ms: Math.round(ms * 1000) / 1000,
-    };
+    try {
+      const [, keys] = await redis.scan("0", "MATCH", `${prefix}*`, "COUNT", "1000");
+      const dbsize = await redis.dbsize();
+      const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+      return {
+        prefix,
+        dbsize,
+        sample: keys.slice(0, 50),
+        sample_size: Math.min(keys.length, 50),
+        ms: Math.round(ms * 1000) / 1000,
+      };
+    } catch (err) {
+      const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
+      if (translated) {
+        reply.code(translated.status);
+        return translated.body;
+      }
+      throw err;
+    }
   });
 
-  app.get("/observability/memory", async () => {
+  app.get("/observability/memory", async (_req, reply) => {
+    const redis = getRedis();
+    const target_label = getActiveTarget().label;
     const t0 = process.hrtime.bigint();
-    const text = await redis.info("memory");
-    const parsed = parseInfo(text);
-    const ms = Number(process.hrtime.bigint() - t0) / 1e6;
-    return { ...parsed, ms: Math.round(ms * 1000) / 1000 };
+    try {
+      const text = await redis.info("memory");
+      const parsed = parseInfo(text);
+      const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+      return { ...parsed, ms: Math.round(ms * 1000) / 1000 };
+    } catch (err) {
+      const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
+      if (translated) {
+        reply.code(translated.status);
+        return translated.body;
+      }
+      throw err;
+    }
   });
 
-  app.get("/observability/shards", async (req) => readShards(redis, req.log));
+  app.get("/observability/shards", async (req, reply) => {
+    const redis = getRedis();
+    const target_label = getActiveTarget().label;
+    try {
+      return await readShards(redis, req.log);
+    } catch (err) {
+      const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
+      if (translated) {
+        reply.code(translated.status);
+        return translated.body;
+      }
+      throw err;
+    }
+  });
 
   // SSE: write one frame immediately, then every `sseIntervalMs` until the
   // client disconnects. We hijack the reply so Fastify doesn't try to send a
@@ -228,7 +268,8 @@ export function registerObservabilityRoutes(
     const send = async (): Promise<void> => {
       if (stopped) return;
       try {
-        const shards = await readShards(redis, req.log);
+        // Re-resolve per tick so an in-flight stream retargets on profile switch.
+        const shards = await readShards(getRedis(), req.log);
         reply.raw.write(`data: ${JSON.stringify(shards)}\n\n`);
       } catch {
         // Swallow transient errors; the next tick may recover.

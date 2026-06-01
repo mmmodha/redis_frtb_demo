@@ -10,12 +10,18 @@ import { Cluster, type Redis } from "ioredis";
 import { createRedisClient } from "@frtb/redis-client";
 import { loadSchema } from "@frtb/schema";
 import { createServer, markBootstrapReady, markBootstrapFailed, markBootstrapSkipped } from "./server.ts";
-import { getActiveTarget, setActiveTarget } from "./active-target.ts";
+import { getActiveTarget, setActiveTarget, getActiveRedisClient } from "./active-target.ts";
+import type { RedisLike } from "./redis-like.ts";
 import { buildCrossBucketCorrelations } from "./sbm/correlations.ts";
 import { createStore } from "./store.ts";
 import { seedConnections } from "./seed.ts";
 import { bootstrapFrtb } from "./bootstrap.ts";
 import { ensureRedisReady } from "./redis-ready.ts";
+import {
+  markBootstrapStatusRunning,
+  markBootstrapStatusReady,
+  markBootstrapStatusFailed,
+} from "./bootstrap-status.ts";
 
 const PORT = Number(process.env.HEALTH_PORT ?? 8080);
 const SCHEMA_PATH = resolve(
@@ -95,10 +101,16 @@ async function main(): Promise<void> {
   // process — endpoints surface the underlying error per-call (mirrors the
   // redis-unreachable graceful-degrade pattern above).
   if (redisConnected && schema) {
+    // Wave 5.16t — publish initial bootstrap status alongside the server
+    // /healthz flags so /redis/active-target/bootstrap-status reflects the
+    // boot-time bootstrap (idle → running → ready/failed) without waiting
+    // for a subsequent active-target switch.
+    markBootstrapStatusRunning(target.label);
     try {
       await bootstrapFrtb(redis, schema);
       // Wave 5.14b.1 — flip /healthz from 503 → 200 only on success.
       markBootstrapReady();
+      markBootstrapStatusReady(target.label);
     } catch (err) {
       // Wave 5.14b.1 — keep logging (diagnostic surface) but also wire the
       // flag so /healthz returns 503 + the error string. Do NOT crash.
@@ -109,6 +121,7 @@ async function main(): Promise<void> {
         err: String(err),
       }));
       markBootstrapFailed(err);
+      markBootstrapStatusFailed(target.label, err);
     }
   } else if (redisConnected && !schema) {
     console.log(JSON.stringify({
@@ -126,7 +139,16 @@ async function main(): Promise<void> {
     markBootstrapSkipped("redis-unreachable");
   }
 
-  const app = await createServer({ redis, correlations, schema, store, logger: true });
+  // Wave 5.16t — wire the per-request accessor so routes follow the
+  // active-target singleton. setActiveTarget() at boot (lines 44-52) and any
+  // subsequent UI-driven profile switch flips getActiveRedisClient() to the
+  // new target; routes see it on the very next call. The boot-time `redis`
+  // remains as a fallback for the brief window before the singleton resolves.
+  const getRedis = (): RedisLike => {
+    const active = getActiveRedisClient();
+    return (active ?? redis) as unknown as RedisLike;
+  };
+  const app = await createServer({ getRedis, correlations, schema, store, logger: true });
   await app.listen({ port: PORT, host: "0.0.0.0" });
   console.log(JSON.stringify({ service: "api", status: "ready", port: PORT, target: target.label }));
 

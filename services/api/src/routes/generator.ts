@@ -13,6 +13,9 @@ import {
   createStreamProducer,
 } from "@frtb/generator";
 import type { RedisLike } from "../redis-like.ts";
+import { getActiveTarget } from "../active-target.ts";
+import { getBootstrapStatus } from "../bootstrap-status.ts";
+import { translateRedisError } from "../redis-errors.ts";
 
 interface GeneratorStartBody {
   rows?: number;
@@ -43,7 +46,7 @@ type PipelineClient = {
 
 export function registerGeneratorRoutes(
   app: FastifyInstance,
-  redis: RedisLike,
+  getRedis: () => RedisLike,
   schema: Schema | undefined,
   opts: GeneratorRoutesOpts = {},
 ): void {
@@ -91,6 +94,11 @@ export function registerGeneratorRoutes(
     const run_id = ulid();
     const t0 = process.hrtime.bigint();
 
+    // Wave 5.16t — resolve active redis per-request so the generator writes
+    // to the currently-active profile's stream.
+    const redis = getRedis();
+    const target_label = getActiveTarget().label;
+
     const generator = createRowGenerator(schema, {
       seed: body.seed,
       sensitivityTypes: sensitivity_types,
@@ -110,6 +118,13 @@ export function registerGeneratorRoutes(
       await producer.close();
     } catch (err) {
       try { await producer.close(); } catch { /* swallow flush-on-close error */ }
+      const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
+      if (translated) {
+        const msg = err instanceof Error ? err.message : String(err);
+        app.log.warn({ evt: "generator-start", run_id, err: msg });
+        reply.code(translated.status);
+        return translated.body;
+      }
       const msg = err instanceof Error ? err.message : String(err);
       app.log.warn({ evt: "generator-start", run_id, err: msg });
       reply.code(502);
