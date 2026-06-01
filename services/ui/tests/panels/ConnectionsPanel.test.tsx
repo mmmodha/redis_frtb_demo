@@ -320,7 +320,7 @@ describe("<ConnectionsPanel/>", () => {
     expect(activateBtn.title).toMatch(/test/i);
   });
 
-  it("keeps Activate disabled with an 'unreachable' title after the auto-test settles ok:false", async () => {
+  it("hides the Activate button entirely after the auto-test settles ok:false", async () => {
     fetchMock.mockImplementation(async (input: RequestInfo, init?: RequestInit) => {
       const url = String(input);
       const method = init?.method ?? "GET";
@@ -333,9 +333,32 @@ describe("<ConnectionsPanel/>", () => {
     });
     renderPanel();
     await waitFor(() => expect(screen.getByTestId("test-result-01J")).toBeInTheDocument());
-    const activateBtn = screen.getByRole("button", { name: /^Activate$/ }) as HTMLButtonElement;
-    expect(activateBtn.disabled).toBe(true);
-    expect(activateBtn.title).toMatch(/unreachable/i);
+    // Confirmed-unreachable profiles render no Activate button at all.
+    expect(screen.queryByRole("button", { name: /^Activate$/ })).toBeNull();
+    // A small muted hint takes its place.
+    expect(screen.getByTestId("activate-hint-01J")).toHaveTextContent(/unreachable/i);
+  });
+
+  it("hides the Activate button when a profile transitions from untested/pending to ok:false", async () => {
+    let resolveTest: ((r: Response) => void) | null = null;
+    fetchMock.mockImplementation(async (input: RequestInfo, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      if (url.match(/\/redis\/active-target$/)) return new Response(JSON.stringify({ host: "h", port: 1, tls: false, db: 0, label: "x" }), { status: 200, headers: { "content-type": "application/json" } });
+      if (url.match(/\/connections$/) && method === "GET") return new Response(JSON.stringify([profile()]), { status: 200, headers: { "content-type": "application/json" } });
+      if (url.match(/\/connections\/01J\/test$/) && method === "POST") {
+        return new Promise<Response>((resolve) => { resolveTest = resolve; });
+      }
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    });
+    renderPanel();
+    // While the auto-test is in flight the Activate button is rendered (disabled).
+    const initialBtn = await screen.findByRole("button", { name: /^Activate$/ }) as HTMLButtonElement;
+    expect(initialBtn.disabled).toBe(true);
+    // Resolve the in-flight test with ok:false → button disappears entirely.
+    resolveTest!(new Response(JSON.stringify({ ok: false, errors: ["dns fail"], modules: [] }), { status: 200, headers: { "content-type": "application/json" } }));
+    await waitFor(() => expect(screen.queryByRole("button", { name: /^Activate$/ })).toBeNull());
+    expect(screen.getByTestId("activate-hint-01J")).toBeInTheDocument();
   });
 
   it("enables Activate after the auto-test settles ok:true for a non-active profile", async () => {

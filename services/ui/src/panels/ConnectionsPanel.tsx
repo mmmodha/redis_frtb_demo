@@ -49,6 +49,10 @@ function isReachable(tr: ConnectionTestResult | "pending" | undefined): boolean 
   return !!tr && tr !== "pending" && tr.ok === true;
 }
 
+function isConfirmedUnreachable(tr: ConnectionTestResult | "pending" | undefined): boolean {
+  return !!tr && tr !== "pending" && tr.ok === false;
+}
+
 export function ConnectionsPanel() {
   const [state, setState] = useState<LoadState>("loading");
   const [profiles, setProfiles] = useState<ConnectionProfile[]>([]);
@@ -275,12 +279,17 @@ export function ConnectionsPanel() {
                       Edit
                     </button>
                     {(() => {
+                      // Confirmed-unreachable (and not already active) hides the Activate button
+                      // entirely — a greyed-out button on a known-broken cluster is noisy UX.
+                      if (!active && isConfirmedUnreachable(tr)) {
+                        return (
+                          <span className="profile-card__activate-hint" data-testid={`activate-hint-${p.id}`}>
+                            Unreachable — fix connection to activate
+                          </span>
+                        );
+                      }
                       const unreachableReason = !active && !isReachable(tr)
-                        ? (tr === undefined
-                            ? "Test the connection first"
-                            : tr === "pending"
-                              ? "Testing connection…"
-                              : "Cluster unreachable — fix credentials or network before activating")
+                        ? (tr === "pending" ? "Testing connection…" : "Test the connection first")
                         : null;
                       const hintId = unreachableReason ? `activate-hint-${p.id}` : undefined;
                       return (
