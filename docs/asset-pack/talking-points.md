@@ -1,6 +1,6 @@
-# Presenter Talking Points — HSBC FRTB-SA Demo
+# Presenter Talking Points — Tier-1 bank FRTB-SA Demo
 
-The Solutions Architect's pocket reference for running the 15–20 min demo. One entry per step in the [Demo Flow](../../README.md). Every entry gives the **buying signal** being proven, the **narration** to say out loud, the **objection** HSBC is most likely to raise, the **rebuttal** (Enterprise-specific, never generic), and a **fallback** if the live moment misbehaves.
+The Solutions Architect's pocket reference for running the 15–20 min demo. One entry per step in the [Demo Flow](../../README.md). Every entry gives the **buying signal** being proven, the **narration** to say out loud, the **objection** the bank is most likely to raise, the **rebuttal** (Enterprise-specific, never generic), and a **fallback** if the live moment misbehaves.
 
 Buying-signal numbers refer to the "Why Redis Enterprise" table in the spec.
 
@@ -17,7 +17,7 @@ Buying-signal numbers refer to the "Why Redis Enterprise" table in the spec.
 ## Step 2 — Architecture + deployment (1 min)
 
 - **Buying signal:** #8 Deploy in your perimeter; #11 Kubernetes Operator / Ansible.
-- **Narration:** "This is Redis Enterprise Software running inside HSBC's own perimeter — your VPC, your VMs, your OpenShift cluster. Same product as Redis Cloud, you operate it. K8s Operator for GKE/EKS/OpenShift, Ansible roles for VM-based. No SaaS dependency, no data egress."
+- **Narration:** "This is Redis Enterprise Software running inside the bank's own perimeter — your VPC, your VMs, your OpenShift cluster. Same product as Redis Cloud, you operate it. K8s Operator for GKE/EKS/OpenShift, Ansible roles for VM-based. No SaaS dependency, no data egress."
 - **Objection:** "We already standardise on Redis Cloud / we can't take a SaaS dependency."
 - **Rebuttal:** "Redis Enterprise Software is the self-managed install of the exact same product. Same modules, same Active-Active CRDTs, same Auto Tiering. Your platform team installs it via the official Operator; day-2 ops are GitOps-native via BDB CRDs."
 - **Fallback:** If the architecture diagram doesn't load, show the static PNG from the asset pack or the deck slide directly.
@@ -44,7 +44,7 @@ Buying-signal numbers refer to the "Why Redis Enterprise" table in the spec.
 - **Narration:** "Open one GIRR row in the inspector — `risk_value` is a ten-tenor JSON array, stored in place. No row explosion, no flattening, no JOIN tax. Your file shape, untouched. This is ReJSON, bundled in the Enterprise module set."
 - **Objection:** "We can store this in Oracle as JSON too."
 - **Rebuttal:** "Oracle JSON is parsed on read — sub-second pivots over 10M nested docs are not on the menu. ReJSON in Redis Enterprise gives you JSONPath partial updates *and* a search index over JSON fields. No other operational store offers both."
-- **Fallback:** If the inspector won't render the row, drop into a terminal and run `JSON.GET sens:{GIRR:USD-IRS}:01HZ...` so HSBC sees the raw shape.
+- **Fallback:** If the inspector won't render the row, drop into a terminal and run `JSON.GET sens:{GIRR:USD-IRS}:01HZ...` so the bank sees the raw shape.
 
 ## Step 5 — Pivot at speed (3 min)
 
@@ -73,7 +73,7 @@ Buying-signal numbers refer to the "Why Redis Enterprise" table in the spec.
 ## Step 8 — Concurrent workforce scenario (3 min)
 
 - **Buying signal:** #2 Redis Query Engine; #3 In-database compute; #10 Performance per node.
-- **Narration:** "200 simulated HSBC analysts running mixed pivot + calc queries. Watch the p99 latency — it holds. Ops/sec per shard stays high, memory is stable, no thread contention. This is what multi-threaded Enterprise shards give you that OSS does not."
+- **Narration:** "200 simulated tenant analysts running mixed pivot + calc queries. Watch the p99 latency — it holds. Ops/sec per shard stays high, memory is stable, no thread contention. This is what multi-threaded Enterprise shards give you that OSS does not."
 - **Objection:** "We'd just scale our existing stack horizontally."
 - **Rebuttal:** "Your incumbent stack scales by adding JVM instances and load-balancing — every instance is a stateless replica of the calc logic but still hits the same Oracle bottleneck. Redis Enterprise scales by adding shards: each shard owns its slice of data, runs its own calc. Linear scale-out, hash-tag locality, no shared bottleneck."
 - **Fallback:** If loadgen flakes, narrate the previously captured load-test report from the asset pack; the numbers are the same.
@@ -88,8 +88,8 @@ Buying-signal numbers refer to the "Why Redis Enterprise" table in the spec.
 
 ## Step 10 — Scale pivot: Auto Tiering on RS (2 min)
 
-- **Buying signal:** #5 Auto Tiering (Enterprise exclusive); #4 Linear scale-out; #8 In HSBC's perimeter.
-- **Narration:** "The 'but 450M rows won't fit in RAM' answer. Switch active target to `scale-cluster` — Redis Enterprise with Auto Tiering on NVMe. Same UI, same code, same hot-key latency; cold keys served from SSD. And this runs on HSBC's own NVMe VMs — no SaaS dependency."
+- **Buying signal:** #5 Auto Tiering (Enterprise exclusive); #4 Linear scale-out; #8 In the bank's perimeter.
+- **Narration:** "The 'but 450M rows won't fit in RAM' answer. Switch active target to `scale-cluster` — Redis Enterprise with Auto Tiering on NVMe. Same UI, same code, same hot-key latency; cold keys served from SSD. And this runs on the bank's own NVMe VMs — no SaaS dependency."
 - **Objection:** "We'd just buy more RAM."
 - **Rebuttal:** "RAM at 450M-row scale is six-figure capex per cluster, repeated per region. Auto Tiering is a Redis Enterprise *exclusive* — OSS doesn't have it, no other KV store has it. RAM for the hot working set, NVMe for the long tail, one logical database. Cost falls by 60–80% with no application change."
 - **Fallback:** If `scale-cluster` isn't reachable, show the architecture diagram and narrate the scale-out math — same numbers, different medium.
@@ -105,7 +105,7 @@ Buying-signal numbers refer to the "Why Redis Enterprise" table in the spec.
 ## Step 12 — Close + Q&A (2 min)
 
 - **Buying signal:** Recap of all proven signals; sets up POC + procurement.
-- **Narration:** "Today you saw JSON-native storage, sub-second RQE pivots, in-database SBM compute via Redis Functions, multi-threaded shard scale-out, Auto Tiering for the 450M scale story, and HA failover — all inside HSBC's perimeter. Next step is a scoped POC against one of your own desks; the asset pack covers procurement and Professional Services."
+- **Narration:** "Today you saw JSON-native storage, sub-second RQE pivots, in-database SBM compute via Redis Functions, multi-threaded shard scale-out, Auto Tiering for the 450M scale story, and HA failover — all inside the bank's perimeter. Next step is a scoped POC against one of your own desks; the asset pack covers procurement and Professional Services."
 - **Objection:** "What's the realistic timeline to production?"
 - **Rebuttal:** "Two-week POC on one risk class with your own data, four-week pilot across GIRR + Equity + FX, eight-week production rollout via the K8s Operator. Professional Services scopes the Auto Tiering sizing and the Active-Active geo topology in parallel."
 - **Fallback:** If Q&A goes sideways, return to the buying-signal table in the deck — every answer ties back to one of the 13 signals.

@@ -1,5 +1,5 @@
 # FRTB SBM PoV — application services only.
-# Redis runs as Redis Enterprise Software inside HSBC's perimeter (now also the
+# Redis runs as Redis Enterprise Software inside the bank's perimeter (now also the
 # model for our demo: the user supplies REDIS_URL via .env.local pointing at
 # their own Redis Enterprise cluster). No Redis container is started by this
 # compose file. A dev-only Redis Stack container is available behind the

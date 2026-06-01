@@ -1,5 +1,5 @@
 // Wave 3.5A — Connections panel. CRUD + Test + Activate for Redis Enterprise
-// cluster profiles. First panel HSBC sees in the demo (step 2a).
+// cluster profiles. First panel the bank sees in the demo (step 2a).
 //
 // Surfaces three buying-signal callouts at the top (perimeter / module bundle
 // / TLS+ACL), then a card per profile. Active profile gets a brand-red border
@@ -195,7 +195,7 @@ export function ConnectionsPanel() {
 
       <div className="connections-panel__callouts">
         <EnterpriseCallout signal="ClusterScaleOut">
-          <strong>Deploy in your perimeter</strong> — bare-metal, VMware, GCP, AWS, OpenShift; HSBC&rsquo;s VPC, HSBC&rsquo;s NVMe, no SaaS dependency.
+          <strong>Deploy in your perimeter</strong> — bare-metal, VMware, GCP, AWS, OpenShift; the bank&rsquo;s VPC, the bank&rsquo;s NVMe, no SaaS dependency.
         </EnterpriseCallout>
         <EnterpriseCallout signal="Functions">
           <strong>Module bundle</strong> — ReJSON, RediSearch, and Functions ship inside Redis Enterprise; one Test click verifies all three.

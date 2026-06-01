@@ -18,7 +18,7 @@ beforeAll(() => {
 });
 
 describe("createRowGenerator (schema-driven, per-risk-class)", () => {
-  it("emits GIRR rows with risk_value as a per-tenor JSON object (Wave 5.17a HSBC reshape)", () => {
+  it("emits GIRR rows with risk_value as a per-tenor JSON object (Wave 5.17a tenant reshape)", () => {
     const gen = createRowGenerator(schema, { seed: 1 });
     const row = gen.generate("GIRR");
     const tenorNodes = schema.risk_classes.GIRR!.tenor!.nodes;
@@ -63,7 +63,7 @@ describe("createRowGenerator (schema-driven, per-risk-class)", () => {
     expect(row.pair).toBeTypeOf("string");
   });
 
-  it("emits HSBC trade_id (T0001-style) and risk_factor (RF_<CLASS>_NN) on every row [Wave 5.17a]", () => {
+  it("emits tenant trade_id (T0001-style) and risk_factor (RF_<CLASS>_NN) on every row [Wave 5.17a]", () => {
     const gen = createRowGenerator(schema, { seed: 5 });
     for (const cls of ["GIRR", "EQUITY", "FX"] as const) {
       const row = gen.generate(cls);

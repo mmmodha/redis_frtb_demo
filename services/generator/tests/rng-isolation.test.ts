@@ -1,11 +1,11 @@
-// Wave 5.17a — Byte-equivalence harness for the HSBC reshape.
+// Wave 5.17a — Byte-equivalence harness for the tenant reshape.
 //
 // Proves DoD #2: a seeded row-generator run reproduces the same numeric
 // `risk_value` payload across two configurations of the new aux-RNG fields
 // (trade_pool_size / factor_pool_size). The reshape changes only the
 // *container* of the numbers (array → object, scalar → { spot }); the
 // underlying floating-point values must be bit-identical because the main
-// value-RNG sequence is never touched by the new HSBC field draws.
+// value-RNG sequence is never touched by the new tenant field draws.
 //
 // This is the unit-level proxy for the smoke-run-16 invariant: if every
 // pre-reshape risk_value number reproduces post-reshape, every K_b / S_b

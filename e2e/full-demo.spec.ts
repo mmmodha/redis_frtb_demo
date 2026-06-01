@@ -2,7 +2,7 @@ import { test, expect, type Page, type Route } from "@playwright/test";
 import path from "node:path";
 import fs from "node:fs";
 
-// Full 11-step HSBC demo flow — Wave 4.4.
+// Full 11-step demo flow — Wave 4.4.
 // Acts as (a) demo-protection regression and (b) storyboard for the recorded
 // dry-run. Each step takes a screenshot into docs/recordings/screenshots/.
 //
@@ -183,7 +183,7 @@ test.describe.configure({ mode: "serial" });
 // (Wave 5.5 smoke). Unset (default) keeps fully-mocked fast CI behaviour.
 const INTEGRATION = process.env.INTEGRATION === "1";
 
-test.describe("Full HSBC demo — 11-step flow (storyboard + protection)", () => {
+test.describe("Full demo — 11-step flow (storyboard + protection)", () => {
   test.beforeEach(async ({ page }) => {
     if (!INTEGRATION) {
       await installCommonRoutes(page);

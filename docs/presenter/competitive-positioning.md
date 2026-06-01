@@ -1,6 +1,6 @@
 # Competitive Positioning — Redis Enterprise vs the Alternatives for FRTB-SA
 
-How to position Redis Enterprise against the stores HSBC is already running or evaluating. Each section names a competitor, the workload-specific weakness vs Redis Enterprise, and a one-line rebuttal the SA can deliver verbatim.
+How to position Redis Enterprise against the stores the bank is already running or evaluating. Each section names a competitor, the workload-specific weakness vs Redis Enterprise, and a one-line rebuttal the SA can deliver verbatim.
 
 The buying signals referenced (#1 .. #13) are defined in the "Why Redis Enterprise" table of the spec.
 
@@ -8,13 +8,13 @@ The buying signals referenced (#1 .. #13) are defined in the "Why Redis Enterpri
 
 ## OSS Redis
 
-**Where HSBC will raise it:** "Redis is free. Why pay for Enterprise?"
+**Where the bank will raise it:** "Redis is free. Why pay for Enterprise?"
 
 **What OSS Redis cannot do for this workload:**
 
 - **Single-threaded shards.** OSS Redis is single-threaded per shard. Enterprise shards are multi-threaded and the Enterprise proxy is multi-threaded — for the same FRTB ingest + concurrent-pivot workload you need 2–3× fewer Enterprise nodes (signal #10).
 - **No Auto Tiering.** OSS holds the entire dataset in RAM. The 450M-row scale story does not exist on OSS — full stop. Auto Tiering (RAM + NVMe in one logical DB) is a Redis Enterprise *exclusive* (signal #5).
-- **No Active-Active CRDTs.** HSBC London / Hong Kong / New York / Singapore each need local-write latency. OSS Redis offers only async replication. Active-Active is Enterprise-exclusive (signal #12).
+- **No Active-Active CRDTs.** The bank's London / Hong Kong / New York / Singapore desks each need local-write latency. OSS Redis offers only async replication. Active-Active is Enterprise-exclusive (signal #12).
 - **No RBAC, no ACL UI, no TLS-by-default, no audit log SIEM integration.** Bolt-on at best on OSS. First-class on Enterprise (signals #7, #13).
 - **No K8s Operator with BDB CRDs.** Day-2 ops on OSS in K8s is a custom Helm chart you maintain. Enterprise gives you the official Operator on GKE/EKS/OpenShift (signal #11).
 - **Module bundle not included.** ReJSON, RediSearch, RedisGears (Functions), Bloom, TimeSeries — you self-assemble these on OSS, manage their upgrade cycle individually, and have no commercial support contract. Enterprise bundles all of them in one license (signal #9).
@@ -25,7 +25,7 @@ The buying signals referenced (#1 .. #13) are defined in the "Why Redis Enterpri
 
 ## ClickHouse / Snowflake / columnar warehouses
 
-**Where HSBC will raise it:** "We already pivot trade data in ClickHouse / Snowflake."
+**Where the bank will raise it:** "We already pivot trade data in ClickHouse / Snowflake."
 
 **What columnar warehouses cannot do for this workload:**
 
@@ -40,7 +40,7 @@ The buying signals referenced (#1 .. #13) are defined in the "Why Redis Enterpri
 
 ## Aerospike / ScyllaDB / DynamoDB
 
-**Where HSBC will raise it:** "We're standardising on Aerospike / Scylla / DynamoDB for low-latency KV."
+**Where the bank will raise it:** "We're standardising on Aerospike / Scylla / DynamoDB for low-latency KV."
 
 **What other KV stores cannot do for this workload:**
 
@@ -56,7 +56,7 @@ The buying signals referenced (#1 .. #13) are defined in the "Why Redis Enterpri
 
 ## KDB+ (kx Systems)
 
-**Where HSBC will raise it:** "Market risk teams have always used KDB."
+**Where the bank will raise it:** "Market risk teams have always used KDB."
 
 **What KDB cannot do for this workload going forward:**
 
@@ -70,9 +70,9 @@ The buying signals referenced (#1 .. #13) are defined in the "Why Redis Enterpri
 
 ---
 
-## Oracle + Spark + JVM risk engines (HSBC's likely incumbent stack)
+## Oracle + Spark + JVM risk engines (the bank's likely incumbent stack)
 
-**Where HSBC will raise it:** "We already have Oracle for state, Spark for ETL, and JVM-based risk engines for calc — why change?"
+**Where the bank will raise it:** "We already have Oracle for state, Spark for ETL, and JVM-based risk engines for calc — why change?"
 
 **What the incumbent stack cannot do well:**
 
@@ -99,6 +99,6 @@ The buying signals referenced (#1 .. #13) are defined in the "Why Redis Enterpri
 | K8s Operator + Ansible | DIY | DIY | varies | DIY | DIY | ✅ official |
 | RBAC + TLS + audit-ready | bolt-on | ✅ | ✅ | bolt-on | ✅ | ✅ |
 | Module bundle in one license | self-assemble | n/a | n/a | n/a | n/a | ✅ |
-| HSBC perimeter, no SaaS dependency | ✅ | varies | DynamoDB AWS-only | ✅ | ✅ | ✅ |
+| The bank's perimeter, no SaaS dependency | ✅ | varies | DynamoDB AWS-only | ✅ | ✅ | ✅ |
 
 The pattern: **no single competitor checks every box for the FRTB-SA operational workload.** Redis Enterprise does. That is the close.

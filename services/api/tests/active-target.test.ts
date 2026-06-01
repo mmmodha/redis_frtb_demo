@@ -37,7 +37,7 @@ describe("active-target singleton", () => {
   it("setActiveTarget overrides env and persists across calls", () => {
     process.env.REDIS_URL = "redis://envhost:6379";
     const override: ActiveTarget = {
-      host: "demo-cluster.hsbc.internal",
+      host: "demo-cluster.bank.internal",
       port: 12000,
       tls: true,
       db: 0,

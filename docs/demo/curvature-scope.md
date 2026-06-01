@@ -49,7 +49,7 @@ New `sensitivity_type` enum value: `"Curvature"` (joining `"Delta"` and `"Vega"`
 
 | Shape | `risk_value` payload | Math owner | Row size (GIRR, 10 tenors) | Compose with current code? |
 |---|---|---|---|---|
-| **A — pre-computed CVR** (recommended) | `{ cvr_up: number[T], cvr_down: number[T] }` — per-tenor `CVR_k⁺` and `CVR_k⁻` already shock-revalued and Delta-stripped upstream | upstream risk engine (HSBC sends them) | ~2× the Delta row payload | Yes — Lua does no revaluation; just bucket-aggregates two vectors, same SCAN+sum pattern as `girr_delta.lua` |
+| **A — pre-computed CVR** (recommended) | `{ cvr_up: number[T], cvr_down: number[T] }` — per-tenor `CVR_k⁺` and `CVR_k⁻` already shock-revalued and Delta-stripped upstream | upstream risk engine (the bank sends them) | ~2× the Delta row payload | Yes — Lua does no revaluation; just bucket-aggregates two vectors, same SCAN+sum pattern as `girr_delta.lua` |
 | B — shocked PnLs + Delta | `{ v_up: number[T], v_down: number[T], v_base: number, delta: number[T] }` plus row-level `RW_curv` | Lua, on every call (subtracts linear term per row) | ~3.5× the Delta row payload (4 number arrays vs 1) | No — Lua needs to apply MAR21 §21.5(2), tracking per-instrument `V_i` independently; this is a real revaluation engine and not in scope for a 2026-Q2 MVP |
 
 **Rationale for A**: MAR21 §21.5(2)'s subtraction term is bank-internal — the CVR values that arrive at the regulatory engine are the pure-curvature numbers the bank's pricing system already produced. Asking Lua to redo it would (i) force a per-row Delta sensitivity field into every Curvature row, (ii) duplicate revaluation logic already inside the bank, and (iii) violate the "calc layer is aggregation, not pricing" boundary that the MVP is built on. Shape A keeps the Curvature Lua function structurally identical to `girr_delta.lua` — only the field name changes from `risk_value` to `{cvr_up, cvr_down}`.
@@ -130,7 +130,7 @@ Each `risk_classes.<CLASS>` entry gains three new refs: `curvature_risk_weights_
 2. **Cost-cap trade-off** — §6 options 1/2/3. Default recommendation: raise to 25 MB (option 1).
 3. **Curvature ρ_kl and γ_bc source** — MAR21 §21.5(3) prescribes `ρ_kl^{curv} = ρ_kl^{delta}²` (and similarly γ²). For the MVP, encode them as independent schema entries (so the YAML is auditable) or auto-derive at load? Recommendation: encode independently for transparency.
 4. **§21.5(5)(b) sign-flip fallback** — needed for the MVP, or stub it as "non-positive interior triggers `charge = max(charge_signs)`"? Recommendation: implement faithfully (mirrors the §21.4(7) work already in `reduce.ts:51-62`; not a large delta).
-5. **Multi-instrument mapping** — MAR21 §21.5(2) sums `V_i` over instruments mapped to risk factor `k`. Under shape A this collapses into the ingest layer (rows arrive pre-aggregated per factor) — confirm this matches HSBC's expected feed shape.
+5. **Multi-instrument mapping** — MAR21 §21.5(2) sums `V_i` over instruments mapped to risk factor `k`. Under shape A this collapses into the ingest layer (rows arrive pre-aggregated per factor) — confirm this matches the bank's expected feed shape.
 
 ## 8. Out of scope for the Curvature MVP
 
@@ -138,5 +138,5 @@ Each `risk_classes.<CLASS>` entry gains three new refs: `curvature_risk_weights_
 - **MAR21 §21.5(3) high/low correlation alternative** — the prescribed `ρ_kl^{curv}` is used; the high (× 1.25) / low (× 0.75) scenario sweep that §21.6 references for total capital is a separate aggregation layer.
 - **Cross-currency Curvature edge cases** for GIRR — same single-currency-bucket simplification as the Delta path in run-15; multi-currency basis correlation γ_cur is not added in this scope.
 - **CSR / Commodity Curvature** — the MVP family stays on the GIRR / Equity / FX trio that Delta + Vega already cover. CSR and Commodity Curvature reuse the same Lua/TS template but are not delivered in Wave 5.16.
-- **Curvature shock-size schema versioning** — `curvature_weights` ship as a single representative magnitude per class for the MVP; the "swap-on-real-HSBC-schema" path (Wave 2 lock) carries over unchanged.
+- **Curvature shock-size schema versioning** — `curvature_weights` ship as a single representative magnitude per class for the MVP; the "swap-on-real-tenant-schema" path (Wave 2 lock) carries over unchanged.
 - **Total-capital aggregation** — Delta + Vega + Curvature → single per-class capital number per MAR21 §21.6 is **not** in Wave 5.16; it is a separate Wave 5.17 candidate.

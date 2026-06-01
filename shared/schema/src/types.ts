@@ -114,9 +114,9 @@ export interface Sensitivity {
   risk_value: SensitivityRiskValue;
   weight?: number;
   sensitivity_type: "DELTA" | "VEGA" | "CURVATURE";
-  /** HSBC trade identifier (e.g. `T0001`); pool size controlled by generator. */
+  /** Tenant trade identifier (e.g. `T0001`); pool size controlled by generator. */
   trade_id?: string;
-  /** HSBC risk-factor tag (e.g. `RF_GIRR_01`); 16 per class by default. */
+  /** Tenant risk-factor tag (e.g. `RF_GIRR_01`); 16 per class by default. */
   risk_factor?: string;
   [field: string]: unknown;
 }

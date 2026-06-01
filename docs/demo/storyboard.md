@@ -1,4 +1,4 @@
-# Demo storyboard — FRTB-SA SBM on Redis (HSBC walkthrough)
+# Demo storyboard — FRTB-SA SBM on Redis (Tier-1 bank walkthrough)
 
 **What this demo proves.** A faithful, live implementation of the Basel FRTB Standardised-Approach Sensitivities-Based Method (MAR21 §21.4 Delta + Vega and §21.5 Curvature) running entirely on Redis: tenor-vector sensitivities and Curvature CVR pairs stored as JSON, bucket discovery via the Redis Query Engine, the per-bucket `K_b` math executed in-database through Redis Functions (Lua), and the cross-bucket aggregation reduced in the API service. Nothing is staged — every number on screen comes from a calc against 6,000 rows (2,000 each for Delta, Vega, Curvature) ingested moments earlier into a standalone Redis Cloud DB (Redis 8.4.0). Source-of-truth for the live values shown here is [`docs/demo/mar21-traceability.md`](./mar21-traceability.md) (the clause-by-clause pack covering §21.4 and §21.5) and [`docs/recordings/smoke-run-17/`](../recordings/smoke-run-17/) (raw calc JSONs + memory timeline + the 9-variant aggregate).
 
@@ -124,7 +124,7 @@
 
 ## Closer beat (≤ 30 s — what production looks like)
 
-**On-screen.** A single slide with three bullets: cluster topology (multi-shard Redis Enterprise with hash-tag locality preserved), the FRTB matrix scope HSBC would want next (§21.6 cross-class total, DRC default-risk charge, RRAO residual-risk add-on), and the integration shape (one REST endpoint, JSON in / JSON out, schema in `config/schema/`).
+**On-screen.** A single slide with three bullets: cluster topology (multi-shard Redis Enterprise with hash-tag locality preserved), the FRTB matrix scope the bank would want next (§21.6 cross-class total, DRC default-risk charge, RRAO residual-risk add-on), and the integration shape (one REST endpoint, JSON in / JSON out, schema in `config/schema/`).
 
 **Presenter says.** "Today you saw the full SBM-Delta + SBM-Vega + SBM-Curvature path on a standalone DB with 6,000 rows. The same code runs on a multi-shard Redis Enterprise cluster — the hash-tag locality you saw on line-70 of `girr_delta.lua` is the property that makes that scale-up linear, not a code change. The next slots in the matrix are the §21.6 cross-class total (rolling the grand L2 you just saw into a single trading-book number), the default-risk charge (DRC), and the residual-risk add-on (RRAO). The integration surface stays a single POST."
 
@@ -134,7 +134,7 @@
 
 ---
 
-## Anticipated questions (HSBC market-risk reviewers)
+## Anticipated questions (the bank's market-risk reviewers)
 
 **Q1 — Why Redis vs a traditional risk grid?** The SBM map step is per-bucket and embarrassingly parallel; pinning each `K_b` calculation to the slot owning that bucket (via the `{risk_class:bucket}` hash tag) removes the network round-trip per row. On this run the per-variant fanout was `149–181 ms` over eleven (or thirteen, for Equity) buckets — the same shape scales linearly on a multi-shard cluster, where each shard does its own `K_b` locally.
 
@@ -142,7 +142,7 @@
 
 **Q3 — Why is GIRR Curvature ~10⁴× larger than GIRR Delta?** That gap is structural, not a sign error. Delta is `WS_k = RW_k · s_k` — a risk weight times a unit-sensitivity (§21.4(3)). Curvature is `CVR_k = −Σ_i [ V_i(x_k ± RW_k^curv) − V_i(x_k) − RW_k^curv · s_{ik} ]` — a full upstream revaluation gap at the shocked rate (§21.5(2)). Different units, different scale, by Basel's design. On a 2 000-row Curvature leg the GIRR ratio lands near 1.4 × 10⁴; EQUITY ≈ 53×; FX ≈ 894×. That is what regulators expect when CVR pairs are upstream revaluations rather than RW · sensitivity products.
 
-**Q4 — How are you handling §21.5(5)(b)?** Clip-and-recompute mirroring the §21.4(7) shape: when the cross-bucket interior `Σ K_b² + Σ γ²_bc · S_b · S_c · ψ` goes negative, we replace each `S_b` with `S_b* = max(min(S_b, K_b), −K_b)` and re-evaluate the same expression with the same γ_curv and ψ gate. Implementation at [`services/calc/src/curvatureCommon.ts:128-139`](../../services/calc/src/curvatureCommon.ts); the inline comment at [`services/calc/src/curvatureCommon.ts:99`](../../services/calc/src/curvatureCommon.ts) flags this explicitly as a **text-fidelity caveat** — a strict Curvature-only reading of §21.5(5)(b) would clip negatives to 0 instead of to ±K_b. We chose the ±K_b shape for consistency with the §21.4(7) implementation already in production at `services/api/src/sbm/reduce.ts:51-62`, and we have flagged the choice for HSBC business sign-off before production cut-over.
+**Q4 — How are you handling §21.5(5)(b)?** Clip-and-recompute mirroring the §21.4(7) shape: when the cross-bucket interior `Σ K_b² + Σ γ²_bc · S_b · S_c · ψ` goes negative, we replace each `S_b` with `S_b* = max(min(S_b, K_b), −K_b)` and re-evaluate the same expression with the same γ_curv and ψ gate. Implementation at [`services/calc/src/curvatureCommon.ts:128-139`](../../services/calc/src/curvatureCommon.ts); the inline comment at [`services/calc/src/curvatureCommon.ts:99`](../../services/calc/src/curvatureCommon.ts) flags this explicitly as a **text-fidelity caveat** — a strict Curvature-only reading of §21.5(5)(b) would clip negatives to 0 instead of to ±K_b. We chose the ±K_b shape for consistency with the §21.4(7) implementation already in production at `services/api/src/sbm/reduce.ts:51-62`, and we have flagged the choice for the bank's business sign-off before production cut-over.
 
 **Q5 — What is the scale-up story?** Today's standalone Redis Cloud DB has a 2.5 GB ceiling and we measured 3.86 KB/row blended (Delta + Vega + Curvature) at 6,000 rows. Production answer is a multi-shard Redis Enterprise cluster: same `FCALL` code, same hash-tag layout, no app-side sharding logic. The math is unchanged.
 
@@ -171,4 +171,4 @@
 - Clause-by-clause traceability (§21.4 + §21.5): [`docs/demo/mar21-traceability.md`](./mar21-traceability.md).
 - Run verdict + memory timeline + 9-variant calc matrix: [`docs/recordings/smoke-run-17/SUMMARY.md`](../recordings/smoke-run-17/SUMMARY.md).
 - Raw calc JSONs (nine variants + aggregate): [`docs/recordings/smoke-run-17/calc/`](../recordings/smoke-run-17/calc/) — `calc-GIRR-Delta.json`, `calc-GIRR-Vega.json`, `calc-GIRR-Curvature.json`, `calc-EQUITY-Delta.json`, `calc-EQUITY-Vega.json`, `calc-EQUITY-Curvature.json`, `calc-FX-Delta.json`, `calc-FX-Vega.json`, `calc-FX-Curvature.json`; plus [`aggregate.json`](../recordings/smoke-run-17/aggregate.json) for the rolled-up 3 × 3 matrix.
-- Spec context: workspace note id `spec` (FRTB SBM Redis PoV — HSBC).
+- Spec context: workspace note id `spec` (FRTB SBM Redis PoV).

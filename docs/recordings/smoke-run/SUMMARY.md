@@ -9,7 +9,7 @@
 
 ## TL;DR (honest)
 
-The "Wave 4 verified GREEN" claim in the spec is contradicted by what `docker compose up` produces. Three of the seven service images are still placeholder/broken Dockerfiles, and the compose file has no Redis container at all by design (HSBC perimeter assumption). Result: every Redis-touching code path (calc, observability, pivot, ingest, loadgen) returns HTTP 500 (`maxRetries`) after ~8 s. The two extrapolated ACs (`6 variants <2 s` and `200-user p99 <500 ms`) cannot be evaluated, because nothing is computing — they are timeouts, not work.
+The "Wave 4 verified GREEN" claim in the spec is contradicted by what `docker compose up` produces. Three of the seven service images are still placeholder/broken Dockerfiles, and the compose file has no Redis container at all by design (the bank perimeter assumption). Result: every Redis-touching code path (calc, observability, pivot, ingest, loadgen) returns HTTP 500 (`maxRetries`) after ~8 s. The two extrapolated ACs (`6 variants <2 s` and `200-user p99 <500 ms`) cannot be evaluated, because nothing is computing — they are timeouts, not work.
 
 ## Pre-flight
 
@@ -28,7 +28,7 @@ The "Wave 4 verified GREEN" claim in the spec is contradicted by what `docker co
 | Services healthy | api, ui, calc, source, ingest, loadgen (6/7) |
 | Services unhealthy | **generator** — restart loop |
 
-**Stack shape vs. task-note assumption:** Task note expected "3-node RE cluster + 7 services". Actual compose: **7 application services and zero Redis containers** (compose-file comment: *"Redis runs as Redis Enterprise Software inside HSBC's perimeter and is configured via the UI Connections panel; no Redis container is started by this compose file."*). The `dev-redis` profile exists but is not part of the demo flow.
+**Stack shape vs. task-note assumption:** Task note expected "3-node RE cluster + 7 services". Actual compose: **7 application services and zero Redis containers** (compose-file comment: *"Redis runs as Redis Enterprise Software inside the bank's perimeter and is configured via the UI Connections panel; no Redis container is started by this compose file."*). The `dev-redis` profile exists but is not part of the demo flow.
 
 ## 2. Observability — shard count
 

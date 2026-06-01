@@ -1,6 +1,6 @@
-# FRTB SBM on Redis Enterprise — HSBC Demo Script
+# FRTB SBM on Redis Enterprise — Tier-1 bank Demo Script
 
-> **Audience:** HSBC FRTB / market-risk stakeholders.
+> **Audience:** The bank's FRTB / market-risk stakeholders.
 > **Goal:** Land Redis Enterprise Software buying signals (not "explain FRTB").
 > **Length:** 15–20 min walkthrough + 2 min Q&A.
 > **Presenter:** Redis Solutions Architect (SA).
@@ -27,7 +27,7 @@ Each step lists: **Purpose · What to click · What to narrate · Acceptance cri
 - **Click:** Advance to architecture slide. Hover the "K8s Operator / Ansible" callout.
 - **Narrate:** *"RS runs anywhere — bare-metal, VMware, GCP, AWS, OpenShift. Your VPC, your controls, no SaaS dependency, no data egress. Same product Redis Cloud uses, operated by your platform team via the K8s Operator."*
 - **Buying signals:** #8 (deploy in your perimeter), #11 (K8s Operator + Ansible), #12 (Active-Active option).
-- **Acceptance criterion proved:** Spec §Architecture, Assumptions (RS in HSBC perimeter).
+- **Acceptance criterion proved:** Spec §Architecture, Assumptions (RS in the bank perimeter).
 - **Fallback:** Read the deployment-paths bullet aloud; reference `docs/presenter/deploy-paths.md`.
 
 ## Step 2a — Connections + Sources (1 min, live app)
@@ -172,7 +172,7 @@ Each step lists: **Purpose · What to click · What to narrate · Acceptance cri
 
 | Step | Spec acceptance criterion proved |
 |---|---|
-| 2 | Architecture / Assumptions (RS in HSBC perimeter) |
+| 2 | Architecture / Assumptions (RS in the bank perimeter) |
 | 2a | "Connections + Sources" section; "Demo step 2a is now executable end-to-end" |
 | 3 | `Ingest sustains ≥50k rows/sec`, `Keys use the sens:{risk_class:bucket}:{ulid} hash-tag pattern`, `UI surfaces: live ingest throughput` |
 | 4 | `Redis stores GIRR rows with risk_value as a native JSON array (10 tenor points)` |

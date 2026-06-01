@@ -3,7 +3,7 @@
 // When a freshly-activated profile has no `idx:sens` or `frtb` Lua library
 // yet, Redis surfaces opaque errors ("Unknown Index name", "Function not
 // found", "unknown command 'fcall'"). The UI shouldn't show those raw to
-// HSBC's risk team in the middle of a demo — translate them into a 412 with
+// the bank's risk team in the middle of a demo — translate them into a 412 with
 // the current target_label and bootstrap_phase so the user knows whether
 // a background bootstrap is in flight or required.
 

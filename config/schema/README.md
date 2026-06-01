@@ -1,7 +1,7 @@
 # FRTB-SA Schema Configuration
 
 Hot-swappable schema layer that drives the entire pipeline (generator, ingest,
-RQE indexes, SBM calc bindings). When HSBC ships their actual data model we
+RQE indexes, SBM calc bindings). When the bank ships their actual data model we
 replace one of these YAML files and re-run — **no code changes**.
 
 ## Files

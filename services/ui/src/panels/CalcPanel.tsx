@@ -715,6 +715,19 @@ function BucketDrilldown({
 }) {
   const [state, setState] = useState<DrilldownState>({ status: "loading" });
   const firstFocusRef = useRef<HTMLButtonElement | null>(null);
+  // Wave 5.21e: trade_id pill → JSON drawer state. Track the originating
+  // button so focus returns there on close.
+  const [drawerRow, setDrawerRow] = useState<PivotRow | null>(null);
+  const drawerTriggerRef = useRef<HTMLButtonElement | null>(null);
+
+  function openDrawer(row: PivotRow, el: HTMLButtonElement) {
+    drawerTriggerRef.current = el;
+    setDrawerRow(row);
+  }
+  function closeDrawer() {
+    drawerTriggerRef.current?.focus();
+    setDrawerRow(null);
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -833,12 +846,20 @@ function BucketDrilldown({
               </tr>
             </thead>
             <tbody>
-              {state.rows.map((row) => (
+              {state.rows.map((row) => {
+                const tradeLabel = String(row.doc.trade_id ?? row.key);
+                return (
                 <tr key={row.key} data-testid="drilldown-row" data-trade-id={row.doc.trade_id ?? ""}>
                   <td>
-                    <span className="drilldown-pill drilldown-pill--trade">
-                      {row.doc.trade_id ?? row.key}
-                    </span>
+                    <button
+                      type="button"
+                      className="drilldown-pill drilldown-pill--trade"
+                      onClick={(e) => openDrawer(row, e.currentTarget)}
+                      aria-label={`View JSON for trade ${tradeLabel}`}
+                      data-testid="drilldown-pill-trade"
+                    >
+                      {tradeLabel}
+                    </button>
                   </td>
                   <td>
                     <span className="drilldown-pill drilldown-pill--rf">
@@ -860,7 +881,8 @@ function BucketDrilldown({
                       : "—"}
                   </td>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
           <div className="bucket-drilldown__footer">
@@ -883,14 +905,98 @@ function BucketDrilldown({
           </div>
         </>
       ) : null}
+      {drawerRow ? <TradeJsonDrawer row={drawerRow} onClose={closeDrawer} /> : null}
     </div>
+  );
+}
+
+// Wave 5.21e: side drawer that renders the full JSON document for a trade
+// row. Slides in from the right; non-modal so the page below stays scrollable
+// but is dimmed. Re-uses the JSON Explorer's pretty-printed <pre> idiom for
+// visual consistency. Focus moves to the close button on open; the parent
+// (BucketDrilldown) restores focus to the originating pill on close.
+function TradeJsonDrawer({ row, onClose }: { row: PivotRow; onClose: () => void }) {
+  const closeRef = useRef<HTMLButtonElement | null>(null);
+  const [copied, setCopied] = useState(false);
+  const tradeLabel = String(row.doc.trade_id ?? row.key);
+  const json = JSON.stringify(row.doc, null, 2);
+
+  useEffect(() => {
+    closeRef.current?.focus();
+  }, []);
+
+  async function copyJson() {
+    try {
+      await navigator.clipboard.writeText(json);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Best effort — clipboard unavailable (e.g. insecure context). Silent.
+    }
+  }
+
+  function onKeyDown(e: KeyboardEvent<HTMLDivElement>) {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      // Stop the surrounding BucketDrilldown's Escape handler from also firing
+      // (it would close the entire drill-down accordion).
+      e.stopPropagation();
+      onClose();
+    }
+  }
+
+  return (
+    <>
+      <div
+        className="trade-json-drawer__backdrop"
+        data-testid="trade-json-drawer-backdrop"
+        onClick={onClose}
+      />
+      <div
+        className="trade-json-drawer"
+        role="dialog"
+        aria-modal="false"
+        aria-label={`Trade ${tradeLabel} JSON`}
+        data-testid="trade-json-drawer"
+        onKeyDown={onKeyDown}
+      >
+        <div className="trade-json-drawer__header">
+          <h4 className="trade-json-drawer__title" data-testid="trade-json-drawer-title">
+            {tradeLabel}
+          </h4>
+          <div className="trade-json-drawer__actions">
+            <button
+              type="button"
+              className="trade-json-drawer__copy"
+              onClick={copyJson}
+              data-testid="trade-json-drawer-copy"
+            >
+              {copied ? "Copied" : "Copy JSON"}
+            </button>
+            <button
+              ref={closeRef}
+              type="button"
+              className="trade-json-drawer__close"
+              onClick={onClose}
+              aria-label={`Close JSON drawer for trade ${tradeLabel}`}
+              data-testid="trade-json-drawer-close"
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+        <pre className="trade-json-drawer__body" data-testid="trade-json-drawer-body">
+          {json}
+        </pre>
+      </div>
+    </>
   );
 }
 
 // Wave 5.16m: read-only observability panel that renders the exact Redis
 // commands the api dispatched. Surfaces the Redis Enterprise primitives
 // (RediSearch FT.AGGREGATE for discovery, Redis Functions FCALL for the
-// slot-local fan-out) in plain view for the HSBC demo. Display-only — no
+// slot-local fan-out) in plain view for the bank demo. Display-only — no
 // re-execution, no logging beyond the api response.
 function CommandsPanel({ commands }: { commands: CalcCommands }) {
   const codeStyle: CSSProperties = {

@@ -2,7 +2,7 @@
   "name": "frtb-sbm-redis-pov",
   "version": "0.1.0",
   "private": true,
-  "description": "HSBC FRTB-SA SBM PoV on Redis Enterprise — sales vehicle demo",
+  "description": "Tier-1 bank FRTB-SA SBM PoV on Redis Enterprise — sales vehicle demo",
   "workspaces": [
     "services/*",
     "shared/*",

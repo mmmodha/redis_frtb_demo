@@ -22,7 +22,7 @@ interface GeneratorStartBody {
   classes?: string[];
   sensitivity_types?: string[];
   seed?: string | number;
-  // Wave 5.17a — HSBC reshape: optional pool sizes for aux-RNG trade_id and
+  // Wave 5.17a — tenant reshape: optional pool sizes for aux-RNG trade_id and
   // risk_factor fields. Defaults preserve smoke-run-16 byte-equivalence.
   trade_pool_size?: number;
   factor_pool_size?: number;

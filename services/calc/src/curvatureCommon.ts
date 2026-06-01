@@ -99,7 +99,7 @@ function gammaOf(
 // Text-fidelity caveat: Implements §21.5(5)(b) by clipping to ±K_b
 // (consistent with §21.4(7) reduce.ts:51-62 shape). A strict
 // Curvature-only reading of §21.5(5)(b) clips negatives to 0; flagged
-// for HSBC business sign-off before production.
+// for the bank's business sign-off before production.
 export function aggregateAcrossBuckets(
   per: ReadonlyArray<BucketCurvature>,
   gammaCurv: CurvatureGammaSpec,

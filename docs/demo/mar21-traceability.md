@@ -1,6 +1,6 @@
 # MAR21 §21.4 + §21.5 — Sensitivities-Based Method (SBM) traceability pack
 
-**Basel framework reference**: MAR21 §21.4 (Delta + Vega) and §21.5 (Curvature) — *"Sensitivities-based method: aggregation of sensitivities and risk charges within a risk class"*. §21.4 clauses 3, 4, 5 + the 5(b) (negative-interior) alternative cover the Delta/Vega path; §21.5 clauses (2), (3), (5) + the (5)(b) alternative cover the Curvature path. HSBC market-risk reviewers can locate the source clauses in their Basel framework copy by searching for "MAR21 21.4" and "MAR21 21.5".
+**Basel framework reference**: MAR21 §21.4 (Delta + Vega) and §21.5 (Curvature) — *"Sensitivities-based method: aggregation of sensitivities and risk charges within a risk class"*. §21.4 clauses 3, 4, 5 + the 5(b) (negative-interior) alternative cover the Delta/Vega path; §21.5 clauses (2), (3), (5) + the (5)(b) alternative cover the Curvature path. The bank's market-risk reviewers can locate the source clauses in their Basel framework copy by searching for "MAR21 21.4" and "MAR21 21.5".
 
 **Source DB**: `lip-veil-spring-32424.db.redis.io:14596` — standalone Redis Cloud DB, Redis 8.4.0, single primary + 1 replica, `maxmemory_policy=noeviction`.
 **§21.4 (Delta + Vega) run timestamp**: 2026-05-29T22:47Z (Wave 5.15s, smoke-run-15).
@@ -50,7 +50,7 @@ Substitute `"Vega"` or `"Curvature"` for the other §21.4 row or the §21.5 rows
 
 ## Provenance footnote
 
-This pack ties Basel MAR21 §21.4 + §21.5 (the prescribed clause text, by clause number) to specific source lines in this repository **and** to each run's live production-shape calc output. §21.4 live values come from `docs/recordings/smoke-run-15/calc-girr-delta.json` (full 6-variant matrix in `docs/recordings/smoke-run-15/calc-results.json`); §21.5 live values come from `docs/recordings/smoke-run-17/calc/calc-GIRR-Curvature.json` (full 9-variant matrix in `docs/recordings/smoke-run-17/aggregate.json`). It is intended as a single-page demo evidence asset for an HSBC market-risk reviewer who wants to confirm the implementation is a faithful translation of MAR21 §21.4(3)–(5) (including the §21.4(7) negative-interior alternative) and §21.5(2)–(5) (including the §21.5(5)(b) alternative), before approving the PoV for wider rollout.
+This pack ties Basel MAR21 §21.4 + §21.5 (the prescribed clause text, by clause number) to specific source lines in this repository **and** to each run's live production-shape calc output. §21.4 live values come from `docs/recordings/smoke-run-15/calc-girr-delta.json` (full 6-variant matrix in `docs/recordings/smoke-run-15/calc-results.json`); §21.5 live values come from `docs/recordings/smoke-run-17/calc/calc-GIRR-Curvature.json` (full 9-variant matrix in `docs/recordings/smoke-run-17/aggregate.json`). It is intended as a single-page demo evidence asset for the bank's market-risk reviewer who wants to confirm the implementation is a faithful translation of MAR21 §21.4(3)–(5) (including the §21.4(7) negative-interior alternative) and §21.5(2)–(5) (including the §21.5(5)(b) alternative), before approving the PoV for wider rollout.
 
 ---
 

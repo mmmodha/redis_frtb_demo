@@ -1,6 +1,6 @@
 # Recordings
 
-This directory holds the recorded demo assets for the HSBC walkthrough.
+This directory holds the recorded demo assets for the bank walkthrough.
 
 ## Deliverables
 

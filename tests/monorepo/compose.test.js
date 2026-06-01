@@ -23,7 +23,7 @@ describe('docker-compose.yml', () => {
     }
   });
 
-  it('does NOT include a redis container in the default profile (RS runs in HSBC perimeter)', () => {
+  it('does NOT include a redis container in the default profile (RS runs in the bank perimeter)', () => {
     const redis = doc.services?.redis;
     if (!redis) return;
     const profiles = redis.profiles || [];

@@ -1,4 +1,4 @@
-# Presenter Preflight Checklist — HSBC Demo
+# Presenter Preflight Checklist — Tier-1 bank Demo
 
 > Run this top-to-bottom **the morning of** the demo, and again **30 minutes before** going on. Anything not ticked is a risk to the live moment.
 
@@ -46,7 +46,7 @@
 
 - [ ] Browser zoom = 100%, all tabs closed except: app (`/connections`), deck (`docs/deck/index.html`), RS admin UI (for the optional kill-a-node step).
 - [ ] Notifications silenced (Slack, mail, calendar). Screen-share preview confirmed.
-- [ ] Mic + screen-share check with HSBC counterpart.
+- [ ] Mic + screen-share check with the bank's counterpart.
 - [ ] Pre-rendered fallback assets open in background tab and **muted**:
   - `docs/asset-pack/json-shape.png`
   - `docs/asset-pack/pivot-p99.png`
@@ -85,7 +85,7 @@ Then: switch to `docs/asset-pack/concurrent-p99.png` for 30 seconds, narrate the
 
 ## Post-demo
 
-- [ ] Hand HSBC the USB drive + cloud-storage link. The drive contains:
+- [ ] Hand the bank the USB drive + cloud-storage link. The drive contains:
   - `docs/deck/` exported as PDF
   - `docs/asset-pack/*.png`
   - `docs/recordings/dry-run-15min.mp4`

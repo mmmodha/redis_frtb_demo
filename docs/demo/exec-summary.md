@@ -1,4 +1,4 @@
-# FRTB SBM on Redis — HSBC PoV Executive Summary
+# FRTB SBM on Redis — Tier-1 bank PoV Executive Summary
 
 **Audience**: Market-risk leadership. **Basis**: Live evidence from smoke-run-17 (Wave 5.17d, 2026-06-01T17:10Z, 6,000 rows = 2,000 each Delta / Vega / Curvature on a standalone Redis Cloud DB).
 
@@ -47,7 +47,7 @@ This MVP demonstrates a Basel-faithful Sensitivities-Based Method (SBM) capital 
 
 **30 MB cap rationale.** Wave 5.16e1 pre-flight measured the per-Curvature-row cost at **9.47 KB / row** on this standalone DB (50-row probe, `Δ_data = 484,672 B`). Extrapolated to 2,000 Curvature rows × 3 legs that projects to ≈ 18.5 MB for Curvature plus ≈ 7.3 MB carry-over from the Delta + Vega smoke-run-15 footprint, landing in the low-20s MB range. The 30 MB cap is sized to give ≈ 25 % headroom over that projection; the live run came in at **23.99 MB = 79.96 %** of the cap, with **6.01 MB headroom** to spare.
 
-**§21.5(5)(b) text-fidelity caveat.** The negative-interior Curvature fallback is implemented with a clip-to-±K_b shape (`S_b* = max(min(S_b, K_b), −K_b)` at [`services/calc/src/curvatureCommon.ts:128-139`](../../services/calc/src/curvatureCommon.ts)), mirroring the §21.4(7) Delta/Vega fallback at `services/api/src/sbm/reduce.ts:51-62`; a strict Curvature-only reading of §21.5(5)(b) would clip negatives to 0 instead. The choice is flagged inline at [`services/calc/src/curvatureCommon.ts:99`](../../services/calc/src/curvatureCommon.ts) and is queued for HSBC business sign-off before production cut-over.
+**§21.5(5)(b) text-fidelity caveat.** The negative-interior Curvature fallback is implemented with a clip-to-±K_b shape (`S_b* = max(min(S_b, K_b), −K_b)` at [`services/calc/src/curvatureCommon.ts:128-139`](../../services/calc/src/curvatureCommon.ts)), mirroring the §21.4(7) Delta/Vega fallback at `services/api/src/sbm/reduce.ts:51-62`; a strict Curvature-only reading of §21.5(5)(b) would clip negatives to 0 instead. The choice is flagged inline at [`services/calc/src/curvatureCommon.ts:99`](../../services/calc/src/curvatureCommon.ts) and is queued for the bank's business sign-off before production cut-over.
 
 ## 4. Compliance evidence
 

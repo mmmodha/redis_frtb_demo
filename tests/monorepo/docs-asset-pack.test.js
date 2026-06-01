@@ -77,7 +77,7 @@ describe('npm run asset-pack', () => {
     }
   });
 
-  it('zips the bundle as docs/asset-pack.zip ready to email to HSBC', () => {
+  it('zips the bundle as docs/asset-pack.zip ready to email to the bank', () => {
     const zip = resolve(ROOT, 'docs/asset-pack.zip');
     expect(existsSync(zip), 'docs/asset-pack.zip must exist after asset-pack run').toBe(true);
     expect(statSync(zip).size, 'docs/asset-pack.zip must be non-empty').toBeGreaterThan(0);

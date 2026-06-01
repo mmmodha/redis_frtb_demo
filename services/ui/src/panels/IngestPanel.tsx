@@ -325,7 +325,7 @@ function fmtMB(n: number): string {
 
 // Wave 5.17b — configurable synthetic generator. Always rendered as its own
 // PanelCard so the demo can top up sensitivities:in with explicit row count,
-// class mix, sensitivity types, seed, and HSBC-style pool sizes.
+// class mix, sensitivity types, seed, and tenant-style pool sizes.
 //
 // Wave 5.20a — adds a primary "Generate 200 rows" button (empty-body post,
 // api applies its DEFAULT_ROWS / DEFAULT_CLASSES / DEFAULT_SENSITIVITY_TYPES)

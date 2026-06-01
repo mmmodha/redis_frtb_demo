@@ -125,7 +125,7 @@ Concrete shape:
 1. **Lift each shard's `maxmemory` ceiling** from the observed ~700 M cap to ≥ 1 200 M (≈ 70 % headroom over smoke-run-13's 738.30 M peak). This is a cluster-side ops change (Redis Enterprise console / REST API) — out of scope for any code-only wave.
 2. Re-run the smoke runbook at the original `--rows 300000 --classes GIRR,EQUITY,FX` workload. The expected outcome is `sens:*` density ≥ 95 % on **both** shards (shard A ≈ 7/22 × 300 k = 95 454, shard B ≈ 15/22 × 300 k = 204 546).
 3. With both shards populated, re-run step 9 loadgen — the calc p99 should drop materially below the smoke-run-13 ceiling (target < 5 s; if still > 5 s, that's a real engine perf signal worth a separate wave).
-4. Re-run step 10 e2e — once the `sens:*` cohort is present on both shards, the per-shard breakdown panel becomes a non-trivial demo asset for HSBC buying-signal #4 (linear scale-out + hash-tag locality). The pre-existing `seedConnections` issue remains an independent fix.
+4. Re-run step 10 e2e — once the `sens:*` cohort is present on both shards, the per-shard breakdown panel becomes a non-trivial demo asset for the bank buying-signal #4 (linear scale-out + hash-tag locality). The pre-existing `seedConnections` issue remains an independent fix.
 
 **Why not a hash-tag space redesign**: the 7/15 split is a CRC16 outcome that would require re-tagging buckets to balance — heavyweight, risks correctness drift, and the runbook explicitly puts it out of scope for this wave. `maxmemory` lift is the smallest-blast-radius fix.
 

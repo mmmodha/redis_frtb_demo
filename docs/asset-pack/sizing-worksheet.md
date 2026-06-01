@@ -1,6 +1,6 @@
 # Redis Enterprise Sizing Worksheet — FRTB-SA
 
-Fill out one column per HSBC desk or business line. Drives a Redis Enterprise Software (RS) sizing recommendation: shard count, shard memory, tier mix (RAM-only vs Auto Tiering), and a Redis Cloud SKU equivalent for cost benchmarking.
+Fill out one column per tenant desk or business line. Drives a Redis Enterprise Software (RS) sizing recommendation: shard count, shard memory, tier mix (RAM-only vs Auto Tiering), and a Redis Cloud SKU equivalent for cost benchmarking.
 
 ## Inputs (ask the desk)
 

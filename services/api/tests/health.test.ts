@@ -73,7 +73,7 @@ describe("GET /redis/active-target", () => {
     app = await createServer({
       redis: fakeRedis(),
       activeTarget: {
-        host: "demo-cluster.hsbc",
+        host: "demo-cluster.bank",
         port: 12000,
         tls: true,
         db: 0,
@@ -84,7 +84,7 @@ describe("GET /redis/active-target", () => {
     expect(res.statusCode).toBe(200);
     const body = res.json();
     expect(body).toEqual({
-      host: "demo-cluster.hsbc",
+      host: "demo-cluster.bank",
       port: 12000,
       tls: true,
       db: 0,

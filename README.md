@@ -1,7 +1,7 @@
-# FRTB SBM Redis PoV — HSBC
+# FRTB SBM Redis PoV
 
 Sales-vehicle demo proving Redis Enterprise Software (RS) is the right substrate
-for HSBC's FRTB-SA market-risk tooling. See the workspace `spec` note for the full
+for a Tier-1 bank's FRTB-SA market-risk tooling. See the workspace `spec` note for the full
 narrative and the 13 Redis Enterprise buying signals each demo moment lands.
 
 ## Architecture (high level)
@@ -19,7 +19,7 @@ Seven microservices, each fault-isolated, each killable without bringing down th
 | `loadgen`     | Concurrent-analyst load generator — drives the scale moments                 |
 
 **There is no Redis container in this compose stack.** Redis Enterprise Software
-runs inside HSBC's perimeter (their VPC / on-prem) and is configured at runtime
+runs inside the bank's perimeter (their VPC / on-prem) and is configured at runtime
 through the UI Connections panel. The Solutions Architect points the app at two
 RS clusters: `demo-cluster` (smaller, headline demo) and `scale-cluster` (larger,
 Auto Tiering, scale pivot moment).
@@ -113,6 +113,6 @@ Monorepo-level contract tests live in `tests/monorepo/` and assert:
 ## Redis Enterprise license
 
 The recommended path is the **Redis Enterprise trial / eval license**, valid for
-local PoV use. Production deployments at HSBC require a commercial RS subscription
+local PoV use. Production deployments at the bank require a commercial RS subscription
 (K8s Operator on GKE/EKS/OpenShift or Ansible roles for VM-based — see the spec's
 deployment-paths section).

@@ -21,7 +21,7 @@ export interface RowGeneratorOptions {
    */
   sensitivityTypes?: readonly string[];
   /**
-   * Wave 5.17a — HSBC reshape. Trade-id pool size for the post-loop aux-RNG
+   * Wave 5.17a — tenant reshape. Trade-id pool size for the post-loop aux-RNG
    * draw. Defaults to 200 (matches the smoke-run-16 canonical 2000-row / 10
    * trades-per-id ratio). Aux-RNG is seeded with `seed + ':aux'` so the
    * main value-RNG sequence is unchanged — pre/post-reshape numeric outputs
@@ -29,7 +29,7 @@ export interface RowGeneratorOptions {
    */
   tradePoolSize?: number;
   /**
-   * Wave 5.17a — HSBC reshape. Risk-factor pool size per class (default 16).
+   * Wave 5.17a — tenant reshape. Risk-factor pool size per class (default 16).
    * Emitted as `RF_<CLASS>_<NN>` via the aux RNG.
    */
   factorPoolSize?: number;
@@ -71,9 +71,9 @@ export function createRowGenerator(
 ): RowGenerator {
   const seedStr = String(opts.seed ?? 0);
   const rng = seedrandom(seedStr);
-  // Wave 5.17a — aux RNG for HSBC fields (trade_id, risk_factor). Seeded
+  // Wave 5.17a — aux RNG for tenant fields (trade_id, risk_factor). Seeded
   // with `<seed>:aux` so it cannot collide with or perturb the main value
-  // RNG. CRITICAL: never call rng() (the main stream) from the HSBC-field
+  // RNG. CRITICAL: never call rng() (the main stream) from the tenant-field
   // path — that would shift every downstream numeric draw and break the
   // pre-reshape vs post-reshape byte-equivalence invariant.
   const auxRng = seedrandom(seedStr + ":aux");
@@ -183,7 +183,7 @@ export function createRowGenerator(
               row[op.name] = { cvr_up: up, cvr_down: down };
             } else {
               // Wave 5.17a — Delta/Vega array values wrapped as a tenor-keyed
-              // object so HSBC can FT.SEARCH per-tenor without unpacking. The
+              // object so the bank can FT.SEARCH per-tenor without unpacking. The
               // rng() draw order and the resulting numeric values are
               // bit-identical to the prior array shape — only the container
               // changes. When tenor metadata is missing (defensive), fall
@@ -231,7 +231,7 @@ export function createRowGenerator(
           }
         }
       }
-      // Wave 5.17a — HSBC fields drawn from an isolated aux RNG so the main
+      // Wave 5.17a — tenant fields drawn from an isolated aux RNG so the main
       // value-RNG sequence above is unchanged across the reshape. trade_id
       // overwrites any value the generic TAG branch may have set (preserves
       // the original main-rng tick count for classes that listed trade_id in
