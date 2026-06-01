@@ -224,10 +224,25 @@ export function registerObservabilityRoutes(
     const target_label = getActiveTarget().label;
     const t0 = process.hrtime.bigint();
     try {
-      const text = await redis.info("memory");
+      const [text, dbsize] = await Promise.all([
+        redis.info("memory"),
+        redis.dbsize(),
+      ]);
       const parsed = parseInfo(text);
+      // Wave 5.20a — surface cluster capacity for the UI's pre-submit sanity
+      // check. `maxmemory_bytes`/`total_system_memory_bytes` are the same
+      // numeric values already parsed from INFO memory under their canonical
+      // keys; the `_bytes` suffix mirrors the UI contract.
+      const maxmemory_bytes = Number(parsed.maxmemory ?? 0);
+      const total_system_memory_bytes = Number(parsed.total_system_memory ?? 0);
       const ms = Number(process.hrtime.bigint() - t0) / 1e6;
-      return { ...parsed, ms: Math.round(ms * 1000) / 1000 };
+      return {
+        ...parsed,
+        maxmemory_bytes,
+        total_system_memory_bytes,
+        dbsize,
+        ms: Math.round(ms * 1000) / 1000,
+      };
     } catch (err) {
       const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
       if (translated) {

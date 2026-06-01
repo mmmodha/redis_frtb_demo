@@ -68,4 +68,32 @@ describe("GET /observability/memory", () => {
     expect(info).toBeDefined();
     expect(info!.args).toEqual(["memory"]);
   });
+
+  // Wave 5.20a — surface cluster capacity for the UI's pre-submit sanity check.
+  it("surfaces maxmemory_bytes, total_system_memory_bytes and dbsize", async () => {
+    const fr = fakeRedis();
+    fr.setDbsize(4321);
+    fr.setInfo(
+      "# Memory\r\nused_memory:1048576\r\nused_memory_human:1.00M\r\nmaxmemory:8388608\r\ntotal_system_memory:17179869184\r\n"
+    );
+    app = await createServer({ redis: fr });
+    const res = await app.inject({ method: "GET", url: "/observability/memory" });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.maxmemory_bytes).toBe(8388608);
+    expect(body.total_system_memory_bytes).toBe(17179869184);
+    expect(body.dbsize).toBe(4321);
+  });
+
+  it("treats unset maxmemory as 0 (acceptable)", async () => {
+    const fr = fakeRedis();
+    fr.setDbsize(0);
+    fr.setInfo("# Memory\r\nused_memory:0\r\nmaxmemory:0\r\ntotal_system_memory:1073741824\r\n");
+    app = await createServer({ redis: fr });
+    const res = await app.inject({ method: "GET", url: "/observability/memory" });
+    const body = res.json();
+    expect(body.maxmemory_bytes).toBe(0);
+    expect(body.dbsize).toBe(0);
+    expect(body.total_system_memory_bytes).toBe(1073741824);
+  });
 });

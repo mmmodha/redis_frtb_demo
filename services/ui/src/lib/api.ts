@@ -14,6 +14,11 @@ export interface ObservabilityMemoryResponse {
   used_memory: number;
   used_memory_human: string;
   used_memory_peak?: number;
+  // Wave 5.20a — cluster capacity surfaced for the Ingest panel sanity check.
+  // `maxmemory_bytes` is 0 when Redis has no `maxmemory` configured.
+  maxmemory_bytes?: number;
+  total_system_memory_bytes?: number;
+  dbsize?: number;
   ms: number;
   [k: string]: number | string | undefined;
 }

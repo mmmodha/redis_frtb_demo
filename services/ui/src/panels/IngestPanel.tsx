@@ -17,6 +17,11 @@ import {
   type Source,
 } from "../lib/ingest";
 
+// Wave 5.20a — defensive fallback when dbsize=0 (no rows yet) so the sanity
+// check still produces a meaningful estimate. ~1.5 KB/row is the smoke-run-12
+// observed average for sens:{class:bucket}:{ulid} JSON docs.
+const FALLBACK_BYTES_PER_ROW = 1500;
+
 // Wave 5.17b — synthetic generator form domain. Risk classes and sensitivity
 // types mirror services/api/src/routes/generator.ts DEFAULT_CLASSES /
 // DEFAULT_SENSITIVITY_TYPES; "Curvature" is opt-in (Equity, FX only).
@@ -59,6 +64,16 @@ function fmtBytes(n: number): string {
 
 function fmtInt(n: number): string {
   return Number.isFinite(n) ? Math.round(n).toLocaleString("en-US") : "—";
+}
+
+function seriesStats(samples: ChartSample[]): { current: number; min: number; max: number } {
+  if (samples.length === 0) return { current: 0, min: 0, max: 0 };
+  const vs = samples.map((s) => s.v);
+  return {
+    current: vs[vs.length - 1]!,
+    min: Math.min(...vs),
+    max: Math.max(...vs),
+  };
 }
 
 export function IngestPanel() {
@@ -132,6 +147,10 @@ export function IngestPanel() {
   const tput = chartPath(throughput.current, 360, 80);
   const memPath = chartPath(memorySeries.current, 360, 80);
   const sampleKeys = keys?.sample ?? [];
+  // Wave 5.20a — surface current/min/max next to each sparkline so the
+  // demo audience can read numeric values without hovering the SVG.
+  const tputStats = seriesStats(throughput.current);
+  const memStats = seriesStats(memorySeries.current);
 
   return (
     <div className="panel ingest-panel">
@@ -198,12 +217,22 @@ export function IngestPanel() {
             {tput.area ? <path d={tput.area} fill="rgba(255, 68, 56, 0.18)" /> : null}
             {tput.line ? <path d={tput.line} fill="none" stroke="#FF4438" strokeWidth="2" /> : null}
           </svg>
+          <div className="chart-card__labels" data-testid="chart-throughput-labels">
+            <span>now <strong>{fmtInt(tputStats.current)}</strong></span>
+            <span>min <strong>{fmtInt(tputStats.min)}</strong></span>
+            <span>max <strong>{fmtInt(tputStats.max)}</strong></span>
+          </div>
         </PanelCard>
         <PanelCard title="Memory growth">
           <svg data-testid="chart-memory" viewBox="0 0 360 80" width="100%" height="80" role="img" aria-label="memory usage chart">
             {memPath.area ? <path d={memPath.area} fill="rgba(138, 180, 199, 0.18)" /> : null}
             {memPath.line ? <path d={memPath.line} fill="none" stroke="#8AB4C7" strokeWidth="2" /> : null}
           </svg>
+          <div className="chart-card__labels" data-testid="chart-memory-labels">
+            <span>now <strong>{fmtBytes(memStats.current)}</strong></span>
+            <span>min <strong>{fmtBytes(memStats.min)}</strong></span>
+            <span>max <strong>{fmtBytes(memStats.max)}</strong></span>
+          </div>
         </PanelCard>
       </div>
 
@@ -228,9 +257,77 @@ export function IngestPanel() {
   );
 }
 
+// Wave 5.20a — pre-submit sanity check.
+//
+//   bytes_per_row = used_memory / dbsize   (fallback FALLBACK_BYTES_PER_ROW)
+//   estimate      = rows × bytes_per_row
+//   headroom      = maxmemory ? maxmemory − used : total_system × 0.7 − used
+//
+// pct = estimate / headroom:
+//   <70%   → submit immediately (returns null)
+//   70-100 → yellow warning modal (variant="warn")
+//   >100%  → red block-with-override modal (variant="block")
+//
+// If both `maxmemory_bytes` and `total_system_memory_bytes` are 0/unknown
+// we can't compute headroom — return null and let the request through so
+// the api's own MAX_ROWS guard remains the authoritative limit.
+export interface SanityEstimate {
+  variant: "warn" | "block";
+  estimateBytes: number;
+  usedBytes: number;
+  headroomBytes: number;
+  pct: number;
+  suggestedRows: number;
+  bytesPerRow: number;
+}
+
+export function computeSanity(
+  rows: number,
+  mem: Pick<ObservabilityMemoryResponse, "used_memory" | "maxmemory_bytes" | "total_system_memory_bytes" | "dbsize">,
+): SanityEstimate | null {
+  const used = Number(mem.used_memory ?? 0);
+  const max = Number(mem.maxmemory_bytes ?? 0);
+  const totSys = Number(mem.total_system_memory_bytes ?? 0);
+  const dbsize = Number(mem.dbsize ?? 0);
+  const bpr = dbsize > 0 && used > 0 ? used / dbsize : FALLBACK_BYTES_PER_ROW;
+  const estimate = rows * bpr;
+  const headroom = max > 0 ? max - used : totSys * 0.7 - used;
+  if (!Number.isFinite(headroom) || headroom <= 0) {
+    if (max <= 0 && totSys <= 0) return null;
+    return {
+      variant: "block",
+      estimateBytes: estimate,
+      usedBytes: used,
+      headroomBytes: Math.max(0, headroom),
+      pct: Infinity,
+      suggestedRows: Math.max(1, Math.floor((Math.max(0, headroom) * 0.7) / bpr) || 1),
+      bytesPerRow: bpr,
+    };
+  }
+  const pct = (estimate / headroom) * 100;
+  if (pct < 70) return null;
+  const variant: "warn" | "block" = pct > 100 ? "block" : "warn";
+  const suggestedRows = Math.max(1, Math.floor((headroom * 0.7) / bpr));
+  return { variant, estimateBytes: estimate, usedBytes: used, headroomBytes: headroom, pct, suggestedRows, bytesPerRow: bpr };
+}
+
+interface PendingSubmit {
+  cfg: GeneratorConfig | null; // null ⇒ post empty body (api defaults)
+  rows: number;                // for "Use N rows" override
+  est: SanityEstimate;
+}
+
+function fmtMB(n: number): string {
+  return `${(n / (1024 * 1024)).toFixed(n >= 10 * 1024 * 1024 ? 0 : 1)} MB`;
+}
+
 // Wave 5.17b — configurable synthetic generator. Always rendered as its own
 // PanelCard so the demo can top up sensitivities:in with explicit row count,
 // class mix, sensitivity types, seed, and HSBC-style pool sizes.
+//
+// Wave 5.20a — adds a primary "Generate 200 rows" button (empty-body post,
+// api applies its DEFAULT_ROWS / DEFAULT_CLASSES / DEFAULT_SENSITIVITY_TYPES)
+// and a pre-submit sanity-check modal that prevents OOMs.
 function SyntheticGeneratorCard() {
   const [rows, setRows] = useState<number>(DEFAULT_GEN_ROWS);
   const [classes, setClasses] = useState<Set<string>>(() => new Set(GENERATOR_CLASSES));
@@ -241,6 +338,8 @@ function SyntheticGeneratorCard() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<GeneratorStartResponse | null>(null);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [pending, setPending] = useState<PendingSubmit | null>(null);
 
   function toggleMember(prev: Set<string>, value: string): Set<string> {
     const next = new Set(prev);
@@ -248,22 +347,10 @@ function SyntheticGeneratorCard() {
     return next;
   }
 
-  async function onSubmit(e: FormEvent<HTMLFormElement>) {
-    e.preventDefault();
-    setError(null);
-    setResult(null);
-    if (!Number.isFinite(rows) || rows < 100 || rows > 2000) {
-      setError("Rows must be between 100 and 2000.");
-      return;
-    }
-    if (classes.size === 0) {
-      setError("Select at least one risk class.");
-      return;
-    }
-    if (sensTypes.size === 0) {
-      setError("Select at least one sensitivity type.");
-      return;
-    }
+  function buildAdvancedConfig(): GeneratorConfig | string {
+    if (!Number.isFinite(rows) || rows < 100 || rows > 2000) return "Rows must be between 100 and 2000.";
+    if (classes.size === 0) return "Select at least one risk class.";
+    if (sensTypes.size === 0) return "Select at least one sensitivity type.";
     const seedTrim = seed.trim();
     const seedValue: string | number = /^-?\d+$/.test(seedTrim) ? Number(seedTrim) : seedTrim;
     const cfg: GeneratorConfig = {
@@ -274,12 +361,14 @@ function SyntheticGeneratorCard() {
       factor_pool_size: factorPool,
     };
     const tradeTrim = tradePool.trim();
-    if (tradeTrim !== "") {
-      cfg.trade_pool_size = Number(tradeTrim);
-    }
+    if (tradeTrim !== "") cfg.trade_pool_size = Number(tradeTrim);
+    return cfg;
+  }
+
+  async function postGenerator(cfg: GeneratorConfig | null) {
     setBusy(true);
     try {
-      const r = await startGenerator(cfg);
+      const r = await startGenerator(cfg ?? undefined);
       setResult(r);
     } catch (err) {
       setError((err as Error).message);
@@ -288,111 +377,179 @@ function SyntheticGeneratorCard() {
     }
   }
 
+  async function runWithSanityCheck(cfg: GeneratorConfig | null, rowsForCheck: number) {
+    setError(null);
+    setResult(null);
+    let mem: ObservabilityMemoryResponse | null = null;
+    try { mem = await getObservabilityMemory(); } catch { mem = null; }
+    const est = mem ? computeSanity(rowsForCheck, mem) : null;
+    if (!est) { await postGenerator(cfg); return; }
+    setPending({ cfg, rows: rowsForCheck, est });
+  }
+
+  async function onSubmit(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    setError(null);
+    setResult(null);
+    const built = buildAdvancedConfig();
+    if (typeof built === "string") { setError(built); return; }
+    await runWithSanityCheck(built, built.rows ?? DEFAULT_GEN_ROWS);
+  }
+
+  async function onGenerateDefaults() {
+    await runWithSanityCheck(null, DEFAULT_GEN_ROWS);
+  }
+
   function onRandomSeed() {
     setSeed(String(Math.floor(Math.random() * 1_000_000_000)));
+  }
+
+  function onModalCancel() { setPending(null); }
+  async function onModalProceed() {
+    const p = pending; setPending(null);
+    if (p) await postGenerator(p.cfg);
+  }
+  async function onModalUseSuggested() {
+    const p = pending; setPending(null);
+    if (!p) return;
+    const cfg: GeneratorConfig = p.cfg
+      ? { ...p.cfg, rows: p.est.suggestedRows }
+      : { rows: p.est.suggestedRows };
+    await postGenerator(cfg);
   }
 
   return (
     <PanelCard title="Synthetic generator">
       <form className="generator-form" onSubmit={onSubmit} aria-label="Synthetic generator">
-        <div className="generator-form__row">
-          <label htmlFor="gen-rows">Rows</label>
-          <input
-            id="gen-rows"
-            type="number"
-            min={100}
-            max={2000}
-            value={rows}
-            disabled={busy}
-            onChange={(e) => setRows(Number(e.target.value) || 0)}
-          />
-        </div>
-
-        <fieldset className="generator-form__group" disabled={busy}>
-          <legend>Risk classes</legend>
-          {GENERATOR_CLASSES.map((c) => (
-            <label key={c} className="generator-form__check">
-              <input
-                type="checkbox"
-                name="gen-class"
-                value={c}
-                checked={classes.has(c)}
-                onChange={() => setClasses((prev) => toggleMember(prev, c))}
-              />
-              {c}
-            </label>
-          ))}
-        </fieldset>
-
-        <fieldset className="generator-form__group" disabled={busy}>
-          <legend>Sensitivity types</legend>
-          {GENERATOR_SENS_TYPES.map((t) => (
-            <label key={t} className="generator-form__check">
-              <input
-                type="checkbox"
-                name="gen-sens"
-                value={t}
-                checked={sensTypes.has(t)}
-                onChange={() => setSensTypes((prev) => toggleMember(prev, t))}
-              />
-              {t}
-            </label>
-          ))}
-        </fieldset>
-
-        <div className="generator-form__row">
-          <label htmlFor="gen-seed">Seed</label>
-          <input
-            id="gen-seed"
-            type="text"
-            value={seed}
-            disabled={busy}
-            onChange={(e) => setSeed(e.target.value)}
-          />
-          <button type="button" className="btn btn--secondary" onClick={onRandomSeed} disabled={busy}>
-            Random
-          </button>
-        </div>
-
-        <div className="generator-form__row">
-          <label htmlFor="gen-trade-pool">Trade pool size</label>
-          <input
-            id="gen-trade-pool"
-            type="number"
-            min={1}
-            max={10000}
-            placeholder="auto"
-            value={tradePool}
-            disabled={busy}
-            onChange={(e) => setTradePool(e.target.value)}
-          />
-          <span className="generator-form__hint">empty = auto (ceil(rows/10))</span>
-        </div>
-
-        <div className="generator-form__row">
-          <label htmlFor="gen-factor-pool">Risk factor pool size</label>
-          <input
-            id="gen-factor-pool"
-            type="number"
-            min={1}
-            max={256}
-            value={factorPool}
-            disabled={busy}
-            onChange={(e) => setFactorPool(Number(e.target.value) || 0)}
-          />
-        </div>
-
         <div className="generator-form__actions">
-          <button type="submit" className="btn btn--primary" disabled={busy}>
+          <button
+            type="button"
+            className="btn btn--primary"
+            disabled={busy}
+            onClick={onGenerateDefaults}
+            data-testid="generator-defaults-btn"
+          >
             {busy ? (
               <>
                 <span className="generator-form__spinner" aria-hidden="true">⟳</span>
                 Generating…
               </>
             ) : (
-              "Generate"
+              "Generate 200 rows"
             )}
           </button>
+          <span className="generator-form__hint">uses api defaults (200 rows · all classes · Delta+Vega)</span>
+        </div>
+
+        <button
+          type="button"
+          className="generator-form__advanced-toggle"
+          aria-expanded={advancedOpen}
+          aria-controls="generator-form-advanced"
+          onClick={() => setAdvancedOpen((v) => !v)}
+        >
+          {advancedOpen ? "▾" : "▸"} Advanced options
+        </button>
+        <div id="generator-form-advanced" className="generator-form__advanced-body">
+          <div className="generator-form__row">
+            <label htmlFor="gen-rows">Rows</label>
+            <input
+              id="gen-rows"
+              type="number"
+              min={100}
+              max={2000}
+              value={rows}
+              disabled={busy}
+              onChange={(e) => setRows(Number(e.target.value) || 0)}
+            />
+          </div>
+
+          <fieldset className="generator-form__group" disabled={busy}>
+            <legend>Risk classes</legend>
+            {GENERATOR_CLASSES.map((c) => (
+              <label key={c} className="generator-form__check">
+                <input
+                  type="checkbox"
+                  name="gen-class"
+                  value={c}
+                  checked={classes.has(c)}
+                  onChange={() => setClasses((prev) => toggleMember(prev, c))}
+                />
+                {c}
+              </label>
+            ))}
+          </fieldset>
+
+          <fieldset className="generator-form__group" disabled={busy}>
+            <legend>Sensitivity types</legend>
+            {GENERATOR_SENS_TYPES.map((t) => (
+              <label key={t} className="generator-form__check">
+                <input
+                  type="checkbox"
+                  name="gen-sens"
+                  value={t}
+                  checked={sensTypes.has(t)}
+                  onChange={() => setSensTypes((prev) => toggleMember(prev, t))}
+                />
+                {t}
+              </label>
+            ))}
+          </fieldset>
+
+          <div className="generator-form__row">
+            <label htmlFor="gen-seed">Seed</label>
+            <input
+              id="gen-seed"
+              type="text"
+              value={seed}
+              disabled={busy}
+              onChange={(e) => setSeed(e.target.value)}
+            />
+            <button type="button" className="btn btn--secondary" onClick={onRandomSeed} disabled={busy}>
+              Random
+            </button>
+          </div>
+
+          <div className="generator-form__row">
+            <label htmlFor="gen-trade-pool">Trade pool size</label>
+            <input
+              id="gen-trade-pool"
+              type="number"
+              min={1}
+              max={10000}
+              placeholder="auto"
+              value={tradePool}
+              disabled={busy}
+              onChange={(e) => setTradePool(e.target.value)}
+            />
+            <span className="generator-form__hint">empty = auto (ceil(rows/10))</span>
+          </div>
+
+          <div className="generator-form__row">
+            <label htmlFor="gen-factor-pool">Risk factor pool size</label>
+            <input
+              id="gen-factor-pool"
+              type="number"
+              min={1}
+              max={256}
+              value={factorPool}
+              disabled={busy}
+              onChange={(e) => setFactorPool(Number(e.target.value) || 0)}
+            />
+          </div>
+
+          <div className="generator-form__actions">
+            <button type="submit" className="btn btn--secondary" disabled={busy}>
+              {busy ? (
+                <>
+                  <span className="generator-form__spinner" aria-hidden="true">⟳</span>
+                  Generating…
+                </>
+              ) : (
+                "Generate"
+              )}
+            </button>
+          </div>
         </div>
 
         {error ? (
@@ -405,7 +562,67 @@ function SyntheticGeneratorCard() {
           </div>
         ) : null}
       </form>
+
+      {pending ? (
+        <SanityCheckModal
+          est={pending.est}
+          requestedRows={pending.rows}
+          onCancel={onModalCancel}
+          onProceed={onModalProceed}
+          onUseSuggested={onModalUseSuggested}
+        />
+      ) : null}
     </PanelCard>
+  );
+}
+
+// Wave 5.20a — pre-submit sanity-check dialog. Reuses .dialog primitives;
+// `variant` selects the yellow-warning or red-block left-border colour.
+function SanityCheckModal(props: {
+  est: SanityEstimate;
+  requestedRows: number;
+  onCancel: () => void;
+  onProceed: () => void;
+  onUseSuggested: () => void;
+}) {
+  const { est, requestedRows, onCancel, onProceed, onUseSuggested } = props;
+  const pctText = Number.isFinite(est.pct) ? `${est.pct.toFixed(0)}%` : "∞";
+  const isBlock = est.variant === "block";
+  return (
+    <div className="dialog-backdrop" role="dialog" aria-modal="true" aria-label="Sanity check">
+      <div className={`dialog sanity-modal--${est.variant}`} data-testid={`sanity-modal-${est.variant}`}>
+        <h2>{isBlock ? "Cluster headroom exceeded" : "Large generator batch"}</h2>
+        <div className="sanity-modal__body">
+          {isBlock ? (
+            <>
+              Estimated <strong>{fmtMB(est.estimateBytes)}</strong> exceeds available{" "}
+              <strong>{fmtMB(est.headroomBytes)}</strong> headroom for {requestedRows} rows.
+              <div className="sanity-modal__detail">
+                Suggested max rows: <strong>{est.suggestedRows}</strong> (≈70% headroom).
+              </div>
+            </>
+          ) : (
+            <>
+              Estimated ~<strong>{fmtMB(est.estimateBytes)}</strong> on top of{" "}
+              <strong>{fmtMB(est.usedBytes)}</strong> used ({pctText} of available headroom). Continue?
+            </>
+          )}
+        </div>
+        <div className="dialog__actions">
+          <button type="button" className="btn" onClick={onCancel}>Cancel</button>
+          {isBlock ? (
+            <>
+              <button type="button" className="btn btn--secondary" onClick={onUseSuggested}>
+                Use {est.suggestedRows} rows
+              </button>
+              <button type="button" className="btn btn--danger" onClick={onProceed}>Override</button>
+            </>
+          ) : (
+            <button type="button" className="btn btn--primary" onClick={onProceed}>Proceed</button>
+          )}
+        </div>
+      </div>
+    </div>
   );
 }
 
