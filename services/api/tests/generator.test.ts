@@ -271,6 +271,35 @@ describe("POST /generator/start/stream (Wave 5.20c) — SSE progress + cancellat
     expect(fr.xadds).toHaveLength(50);
   });
 
+  // Wave 5.21c — regression: the previous implementation listened on
+  // `req.raw` for `close`/`error`, which Fastify fires as soon as the
+  // inbound JSON body finishes parsing. That flipped `cancelFlag` before
+  // the generation loop even started, so a default 200-row run terminated
+  // with `rows_queued: 1, cancelled: true`. Listening on `reply.raw`
+  // instead keys cancellation to the actual response socket.
+  it("completes a 200-row default run without firing cancel", async () => {
+    const schema = loadFixtureSchema();
+    const fr = pipelineFakeRedis();
+    app = await createServer({ redis: fr, schema });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/generator/start/stream",
+      payload: {},
+      headers: { accept: "text/event-stream", "content-type": "application/json" },
+      payloadAsStream: true,
+    });
+    expect(res.statusCode).toBe(200);
+
+    const body = await collectStream(res.stream() as unknown as NodeJS.ReadableStream);
+    const frames = parseSseFrames(body);
+    const terminal = frames[frames.length - 1]!;
+    expect(terminal.done).toBe(true);
+    expect(terminal.cancelled).toBe(false);
+    expect(terminal.rows_queued).toBe(200);
+    expect(fr.xadds).toHaveLength(200);
+  });
+
   it("cancel endpoint flips the flag → terminal frame is cancelled:true", async () => {
     const schema = loadFixtureSchema();
     const fr = delayedPipelineFakeRedis();

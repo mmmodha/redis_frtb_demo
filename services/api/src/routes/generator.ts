@@ -261,10 +261,13 @@ export function registerGeneratorRoutes(
     reply.hijack();
 
     // Client-disconnect halts the run server-side (closing the browser tab,
-    // network drop, AbortController on the UI side).
+    // network drop, AbortController on the UI side). Listen on `reply.raw`
+    // (the response socket) — `req.raw` fires `close` as soon as Fastify
+    // finishes consuming the inbound JSON body, which would flip the cancel
+    // flag before the generation loop even starts.
     const onClose = (): void => { cancelFlag.cancelled = true; };
-    req.raw.on("close", onClose);
-    req.raw.on("error", onClose);
+    reply.raw.on("close", onClose);
+    reply.raw.on("error", onClose);
 
     const generator = createRowGenerator(schema, {
       seed: body.seed,
