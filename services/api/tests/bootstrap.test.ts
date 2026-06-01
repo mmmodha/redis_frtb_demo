@@ -39,18 +39,38 @@ function fakeCluster(nodeIds: string[], recorded: RecordedCall[]): RedisLike {
   return { nodes: (_role: string) => nodes } as unknown as RedisLike;
 }
 
+// Wave 5.16f1: bootstrap now registers all 9 (risk_class × leg) snippets
+// — the 6 Delta/Vega ones plus the 3 Curvature ones added in 5.16a/b.
+const EXPECTED_SNIPPET_NAMES = [
+  "sbm_delta_bucket",
+  "sbm_vega_bucket",
+  "equity_delta",
+  "equity_vega",
+  "fx_delta",
+  "fx_vega",
+  "girr_curvature",
+  "equity_curvature",
+  "fx_curvature",
+];
+
 describe("bootstrap — buildFrtbSnippets", () => {
-  it("returns exactly the 6 locked function names in build order", () => {
+  it("returns exactly the 9 locked function names in build order", () => {
     const schema = loadSchema(SCHEMA_PATH);
     const snippets = buildFrtbSnippets(schema);
-    expect(snippets.map((s) => s.name)).toEqual([
-      "sbm_delta_bucket",
-      "sbm_vega_bucket",
-      "equity_delta",
-      "equity_vega",
-      "fx_delta",
-      "fx_vega",
-    ]);
+    expect(snippets.map((s) => s.name)).toEqual(EXPECTED_SNIPPET_NAMES);
+  });
+
+  it("buildFrtbSnippets registers all 9 (risk_class × leg) function names", () => {
+    const schema = loadSchema(SCHEMA_PATH);
+    const snippets = buildFrtbSnippets(schema);
+    expect(snippets).toHaveLength(9);
+    const pattern = /^(girr|equity|fx|sbm)_(delta|vega|curvature)(_bucket)?$/;
+    for (const snip of snippets) {
+      expect(snip.name).toMatch(pattern);
+    }
+    // Set-equality check independent of build order — catches both missing
+    // entries (regression) and duplicates.
+    expect(new Set(snippets.map((snip) => snip.name))).toEqual(new Set(EXPECTED_SNIPPET_NAMES));
   });
 });
 
@@ -82,14 +102,7 @@ describe("bootstrap — bootstrapFrtb (standalone)", () => {
     expect(ftCreate).toHaveLength(1);
     expect(funcLoad).toHaveLength(1);
     expect(result.index.nodes).toBe(1);
-    expect(result.functions.functions).toEqual([
-      "sbm_delta_bucket",
-      "sbm_vega_bucket",
-      "equity_delta",
-      "equity_vega",
-      "fx_delta",
-      "fx_vega",
-    ]);
+    expect(result.functions.functions).toEqual(EXPECTED_SNIPPET_NAMES);
 
     expect(logs).toEqual([
       { service: "api", bootstrap: "idx:sens", action: "created", nodes: 1 },

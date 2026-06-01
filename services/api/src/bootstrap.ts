@@ -1,11 +1,14 @@
 // FRTB SBM PoV — api startup bootstrap.
 //
 // Wave 5.6.3: idempotently ensure the RediSearch index `idx:sens` exists and
-// the Redis Functions library `frtb` is loaded with all six per-bucket
-// functions (sbm_delta_bucket, sbm_vega_bucket, equity_delta, equity_vega,
-// fx_delta, fx_vega). Fans out across master shards in cluster mode because
-// both FT.CREATE (RediSearch) and FUNCTION LOAD are per-shard in ioredis
-// Cluster — a single .call() only hits one node.
+// the Redis Functions library `frtb` is loaded with all nine per-bucket
+// functions ({girr,equity,fx} x {delta,vega,curvature}). Fans out across
+// master shards in cluster mode because both FT.CREATE (RediSearch) and
+// FUNCTION LOAD are per-shard in ioredis Cluster — a single .call() only
+// hits one node.
+//
+// Wave 5.16f1: extended buildFrtbSnippets to register the three *_curvature
+// snippets at startup (previously a docs-scoped runtime helper).
 
 import type { Cluster, Redis } from "ioredis";
 import { ensureSensIndex } from "@frtb/rqe";
@@ -20,6 +23,9 @@ import { buildEquityDeltaSnippet } from "@frtb/calc/src/equityDeltaSnippet.ts";
 import { buildEquityVegaSnippet } from "@frtb/calc/src/equityVegaSnippet.ts";
 import { buildFxDeltaSnippet } from "@frtb/calc/src/fxDeltaSnippet.ts";
 import { buildFxVegaSnippet } from "@frtb/calc/src/fxVegaSnippet.ts";
+import { buildGirrCurvatureSnippet } from "@frtb/calc/src/girrCurvatureSnippet.ts";
+import { buildEquityCurvatureSnippet } from "@frtb/calc/src/equityCurvatureSnippet.ts";
+import { buildFxCurvatureSnippet } from "@frtb/calc/src/fxCurvatureSnippet.ts";
 
 export type RedisLike = Redis | Cluster;
 
@@ -28,9 +34,9 @@ export interface BootstrapResult {
   functions: { nodes: number; functions: string[] };
 }
 
-// Build the six locked frtb snippets from schema-resolved weights/correlations.
-// Exported separately so tests can verify the exact snippet set independent
-// of the network fan-out.
+// Build the nine locked frtb snippets ({girr,equity,fx} × {delta,vega,curvature})
+// from schema-resolved weights/correlations. Exported separately so tests can
+// verify the exact snippet set independent of the network fan-out.
 export function buildFrtbSnippets(schema: Schema): FrtbLibrarySnippet[] {
   const w = schema.risk_weights;
   const c = schema.correlations;
@@ -41,6 +47,7 @@ export function buildFrtbSnippets(schema: Schema): FrtbLibrarySnippet[] {
   const girrRho = c.girr_rho_kl;
   const girrVegaRho = c.girr_vega_rho_kl;
   const equityRho = c.equity_rho;
+  const fxRho = c.fx_rho;
   if (girrRho?.kind !== "constant") {
     throw new Error("bootstrap: correlations.girr_rho_kl must be constant");
   }
@@ -50,9 +57,15 @@ export function buildFrtbSnippets(schema: Schema): FrtbLibrarySnippet[] {
   if (equityRho?.kind !== "constant") {
     throw new Error("bootstrap: correlations.equity_rho must be constant");
   }
+  if (fxRho?.kind !== "constant") {
+    throw new Error("bootstrap: correlations.fx_rho must be constant");
+  }
   // GIRR delta wants weights as a vector in tenor declaration order.
   const tenorNodes = schema.risk_classes.GIRR?.tenor?.nodes ?? [];
   const girrDeltaWeights = tenorNodes.map((t) => girrDeltaW.by_tenor[t] ?? 0);
+  // ρ_curv = (ρ_delta)² per MAR21 §21.5(3) — pre-square at build time so the
+  // Lua kernels stay arithmetic-only and mirror the delta snippet substitution
+  // scheme exactly.
   return [
     buildGirrDeltaSnippet({ weights: girrDeltaWeights, rho: girrRho.value }),
     buildGirrVegaSnippet({ weight: girrVegaW.constant, rho: girrVegaRho.value }),
@@ -60,6 +73,9 @@ export function buildFrtbSnippets(schema: Schema): FrtbLibrarySnippet[] {
     buildEquityVegaSnippet({ weight: 1.0, rho: equityRho.value }),
     buildFxDeltaSnippet({ weight: fxW.constant }),
     buildFxVegaSnippet({ weight: 1.0 }),
+    buildGirrCurvatureSnippet({ tenors: tenorNodes.length, rho: girrRho.value * girrRho.value }),
+    buildEquityCurvatureSnippet({ rho: equityRho.value * equityRho.value }),
+    buildFxCurvatureSnippet({ rho: fxRho.value * fxRho.value }),
   ];
 }
 

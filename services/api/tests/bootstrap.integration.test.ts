@@ -101,7 +101,7 @@ describe.skipIf(!stackAvailable)("bootstrap — integration against redis-stack-
     );
     expect(map.index_name).toBe("idx:sens");
 
-    // FUNCTION LIST must report the `frtb` library with all 6 functions.
+    // FUNCTION LIST must report the `frtb` library with all 9 functions.
     const list = (await redis!.call("FUNCTION", "LIST", "LIBRARYNAME", "frtb")) as unknown[];
     expect(list.length).toBeGreaterThan(0);
     const libEntry = list[0] as unknown[];
@@ -124,6 +124,9 @@ describe.skipIf(!stackAvailable)("bootstrap — integration against redis-stack-
       "equity_vega",
       "fx_delta",
       "fx_vega",
+      "girr_curvature",
+      "equity_curvature",
+      "fx_curvature",
     ]) {
       expect(fns, `function ${expected} must be registered`).toContain(expected);
     }
@@ -134,7 +137,7 @@ describe.skipIf(!stackAvailable)("bootstrap — integration against redis-stack-
     // First call already happened in the test above — just run twice more.
     await bootstrapFrtb(redis!, schema, () => undefined);
     const result = await bootstrapFrtb(redis!, schema, () => undefined);
-    expect(result.functions.functions).toHaveLength(6);
+    expect(result.functions.functions).toHaveLength(9);
     // Index still resolves; library still queryable.
     const info = (await redis!.call("FT.INFO", "idx:sens")) as unknown[];
     expect(info.length).toBeGreaterThan(0);
