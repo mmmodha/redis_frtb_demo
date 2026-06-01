@@ -60,6 +60,9 @@ export function AppShell({ children }: AppShellProps) {
             </li>
           ))}
         </ul>
+        <div className="app-shell__nav-brand">
+          <img src="/redis-logo.svg" alt="Redis" />
+        </div>
       </nav>
       <main className="app-shell__main">{children}</main>
     </div>
