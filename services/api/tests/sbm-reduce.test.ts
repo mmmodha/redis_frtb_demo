@@ -159,7 +159,7 @@ describe("reduceCurvatureCharge — §21.5(5) + §21.5(5)(b) against the calc or
       bucket: b.bucket, K_b: b.K_b, S_b: b.S_b, count: b.count, ms: 0,
     }));
     const out = reduceCurvatureCharge(per, { kind: "constant", value: gammaDelta });
-    expect(Math.abs(out - oracle.riskClassCharge)).toBeLessThan(1e-9);
+    expect(Math.abs(out.charge - oracle.riskClassCharge)).toBeLessThan(1e-9);
   });
 
   // ---------- Equity (scalar CVR per row — one row per issuer factor) ----------
@@ -209,7 +209,7 @@ describe("reduceCurvatureCharge — §21.5(5) + §21.5(5)(b) against the calc or
       bucket: b.bucket, K_b: b.K_b, S_b: b.S_b, count: b.count, ms: 0,
     }));
     const out = reduceCurvatureCharge(per, { kind: "constant", value: gammaDelta });
-    expect(Math.abs(out - oracle.riskClassCharge)).toBeLessThan(1e-9);
+    expect(Math.abs(out.charge - oracle.riskClassCharge)).toBeLessThan(1e-9);
   });
 
   // ---------- FX (scalar CVR per currency pair) ----------
@@ -257,10 +257,43 @@ describe("reduceCurvatureCharge — §21.5(5) + §21.5(5)(b) against the calc or
       bucket: b.bucket, K_b: b.K_b, S_b: b.S_b, count: b.count, ms: 0,
     }));
     const out = reduceCurvatureCharge(per, { kind: "constant", value: gammaDelta });
-    expect(Math.abs(out - oracle.riskClassCharge)).toBeLessThan(1e-9);
+    expect(Math.abs(out.charge - oracle.riskClassCharge)).toBeLessThan(1e-9);
   });
 
-  it("empty bucket list returns 0", () => {
-    expect(reduceCurvatureCharge([], { kind: "constant", value: 0.5 })).toBe(0);
+  it("empty bucket list returns { charge: 0, usedFallback: false }", () => {
+    expect(reduceCurvatureCharge([], { kind: "constant", value: 0.5 })).toEqual({
+      charge: 0,
+      usedFallback: false,
+    });
+  });
+
+  // §21.5(5)(b) fallback propagation: when ΣK_b² + Σγ²·S·S·ψ is negative the
+  // shared kernel re-runs with S_b clipped into [-K_b, +K_b]. We feed
+  // synthesised per-bucket inputs that pin the interior negative — small K_b
+  // alongside mixed-sign S_b (one strongly positive, one strongly negative)
+  // and γ_delta near 1 so γ_curv = γ_delta² is large enough to dominate.
+  // ψ(S_A, S_B) = 1 because they have opposite signs (only ψ=0 when BOTH are
+  // strictly negative), so the cross term is preserved at its full magnitude.
+  it("propagates usedFallback=true when §21.5(5) interior is negative", () => {
+    const per: Array<{ bucket: string; K_b: number; S_b: number; count: number; ms: number }> = [
+      { bucket: "A", K_b: 1, S_b: 10, count: 1, ms: 0 },
+      { bucket: "B", K_b: 1, S_b: -10, count: 1, ms: 0 },
+    ];
+    // γ_delta=0.99 → γ_curv = 0.9801. Cross = 2·(0.9801·10·-10·ψ) = -196.02.
+    // ΣK² = 2 → interior = -194.02 < 0 → fallback fires. Clipped S = ±1, so
+    // cross+ = 2·(0.9801·1·-1·ψ) = -1.9602 → sumAlt = 0.0398 → charge ≈ 0.1995.
+    const out = reduceCurvatureCharge(per, { kind: "constant", value: 0.99 });
+    expect(out.usedFallback).toBe(true);
+    expect(out.charge).toBeCloseTo(Math.sqrt(0.0398), 6);
+  });
+
+  it("reports usedFallback=false when §21.5(5) interior is non-negative", () => {
+    const per: Array<{ bucket: string; K_b: number; S_b: number; count: number; ms: number }> = [
+      { bucket: "A", K_b: 2, S_b: 1, count: 1, ms: 0 },
+      { bucket: "B", K_b: 2, S_b: 1, count: 1, ms: 0 },
+    ];
+    const out = reduceCurvatureCharge(per, { kind: "constant", value: 0.5 });
+    expect(out.usedFallback).toBe(false);
+    expect(out.charge).toBeGreaterThan(0);
   });
 });

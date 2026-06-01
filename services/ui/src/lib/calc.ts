@@ -54,6 +54,10 @@ export interface CalcSbmResponse {
   shard_breakdown: ShardBreakdownEntry[];
   fanout_ms: number;
   commands?: CalcCommands;
+  // Wave 5.19: present only on Curvature responses. Identifies which
+  // §21.5(5) branch produced the charge — primary positive-interior path or
+  // the §21.5(5)(b) S_b-clipped fallback when the interior went negative.
+  curvature_branch?: "positive_interior" | "fallback_clipped_s";
 }
 
 export async function postCalcSbm(body: CalcSbmRequest): Promise<CalcSbmResponse> {

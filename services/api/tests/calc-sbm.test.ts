@@ -198,6 +198,9 @@ describe("POST /calc/sbm — MVP endpoint", () => {
       expect(body.per_bucket).toHaveLength(2);
       expect(body.total_ms).toBeGreaterThanOrEqual(0);
       expect(Array.isArray(body.shard_breakdown)).toBe(true);
+      // Wave 5.19: curvature responses surface the §21.5(5) branch decision.
+      // Positive-interior fixture (both S_b=3) → "positive_interior".
+      expect(body.curvature_branch).toBe("positive_interior");
       // Routing: every FCALL hits the curvature function for this risk class.
       const fcalls = fr.calls.filter((c) => c.command === "FCALL");
       expect(fcalls).toHaveLength(2);
@@ -207,6 +210,26 @@ describe("POST /calc/sbm — MVP endpoint", () => {
       }
     },
   );
+
+  // Wave 5.19: curvature_branch must be OMITTED (not null) for non-curvature
+  // legs so the UI's `result.curvature_branch != null` gate is unambiguous.
+  it("Wave 5.19: omits curvature_branch from Delta/Vega responses", async () => {
+    const fr = fakeRedis();
+    fr.setResponse("FT.AGGREGATE", ftAggregateReply(["USD-IRS"]));
+    fr.setResponse("FCALL", ["K_b", "3", "S_b", "3", "count", "10", "ms", "1"]);
+    app = await createServer({
+      redis: fr,
+      correlations: { GIRR: { kind: "constant", value: 0 } },
+    });
+    const res = await app.inject({
+      method: "POST",
+      url: "/calc/sbm",
+      payload: { risk_class: "GIRR", sensitivity_type: "Delta" },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect("curvature_branch" in body).toBe(false);
+  });
 
   // Wave 5.8.4 + 5.15d.1: a 200 with charge=0 on a portfolio that has no rows
   // (or no idx:sens on some shards) silently masks a precondition failure. The

@@ -305,11 +305,18 @@ export function registerCalcRoute(
     // 3) Reduce per-bucket K_b/S_b → risk-class charge. Curvature follows the
     //    §21.5(5)/(5)(b) shape (γ² + ψ-gated cross terms); Delta/Vega use the
     //    §21.4(5)/(7) shape. `corr` carries the Delta γ in both cases —
-    //    reduceCurvatureCharge squares it internally per §21.5(5).
-    const charge =
-      leg === "curvature"
-        ? reduceCurvatureCharge(results, corr)
-        : reduceRiskClassCharge(results, corr);
+    //    reduceCurvatureCharge squares it internally per §21.5(5). Curvature
+    //    also reports whether the §21.5(5)(b) clip-to-±K_b fallback fired so
+    //    the UI can render the regulatory branch beside the charge.
+    let charge: number;
+    let curvatureBranch: "positive_interior" | "fallback_clipped_s" | undefined;
+    if (leg === "curvature") {
+      const out = reduceCurvatureCharge(results, corr);
+      charge = out.charge;
+      curvatureBranch = out.usedFallback ? "fallback_clipped_s" : "positive_interior";
+    } else {
+      charge = reduceRiskClassCharge(results, corr);
+    }
     const total_ms = Number(process.hrtime.bigint() - t0) / 1e6;
 
     // Wave 5.16m: observability — surface the exact Redis commands the route
@@ -349,6 +356,7 @@ export function registerCalcRoute(
       // diagnostic — useful for the demo "look how parallel we are" callout
       fanout_ms: Math.round(fanoutMs * 1000) / 1000,
       commands,
+      ...(curvatureBranch !== undefined ? { curvature_branch: curvatureBranch } : {}),
       ...(note ? { ok: true, note } : {}),
     };
   });

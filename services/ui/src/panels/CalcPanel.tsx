@@ -385,6 +385,34 @@ function prefersReducedMotion(): boolean {
   }
 }
 
+// Wave 5.19: small inline pill that labels which §21.5(5) branch produced
+// the curvature charge — primary positive-interior path or the §21.5(5)(b)
+// S_b-clipped fallback. Rendered only when the api response includes the
+// `curvature_branch` field (i.e. curvature legs); omitted for Delta/Vega.
+function CurvatureBranchPill({
+  branch,
+}: {
+  branch: "positive_interior" | "fallback_clipped_s";
+}) {
+  const isFallback = branch === "fallback_clipped_s";
+  const label = isFallback
+    ? "§21.5(5)(b) · S_b clipped fallback"
+    : "§21.5(5) · positive interior";
+  const tooltip = isFallback
+    ? "interior was negative; recomputed with S_b clipped into [-K_b, +K_b] per §21.5(5)(b)"
+    : "Σ K_b² + Σ γ² · S_b · S_c ≥ 0; standard §21.5(5) charge";
+  return (
+    <span
+      className="curvature-branch-pill"
+      data-branch={branch}
+      data-testid="curvature-branch-pill"
+      title={tooltip}
+    >
+      {label}
+    </span>
+  );
+}
+
 // Wave 5.18: charge tile with a ~600ms ease-out count-up on fresh result.
 function AnimatedCharge({ value }: { value: number }) {
   const [displayed, setDisplayed] = useState<number>(() => (prefersReducedMotion() ? value : 0));
@@ -464,7 +492,12 @@ function CalcResult({
           </span>
         }
       >
-        <AnimatedCharge value={result.charge} />
+        <div className="calc-panel__charge-row">
+          <AnimatedCharge value={result.charge} />
+          {result.curvature_branch ? (
+            <CurvatureBranchPill branch={result.curvature_branch} />
+          ) : null}
+        </div>
         <p className="calc-panel__basel-caption" data-testid="basel-caption">
           {caption}
         </p>

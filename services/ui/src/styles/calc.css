@@ -10,6 +10,39 @@
   letter-spacing: 0.01em;
 }
 
+/* Wave 5.19: hero charge + branch pill sit on the same baseline so the
+   regulatory provenance reads as a caption to the big number. */
+.calc-panel__charge-row {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+/* Wave 5.19: §21.5(5) / §21.5(5)(b) branch pill. Two states — neutral-green
+   for the primary positive-interior path, amber for the clipped fallback.
+   Tracks the bucket-pill visual idiom so the cluster reads as one family. */
+.curvature-branch-pill {
+  display: inline-block;
+  padding: 0.125rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+.curvature-branch-pill[data-branch="positive_interior"] {
+  background: rgba(91, 211, 123, 0.10);
+  border-color: rgba(91, 211, 123, 0.45);
+  color: #5BD37B;
+}
+.curvature-branch-pill[data-branch="fallback_clipped_s"] {
+  background: rgba(240, 180, 41, 0.12);
+  border-color: rgba(240, 180, 41, 0.50);
+  color: #f0b429;
+}
+
 /* Wave 5.18: class-aware bucket pill. Single rule per data-class drives
    the accent so adding a new risk class is just one more selector. */
 .bucket-pill {

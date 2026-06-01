@@ -88,11 +88,16 @@ export function reduceRiskClassCharge(
 // equity_curvature / fx_curvature functions pick the worse direction per
 // §21.5(3) and return the winning K_b and signed S_b). `deltaCorr` is the
 // Delta γ_bc spec; it is squared internally per §21.5(5).
+//
+// Returns both the charge and `usedFallback`: true when the §21.5(5)
+// interior went negative and the §21.5(5)(b) clip-to-±K_b recompute fired.
+// The route layer surfaces this as the response `curvature_branch` so the
+// UI can label which regulatory branch produced the number.
 export function reduceCurvatureCharge(
   per: BucketResult[],
   deltaCorr: CorrelationSpec
-): number {
-  if (per.length === 0) return 0;
+): { charge: number; usedFallback: boolean } {
+  if (per.length === 0) return { charge: 0, usedFallback: false };
   const gammaCurv: CurvatureGammaSpec = squareCorrelationSpec(deltaCorr as CurvatureGammaSpec);
   const adapted = per.map((p) => ({
     bucket: p.bucket,
@@ -105,6 +110,5 @@ export function reduceCurvatureCharge(
     direction: "tie" as const,
     count: p.count,
   }));
-  const { charge } = aggregateAcrossBuckets(adapted, gammaCurv);
-  return charge;
+  return aggregateAcrossBuckets(adapted, gammaCurv);
 }

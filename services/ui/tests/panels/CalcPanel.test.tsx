@@ -245,6 +245,55 @@ describe("<CalcPanel />", () => {
     expect(chartOrder).toEqual(["USD-IRS", "EUR-IRS", "JPY-IRS"]);
   });
 
+  // Wave 5.19: branch badge surfaces the §21.5(5) / §21.5(5)(b) decision
+  // from the api beside the hero charge tile. Three guard-rail checks:
+  // (a) badge present on curvature result, (b) absent for Delta result,
+  // (c) absent before the first calc.
+  it("Wave 5.19: renders the curvature-branch pill with the §21.5(5) label on positive_interior", async () => {
+    const curvatureResp: CalcSbmResponse = {
+      ...baseResponse,
+      curvature_branch: "positive_interior",
+    };
+    mockCalcResponse(curvatureResp);
+    render(<CalcPanel />);
+    fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
+    await waitFor(() => expect(screen.getByTestId("curvature-branch-pill")).toBeInTheDocument());
+    const pill = screen.getByTestId("curvature-branch-pill");
+    expect(pill).toHaveAttribute("data-branch", "positive_interior");
+    expect(pill.textContent).toMatch(/§21\.5\(5\)/);
+    expect(pill.textContent).toMatch(/positive interior/i);
+    expect(pill.getAttribute("title")).toMatch(/standard §21\.5\(5\)/);
+  });
+
+  it("Wave 5.19: switches to amber §21.5(5)(b) labelling on fallback_clipped_s", async () => {
+    const curvatureResp: CalcSbmResponse = {
+      ...baseResponse,
+      curvature_branch: "fallback_clipped_s",
+    };
+    mockCalcResponse(curvatureResp);
+    render(<CalcPanel />);
+    fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
+    await waitFor(() => expect(screen.getByTestId("curvature-branch-pill")).toBeInTheDocument());
+    const pill = screen.getByTestId("curvature-branch-pill");
+    expect(pill).toHaveAttribute("data-branch", "fallback_clipped_s");
+    expect(pill.textContent).toMatch(/§21\.5\(5\)\(b\)/);
+    expect(pill.textContent).toMatch(/clipped/i);
+    expect(pill.getAttribute("title")).toMatch(/interior was negative/);
+  });
+
+  it("Wave 5.19: omits the curvature-branch pill from Delta/Vega responses", async () => {
+    mockCalcResponse(baseResponse); // no curvature_branch field
+    render(<CalcPanel />);
+    fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
+    await waitFor(() => expect(screen.getByTestId("calc-charge")).toBeInTheDocument());
+    expect(screen.queryByTestId("curvature-branch-pill")).toBeNull();
+  });
+
+  it("Wave 5.19: the curvature-branch pill is absent before the first calc", () => {
+    render(<CalcPanel />);
+    expect(screen.queryByTestId("curvature-branch-pill")).toBeNull();
+  });
+
   it("Wave 5.16n: tones the dominant bucket bar red when its K_b share exceeds 40%", async () => {
     const skewed: CalcSbmResponse = {
       ...baseResponse,
