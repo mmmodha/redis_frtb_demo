@@ -86,6 +86,11 @@ services:
       # (see services/api/Dockerfile). Mirrors the generator service for parity
       # and makes SCHEMA_FILE overridable at runtime for alt-schema testing.
       SCHEMA_FILE: ${SCHEMA_FILE:-/app/config/schema/frtb-default.yaml}
+      # Wave 5.16l: point the /sources/* proxy at the source container's actual
+      # listen port (PORT=8082 below). The code default in
+      # services/api/src/routes/sources-proxy.ts is http://source:3002 for
+      # non-compose runs; under compose we must override or the proxy 502s.
+      SOURCE_BASE: http://source:8082
     ports:
       - "8080:8080"
     volumes:
