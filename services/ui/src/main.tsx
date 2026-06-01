@@ -12,6 +12,7 @@ import "./styles/calc.css";
 import "./styles/pivot.css";
 import "./styles/ingest.css";
 import "./styles/loadgen.css";
+import "./styles/json-explorer.css";
 
 const rootEl = document.getElementById("root");
 if (!rootEl) {

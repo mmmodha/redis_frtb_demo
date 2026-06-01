@@ -1,0 +1,118 @@
+/* Wave 5.20b — JSON Explorer panel. Shared primitives (panel-card, buttons,
+   amber callout) come from shell.css; this sheet adds the filter grid,
+   results table, key-contains row, and the pretty-printed JSON pre block. */
+
+.json-explorer-panel { display: block; }
+
+.json-explorer-filters {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: var(--grid) calc(var(--grid) * 2);
+  align-items: center;
+}
+.json-explorer-filters label {
+  color: var(--redis-text-secondary);
+  font-size: 0.875rem;
+}
+.json-explorer-filters select,
+.json-explorer-filters input {
+  min-height: 36px;
+  padding: 0 calc(var(--grid) * 1.5);
+  background: var(--redis-bg-tertiary);
+  color: var(--redis-text-primary);
+  border: 1px solid var(--redis-border-primary);
+  border-radius: var(--radius);
+  font-family: var(--font-body);
+}
+
+.json-explorer-keyfilter {
+  display: flex;
+  align-items: center;
+  gap: var(--grid);
+  margin-bottom: calc(var(--grid) * 2);
+}
+.json-explorer-keyfilter label { color: var(--redis-text-secondary); font-size: 0.875rem; }
+.json-explorer-keyfilter input {
+  flex: 1;
+  min-height: 36px;
+  padding: 0 calc(var(--grid) * 1.5);
+  background: var(--redis-bg-tertiary);
+  color: var(--redis-text-primary);
+  border: 1px solid var(--redis-border-primary);
+  border-radius: var(--radius);
+  font-family: var(--font-body);
+}
+
+.json-explorer-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.875rem;
+}
+.json-explorer-table th,
+.json-explorer-table td {
+  text-align: left;
+  padding: calc(var(--grid) * 1.25) var(--grid);
+  border-bottom: 1px solid var(--redis-border-primary);
+}
+.json-explorer-table th {
+  color: var(--redis-text-secondary);
+  font-weight: 600;
+}
+.json-explorer-table code {
+  color: var(--redis-text-link);
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+}
+
+.json-explorer-toggle {
+  min-height: 28px;
+  min-width: 28px;
+  padding: 0 calc(var(--grid) * 0.75);
+  background: transparent;
+  border: 1px solid var(--redis-border-primary);
+  border-radius: var(--radius);
+  color: var(--redis-text-primary);
+  cursor: pointer;
+  font-family: var(--font-mono);
+  line-height: 1;
+}
+.json-explorer-toggle:hover,
+.json-explorer-toggle:focus-visible {
+  border-color: var(--redis-hyper);
+  color: var(--redis-hyper);
+  outline: none;
+}
+
+.json-explorer-docrow td {
+  background: var(--redis-bg-primary);
+  border-bottom: 1px solid var(--redis-border-primary);
+}
+.json-explorer-doc {
+  margin: 0;
+  padding: calc(var(--grid) * 1.5);
+  background: var(--redis-bg-tertiary);
+  color: var(--redis-text-primary);
+  border: 1px solid var(--redis-border-secondary);
+  border-radius: var(--radius);
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  white-space: pre;
+  overflow-x: auto;
+  max-height: 480px;
+}
+
+.json-explorer-error {
+  background: rgba(255, 68, 56, 0.08);
+  border: 1px solid var(--redis-hyper);
+  color: var(--redis-text-primary);
+  border-radius: var(--radius);
+  padding: calc(var(--grid) * 1.5) calc(var(--grid) * 2);
+  margin-bottom: calc(var(--grid) * 3);
+}
+
+.json-explorer-pagination {
+  display: flex;
+  gap: var(--grid);
+  margin-top: calc(var(--grid) * 2);
+}

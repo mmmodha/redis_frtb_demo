@@ -1,39 +1,30 @@
-import { useMemo, useState } from "react";
+import { Fragment, useMemo, useState } from "react";
 import { PanelCard } from "../components/PanelCard";
-import { EnterpriseCallout } from "../components/EnterpriseCallout";
-import { MetricTile } from "../components/MetricTile";
 import { apiBase } from "../lib/api";
 import {
   EmptyTargetError,
   checkEmptyTargetError,
   readErrorBody,
 } from "../lib/empty-target";
-import type { PivotResp } from "../lib/pivot";
 import { BUCKETS_BY_RISK_CLASS, RISK_CLASSES, SENSITIVITY_TYPES } from "../lib/buckets";
+import type { PivotResp, PivotRow } from "../lib/pivot";
 
-const DEFAULT_LIMIT = 100;
-const HIST_WINDOW = 100;
+const PAGE_SIZES = [10, 25, 100] as const;
 
-function percentile(values: number[], p: number): number {
-  if (values.length === 0) return 0;
-  const sorted = [...values].sort((a, b) => a - b);
-  const idx = Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length));
-  return Math.round((sorted[idx] ?? 0) * 1000) / 1000;
-}
-
-export function PivotPanel(): JSX.Element {
+export function JsonExplorerPanel(): JSX.Element {
   const [riskClass, setRiskClass] = useState<string>("");
   const [bucket, setBucket] = useState<string>("");
   const [sensType, setSensType] = useState<string>("");
   const [book, setBook] = useState<string>("");
+  const [tradeId, setTradeId] = useState<string>("");
+  const [limit, setLimit] = useState<number>(25);
   const [offset, setOffset] = useState<number>(0);
-  const limit = DEFAULT_LIMIT;
+  const [keyContains, setKeyContains] = useState<string>("");
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [emptyError, setEmptyError] = useState<EmptyTargetError | null>(null);
   const [result, setResult] = useState<PivotResp | null>(null);
-  const [serverMs, setServerMs] = useState<number[]>([]);
-  const [clientMs, setClientMs] = useState<number[]>([]);
 
   const buckets = useMemo<string[]>(() => BUCKETS_BY_RISK_CLASS[riskClass] ?? [], [riskClass]);
 
@@ -51,30 +42,26 @@ export function PivotPanel(): JSX.Element {
     if (bucket) params.set("bucket", bucket);
     if (sensType) params.set("sensitivity_type", sensType);
     if (book) params.set("book", book);
+    if (tradeId) params.set("trade_id", tradeId);
     params.set("limit", String(limit));
     params.set("offset", String(nextOffset));
     const url = `${apiBase().replace(/\/$/, "")}/pivot?${params.toString()}`;
-    const t0 = performance.now();
     try {
       const res = await fetch(url);
-      const t1 = performance.now();
       if (!res.ok) {
-        // Wave 5.16z3: 412/503 with the api's friendly empty-data shape are
-        // not real failures — surface them as an amber banner instead.
         const friendly = checkEmptyTargetError(res.status, await readErrorBody(res));
         if (friendly) throw friendly;
-        throw new Error(`Pivot failed (HTTP ${res.status})`);
+        throw new Error(`Explorer failed (HTTP ${res.status})`);
       }
       const body = (await res.json()) as PivotResp;
       setResult(body);
       setOffset(nextOffset);
-      setServerMs((prev) => [...prev.slice(-(HIST_WINDOW - 1)), body.ms]);
-      setClientMs((prev) => [...prev.slice(-(HIST_WINDOW - 1)), Math.round((t1 - t0) * 1000) / 1000]);
+      setExpanded({});
     } catch (e) {
       if (e instanceof EmptyTargetError) {
         setEmptyError(e);
       } else {
-        const msg = e instanceof Error ? e.message : "Failed to load pivot";
+        const msg = e instanceof Error ? e.message : "Failed to load documents";
         setError(msg);
       }
       setResult(null);
@@ -88,39 +75,36 @@ export function PivotPanel(): JSX.Element {
     void runAt(0);
   }
 
-  async function runBurst(n: number): Promise<void> {
-    for (let i = 0; i < n; i++) {
-      await runAt(0);
-    }
+  function toggle(key: string): void {
+    setExpanded((prev) => ({ ...prev, [key]: !prev[key] }));
   }
+
+  const filteredRows = useMemo<PivotRow[]>(() => {
+    if (!result) return [];
+    const q = keyContains.trim().toLowerCase();
+    if (q === "") return result.rows;
+    return result.rows.filter((r) => r.key.toLowerCase().includes(q));
+  }, [result, keyContains]);
 
   const hasPrev = result !== null && offset > 0;
   const hasNext = result !== null && offset + result.rows.length < result.total;
 
   return (
-    <div className="pivot-panel">
-      <h1>Pivot</h1>
-      <EnterpriseCallout signal="RedisQueryEngine">
-        Sub-100ms FT.SEARCH across millions of native-JSON sensitivity docs — no flattening, no JOIN tax.
-      </EnterpriseCallout>
+    <div className="json-explorer-panel">
+      <h1>JSON Explorer</h1>
 
       <PanelCard
         title="Filters"
         actions={
-          <>
-            <button type="button" onClick={() => void runAt(0)} disabled={loading}>
-              {loading ? "Running…" : "Run query"}
-            </button>
-            <button type="button" onClick={() => void runBurst(100)} disabled={loading}>
-              Run 100x
-            </button>
-          </>
+          <button type="button" onClick={() => void runAt(0)} disabled={loading}>
+            {loading ? "Loading…" : "Run query"}
+          </button>
         }
       >
-        <form onSubmit={onSubmit} className="pivot-filters">
-          <label htmlFor="pivot-risk-class">Risk class</label>
+        <form onSubmit={onSubmit} className="json-explorer-filters">
+          <label htmlFor="je-risk-class">Risk class</label>
           <select
-            id="pivot-risk-class"
+            id="je-risk-class"
             aria-label="Risk class"
             value={riskClass}
             onChange={(e) => onRiskClassChange(e.target.value)}
@@ -130,9 +114,9 @@ export function PivotPanel(): JSX.Element {
               <option key={r} value={r}>{r}</option>
             ))}
           </select>
-          <label htmlFor="pivot-bucket">Bucket</label>
+          <label htmlFor="je-bucket">Bucket</label>
           <select
-            id="pivot-bucket"
+            id="je-bucket"
             aria-label="Bucket"
             value={bucket}
             onChange={(e) => setBucket(e.target.value)}
@@ -143,9 +127,9 @@ export function PivotPanel(): JSX.Element {
               <option key={b} value={b}>{b}</option>
             ))}
           </select>
-          <label htmlFor="pivot-sensitivity-type">Sensitivity type</label>
+          <label htmlFor="je-sensitivity-type">Sensitivity type</label>
           <select
-            id="pivot-sensitivity-type"
+            id="je-sensitivity-type"
             aria-label="Sensitivity type"
             value={sensType}
             onChange={(e) => setSensType(e.target.value)}
@@ -154,38 +138,36 @@ export function PivotPanel(): JSX.Element {
               <option key={s || "_all"} value={s}>{s || "All sensitivity types"}</option>
             ))}
           </select>
-          <label htmlFor="pivot-book">Book</label>
+          <label htmlFor="je-book">Book</label>
           <input
-            id="pivot-book"
+            id="je-book"
             aria-label="Book"
             type="text"
             value={book}
             onChange={(e) => setBook(e.target.value)}
             placeholder="e.g. RATES-LDN"
           />
+          <label htmlFor="je-trade-id">Trade ID</label>
+          <input
+            id="je-trade-id"
+            aria-label="Trade ID"
+            type="text"
+            value={tradeId}
+            onChange={(e) => setTradeId(e.target.value)}
+            placeholder="e.g. T-12345"
+          />
+          <label htmlFor="je-page-size">Page size</label>
+          <select
+            id="je-page-size"
+            aria-label="Page size"
+            value={limit}
+            onChange={(e) => setLimit(parseInt(e.target.value, 10) || 25)}
+          >
+            {PAGE_SIZES.map((n) => (
+              <option key={n} value={n}>{n}</option>
+            ))}
+          </select>
         </form>
-      </PanelCard>
-
-      {result !== null && result.ms < 100 && (
-        <div data-testid="sub-100ms-callout" className="pivot-sub100" role="status">
-          <strong>Sub-100ms</strong> on Redis Enterprise — last pivot returned in <strong>{result.ms}</strong> ms.
-        </div>
-      )}
-
-      <PanelCard title="Latency histogram (last 100 runs)">
-        <div data-testid="latency-histogram" className="pivot-latency">
-          <p className="pivot-latency__last">
-            {result ? <>Last query: <strong>{result.ms}</strong> ms (server-reported)</> : <em>No runs yet.</em>}
-          </p>
-          <div className="pivot-latency__grid">
-            <MetricTile label="server p50" value={percentile(serverMs, 50)} unit="ms" />
-            <MetricTile label="server p95" value={percentile(serverMs, 95)} unit="ms" />
-            <MetricTile label="server p99" value={percentile(serverMs, 99)} unit="ms" />
-            <MetricTile label="client p50" value={percentile(clientMs, 50)} unit="ms" />
-            <MetricTile label="client p95" value={percentile(clientMs, 95)} unit="ms" />
-            <MetricTile label="client p99" value={percentile(clientMs, 99)} unit="ms" />
-          </div>
-        </div>
       </PanelCard>
 
       {emptyError !== null && (
@@ -199,7 +181,7 @@ export function PivotPanel(): JSX.Element {
             <>
               Bootstrapping <strong>{emptyError.target_label ?? "this target"}</strong>
               {emptyError.bootstrap_phase ? <> — {emptyError.bootstrap_phase}</> : null}.
-              Pivot will be available once it's ready.
+              Explorer will be available once it's ready.
             </>
           ) : (
             <>
@@ -211,49 +193,85 @@ export function PivotPanel(): JSX.Element {
       )}
 
       {error !== null && (
-        <div role="alert" className="pivot-error">{error}</div>
+        <div role="alert" className="json-explorer-error">{error}</div>
       )}
 
       {result !== null && result.rows.length === 0 && error === null && (
-        <PanelCard title="Results">
-          <p>No sensitivities match these filters.</p>
+        <PanelCard title="Documents">
+          <p>No documents match these filters.</p>
         </PanelCard>
       )}
 
       {result !== null && result.rows.length > 0 && (
         <PanelCard
-          title="Results"
+          title="Documents"
           actions={
-            <span data-testid="results-summary">
-              Showing {result.rows.length} of {result.total}
+            <span data-testid="explorer-summary">
+              Showing {filteredRows.length} of {result.total}
             </span>
           }
         >
-          <table aria-label="Pivot results" className="pivot-table">
+          <div className="json-explorer-keyfilter">
+            <label htmlFor="je-key-contains">Key contains</label>
+            <input
+              id="je-key-contains"
+              aria-label="Key contains"
+              type="text"
+              value={keyContains}
+              onChange={(e) => setKeyContains(e.target.value)}
+              placeholder="substring filter"
+            />
+          </div>
+          <table aria-label="Explorer results" className="json-explorer-table">
             <thead>
               <tr>
+                <th aria-label="Expand" />
                 <th>Key</th>
                 <th>Risk class</th>
                 <th>Bucket</th>
                 <th>Sensitivity</th>
                 <th>Book</th>
-                <th>Trade</th>
               </tr>
             </thead>
             <tbody>
-              {result.rows.map((r) => (
-                <tr key={r.key}>
-                  <td><code>{r.key}</code></td>
-                  <td>{String(r.doc.risk_class ?? "")}</td>
-                  <td>{String(r.doc.bucket ?? "")}</td>
-                  <td>{String(r.doc.sensitivity_type ?? "")}</td>
-                  <td>{String(r.doc.book ?? "")}</td>
-                  <td>{String(r.doc.trade_id ?? "")}</td>
-                </tr>
-              ))}
+              {filteredRows.map((r) => {
+                const open = !!expanded[r.key];
+                return (
+                  <Fragment key={r.key}>
+                    <tr data-testid="explorer-row">
+                      <td>
+                        <button
+                          type="button"
+                          className="json-explorer-toggle"
+                          aria-label={open ? `Collapse ${r.key}` : `Expand ${r.key}`}
+                          aria-expanded={open}
+                          onClick={() => toggle(r.key)}
+                        >
+                          {open ? "▼" : "▶"}
+                        </button>
+                      </td>
+                      <td><code>{r.key}</code></td>
+                      <td>{String(r.doc.risk_class ?? "")}</td>
+                      <td>{String(r.doc.bucket ?? "")}</td>
+                      <td>{String(r.doc.sensitivity_type ?? "")}</td>
+                      <td>{String(r.doc.book ?? "")}</td>
+                    </tr>
+                    {open && (
+                      <tr className="json-explorer-docrow">
+                        <td />
+                        <td colSpan={5}>
+                          <pre className="json-explorer-doc" data-testid="explorer-doc">
+                            {JSON.stringify(r.doc, null, 2)}
+                          </pre>
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
+                );
+              })}
             </tbody>
           </table>
-          <div className="pivot-pagination">
+          <div className="json-explorer-pagination">
             <button
               type="button"
               onClick={() => void runAt(Math.max(0, offset - limit))}
@@ -275,4 +293,4 @@ export function PivotPanel(): JSX.Element {
   );
 }
 
-export default PivotPanel;
+export default JsonExplorerPanel;

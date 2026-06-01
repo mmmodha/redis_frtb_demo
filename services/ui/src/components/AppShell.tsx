@@ -13,6 +13,7 @@ const SECTIONS = [
   { to: "/pivot", label: "Pivot" },
   { to: "/calc", label: "Calc" },
   { to: "/observability", label: "Observability" },
+  { to: "/explorer", label: "JSON Explorer" },
 ] as const;
 
 export interface AppShellProps {
