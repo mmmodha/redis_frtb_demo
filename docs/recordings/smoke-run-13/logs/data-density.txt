@@ -1,0 +1,3 @@
+num_docs=115796  xlen=300000  density=0.3860 (38.60%)
+classification: data-density-low (<80% — volatile-lru eviction, peak 738.30M > 700M shard limit)
+DoD: this does NOT block AC1 (Wave 5.15k precedent)
