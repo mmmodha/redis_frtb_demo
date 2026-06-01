@@ -45,6 +45,10 @@ function isActiveProfile(p: ConnectionProfile, target: ActiveTarget | null): boo
   return target.host === p.host && target.port === p.port;
 }
 
+function isReachable(tr: ConnectionTestResult | "pending" | undefined): boolean {
+  return !!tr && tr !== "pending" && tr.ok === true;
+}
+
 export function ConnectionsPanel() {
   const [state, setState] = useState<LoadState>("loading");
   const [profiles, setProfiles] = useState<ConnectionProfile[]>([]);
@@ -96,10 +100,19 @@ export function ConnectionsPanel() {
 
   useEffect(() => { void refresh({ autoTest: true }); }, [refresh]);
 
-  const sortedProfiles = useMemo(
-    () => [...profiles].sort((a, b) => a.name.localeCompare(b.name)),
-    [profiles],
-  );
+  const sortedProfiles = useMemo(() => {
+    const rank = (p: ConnectionProfile): number => {
+      const tr = testResults[p.id];
+      if (isReachable(tr)) return 0;
+      if (tr === undefined || tr === "pending") return 1;
+      return 2;
+    };
+    return [...profiles].sort((a, b) => {
+      const dr = rank(a) - rank(b);
+      if (dr !== 0) return dr;
+      return a.name.localeCompare(b.name);
+    });
+  }, [profiles, testResults]);
 
   async function onSubmitDialog(input: ConnectionInput) {
     try {
@@ -261,14 +274,32 @@ export function ConnectionsPanel() {
                     <button type="button" onClick={() => setDialog({ kind: "edit", profile: p })}>
                       Edit
                     </button>
-                    <button
-                      type="button"
-                      onClick={() => void onActivate(p.id)}
-                      disabled={active || !!actionBusy[p.id]}
-                      className={active ? "" : "btn--primary"}
-                    >
-                      {active ? "Activated" : "Activate"}
-                    </button>
+                    {(() => {
+                      const unreachableReason = !active && !isReachable(tr)
+                        ? (tr === undefined
+                            ? "Test the connection first"
+                            : tr === "pending"
+                              ? "Testing connection…"
+                              : "Cluster unreachable — fix credentials or network before activating")
+                        : null;
+                      const hintId = unreachableReason ? `activate-hint-${p.id}` : undefined;
+                      return (
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => void onActivate(p.id)}
+                            disabled={active || !!actionBusy[p.id] || !isReachable(tr)}
+                            className={active ? "" : "btn--primary"}
+                            {...(unreachableReason ? { title: unreachableReason, "aria-describedby": hintId } : {})}
+                          >
+                            {active ? "Activated" : "Activate"}
+                          </button>
+                          {unreachableReason ? (
+                            <span id={hintId} className="visually-hidden">{unreachableReason}</span>
+                          ) : null}
+                        </>
+                      );
+                    })()}
                     <button
                       type="button"
                       onClick={() => void onDelete(p.id)}

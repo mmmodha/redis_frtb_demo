@@ -283,6 +283,9 @@ describe("<ConnectionsPanel/>", () => {
       const method = init?.method ?? "GET";
       if (url.match(/\/redis\/active-target$/)) return new Response(JSON.stringify({ host: "h", port: 1, tls: false, db: 0, label: "scale-cluster" }), { status: 200, headers: { "content-type": "application/json" } });
       if (url.match(/\/connections$/) && method === "GET") return new Response(JSON.stringify([profile(), profile({ id: "01K", name: "scale-cluster" })]), { status: 200, headers: { "content-type": "application/json" } });
+      if (url.match(/\/connections\/[^/]+\/test$/) && method === "POST") {
+        return new Response(JSON.stringify({ ok: true, latency_ms: 4, modules: [], errors: [] }), { status: 200, headers: { "content-type": "application/json" } });
+      }
       if (url.match(/\/connections\/01J\/activate$/) && method === "POST") {
         activatedCalled = true;
         return new Response(JSON.stringify(profile()), { status: 200, headers: { "content-type": "application/json" } });
@@ -291,7 +294,100 @@ describe("<ConnectionsPanel/>", () => {
     });
     renderPanel();
     const activateBtns = await screen.findAllByRole("button", { name: /^Activate$/ });
+    await waitFor(() => expect((activateBtns[0]! as HTMLButtonElement).disabled).toBe(false));
     fireEvent.click(activateBtns[0]!);
     await waitFor(() => expect(activatedCalled).toBe(true));
+  });
+
+  it("disables Activate with a 'Test the connection first' title when no test result yet", async () => {
+    fetchMock.mockImplementation(async (input: RequestInfo, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      if (url.match(/\/redis\/active-target$/)) return new Response(JSON.stringify({ host: "h", port: 1, tls: false, db: 0, label: "x" }), { status: 200, headers: { "content-type": "application/json" } });
+      if (url.match(/\/connections$/) && method === "GET") return new Response(JSON.stringify([profile()]), { status: 200, headers: { "content-type": "application/json" } });
+      // /test never resolves → tr stays "pending"; but for the *undefined*
+      // branch we want the moment before the auto-test pre-fire — assert on
+      // the markup right after the connections list lands, using a profile
+      // whose id won't match the in-flight /test response.
+      if (url.match(/\/connections\/[^/]+\/test$/)) return new Promise(() => {}) as any;
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    });
+    renderPanel();
+    await waitFor(() => expect(screen.getByText("demo-cluster")).toBeInTheDocument());
+    const activateBtn = screen.getByRole("button", { name: /^Activate$/ }) as HTMLButtonElement;
+    expect(activateBtn.disabled).toBe(true);
+    // While auto-test is in flight tr === "pending" → "Testing connection…"
+    expect(activateBtn.title).toMatch(/test/i);
+  });
+
+  it("keeps Activate disabled with an 'unreachable' title after the auto-test settles ok:false", async () => {
+    fetchMock.mockImplementation(async (input: RequestInfo, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      if (url.match(/\/redis\/active-target$/)) return new Response(JSON.stringify({ host: "h", port: 1, tls: false, db: 0, label: "x" }), { status: 200, headers: { "content-type": "application/json" } });
+      if (url.match(/\/connections$/) && method === "GET") return new Response(JSON.stringify([profile()]), { status: 200, headers: { "content-type": "application/json" } });
+      if (url.match(/\/connections\/01J\/test$/) && method === "POST") {
+        return new Response(JSON.stringify({ ok: false, errors: ["nope"], modules: [] }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    });
+    renderPanel();
+    await waitFor(() => expect(screen.getByTestId("test-result-01J")).toBeInTheDocument());
+    const activateBtn = screen.getByRole("button", { name: /^Activate$/ }) as HTMLButtonElement;
+    expect(activateBtn.disabled).toBe(true);
+    expect(activateBtn.title).toMatch(/unreachable/i);
+  });
+
+  it("enables Activate after the auto-test settles ok:true for a non-active profile", async () => {
+    fetchMock.mockImplementation(async (input: RequestInfo, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      if (url.match(/\/redis\/active-target$/)) return new Response(JSON.stringify({ host: "other", port: 9, tls: false, db: 0, label: "other" }), { status: 200, headers: { "content-type": "application/json" } });
+      if (url.match(/\/connections$/) && method === "GET") return new Response(JSON.stringify([profile()]), { status: 200, headers: { "content-type": "application/json" } });
+      if (url.match(/\/connections\/01J\/test$/) && method === "POST") {
+        return new Response(JSON.stringify({ ok: true, latency_ms: 7, modules: [], errors: [] }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    });
+    renderPanel();
+    await waitFor(() => expect(screen.getByTestId("test-result-01J")).toBeInTheDocument());
+    const activateBtn = screen.getByRole("button", { name: /^Activate$/ }) as HTMLButtonElement;
+    await waitFor(() => expect(activateBtn.disabled).toBe(false));
+  });
+
+  it("sorts profile cards by reachability — reachable on top, unreachable on the bottom, regardless of name", async () => {
+    fetchMock.mockImplementation(async (input: RequestInfo, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      if (url.match(/\/redis\/active-target$/)) {
+        return new Response(JSON.stringify({ host: "other", port: 9, tls: false, db: 0, label: "other" }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (url.match(/\/connections$/) && method === "GET") {
+        return new Response(JSON.stringify([
+          profile({ id: "a-dead", name: "alpha-cluster" }),
+          profile({ id: "b-live", name: "zeta-cluster" }),
+          profile({ id: "c-err", name: "mid-cluster" }),
+        ]), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (url.match(/\/connections\/b-live\/test$/) && method === "POST") {
+        return new Response(JSON.stringify({ ok: true, latency_ms: 4, modules: [], errors: [] }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (url.match(/\/connections\/a-dead\/test$/) && method === "POST") {
+        return new Response("nope", { status: 500 });
+      }
+      if (url.match(/\/connections\/c-err\/test$/) && method === "POST") {
+        return new Response(JSON.stringify({ ok: false, errors: ["x"], modules: [] }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    });
+    renderPanel();
+    await waitFor(() => expect(screen.getByTestId("test-result-b-live")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByTestId("test-result-a-dead")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByTestId("test-result-c-err")).toBeInTheDocument());
+    const cards = screen.getAllByTestId("profile-card");
+    const names = cards.map((c) => within(c).getByRole("heading", { level: 3 }).textContent);
+    expect(names[0]).toBe("zeta-cluster"); // ok:true → rank 0
+    // Both remaining are unreachable (ok:false) → rank 2, tie-break by name
+    expect(names.slice(1)).toEqual(["alpha-cluster", "mid-cluster"]);
   });
 });
