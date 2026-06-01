@@ -3,6 +3,7 @@ import type { RedisLike } from "../redis-like.ts";
 import { getActiveTarget } from "../active-target.ts";
 import { getBootstrapStatus } from "../bootstrap-status.ts";
 import { translateRedisError } from "../redis-errors.ts";
+import { corsHeadersForRequest } from "../cors-headers.ts";
 
 const NUMERIC_INFO_FIELDS = new Set([
   "used_memory",
@@ -183,6 +184,11 @@ export async function readShards(
 
 export interface RegisterObservabilityOpts {
   sseIntervalMs?: number;
+  // Wave 5.21i — resolved @fastify/cors allow-list value. Threaded in so the
+  // hijacked /observability/shards/stream response carries the matching
+  // access-control-allow-origin header (the cors plugin's onSend hook is
+  // bypassed by reply.hijack()).
+  corsAllowed?: true | string | string[];
 }
 
 export function registerObservabilityRoutes(
@@ -191,6 +197,7 @@ export function registerObservabilityRoutes(
   opts: RegisterObservabilityOpts = {},
 ): void {
   const sseIntervalMs = opts.sseIntervalMs ?? 1000;
+  const corsAllowed = opts.corsAllowed ?? "http://localhost:3000";
   app.get<{ Querystring: KeysQuery }>("/observability/keys", async (req, reply) => {
     const prefix = req.query.prefix ?? "sens:";
     // Wave 5.16t — resolve active redis per-request so a profile switch is
@@ -272,7 +279,9 @@ export function registerObservabilityRoutes(
   // client disconnects. We hijack the reply so Fastify doesn't try to send a
   // JSON body around it.
   app.get("/observability/shards/stream", async (req, reply) => {
+    const cors = corsHeadersForRequest(req, corsAllowed);
     reply.raw.writeHead(200, {
+      ...cors,
       "content-type": "text/event-stream",
       "cache-control": "no-cache, no-transform",
       connection: "keep-alive",

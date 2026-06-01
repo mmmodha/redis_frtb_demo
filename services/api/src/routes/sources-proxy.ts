@@ -15,6 +15,7 @@ import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { URL } from "node:url";
 import * as inflight from "../inflight-registry.ts";
+import { corsHeadersForRequest } from "../cors-headers.ts";
 
 export interface SourcesProxyOpts {
   sourceBase?: string;
@@ -25,6 +26,10 @@ export interface SourcesProxyOpts {
   // poll never observes a terminal status (default 60000ms). TODO: replace
   // with a tighter signal once source-service exposes a run-completion event.
   ingestTimeoutMs?: number;
+  // Wave 5.21i — resolved @fastify/cors allow-list value. Merged into the
+  // hijacked proxy response so the browser sees the matching
+  // access-control-allow-origin header.
+  corsAllowed?: true | string | string[];
 }
 
 // Hop-by-hop headers per RFC 7230 §6.1 plus `host` (we rewrite it for the
@@ -56,6 +61,7 @@ function streamProxy(
   reply: FastifyReply,
   base: string,
   upstreamPath: string,
+  corsAllowed: true | string | string[],
 ): Promise<void> {
   return new Promise((resolveDone) => {
     const upstreamUrl = new URL(upstreamPath, base);
@@ -97,12 +103,17 @@ function streamProxy(
         settled = true;
         reply.hijack();
         // Forward status + non-hop-by-hop headers. Node will rewrite
-        // transfer-encoding/connection itself.
+        // transfer-encoding/connection itself. Wave 5.21i — also merge in
+        // the @fastify/cors header the plugin can't inject post-hijack.
         const outHeaders: Record<string, string | string[] | number> = {};
         for (const [k, v] of Object.entries(upRes.headers)) {
           if (v === undefined) continue;
           if (HOP_BY_HOP.has(k.toLowerCase())) continue;
           outHeaders[k] = v as string | string[] | number;
+        }
+        const cors = corsHeadersForRequest(req, corsAllowed);
+        for (const [k, v] of Object.entries(cors)) {
+          if (!(k in outHeaders)) outHeaders[k] = v;
         }
         reply.raw.writeHead(status, outHeaders);
         upRes.on("error", () => {
@@ -221,6 +232,7 @@ export function registerSourcesProxyRoutes(app: FastifyInstance, opts: SourcesPr
   const base = opts.sourceBase ?? process.env.SOURCE_BASE ?? "http://source:3002";
   const ingestPollMs = opts.ingestPollMs ?? (Number(process.env.INGEST_POLL_MS) || 5_000);
   const ingestTimeoutMs = opts.ingestTimeoutMs ?? (Number(process.env.INFLIGHT_INGEST_TIMEOUT_MS) || 60_000);
+  const corsAllowed = opts.corsAllowed ?? "http://localhost:3000";
 
   // Encapsulate: inside this register scope we don't want Fastify's body
   // parsers to consume the request body — we hand `request.raw` straight to
@@ -232,20 +244,20 @@ export function registerSourcesProxyRoutes(app: FastifyInstance, opts: SourcesPr
       done(null, payload);
     });
 
-    scope.get("/sources/healthz", (req, reply) => streamProxy(req, reply, base, "/healthz"));
-    scope.get("/sources", (req, reply) => streamProxy(req, reply, base, "/sources"));
+    scope.get("/sources/healthz", (req, reply) => streamProxy(req, reply, base, "/healthz", corsAllowed));
+    scope.get("/sources", (req, reply) => streamProxy(req, reply, base, "/sources", corsAllowed));
     scope.get<{ Params: { id: string } }>("/sources/:id", (req, reply) =>
-      streamProxy(req, reply, base, `/sources/${encodeURIComponent(req.params.id)}`),
+      streamProxy(req, reply, base, `/sources/${encodeURIComponent(req.params.id)}`, corsAllowed),
     );
     scope.delete<{ Params: { id: string } }>("/sources/:id", (req, reply) =>
-      streamProxy(req, reply, base, `/sources/${encodeURIComponent(req.params.id)}`),
+      streamProxy(req, reply, base, `/sources/${encodeURIComponent(req.params.id)}`, corsAllowed),
     );
-    scope.post("/sources/upload", (req, reply) => streamProxy(req, reply, base, "/sources/upload"));
+    scope.post("/sources/upload", (req, reply) => streamProxy(req, reply, base, "/sources/upload", corsAllowed));
     scope.post<{ Params: { id: string } }>("/sources/:id/infer", (req, reply) =>
-      streamProxy(req, reply, base, `/sources/${encodeURIComponent(req.params.id)}/infer`),
+      streamProxy(req, reply, base, `/sources/${encodeURIComponent(req.params.id)}/infer`, corsAllowed),
     );
     scope.post<{ Params: { id: string } }>("/sources/:id/mapping", (req, reply) =>
-      streamProxy(req, reply, base, `/sources/${encodeURIComponent(req.params.id)}/mapping`),
+      streamProxy(req, reply, base, `/sources/${encodeURIComponent(req.params.id)}/mapping`, corsAllowed),
     );
 
     scope.post<{ Params: { id: string } }>("/sources/:id/ingest", async (req, reply) => {

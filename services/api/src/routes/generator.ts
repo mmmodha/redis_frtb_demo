@@ -16,6 +16,7 @@ import type { RedisLike } from "../redis-like.ts";
 import { getActiveTarget } from "../active-target.ts";
 import { getBootstrapStatus } from "../bootstrap-status.ts";
 import { translateRedisError } from "../redis-errors.ts";
+import { corsHeadersForRequest } from "../cors-headers.ts";
 
 interface GeneratorStartBody {
   rows?: number;
@@ -34,6 +35,10 @@ export interface GeneratorRoutesOpts {
   // Tests override this so a small synthetic batch still emits ≥1 progress
   // frame before the terminal frame.
   sseProgressIntervalMs?: number;
+  // Wave 5.21i — resolved @fastify/cors allow-list value. Threaded in so the
+  // hijacked SSE response carries the matching access-control-allow-origin
+  // header that the cors plugin's onSend hook can't inject for a hijack.
+  corsAllowed?: true | string | string[];
 }
 
 const DEFAULT_ROWS = 200;
@@ -66,6 +71,7 @@ export function registerGeneratorRoutes(
   opts: GeneratorRoutesOpts = {},
 ): void {
   const streamName = opts.streamName ?? "sensitivities:in";
+  const corsAllowed = opts.corsAllowed ?? "http://localhost:3000";
 
   app.post<{ Body: GeneratorStartBody }>("/generator/start", async (req, reply) => {
     if (!schema) {
@@ -252,7 +258,9 @@ export function registerGeneratorRoutes(
 
     // Open the SSE channel before kicking off generation so the client
     // immediately sees `run_id` in the first progress frame.
+    const cors = corsHeadersForRequest(req, corsAllowed);
     reply.raw.writeHead(200, {
+      ...cors,
       "content-type": "text/event-stream",
       "cache-control": "no-cache, no-transform",
       connection: "keep-alive",

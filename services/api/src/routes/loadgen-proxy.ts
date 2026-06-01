@@ -15,12 +15,17 @@ import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { URL } from "node:url";
 import * as inflight from "../inflight-registry.ts";
+import { corsHeadersForRequest } from "../cors-headers.ts";
 
 export interface LoadgenProxyOpts {
   loadgenBase?: string;
   // Wave 5.16w — poll interval for /loadgen/status while loadgen handles are
   // registered. Tests dial this down. Default 5000ms per the spec.
   loadgenPollMs?: number;
+  // Wave 5.21i — resolved @fastify/cors allow-list value. Merged into the
+  // hijacked proxy response so the browser sees the matching
+  // access-control-allow-origin header.
+  corsAllowed?: true | string | string[];
 }
 
 const HOP_BY_HOP = new Set([
@@ -50,6 +55,7 @@ function streamProxy(
   reply: FastifyReply,
   base: string,
   upstreamPath: string,
+  corsAllowed: true | string | string[],
 ): Promise<void> {
   return new Promise((resolveDone) => {
     const upstreamUrl = new URL(upstreamPath, base);
@@ -94,6 +100,12 @@ function streamProxy(
           if (v === undefined) continue;
           if (HOP_BY_HOP.has(k.toLowerCase())) continue;
           outHeaders[k] = v as string | string[] | number;
+        }
+        // Wave 5.21i — merge in the @fastify/cors header the plugin can't
+        // inject post-hijack. Don't overwrite an upstream-supplied header.
+        const cors = corsHeadersForRequest(req, corsAllowed);
+        for (const [k, v] of Object.entries(cors)) {
+          if (!(k in outHeaders)) outHeaders[k] = v;
         }
         reply.raw.writeHead(status, outHeaders);
         upRes.on("error", () => {
@@ -170,6 +182,7 @@ function parseLabel(buf: Buffer): string {
 export function registerLoadgenProxyRoutes(app: FastifyInstance, opts: LoadgenProxyOpts = {}): void {
   const base = opts.loadgenBase ?? process.env.LOADGEN_BASE ?? "http://loadgen:8085";
   const pollMs = opts.loadgenPollMs ?? (Number(process.env.LOADGEN_POLL_MS) || 5_000);
+  const corsAllowed = opts.corsAllowed ?? "http://localhost:3000";
   const handles = new Set<inflight.InflightHandle>();
   let pollTimer: ReturnType<typeof setTimeout> | null = null;
   let closed = false;
@@ -227,11 +240,11 @@ export function registerLoadgenProxyRoutes(app: FastifyInstance, opts: LoadgenPr
       done(null, payload);
     });
 
-    scope.get("/loadgen/status", (req, reply) => streamProxy(req, reply, base, "/loadgen/status"));
+    scope.get("/loadgen/status", (req, reply) => streamProxy(req, reply, base, "/loadgen/status", corsAllowed));
     scope.get("/loadgen/metrics", (req, reply) => {
       const qs = (req.raw.url ?? "").split("?")[1];
       const path = qs ? `/loadgen/metrics?${qs}` : "/loadgen/metrics";
-      return streamProxy(req, reply, base, path);
+      return streamProxy(req, reply, base, path, corsAllowed);
     });
 
     scope.post("/loadgen/start", async (req, reply) => {

@@ -22,6 +22,7 @@ import { registerLoadgenProxyRoutes } from "./routes/loadgen-proxy.ts";
 import { registerGeneratorRoutes } from "./routes/generator.ts";
 import { registerInternalTargetRoutes } from "./routes/internal-target.ts";
 import * as inflight from "./inflight-registry.ts";
+import { corsHeadersForRequest } from "./cors-headers.ts";
 import type { ConnectionsStore as RealConnectionsStore } from "./store.ts";
 
 // Wave 5.14b.1 — bootstrap-status flag. Compose healthchecks already curl
@@ -128,8 +129,14 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
   // connections routes). The ui container fetches the api cross-origin
   // from http://localhost:3000 → http://localhost:8080; without this every
   // browser call surfaces as "Failed to fetch".
+  //
+  // Wave 5.21i — the resolved allow-list is also threaded into every route
+  // that calls `reply.hijack()` (SSE + proxy endpoints) so those hand-rolled
+  // `writeHead` responses carry the same `access-control-allow-origin`
+  // header @fastify/cors would have set via its onSend hook.
+  const corsAllowed = parseAllowedOrigins(opts.allowedOrigins ?? process.env.ALLOWED_ORIGINS);
   await app.register(fastifyCors, {
-    origin: parseAllowedOrigins(opts.allowedOrigins ?? process.env.ALLOWED_ORIGINS),
+    origin: corsAllowed,
     methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   });
@@ -176,9 +183,10 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
 
   registerPivotRoute(app, getRedis);
   registerCalcRoute(app, getRedis, { correlations: opts.correlations ?? {} });
-  registerObservabilityRoutes(app, getRedis, { sseIntervalMs: opts.sseIntervalMs });
+  registerObservabilityRoutes(app, getRedis, { sseIntervalMs: opts.sseIntervalMs, corsAllowed });
   registerGeneratorRoutes(app, getRedis, opts.schema, {
     sseProgressIntervalMs: opts.generatorSseProgressIntervalMs,
+    corsAllowed,
   });
 
   // Wave 5.16t — auto-bootstrap on every active-target change. The hook is
@@ -195,15 +203,17 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
     );
   });
 
-  registerSourcesProxyRoutes(app, { sourceBase: opts.sourceBase });
-  registerLoadgenProxyRoutes(app, { loadgenBase: opts.loadgenBase });
+  registerSourcesProxyRoutes(app, { sourceBase: opts.sourceBase, corsAllowed });
+  registerLoadgenProxyRoutes(app, { loadgenBase: opts.loadgenBase, corsAllowed });
 
   // Wave 5.16w — in-flight registry surface. Polled by the UI every 2s for
   // the lockout banner; SSE channel pushes immediate updates so the banner
   // appears/disappears without poll lag.
   app.get("/inflight", async () => inflight.snapshot());
   app.get("/inflight/stream", async (req, reply) => {
+    const cors = corsHeadersForRequest(req, corsAllowed);
     reply.raw.writeHead(200, {
+      ...cors,
       "content-type": "text/event-stream",
       "cache-control": "no-cache, no-transform",
       connection: "keep-alive",

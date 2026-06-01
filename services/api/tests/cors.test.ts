@@ -1,4 +1,8 @@
 import { describe, it, expect, afterEach, beforeEach } from "vitest";
+import { resolve, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import Fastify, { type FastifyInstance } from "fastify";
+import { loadSchema, type Schema } from "@frtb/schema";
 import { createServer, markBootstrapReady, resetBootstrapStatusForTests } from "../src/server.ts";
 import { fakeRedis } from "./helpers/fake-redis.ts";
 
@@ -109,5 +113,158 @@ describe("CORS — @fastify/cors registration (Wave 5.16g)", () => {
     });
     expect(b.statusCode).toBe(200);
     expect(b.headers["access-control-allow-origin"]).toBe("http://localhost:3000");
+  });
+});
+
+// Wave 5.21i — routes that call `reply.hijack()` bypass @fastify/cors's
+// onSend hook, so the actual response went out without
+// access-control-allow-origin and the browser blocked it (visible as a
+// "Failed to fetch" red banner on the Synthetic Generator card). The fix
+// merges a hand-rolled CORS header into each writeHead. Tests below pin the
+// header on every hijacked surface.
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+function loadFixtureSchema(): Schema {
+  return loadSchema(
+    resolve(__dirname, "../../generator/tests/fixtures/multi-class.yaml"),
+  );
+}
+
+interface PipelineFakeRedis extends ReturnType<typeof fakeRedis> {
+  pipeline(): {
+    xadd(stream: string, id: string, ...fields: string[]): unknown;
+    exec(): Promise<Array<[Error | null, unknown]>>;
+  };
+}
+function pipelineFakeRedis(): PipelineFakeRedis {
+  const base = fakeRedis() as PipelineFakeRedis;
+  base.pipeline = () => {
+    const buffered: unknown[] = [];
+    return {
+      xadd(_stream: string, _id: string, ..._fields: string[]) {
+        buffered.push(null);
+        return this;
+      },
+      async exec() {
+        return buffered.map(() => [null, "0-0"] as [Error | null, unknown]);
+      },
+    };
+  };
+  return base;
+}
+
+async function startMockProxyUpstream(): Promise<{ app: FastifyInstance; base: string }> {
+  const app = Fastify({ logger: false });
+  app.get("/sources", async () => [{ id: "src-01" }]);
+  app.get("/loadgen/status", async () => ({ running: false, total_requests: 0 }));
+  await app.listen({ port: 0, host: "127.0.0.1" });
+  const addr = app.server.address();
+  if (!addr || typeof addr === "string") throw new Error("no addr");
+  return { app, base: `http://127.0.0.1:${addr.port}` };
+}
+
+describe("CORS — hijacked SSE + proxy responses carry access-control-allow-origin (Wave 5.21i)", () => {
+  let app: Awaited<ReturnType<typeof createServer>>;
+  let upstream: { app: FastifyInstance; base: string } | undefined;
+
+  beforeEach(() => {
+    markBootstrapReady();
+  });
+
+  afterEach(async () => {
+    if (app) await app.close();
+    if (upstream) { await upstream.app.close(); upstream = undefined; }
+    resetBootstrapStatusForTests();
+  });
+
+  it("GET /inflight/stream echoes access-control-allow-origin + vary: Origin", async () => {
+    app = await createServer({
+      redis: fakeRedis(),
+      allowedOrigins: "http://localhost:3000",
+    });
+    const res = await app.inject({
+      method: "GET",
+      url: "/inflight/stream",
+      headers: { origin: "http://localhost:3000", accept: "text/event-stream" },
+      payloadAsStream: true,
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["access-control-allow-origin"]).toBe("http://localhost:3000");
+    expect(String(res.headers["vary"] ?? "")).toMatch(/Origin/);
+    (res.stream() as unknown as NodeJS.ReadableStream & { destroy?: () => void }).destroy?.();
+  });
+
+  it("POST /generator/start/stream echoes access-control-allow-origin + vary: Origin", async () => {
+    const schema = loadFixtureSchema();
+    app = await createServer({
+      redis: pipelineFakeRedis(),
+      schema,
+      allowedOrigins: "http://localhost:3000",
+    });
+    const res = await app.inject({
+      method: "POST",
+      url: "/generator/start/stream",
+      payload: { rows: 1 },
+      headers: {
+        origin: "http://localhost:3000",
+        accept: "text/event-stream",
+        "content-type": "application/json",
+      },
+      payloadAsStream: true,
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["access-control-allow-origin"]).toBe("http://localhost:3000");
+    expect(String(res.headers["vary"] ?? "")).toMatch(/Origin/);
+    (res.stream() as unknown as NodeJS.ReadableStream & { destroy?: () => void }).destroy?.();
+  });
+
+  it("GET /observability/shards/stream echoes access-control-allow-origin + vary: Origin", async () => {
+    app = await createServer({
+      redis: fakeRedis(),
+      allowedOrigins: "http://localhost:3000",
+      sseIntervalMs: 50,
+    });
+    const res = await app.inject({
+      method: "GET",
+      url: "/observability/shards/stream",
+      headers: { origin: "http://localhost:3000", accept: "text/event-stream" },
+      payloadAsStream: true,
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["access-control-allow-origin"]).toBe("http://localhost:3000");
+    expect(String(res.headers["vary"] ?? "")).toMatch(/Origin/);
+    (res.stream() as unknown as NodeJS.ReadableStream & { destroy?: () => void }).destroy?.();
+  });
+
+  it("GET /sources (proxy) echoes access-control-allow-origin + vary: Origin", async () => {
+    upstream = await startMockProxyUpstream();
+    app = await createServer({
+      sourceBase: upstream.base,
+      allowedOrigins: "http://localhost:3000",
+    });
+    const res = await app.inject({
+      method: "GET",
+      url: "/sources",
+      headers: { origin: "http://localhost:3000" },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["access-control-allow-origin"]).toBe("http://localhost:3000");
+    expect(String(res.headers["vary"] ?? "")).toMatch(/Origin/);
+  });
+
+  it("GET /loadgen/status (proxy) echoes access-control-allow-origin + vary: Origin", async () => {
+    upstream = await startMockProxyUpstream();
+    app = await createServer({
+      loadgenBase: upstream.base,
+      allowedOrigins: "http://localhost:3000",
+    });
+    const res = await app.inject({
+      method: "GET",
+      url: "/loadgen/status",
+      headers: { origin: "http://localhost:3000" },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["access-control-allow-origin"]).toBe("http://localhost:3000");
+    expect(String(res.headers["vary"] ?? "")).toMatch(/Origin/);
   });
 });
