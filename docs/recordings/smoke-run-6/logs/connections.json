@@ -1,0 +1,22 @@
+[
+  {
+    "name": "demo-cluster",
+    "tls": {
+      "enabled": true
+    },
+    "clusterMode": true,
+    "id": "01KSQQKTG4SQKT9VS6MDB3PEN3",
+    "created_at": "2026-05-28T16:45:21.284Z",
+    "updated_at": "2026-05-28T16:45:21.284Z"
+  },
+  {
+    "name": "scale-cluster",
+    "tls": {
+      "enabled": true
+    },
+    "clusterMode": true,
+    "id": "01KSQQKTG5M5VDV8DSEAGF5RRG",
+    "created_at": "2026-05-28T16:45:21.285Z",
+    "updated_at": "2026-05-28T16:45:21.285Z"
+  }
+]
