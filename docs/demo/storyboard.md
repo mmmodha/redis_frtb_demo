@@ -1,6 +1,6 @@
 # Demo storyboard — FRTB-SA SBM on Redis (HSBC walkthrough)
 
-**What this demo proves.** A faithful, live implementation of the Basel FRTB Standardised-Approach Sensitivities-Based Method (MAR21 §21.4 Delta + Vega and §21.5 Curvature) running entirely on Redis: tenor-vector sensitivities and Curvature CVR pairs stored as JSON, bucket discovery via the Redis Query Engine, the per-bucket `K_b` math executed in-database through Redis Functions (Lua), and the cross-bucket aggregation reduced in the API service. Nothing is staged — every number on screen comes from a calc against 6,000 rows (2,000 each for Delta, Vega, Curvature) ingested moments earlier into a standalone Redis Cloud DB (Redis 8.4.0). Source-of-truth for the live values shown here is [`docs/demo/mar21-traceability.md`](./mar21-traceability.md) (the clause-by-clause pack covering §21.4 and §21.5) and [`docs/recordings/smoke-run-16/`](../recordings/smoke-run-16/) (raw calc JSONs + memory timeline + the 9-variant aggregate).
+**What this demo proves.** A faithful, live implementation of the Basel FRTB Standardised-Approach Sensitivities-Based Method (MAR21 §21.4 Delta + Vega and §21.5 Curvature) running entirely on Redis: tenor-vector sensitivities and Curvature CVR pairs stored as JSON, bucket discovery via the Redis Query Engine, the per-bucket `K_b` math executed in-database through Redis Functions (Lua), and the cross-bucket aggregation reduced in the API service. Nothing is staged — every number on screen comes from a calc against 6,000 rows (2,000 each for Delta, Vega, Curvature) ingested moments earlier into a standalone Redis Cloud DB (Redis 8.4.0). Source-of-truth for the live values shown here is [`docs/demo/mar21-traceability.md`](./mar21-traceability.md) (the clause-by-clause pack covering §21.4 and §21.5) and [`docs/recordings/smoke-run-17/`](../recordings/smoke-run-17/) (raw calc JSONs + memory timeline + the 9-variant aggregate).
 
 ---
 
@@ -8,7 +8,7 @@
 
 **On-screen.** Three browser tabs: (1) the Calc panel with risk-class + leg selectors empty, (2) RedisInsight showing the standalone Redis Cloud DB with `idx:sens` present and `num_docs=6000` / `hash_indexing_failures=0`, (3) a terminal with `docker compose ps` showing six containers (`api`, `calc`, `ingest`, `loadgen`, `source`, `ui`) all `Healthy`.
 
-**Presenter says.** "Before I click anything: 6,000 FRTB sensitivities are already in Redis — 2,000 Delta rows, 2,000 Vega rows, 2,000 Curvature rows. RediSearch indexed them in real time, zero indexing failures. The standalone Redis Cloud DB is sitting at Δ-over-baseline = 22.59 MB = 75.32 % of our 30 MB cap. The math you're about to see is loaded as Redis Functions — there is no Python risk grid behind the curtain, and there is no pre-canned result."
+**Presenter says.** "Before I click anything: 6,000 FRTB sensitivities are already in Redis — 2,000 Delta rows, 2,000 Vega rows, 2,000 Curvature rows. RediSearch indexed them in real time, zero indexing failures. The standalone Redis Cloud DB is sitting at Δ-over-baseline = 23.99 MB = 79.96 % of our 30 MB cap. The math you're about to see is loaded as Redis Functions — there is no Python risk grid behind the curtain, and there is no pre-canned result."
 
 **Time budget.** 25 s.
 
@@ -46,10 +46,10 @@
 
 ## Beat 4 — Cross-bucket reduce: the GIRR Delta risk-class charge (clause 5)
 
-- **On-screen.** The "Risk-class charge" tile flips from blank to **`0.6965`** (raw `0.6964748186716158`). Below it, a γ-matrix preview shows the GIRR cross-bucket correlation lookup the reduce step just used.
+- **On-screen.** The "Risk-class charge" tile flips from blank to **`0.6846`** (raw `0.6846307166088303`). Below it, a γ-matrix preview shows the GIRR cross-bucket correlation lookup the reduce step just used.
 - **Presenter says.** "The api takes the eleven `K_b` and `S_b` values and runs the cross-bucket reduce — sum of `K_b²` plus the double sum of `γ_bc · S_b · S_c`, single sqrt at the end. That's **line 49** of `reduce.ts`. The γ values come from the schema YAML, not hard-coded — change the schema, the correlations change."
 - **Basel anchor.** MAR21 §21.4(5): `Charge = √(Σ_b K_b² + Σ_{b≠c} γ_bc · S_b · S_c)`. Implementation: [`services/api/src/sbm/reduce.ts:36-49`](../../services/api/src/sbm/reduce.ts).
-- **Live value to point at.** GIRR Delta `charge = 0.6965`, returned at `total_ms ≈ 296` / `fanout_ms ≈ 174`.
+- **Live value to point at.** GIRR Delta `charge = 0.6846`, returned at `total_ms ≈ 301` / `fanout_ms ≈ 177`.
 - **Time budget.** 40 s.
 
 ---
@@ -59,7 +59,7 @@
 - **On-screen.** Presenter switches to a side-panel diff view that shows the two branches of `reduce.ts`: the positive-interior `√sum` at line 49 and the `S_b*` clamp + re-aggregation at lines 51–62. A small badge on the CAD row reads "branch: positive-interior".
 - **Presenter says.** "Basel's §21.4(7) says: if the expression inside the sqrt ever goes negative, cap each `S_b` inside ±`K_b` and recompute. That fallback is **lines 51–62** — same γ lookup, same schema, just `S_b*` instead of `S_b`. On this run, the positive-interior branch fired; the fallback is one branch away."
 - **Basel anchor.** MAR21 §21.4(7): `S_b* = max(min(S_b, K_b), -K_b)`, then re-aggregate. Implementation: [`services/api/src/sbm/reduce.ts:51-62`](../../services/api/src/sbm/reduce.ts), gated by the `sum >= 0` test on line 49.
-- **Live value to point at.** Branch taken on this run: positive-interior at `reduce.ts:49`; sum-under-sqrt > 0, so the `0.6965` you see is the line-49 result, not the line-62 fallback.
+- **Live value to point at.** Branch taken on this run: positive-interior at `reduce.ts:49`; sum-under-sqrt > 0, so the `0.6846` you see is the line-49 result, not the line-62 fallback.
 - **Time budget.** 25 s.
 
 ---
@@ -69,7 +69,7 @@
 - **On-screen.** Presenter switches `leg = Curvature` in the Calc panel and opens a side pane on `config/schema/frtb-default.yaml` lines 25–28. The schema preview reads: `Curvature (shape A): GIRR → {cvr_up: array<number>, cvr_down: array<number>}; Equity / FX → {cvr_up: number, cvr_down: number}`. A row inspector shows a sample GIRR Curvature row with the full `{cvr_up[], cvr_down[]}` tenor vector populated.
 - **Presenter says.** "Curvature isn't Delta with a different weight. Each row carries Basel's pre-computed `CVR_k` for the up and down shock already — that's clause 2: `CVR_k^{±} = −Σ_i [ V_i(x_k ± RW_k^curv) − V_i(x_k) − RW_k^curv · s_{ik} ]`. The upstream pricing layer materialises the bracketed term; the row hits Redis with `{cvr_up, cvr_down}` already populated. The Lua kernel sums those per tenor across all rows in the bucket — that's **line 48** of `girr_curvature.lua`, gated on `sensitivity_type == 'Curvature'`."
 - **Basel anchor.** MAR21 §21.5(2): `CVR_k^{up|down} = −Σ_i [ V_i(x_k ± RW_k^curv) − V_i(x_k) − RW_k^curv · s_{ik} ]`. Implementation: [`services/calc/lib/girr_curvature.lua:48-71`](../../services/calc/lib/girr_curvature.lua) (per-tenor `sum_up[k]` / `sum_down[k]` aggregation); schema contract at [`config/schema/frtb-default.yaml:25-28`](../../config/schema/frtb-default.yaml).
-- **Live value to point at.** GIRR Curvature: 11 / 11 buckets populated, `count > 0` everywhere; row counts per bucket range from CAD = 76 down to ≈ 56, summing to the 667 GIRR rows of the 2 000-row Curvature ingest leg.
+- **Live value to point at.** GIRR Curvature: 11 / 11 buckets populated, `count > 0` everywhere; row counts per bucket range from AUD = 68 down to EUR = 54, summing to the 667 GIRR rows of the 2 000-row Curvature ingest leg.
 - **Time budget.** 40 s.
 
 ---
@@ -79,27 +79,27 @@
 - **On-screen.** The per-bucket Curvature table populates: eleven rows of `(bucket, count, S_b, K_b, ms)`. Presenter highlights the CAD row.
 - **Presenter says.** "Inside the bucket, §21.5(3) builds K_b in two passes — once for the up-shock CVRs, once for the down-shock CVRs — and takes the worse: `K_b^{up|down}² = max(0, Σ_k CVR_k² + Σ_{k≠l} ρ_curv · CVR_k · CVR_l · ψ(CVR_k, CVR_l))` with `ρ_curv = (ρ_delta)² = 0.99² = 0.9801`, then `K_b = max(K_b^up, K_b^down)`. S_b is the directional sum `Σ_k CVR_k` of whichever side won (tie defaults to up). The ψ gate matters **here**, not just at the cross-bucket reduce — `ψ = 0` whenever **both** CVRs in a pair are strictly negative, dropping that cross-tenor pair from the sum. That guard is the one-liner at **line 89** of `girr_curvature.lua` inside `_curv_kb_sq`. It lights up again at the §21.5(5) reduce — `curvatureCommon.ts:121` — gating bucket-pair contributions there too. So ψ is a two-layer guard, not a single cross-bucket switch."
 - **Basel anchor.** MAR21 §21.5(3): `K_b = max(K_b^up, K_b^down)` where `K_b^{up|down}² = max(0, Σ_k CVR_k² + Σ_{k≠l} ρ_kl^curv · CVR_k · CVR_l · ψ(CVR_k, CVR_l))`, `ρ_kl^curv = (ρ_kl^delta)²`, `ψ(a,b) = 0 iff (a<0 ∧ b<0) else 1`. Implementation: [`services/calc/lib/girr_curvature.lua:78-96`](../../services/calc/lib/girr_curvature.lua) (`_curv_kb_sq` — ψ at line 89; line 84 accumulates `sum_sq = Σ CVR_k²`; line 90 adds the ρ-weighted cross only when ψ allows); direction pick + max selection at [`girr_curvature.lua:107-127`](../../services/calc/lib/girr_curvature.lua) (lines 108-109 compute both `kb_up_sq` / `kb_down_sq`, lines 121-127 pick the larger and emit `direction`). Shared TS kernel at [`services/calc/src/curvatureCommon.ts:62-78`](../../services/calc/src/curvatureCommon.ts) (`kbSquaredForDirection`, ψ at `:55-57`).
-- **Live value to point at.** GIRR Curvature top three: CAD `K_b = 1991.89` / `S_b = 2009.90` / count 76; AUD `K_b = 1823.63` / `S_b = 1840.12` / count 72; EUR `K_b = 1625.57` / `S_b = 1640.28` / count 69. Every bucket strictly positive; ρ_curv = 0.9801. The FCALL computes both `K_b^up` and `K_b^down` internally and ships only the winner — the response surface stays identical to Delta/Vega, but `direction` is logged inside the Lua kernel for trace purposes.
+- **Live value to point at.** GIRR Curvature top three: AUD `K_b = 1841.30` / `S_b = 1857.91` / count 68; CAD `K_b = 1797.30` / `S_b = 1813.57` / count 67; NZD `K_b = 1776.51` / `S_b = 1792.53` / count 67. Every bucket strictly positive; ρ_curv = 0.9801. The FCALL computes both `K_b^up` and `K_b^down` internally and ships only the winner — the response surface stays identical to Delta/Vega, but `direction` is logged inside the Lua kernel for trace purposes.
 - **Time budget.** 35 s.
 
 ---
 
 ## Beat 8 — Cross-bucket reduce for Curvature: §21.5(5) + ψ asymmetry gate
 
-- **On-screen.** The "Risk-class charge" tile for GIRR Curvature flips to **`9,597.03`** (raw `9597.031715206407`). Beside it, a small inspector renders the ψ gate test: `ψ(S_b, S_c) = 0 if (S_b < 0 ∧ S_c < 0) else 1`.
+- **On-screen.** The "Risk-class charge" tile for GIRR Curvature flips to **`9,495.23`** (raw `9495.234078557116`). Beside it, a small inspector renders the ψ gate test: `ψ(S_b, S_c) = 0 if (S_b < 0 ∧ S_c < 0) else 1`.
 - **Presenter says.** "The cross-bucket reduce here is §21.5(5): `√max(0, Σ K_b² + Σ_{b≠c} γ²_bc · S_b · S_c · ψ(S_b, S_c))`. Two differences from §21.4(5): the γ is squared (Basel's curvature-specific γ_curv), and the ψ gate zeros out pairs where both bucket sums are negative — that's the asymmetry. If the interior ever goes negative, we drop into the §21.5(5)(b) fallback that clips each `S_b` into ±`K_b` and recomputes, mirroring the §21.4(7) shape. That fallback sits at **`curvatureCommon.ts:128-139`**; this run took the positive-interior branch at line 126."
 - **Basel anchor.** MAR21 §21.5(5): `Charge = √max(0, Σ K_b² + Σ_{b≠c} γ²_bc · S_b · S_c · ψ(S_b, S_c))`. Implementation: [`services/calc/src/curvatureCommon.ts:103-126`](../../services/calc/src/curvatureCommon.ts) (positive-interior branch); fallback at lines 128-139.
-- **Live value to point at.** GIRR Curvature `charge = 9,597.03`; EQUITY Curvature `charge = 344.33`; FX Curvature `charge = 1,095.11`. All three positive-interior, no fallback fired.
+- **Live value to point at.** GIRR Curvature `charge = 9,495.23`; EQUITY Curvature `charge = 367.29`; FX Curvature `charge = 1,036.94`. All three positive-interior, no fallback fired.
 - **Time budget.** 35 s.
 
 ---
 
 ## Beat 9 — Why Curvature dwarfs Delta: the upstream-revaluation framing
 
-- **On-screen.** Presenter pulls up a two-row comparison: `GIRR Delta = 0.6965` vs `GIRR Curvature = 9,597.03` — roughly **four orders of magnitude apart**. Underneath, a one-line annotation: *CVR_k pairs are full upstream revaluations, not RW · sensitivity products*.
-- **Presenter says.** "This is the question every reviewer asks first, so let's get ahead of it. GIRR Curvature is 9,597 and GIRR Delta is 0.70 — four orders apart. That is exactly what Basel expects from this methodology. Delta is `RW_k · s_k` — a risk weight times a unit-sensitivity. Curvature is `CVR_k = −Σ_i [ V_i(x_k ± RW_k^curv) − V_i(x_k) − RW_k^curv · s_{ik} ]` — a full upstream revaluation gap at the shocked rate. Different units, different scale, by construction. Per §21.5(2), CVR carries notional exposure; Delta carries first-order sensitivity. Seeing a four-orders-of-magnitude gap on a 2 000-row Curvature leg is the methodology working, not a bug."
+- **On-screen.** Presenter pulls up a two-row comparison: `GIRR Delta = 0.6846` vs `GIRR Curvature = 9,495.23` — roughly **four orders of magnitude apart**. Underneath, a one-line annotation: *CVR_k pairs are full upstream revaluations, not RW · sensitivity products*.
+- **Presenter says.** "This is the question every reviewer asks first, so let's get ahead of it. GIRR Curvature is 9,495 and GIRR Delta is 0.68 — four orders apart. That is exactly what Basel expects from this methodology. Delta is `RW_k · s_k` — a risk weight times a unit-sensitivity. Curvature is `CVR_k = −Σ_i [ V_i(x_k ± RW_k^curv) − V_i(x_k) − RW_k^curv · s_{ik} ]` — a full upstream revaluation gap at the shocked rate. Different units, different scale, by construction. Per §21.5(2), CVR carries notional exposure; Delta carries first-order sensitivity. Seeing a four-orders-of-magnitude gap on a 2 000-row Curvature leg is the methodology working, not a bug."
 - **Basel anchor.** MAR21 §21.5(2) (CVR_k as a revaluation gap) vs §21.4(3) (`WS_k = RW_k · s_k`). The unit mismatch is intrinsic to the framework.
-- **Live value to point at.** GIRR Delta `0.6965` vs GIRR Curvature `9,597.03` (ratio ≈ 1.4 × 10⁴). Pattern repeats per risk class: EQUITY Δ `7.43` vs EQUITY Curv `344.33` (≈ 46×); FX Δ `1.43` vs FX Curv `1,095.11` (≈ 770×).
+- **Live value to point at.** GIRR Delta `0.6846` vs GIRR Curvature `9,495.23` (ratio ≈ 1.4 × 10⁴). Pattern repeats per risk class: EQUITY Δ `6.92` vs EQUITY Curv `367.29` (≈ 53×); FX Δ `1.16` vs FX Curv `1,036.94` (≈ 894×).
 - **Time budget.** 35 s.
 
 ---
@@ -136,11 +136,11 @@
 
 ## Anticipated questions (HSBC market-risk reviewers)
 
-**Q1 — Why Redis vs a traditional risk grid?** The SBM map step is per-bucket and embarrassingly parallel; pinning each `K_b` calculation to the slot owning that bucket (via the `{risk_class:bucket}` hash tag) removes the network round-trip per row. On this run the per-variant fanout was `144–191 ms` over eleven (or thirteen, for Equity) buckets — the same shape scales linearly on a multi-shard cluster, where each shard does its own `K_b` locally.
+**Q1 — Why Redis vs a traditional risk grid?** The SBM map step is per-bucket and embarrassingly parallel; pinning each `K_b` calculation to the slot owning that bucket (via the `{risk_class:bucket}` hash tag) removes the network round-trip per row. On this run the per-variant fanout was `149–181 ms` over eleven (or thirteen, for Equity) buckets — the same shape scales linearly on a multi-shard cluster, where each shard does its own `K_b` locally.
 
-**Q2 — How does this handle the curvature charge?** Yes, end-to-end. §21.5(2) CVR_k pairs are pre-computed upstream and arrive on each row as `{cvr_up, cvr_down}` (per-tenor arrays for GIRR; scalars for Equity / FX). §21.5(3) within-bucket K_b runs slot-local in `girr_curvature.lua` / `equity_curvature.lua` / `fx_curvature.lua`. §21.5(5) cross-bucket reduce — with the squared γ_curv and the ψ asymmetry gate — runs in `services/calc/src/curvatureCommon.ts:103-126`, with the §21.5(5)(b) negative-interior fallback at lines 128-139. Live charges this run: GIRR `9,597.03`, EQUITY `344.33`, FX `1,095.11`.
+**Q2 — How does this handle the curvature charge?** Yes, end-to-end. §21.5(2) CVR_k pairs are pre-computed upstream and arrive on each row as `{cvr_up, cvr_down}` (per-tenor arrays for GIRR; scalars for Equity / FX). §21.5(3) within-bucket K_b runs slot-local in `girr_curvature.lua` / `equity_curvature.lua` / `fx_curvature.lua`. §21.5(5) cross-bucket reduce — with the squared γ_curv and the ψ asymmetry gate — runs in `services/calc/src/curvatureCommon.ts:103-126`, with the §21.5(5)(b) negative-interior fallback at lines 128-139. Live charges this run: GIRR `9,495.23`, EQUITY `367.29`, FX `1,036.94`.
 
-**Q3 — Why is GIRR Curvature ~10⁴× larger than GIRR Delta?** That gap is structural, not a sign error. Delta is `WS_k = RW_k · s_k` — a risk weight times a unit-sensitivity (§21.4(3)). Curvature is `CVR_k = −Σ_i [ V_i(x_k ± RW_k^curv) − V_i(x_k) − RW_k^curv · s_{ik} ]` — a full upstream revaluation gap at the shocked rate (§21.5(2)). Different units, different scale, by Basel's design. On a 2 000-row Curvature leg the GIRR ratio lands near 1.4 × 10⁴; EQUITY ≈ 46×; FX ≈ 770×. That is what regulators expect when CVR pairs are upstream revaluations rather than RW · sensitivity products.
+**Q3 — Why is GIRR Curvature ~10⁴× larger than GIRR Delta?** That gap is structural, not a sign error. Delta is `WS_k = RW_k · s_k` — a risk weight times a unit-sensitivity (§21.4(3)). Curvature is `CVR_k = −Σ_i [ V_i(x_k ± RW_k^curv) − V_i(x_k) − RW_k^curv · s_{ik} ]` — a full upstream revaluation gap at the shocked rate (§21.5(2)). Different units, different scale, by Basel's design. On a 2 000-row Curvature leg the GIRR ratio lands near 1.4 × 10⁴; EQUITY ≈ 53×; FX ≈ 894×. That is what regulators expect when CVR pairs are upstream revaluations rather than RW · sensitivity products.
 
 **Q4 — How are you handling §21.5(5)(b)?** Clip-and-recompute mirroring the §21.4(7) shape: when the cross-bucket interior `Σ K_b² + Σ γ²_bc · S_b · S_c · ψ` goes negative, we replace each `S_b` with `S_b* = max(min(S_b, K_b), −K_b)` and re-evaluate the same expression with the same γ_curv and ψ gate. Implementation at [`services/calc/src/curvatureCommon.ts:128-139`](../../services/calc/src/curvatureCommon.ts); the inline comment at [`services/calc/src/curvatureCommon.ts:99`](../../services/calc/src/curvatureCommon.ts) flags this explicitly as a **text-fidelity caveat** — a strict Curvature-only reading of §21.5(5)(b) would clip negatives to 0 instead of to ±K_b. We chose the ±K_b shape for consistency with the §21.4(7) implementation already in production at `services/api/src/sbm/reduce.ts:51-62`, and we have flagged the choice for HSBC business sign-off before production cut-over.
 
@@ -169,6 +169,6 @@
 ## Footer — supporting artefacts
 
 - Clause-by-clause traceability (§21.4 + §21.5): [`docs/demo/mar21-traceability.md`](./mar21-traceability.md).
-- Run verdict + memory timeline + 9-variant calc matrix: [`docs/recordings/smoke-run-16/SUMMARY.md`](../recordings/smoke-run-16/SUMMARY.md).
-- Raw calc JSONs (nine variants + aggregate): [`docs/recordings/smoke-run-16/calc/`](../recordings/smoke-run-16/calc/) — `calc-GIRR-Delta.json`, `calc-GIRR-Vega.json`, `calc-GIRR-Curvature.json`, `calc-EQUITY-Delta.json`, `calc-EQUITY-Vega.json`, `calc-EQUITY-Curvature.json`, `calc-FX-Delta.json`, `calc-FX-Vega.json`, `calc-FX-Curvature.json`; plus [`aggregate.json`](../recordings/smoke-run-16/aggregate.json) for the rolled-up 3 × 3 matrix.
+- Run verdict + memory timeline + 9-variant calc matrix: [`docs/recordings/smoke-run-17/SUMMARY.md`](../recordings/smoke-run-17/SUMMARY.md).
+- Raw calc JSONs (nine variants + aggregate): [`docs/recordings/smoke-run-17/calc/`](../recordings/smoke-run-17/calc/) — `calc-GIRR-Delta.json`, `calc-GIRR-Vega.json`, `calc-GIRR-Curvature.json`, `calc-EQUITY-Delta.json`, `calc-EQUITY-Vega.json`, `calc-EQUITY-Curvature.json`, `calc-FX-Delta.json`, `calc-FX-Vega.json`, `calc-FX-Curvature.json`; plus [`aggregate.json`](../recordings/smoke-run-17/aggregate.json) for the rolled-up 3 × 3 matrix.
 - Spec context: workspace note id `spec` (FRTB SBM Redis PoV — HSBC).
