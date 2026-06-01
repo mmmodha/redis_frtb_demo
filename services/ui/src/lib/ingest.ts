@@ -109,6 +109,11 @@ export function startGeneratorStream(
   let runId: string | null = null;
   let cancelledByClient = false;
 
+  // Wave 5.21f — once the terminal frame has been dispatched, suppress any
+  // further reader errors so a server-closed-socket race does not surface as
+  // "Failed to fetch" through handlers.onError after a successful run.
+  let terminated = false;
+
   void (async () => {
     try {
       const res = await fetch(`${apiBase()}/generator/start/stream`, {
@@ -143,13 +148,24 @@ export function startGeneratorStream(
             try {
               const parsed = JSON.parse(m[1]!) as Record<string, unknown>;
               if (typeof parsed.run_id === "string") runId = parsed.run_id;
-              if (parsed.done === true) handlers.onTerminal(parsed as unknown as TerminalFrame);
-              else handlers.onProgress(parsed as unknown as ProgressFrame);
+              if (parsed.done === true) {
+                // Set terminated BEFORE dispatching so the flag is honoured
+                // even if onTerminal throws.
+                terminated = true;
+                handlers.onTerminal(parsed as unknown as TerminalFrame);
+              } else {
+                handlers.onProgress(parsed as unknown as ProgressFrame);
+              }
             } catch { /* skip malformed frame */ }
           }
         }
+        if (terminated) {
+          try { await reader.cancel(); } catch { /* best effort */ }
+          break;
+        }
       }
     } catch (err) {
+      if (terminated) return;
       if (cancelledByClient) return;
       const e = err as Error;
       if (e?.name === "AbortError") return;

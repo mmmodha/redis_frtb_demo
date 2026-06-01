@@ -1,5 +1,12 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { listSources, startIngest, startGenerator } from "../../src/lib/ingest";
+import {
+  listSources,
+  startIngest,
+  startGenerator,
+  startGeneratorStream,
+  type ProgressFrame,
+  type TerminalFrame,
+} from "../../src/lib/ingest";
 
 const originalFetch = globalThis.fetch;
 afterEach(() => {
@@ -72,5 +79,81 @@ describe("ingest api client", () => {
     globalThis.fetch = (async () => new Response("not found", { status: 404 })) as typeof fetch;
     const sources = await listSources();
     expect(sources).toEqual([]);
+  });
+
+  // Wave 5.21f — regression: the reader can throw "Failed to fetch" after the
+  // server emits the terminal frame and closes the socket. The client must
+  // swallow that post-terminal error and not surface it through onError.
+  it("startGeneratorStream ignores reader errors that arrive after a terminal frame", async () => {
+    const enc = new TextEncoder();
+    const chunks = [
+      "data: {\"run_id\":\"r-1\",\"rows_done\":50,\"rows_total\":200,\"elapsed_ms\":10,\"rows_per_sec\":5000}\n\n",
+      "data: {\"run_id\":\"r-1\",\"done\":true,\"rows_queued\":200,\"ms\":42,\"cancelled\":false}\n\n",
+    ];
+    let step = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (step < chunks.length) {
+          controller.enqueue(enc.encode(chunks[step]!));
+          step++;
+        } else {
+          // Simulate the server-closes-socket race: the reader throws after
+          // the terminal frame has already been delivered.
+          controller.error(new TypeError("Failed to fetch"));
+        }
+      },
+    });
+    globalThis.fetch = (async () => new Response(body, {
+      headers: { "content-type": "text/event-stream" },
+    })) as typeof fetch;
+
+    const progress: ProgressFrame[] = [];
+    const terminals: TerminalFrame[] = [];
+    const errors: Error[] = [];
+    startGeneratorStream(undefined, {
+      onProgress: (f) => progress.push(f),
+      onTerminal: (f) => terminals.push(f),
+      onError: (e) => errors.push(e),
+    });
+
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    expect(terminals).toHaveLength(1);
+    expect(terminals[0]!.rows_queued).toBe(200);
+    expect(terminals[0]!.done).toBe(true);
+    expect(errors).toHaveLength(0);
+    expect(progress).toHaveLength(1);
+  });
+
+  it("startGeneratorStream still surfaces errors that occur BEFORE the terminal frame", async () => {
+    const enc = new TextEncoder();
+    let delivered = false;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (!delivered) {
+          controller.enqueue(enc.encode(
+            "data: {\"run_id\":\"r-2\",\"rows_done\":10,\"rows_total\":200,\"elapsed_ms\":5,\"rows_per_sec\":2000}\n\n",
+          ));
+          delivered = true;
+        } else {
+          controller.error(new TypeError("Failed to fetch"));
+        }
+      },
+    });
+    globalThis.fetch = (async () => new Response(body, {
+      headers: { "content-type": "text/event-stream" },
+    })) as typeof fetch;
+
+    const terminals: TerminalFrame[] = [];
+    const errors: Error[] = [];
+    startGeneratorStream(undefined, {
+      onProgress: () => {},
+      onTerminal: (f) => terminals.push(f),
+      onError: (e) => errors.push(e),
+    });
+
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    expect(terminals).toHaveLength(0);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]!.message).toMatch(/failed to fetch/i);
   });
 });
