@@ -177,7 +177,7 @@ describe("IngestPanel", () => {
     });
   });
 
-  it("falls back to the generator button when /sources is empty (404 or empty list)", async () => {
+  it("renders the synthetic generator card with a Generate button that POSTs /generator/start (Wave 5.17b)", async () => {
     fetchMock.mockImplementation(async (input: RequestInfo, init?: RequestInit) => {
       const url = String(input);
       const method = init?.method ?? "GET";
@@ -186,12 +186,12 @@ describe("IngestPanel", () => {
       if (url.includes("/observability/keys")) return { ok: true, json: async () => keysResponse(0) };
       if (url.includes("/observability/memory")) return { ok: true, json: async () => memoryResponse(0) };
       if (url.endsWith("/generator/start") && method === "POST")
-        return { ok: true, json: async () => ({ ok: true }) };
+        return { ok: true, json: async () => ({ ok: true, rows_queued: 200, ms: 12, run_id: "01HX" }) };
       return { ok: true, json: async () => ({}) };
     });
     renderPanel();
-    const fallback = await waitFor(() => screen.getByRole("button", { name: /run generator/i }));
-    fireEvent.click(fallback);
+    const generateBtn = await waitFor(() => screen.getByRole("button", { name: /^generate$/i }));
+    fireEvent.click(generateBtn);
     await waitFor(() => {
       const posted = fetchMock.mock.calls.find(
         (c) => /\/generator\/start$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",

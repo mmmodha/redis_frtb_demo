@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { EnterpriseCallout } from "../components/EnterpriseCallout";
 import { MetricTile } from "../components/MetricTile";
 import { PanelCard } from "../components/PanelCard";
@@ -8,7 +8,22 @@ import {
   type ObservabilityKeysResponse,
   type ObservabilityMemoryResponse,
 } from "../lib/api";
-import { listSources, startGenerator, startIngest, type Source } from "../lib/ingest";
+import {
+  listSources,
+  startGenerator,
+  startIngest,
+  type GeneratorConfig,
+  type GeneratorStartResponse,
+  type Source,
+} from "../lib/ingest";
+
+// Wave 5.17b — synthetic generator form domain. Risk classes and sensitivity
+// types mirror services/api/src/routes/generator.ts DEFAULT_CLASSES /
+// DEFAULT_SENSITIVITY_TYPES; "Curvature" is opt-in (Equity, FX only).
+const GENERATOR_CLASSES = ["GIRR", "Equity", "FX"] as const;
+const GENERATOR_SENS_TYPES = ["Delta", "Vega", "Curvature"] as const;
+const DEFAULT_GEN_ROWS = 200;
+const DEFAULT_GEN_FACTOR_POOL = 16;
 
 const POLL_MS = 1000;
 const MAX_SAMPLES = 60;
@@ -113,15 +128,6 @@ export function IngestPanel() {
       setLastAction(`Start ingest failed: ${(e as Error).message}`);
     } finally { setBusy(false); }
   }
-  async function onRunGenerator() {
-    setBusy(true); setLastAction(null);
-    try {
-      await startGenerator();
-      setLastAction("Generator started");
-    } catch (e) {
-      setLastAction(`Generator failed: ${(e as Error).message}`);
-    } finally { setBusy(false); }
-  }
 
   const tput = chartPath(throughput.current, 360, 80);
   const memPath = chartPath(memorySeries.current, 360, 80);
@@ -150,11 +156,7 @@ export function IngestPanel() {
             <button type="button" onClick={onStartIngest} disabled={busy} className="btn btn--primary">
               Start ingest
             </button>
-          ) : (
-            <button type="button" onClick={onRunGenerator} disabled={busy} className="btn btn--secondary">
-              Run generator
-            </button>
-          )
+          ) : null
         }
       >
         <div className="ingest-controls">
@@ -162,12 +164,15 @@ export function IngestPanel() {
             {activeSource ? (
               <span>Active source: <code>{activeSource.id}</code> ({activeSource.kind})</span>
             ) : (
-              <span>No sources registered — fallback to synthetic generator.</span>
+              <span>No sources registered — use the synthetic generator below.</span>
             )}
           </div>
           {lastAction ? <div className="ingest-controls__action">{lastAction}</div> : null}
         </div>
       </PanelCard>
+
+      <SyntheticGeneratorCard />
+
 
       <div className="metric-row">
         <MetricTile label="Total rows" value={fmtInt(dbsize)} unit="keys" status={loaded && !error ? "live" : "pending"} />
@@ -220,6 +225,187 @@ export function IngestPanel() {
         </PanelCard>
       </section>
     </div>
+  );
+}
+
+// Wave 5.17b — configurable synthetic generator. Always rendered as its own
+// PanelCard so the demo can top up sensitivities:in with explicit row count,
+// class mix, sensitivity types, seed, and HSBC-style pool sizes.
+function SyntheticGeneratorCard() {
+  const [rows, setRows] = useState<number>(DEFAULT_GEN_ROWS);
+  const [classes, setClasses] = useState<Set<string>>(() => new Set(GENERATOR_CLASSES));
+  const [sensTypes, setSensTypes] = useState<Set<string>>(() => new Set(["Delta", "Vega"]));
+  const [seed, setSeed] = useState<string>("0");
+  const [tradePool, setTradePool] = useState<string>(""); // empty = auto (api derives)
+  const [factorPool, setFactorPool] = useState<number>(DEFAULT_GEN_FACTOR_POOL);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<GeneratorStartResponse | null>(null);
+
+  function toggleMember(prev: Set<string>, value: string): Set<string> {
+    const next = new Set(prev);
+    if (next.has(value)) next.delete(value); else next.add(value);
+    return next;
+  }
+
+  async function onSubmit(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    setError(null);
+    setResult(null);
+    if (!Number.isFinite(rows) || rows < 100 || rows > 2000) {
+      setError("Rows must be between 100 and 2000.");
+      return;
+    }
+    if (classes.size === 0) {
+      setError("Select at least one risk class.");
+      return;
+    }
+    if (sensTypes.size === 0) {
+      setError("Select at least one sensitivity type.");
+      return;
+    }
+    const seedTrim = seed.trim();
+    const seedValue: string | number = /^-?\d+$/.test(seedTrim) ? Number(seedTrim) : seedTrim;
+    const cfg: GeneratorConfig = {
+      rows,
+      classes: Array.from(classes),
+      sensitivity_types: Array.from(sensTypes),
+      seed: seedValue,
+      factor_pool_size: factorPool,
+    };
+    const tradeTrim = tradePool.trim();
+    if (tradeTrim !== "") {
+      cfg.trade_pool_size = Number(tradeTrim);
+    }
+    setBusy(true);
+    try {
+      const r = await startGenerator(cfg);
+      setResult(r);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function onRandomSeed() {
+    setSeed(String(Math.floor(Math.random() * 1_000_000_000)));
+  }
+
+  return (
+    <PanelCard title="Synthetic generator">
+      <form className="generator-form" onSubmit={onSubmit} aria-label="Synthetic generator">
+        <div className="generator-form__row">
+          <label htmlFor="gen-rows">Rows</label>
+          <input
+            id="gen-rows"
+            type="number"
+            min={100}
+            max={2000}
+            value={rows}
+            disabled={busy}
+            onChange={(e) => setRows(Number(e.target.value) || 0)}
+          />
+        </div>
+
+        <fieldset className="generator-form__group" disabled={busy}>
+          <legend>Risk classes</legend>
+          {GENERATOR_CLASSES.map((c) => (
+            <label key={c} className="generator-form__check">
+              <input
+                type="checkbox"
+                name="gen-class"
+                value={c}
+                checked={classes.has(c)}
+                onChange={() => setClasses((prev) => toggleMember(prev, c))}
+              />
+              {c}
+            </label>
+          ))}
+        </fieldset>
+
+        <fieldset className="generator-form__group" disabled={busy}>
+          <legend>Sensitivity types</legend>
+          {GENERATOR_SENS_TYPES.map((t) => (
+            <label key={t} className="generator-form__check">
+              <input
+                type="checkbox"
+                name="gen-sens"
+                value={t}
+                checked={sensTypes.has(t)}
+                onChange={() => setSensTypes((prev) => toggleMember(prev, t))}
+              />
+              {t}
+            </label>
+          ))}
+        </fieldset>
+
+        <div className="generator-form__row">
+          <label htmlFor="gen-seed">Seed</label>
+          <input
+            id="gen-seed"
+            type="text"
+            value={seed}
+            disabled={busy}
+            onChange={(e) => setSeed(e.target.value)}
+          />
+          <button type="button" className="btn btn--secondary" onClick={onRandomSeed} disabled={busy}>
+            Random
+          </button>
+        </div>
+
+        <div className="generator-form__row">
+          <label htmlFor="gen-trade-pool">Trade pool size</label>
+          <input
+            id="gen-trade-pool"
+            type="number"
+            min={1}
+            max={10000}
+            placeholder="auto"
+            value={tradePool}
+            disabled={busy}
+            onChange={(e) => setTradePool(e.target.value)}
+          />
+          <span className="generator-form__hint">empty = auto (ceil(rows/10))</span>
+        </div>
+
+        <div className="generator-form__row">
+          <label htmlFor="gen-factor-pool">Risk factor pool size</label>
+          <input
+            id="gen-factor-pool"
+            type="number"
+            min={1}
+            max={256}
+            value={factorPool}
+            disabled={busy}
+            onChange={(e) => setFactorPool(Number(e.target.value) || 0)}
+          />
+        </div>
+
+        <div className="generator-form__actions">
+          <button type="submit" className="btn btn--primary" disabled={busy}>
+            {busy ? (
+              <>
+                <span className="generator-form__spinner" aria-hidden="true">⟳</span>
+                Generating…
+              </>
+            ) : (
+              "Generate"
+            )}
+          </button>
+        </div>
+
+        {error ? (
+          <div className="generator-form__error" role="alert">{error}</div>
+        ) : null}
+        {result && !error ? (
+          <div className="generator-form__status" data-testid="generator-status">
+            Generated {result.rows_queued} rows in {result.ms}ms
+            {result.run_id ? <> · run_id <code>{result.run_id}</code></> : null}
+          </div>
+        ) : null}
+      </form>
+    </PanelCard>
   );
 }
 
