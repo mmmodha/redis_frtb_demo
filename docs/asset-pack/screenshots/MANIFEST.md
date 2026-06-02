@@ -21,7 +21,32 @@ Each PNG corresponds to a beat reference in [`docs/demo/storyboard.md`](../../de
 | `beat-09-ratio-comparison.png` | Beat 9 — Why Curvature dwarfs Delta | Composed side-by-side image: GIRR Delta `0.6846` ‖ GIRR Curvature `9,495.23` (ratio ≈ 1.4 × 10⁴). |
 | `beat-10-grand-total.png` | Beat 10 — Full 9-variant sweep | CalcPanel after the ninth click — FX Curvature `1,036.94`, positive-interior pill, wallclock under 300 ms. |
 | `beat-10-memory.png` | Beat 10 (terminal tab) | Static render of `curl -s http://localhost:8080/observability/memory \| jq` output: `used_memory_human = 32.93M`, `dbsize = 6001`. |
-| `beat-11-closer.png` | Closer slide (≤ 30 s — what production looks like) | Static slide: cluster topology, FRTB matrix scope (§21.6 / DRC / RRAO), integration shape. |
+| `beat-11-closer.png` | Closer slide (≤ 30 s — what production looks like) | Static slide: cluster topology, FRTB matrix scope (§21.6 / DRC / RRAO), integration shape. **Filename naming offset:** retained from Wave 5.26 — Wave 5.32 inserted Beats 11–14 (filters + typeahead) ahead of the closer in the storyboard, but the closer's existing capture filename is kept to avoid an out-of-scope rename. Wave 5.33 may renumber it (e.g. `beat-15-closer.png`) when it recaptures. |
+
+## Wave 5.33 — captures to add (Wave 5.32 enumerated, NOT captured)
+
+Storyboard v3 (Wave 5.32) added four new interactive beats between Beat 10 and the closer:
+Beat 11 (F1 bucket-subset push-down), Beat 12 (§21.6 correlation regime toggle),
+Beat 13 (F3 metadata exclusion), Beat 14 (Search auto-complete typeahead). Wave 5.33
+needs to capture the following nine new PNGs against the live UI; the table below is
+the capture script's job list.
+
+| Filename | Beat | What the capture must show |
+| --- | --- | --- |
+| `beat-11-refine-before.png` | Beat 11 — F1 bucket subset (baseline) | Risk-class charge PanelCard + commands panel for GIRR Delta over **all 11 buckets** — `fanout_ms ≈ 174`, `commands.discovery.query = "@risk_class:{GIRR}"`. |
+| `beat-11-refine-after.png` | Beat 11 — F1 bucket subset (narrowed) | Same surfaces after de-selecting 8 of 11 pills (e.g., keeping `CAD`, `SEK`, `JPY`) — `fanout_ms` materially lower (target sub-60 ms), `commands.discovery.query = "@risk_class:{GIRR} @bucket:{CAD\|SEK\|JPY}"` visible verbatim in the Redis commands panel. |
+| `beat-12-regime-low.png` | Beat 12 — §21.6 regime (Low) | Correlation-regime segmented control with `Low` selected (`data-selected="true"` on the `Low` button), Risk-class charge tile showing the γ × 0.75 charge, commands panel `regime` block reading `{ name: "low", factor: 0.75, cap: 1.0, note: "γ × 0.75" }`. |
+| `beat-12-regime-high.png` | Beat 12 — §21.6 regime (High) | Same surfaces with `High` selected — charge climbs vs. Med baseline, `regime.factor = 1.25`, `regime.note = "γ × 1.25, each ρ_bc capped at 1.0"`. |
+| `beat-13-exclude-off.png` | Beat 13 — F3 metadata exclusion (baseline) | Per-bucket K_b chart + commands panel for GIRR Delta with **empty** Advanced filters — `arg_template` ends `… GIRR <bucket>` with the three exclude positionals as empty strings (`"" "" ""`), Advanced filters disclosure showing "Advanced filters" header (no `· N excluded` suffix). |
+| `beat-13-exclude-on.png` | Beat 13 — F3 metadata exclusion (one chip) | Same surfaces after committing one `RF_GIRR_05` chip in **Exclude risk factors** — Advanced filters summary reads `Advanced filters · 1 excluded`, affected-bucket `K_b` and `count` visibly lower than the baseline, `arg_template` ends `… GIRR <bucket> "" "" RF_GIRR_05`. |
+| `beat-14-typeahead-dropdown.png` | Beat 14 — Search auto-complete | Exclude books combobox open with a populated 4–8-entry suggestion listbox on the `RA` prefix (`RATES-LDN`, `RATES-NYC`, …). Keyboard focus on the input; `aria-expanded="true"` on the combobox. |
+| `beat-14-typeahead-timing.png` | Beat 14 (DevTools tab) | Browser DevTools Network panel filtered to `/suggest` showing the GET round-trip well under 50 ms for the `RA` prefix request. Optional companion to the dropdown shot. |
+| `beat-14-typeahead-empty.png` | Beat 14 (edge state, optional) | Listbox in the empty/no-match state on an intentionally-no-hit prefix (e.g. `ZZZZ`) — shows the empty-state copy renders cleanly and the input is still focused. |
+
+**Wave 5.32 enumerated nine new entries above; zero new PNGs were committed in 5.32.**
+Capture is Wave 5.33's job — extend `scripts/capture-storyboard-shots.ts` to drive the
+Refine pill row, the Correlation regime segmented control, the Advanced filters chip
+combobox, and the SuggestCombobox listbox, then re-run.
 
 ## Canonical reference numbers (Wave 5.24 dataset)
 
