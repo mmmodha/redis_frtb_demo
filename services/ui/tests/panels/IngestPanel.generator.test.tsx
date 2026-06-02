@@ -92,7 +92,7 @@ describe("<IngestPanel /> — synthetic generator card (Wave 5.17b)", () => {
     vi.restoreAllMocks();
   });
 
-  it("renders the form with correct defaults: rows=200, all classes checked, Delta+Vega checked, seed=0, trade pool empty (auto), factor pool=16", async () => {
+  it("renders the form with correct defaults: rows=200, all classes checked, Delta+Vega checked, seed=0, 'small' preset selected and raw trade/factor pool inputs hidden (Wave 5.49)", async () => {
     baselineFetch(fetchMock);
     renderPanel();
     const card = await waitFor(() => generatorCard());
@@ -110,12 +110,15 @@ describe("<IngestPanel /> — synthetic generator card (Wave 5.17b)", () => {
     expect((within(card).getByRole("checkbox", { name: "Curvature" }) as HTMLInputElement).checked).toBe(false);
 
     expect((within(card).getByLabelText(/^seed$/i) as HTMLInputElement).value).toBe("0");
-    expect((within(card).getByLabelText(/trade pool size/i) as HTMLInputElement).value).toBe("");
-    expect((within(card).getByLabelText(/risk factor pool size/i) as HTMLInputElement).value).toBe("16");
+    // Wave 5.49 — default preset is "small"; raw trade/factor inputs are
+    // hidden until the user picks "Custom…".
+    expect((within(card).getByTestId("generator-preset") as HTMLSelectElement).value).toBe("small");
+    expect(within(card).queryByLabelText(/trade pool size/i)).toBeNull();
+    expect(within(card).queryByLabelText(/risk factor pool size/i)).toBeNull();
     expect(within(card).getByRole("button", { name: /^generate$/i })).toBeInTheDocument();
   });
 
-  it("submitting with defaults POSTs the correct body shape to /generator/start/stream (auto trade pool ⇒ key omitted)", async () => {
+  it("submitting with defaults POSTs the correct body shape to /generator/start/stream (Wave 5.49: small preset ⇒ trade_pool_size=200, factor_pool_size=16)", async () => {
     baselineFetch(fetchMock);
     renderPanel();
     const card = await waitFor(() => generatorCard());
@@ -136,8 +139,8 @@ describe("<IngestPanel /> — synthetic generator card (Wave 5.17b)", () => {
       sensitivity_types: ["Delta", "Vega"],
       seed: 0,
       factor_pool_size: 16,
+      trade_pool_size: 200,
     });
-    expect(body).not.toHaveProperty("trade_pool_size");
   });
 
   it("blocks submit and shows a role=alert when no risk class is checked", async () => {

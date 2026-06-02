@@ -37,6 +37,22 @@ const GENERATOR_SENS_TYPES = ["Delta", "Vega", "Curvature"] as const;
 const DEFAULT_GEN_ROWS = 200;
 const DEFAULT_GEN_FACTOR_POOL = 16;
 
+// Wave 5.49 — named generator presets replace the raw trade_pool / factor_pool
+// inputs in the advanced fieldset. "small" is the default and reproduces the
+// historical trade_pool=200 / factor_pool=16 sizing; "custom" reveals the raw
+// inputs for power users. The select sets internal tradePool / factorPool
+// state on change, so buildAdvancedConfig keeps shipping numeric
+// trade_pool_size / factor_pool_size — no API contract change.
+type GeneratorPreset = "small" | "single-desk" | "trading-book" | "full-bank" | "custom";
+const PRESETS: Record<Exclude<GeneratorPreset, "custom">, { label: string; tradePool: number; factorPool: number }> = {
+  "small":         { label: "Small desk (200 trades · 16 risk factors)",            tradePool: 200,    factorPool: 16  },
+  "single-desk":   { label: "Single desk realistic (2,000 trades · 32 risk factors)", tradePool: 2000,   factorPool: 32  },
+  "trading-book":  { label: "Trading book realistic (20,000 trades · 64 risk factors)", tradePool: 20000,  factorPool: 64  },
+  "full-bank":     { label: "Full bank (100,000 trades · 100 risk factors)",         tradePool: 100000, factorPool: 100 },
+};
+const DEFAULT_PRESET: GeneratorPreset = "small";
+const DEFAULT_GEN_TRADE_POOL = PRESETS[DEFAULT_PRESET].tradePool;
+
 const POLL_MS = 1000;
 const MAX_SAMPLES = 60;
 
@@ -608,7 +624,11 @@ function SyntheticGeneratorCard(props: { preflightGate?: () => Promise<Preflight
   const [classes, setClasses] = useState<Set<string>>(() => new Set(GENERATOR_CLASSES));
   const [sensTypes, setSensTypes] = useState<Set<string>>(() => new Set(["Delta", "Vega"]));
   const [seed, setSeed] = useState<string>("0");
-  const [tradePool, setTradePool] = useState<string>(""); // empty = auto (api derives)
+  // Wave 5.49 — default to the "small" preset's resolved trade/factor sizes
+  // so submit ships trade_pool_size=200, factor_pool_size=16 without needing
+  // the user to expand the (now-hidden) custom inputs.
+  const [preset, setPreset] = useState<GeneratorPreset>(DEFAULT_PRESET);
+  const [tradePool, setTradePool] = useState<string>(String(DEFAULT_GEN_TRADE_POOL));
   const [factorPool, setFactorPool] = useState<number>(DEFAULT_GEN_FACTOR_POOL);
   const [formError, setFormError] = useState<string | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(false);
@@ -738,6 +758,18 @@ function SyntheticGeneratorCard(props: { preflightGate?: () => Promise<Preflight
     setSeed(String(Math.floor(Math.random() * 1_000_000_000)));
   }
 
+  // Wave 5.49 — preset change drops the resolved trade / factor sizes into
+  // the existing state slots so buildAdvancedConfig keeps shipping numeric
+  // trade_pool_size / factor_pool_size. Selecting "custom" reveals the raw
+  // inputs pre-populated with the last preset's values.
+  function onPresetChange(next: GeneratorPreset): void {
+    setPreset(next);
+    if (next !== "custom") {
+      setTradePool(String(PRESETS[next].tradePool));
+      setFactorPool(PRESETS[next].factorPool);
+    }
+  }
+
   // Wave 5.47d — populate per-class targets with an even split of `rows`
   // across the currently-selected classes. Any remainder lands on the first
   // class so the totals sum to `rows` exactly.
@@ -795,6 +827,40 @@ function SyntheticGeneratorCard(props: { preflightGate?: () => Promise<Preflight
           {advancedOpen ? "▾" : "▸"} Advanced options
         </button>
         <div id="generator-form-advanced" className="generator-form__advanced-body">
+          {/* Wave 5.49 — named presets sit at the top of the advanced
+              fieldset; they update tradePool / factorPool state and hide the
+              raw inputs unless "Custom…" is picked. */}
+          <div className="generator-form__row">
+            <label htmlFor="gen-preset">Realistic profile</label>
+            <select
+              id="gen-preset"
+              data-testid="generator-preset"
+              value={preset}
+              disabled={busy}
+              onChange={(e) => onPresetChange(e.target.value as GeneratorPreset)}
+            >
+              {(Object.keys(PRESETS) as Array<Exclude<GeneratorPreset, "custom">>).map((k) => (
+                <option key={k} value={k}>{PRESETS[k].label}</option>
+              ))}
+              <option value="custom">Custom…</option>
+            </select>
+          </div>
+
+          <div className="generator-form__row">
+            <label htmlFor="gen-seed">Seed</label>
+            <input
+              id="gen-seed"
+              type="text"
+              value={seed}
+              disabled={busy}
+              onChange={(e) => setSeed(e.target.value)}
+            />
+            <button type="button" className="btn btn--secondary" onClick={onRandomSeed} disabled={busy}>
+              Random
+            </button>
+            <span className="generator-form__hint">Same seed + preset + classes ⇒ reproducible run</span>
+          </div>
+
           <div className="generator-form__row">
             <label htmlFor="gen-rows">Rows</label>
             <input
@@ -877,47 +943,40 @@ function SyntheticGeneratorCard(props: { preflightGate?: () => Promise<Preflight
             ))}
           </fieldset>
 
-          <div className="generator-form__row">
-            <label htmlFor="gen-seed">Seed</label>
-            <input
-              id="gen-seed"
-              type="text"
-              value={seed}
-              disabled={busy}
-              onChange={(e) => setSeed(e.target.value)}
-            />
-            <button type="button" className="btn btn--secondary" onClick={onRandomSeed} disabled={busy}>
-              Random
-            </button>
-          </div>
+          {/* Wave 5.49 — raw trade / factor pool inputs only surface when
+              the user picks "Custom…". Non-custom presets seed the same
+              underlying state slots, so the submit body is identical. */}
+          {preset === "custom" ? (
+            <>
+              <div className="generator-form__row">
+                <label htmlFor="gen-trade-pool">Trade pool size</label>
+                <input
+                  id="gen-trade-pool"
+                  type="number"
+                  min={1}
+                  max={10000}
+                  placeholder="auto"
+                  value={tradePool}
+                  disabled={busy}
+                  onChange={(e) => setTradePool(e.target.value)}
+                />
+                <span className="generator-form__hint">empty = auto (ceil(rows/10))</span>
+              </div>
 
-          <div className="generator-form__row">
-            <label htmlFor="gen-trade-pool">Trade pool size</label>
-            <input
-              id="gen-trade-pool"
-              type="number"
-              min={1}
-              max={10000}
-              placeholder="auto"
-              value={tradePool}
-              disabled={busy}
-              onChange={(e) => setTradePool(e.target.value)}
-            />
-            <span className="generator-form__hint">empty = auto (ceil(rows/10))</span>
-          </div>
-
-          <div className="generator-form__row">
-            <label htmlFor="gen-factor-pool">Risk factor pool size</label>
-            <input
-              id="gen-factor-pool"
-              type="number"
-              min={1}
-              max={256}
-              value={factorPool}
-              disabled={busy}
-              onChange={(e) => setFactorPool(Number(e.target.value) || 0)}
-            />
-          </div>
+              <div className="generator-form__row">
+                <label htmlFor="gen-factor-pool">Risk factor pool size</label>
+                <input
+                  id="gen-factor-pool"
+                  type="number"
+                  min={1}
+                  max={256}
+                  value={factorPool}
+                  disabled={busy}
+                  onChange={(e) => setFactorPool(Number(e.target.value) || 0)}
+                />
+              </div>
+            </>
+          ) : null}
 
           {/* Wave 5.47c — optional stop conditions. Whichever trips first
               halts the run; leaving all three empty preserves the historical
