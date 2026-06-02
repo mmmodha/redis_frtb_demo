@@ -36,7 +36,7 @@ describe("<AppShell />", () => {
   it("renders a left rail with the 6 locked navigation sections", () => {
     renderShell();
     const nav = screen.getByRole("navigation", { name: /primary/i });
-    const labels = ["Connections", "Sources", "Ingest", "Pivot", "Calc", "Observability"];
+    const labels = ["Connections", "Sources", "Ingest", "Search", "Calc", "Observability"];
     for (const label of labels) {
       expect(within(nav).getByRole("link", { name: label })).toBeInTheDocument();
     }
@@ -64,7 +64,7 @@ describe("<AppShell />", () => {
     expect(pill).toHaveTextContent("42 / 100");
     expect(pill).toHaveAttribute("role", "status");
     expect(pill).toHaveAttribute("aria-live", "polite");
-    expect(pill).toHaveAttribute("aria-label", "Pivot burst running, 42 of 100");
+    expect(pill).toHaveAttribute("aria-label", "Search burst running, 42 of 100");
     unmount();
 
     const idle: PivotBurstContextValue = {

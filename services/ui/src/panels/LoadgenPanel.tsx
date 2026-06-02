@@ -100,7 +100,7 @@ export function LoadgenPanel() {
   return (
     <PanelCard title="Concurrent Load">
       <EnterpriseCallout signal="Functions">
-        Drives a configurable workforce of pivot + calc clients against the
+        Drives a configurable workforce of search + calc clients against the
         api so observability tiles light up under realistic load.
         <strong> 200 concurrent users · target p99 &lt; 500ms.</strong>
       </EnterpriseCallout>

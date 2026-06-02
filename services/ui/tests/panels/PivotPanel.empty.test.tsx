@@ -73,7 +73,7 @@ describe("<PivotPanel /> friendly empty-target banner (Wave 5.16z3)", () => {
     expect(banner.textContent).toMatch(/Bootstrapping/i);
     expect(banner.textContent).toMatch(/test2/);
     expect(banner.textContent).toMatch(/library-loading/);
-    expect(banner.textContent).toMatch(/Pivot will be available/i);
+    expect(banner.textContent).toMatch(/Search will be available/i);
     expect(screen.queryByRole("alert")).toBeNull();
   });
 

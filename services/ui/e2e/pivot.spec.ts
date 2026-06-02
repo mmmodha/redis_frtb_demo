@@ -42,7 +42,7 @@ test.describe("/pivot — Query/Pivot panel", () => {
     });
 
     await page.goto("/pivot");
-    await expect(page.getByRole("heading", { name: /^Pivot$/, level: 1 })).toBeVisible();
+    await expect(page.getByRole("heading", { name: /^Search$/, level: 1 })).toBeVisible();
     await expect(page.getByText(/RedisQueryEngine/)).toBeVisible();
 
     await page.getByLabel(/risk class/i).selectOption("GIRR");
@@ -50,7 +50,7 @@ test.describe("/pivot — Query/Pivot panel", () => {
     await page.getByLabel(/sensitivity type/i).selectOption("Delta");
     await page.getByRole("button", { name: /run query/i }).click();
 
-    const table = page.getByRole("table", { name: /pivot results/i });
+    const table = page.getByRole("table", { name: /search results/i });
     await expect(table).toBeVisible();
     await expect(table.getByText("sens:{GIRR:USD-IRS}:01HXAA")).toBeVisible();
     await expect(table.getByText("sens:{GIRR:USD-IRS}:01HXBB")).toBeVisible();
@@ -79,7 +79,7 @@ test.describe("/pivot — Query/Pivot panel", () => {
     await page.getByLabel(/risk class/i).selectOption("FX");
     await page.getByRole("button", { name: /run query/i }).click();
     await expect(page.getByText(/no sensitivities match these filters/i)).toBeVisible();
-    await expect(page.getByRole("table", { name: /pivot results/i })).toHaveCount(0);
+    await expect(page.getByRole("table", { name: /search results/i })).toHaveCount(0);
   });
 
   test("error state surfaces an alert when the api responds 5xx", async ({ page }) => {
@@ -124,7 +124,7 @@ test.describe("/pivot — Query/Pivot panel", () => {
     });
     await page.goto("/pivot");
     await page.getByRole("button", { name: /run query/i }).click();
-    await expect(page.getByRole("table", { name: /pivot results/i })).toBeVisible();
+    await expect(page.getByRole("table", { name: /search results/i })).toBeVisible();
     await page.getByRole("button", { name: /next/i }).click();
     await expect.poll(() => calls.length).toBeGreaterThanOrEqual(2);
     expect(calls[1]).toContain("offset=100");

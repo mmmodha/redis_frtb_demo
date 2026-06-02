@@ -23,7 +23,7 @@
 - [ ] **Smoke check `GET /redis/active-target`** — returns `demo-cluster` host/port/tls (no password leak).
 - [ ] **Open the UI:** `http://localhost:5173`. Confirm:
   - Active-target pill in header shows green `demo-cluster`.
-  - Left rail renders all 6 sections (Connections, Sources, Ingest, Pivot, Calc, Observability) + Loadgen (Wave 4.2 once live).
+  - Left rail renders all 6 sections (Connections, Sources, Ingest, Search, Calc, Observability) + Loadgen (Wave 4.2 once live).
 - [ ] **Pre-warm a sample upload** so the Sources wizard appears instantly during the demo:
   - Go to `/sources` → drag-drop the small `girr-sample-100k.csv` (lives under `data/samples/`).
   - Click **Infer**. Confirm columns auto-detect. Leave the wizard idle but warmed.

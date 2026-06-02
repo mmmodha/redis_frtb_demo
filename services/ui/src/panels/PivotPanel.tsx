@@ -59,7 +59,7 @@ export function PivotPanel(): JSX.Element {
         // not real failures — surface them as an amber banner instead.
         const friendly = checkEmptyTargetError(res.status, await readErrorBody(res));
         if (friendly) throw friendly;
-        throw new Error(`Pivot failed (HTTP ${res.status})`);
+        throw new Error(`Search failed (HTTP ${res.status})`);
       }
       const body = (await res.json()) as PivotResp;
       setOffset(nextOffset);
@@ -69,7 +69,7 @@ export function PivotPanel(): JSX.Element {
       if (e instanceof EmptyTargetError) {
         setEmptyError(e);
       } else {
-        const msg = e instanceof Error ? e.message : "Failed to load pivot";
+        const msg = e instanceof Error ? e.message : "Failed to load search";
         setError(msg);
       }
       return false;
@@ -106,7 +106,7 @@ export function PivotPanel(): JSX.Element {
         if (err instanceof EmptyTargetError) {
           setEmptyError(err);
         } else {
-          setError(err.message || "Failed to load pivot");
+          setError(err.message || "Failed to load search");
         }
       },
     });
@@ -117,7 +117,7 @@ export function PivotPanel(): JSX.Element {
 
   return (
     <div className="pivot-panel">
-      <h1>Pivot</h1>
+      <h1>Search</h1>
       <EnterpriseCallout signal="RedisQueryEngine">
         Sub-100ms FT.SEARCH across millions of native-JSON sensitivity docs — no flattening, no JOIN tax.
       </EnterpriseCallout>
@@ -207,7 +207,7 @@ export function PivotPanel(): JSX.Element {
 
       {result !== null && result.ms < 100 && (
         <div data-testid="sub-100ms-callout" className="pivot-sub100" role="status">
-          <strong>Sub-100ms</strong> on Redis Enterprise — last pivot returned in <strong>{result.ms}</strong> ms.
+          <strong>Sub-100ms</strong> on Redis Enterprise — last search returned in <strong>{result.ms}</strong> ms.
         </div>
       )}
 
@@ -238,7 +238,7 @@ export function PivotPanel(): JSX.Element {
             <>
               Bootstrapping <strong>{emptyError.target_label ?? "this target"}</strong>
               {emptyError.bootstrap_phase ? <> — {emptyError.bootstrap_phase}</> : null}.
-              Pivot will be available once it's ready.
+              Search will be available once it's ready.
             </>
           ) : (
             <>
@@ -268,7 +268,7 @@ export function PivotPanel(): JSX.Element {
             </span>
           }
         >
-          <table aria-label="Pivot results" className="pivot-table">
+          <table aria-label="Search results" className="pivot-table">
             <thead>
               <tr>
                 <th>Key</th>

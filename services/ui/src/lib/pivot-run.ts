@@ -44,7 +44,7 @@ export async function runPivot(
   if (!res.ok) {
     const friendly = checkEmptyTargetError(res.status, await readErrorBody(res));
     if (friendly) throw friendly;
-    throw new Error(`Pivot failed (HTTP ${res.status})`);
+    throw new Error(`Search failed (HTTP ${res.status})`);
   }
   const body = (await res.json()) as PivotResp;
   return { body, clientMs: Math.round((t1 - t0) * 1000) / 1000 };

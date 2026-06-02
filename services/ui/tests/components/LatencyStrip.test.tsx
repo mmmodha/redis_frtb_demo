@@ -7,7 +7,7 @@ describe("<LatencyStrip />", () => {
     render(<LatencyStrip server={[]} client={[]} />);
     const strip = screen.getByTestId("latency-strip");
     expect(strip).toHaveAttribute("data-empty", "true");
-    expect(strip).toHaveTextContent(/Run a pivot to start collecting samples\./);
+    expect(strip).toHaveTextContent(/Run a search to start collecting samples\./);
   });
 
   it("renders 100 bar groups when given 100 samples for both series", () => {

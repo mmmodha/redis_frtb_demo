@@ -43,16 +43,16 @@ Buying-signal numbers refer to the "Why Redis Enterprise" table in the spec.
 - **Buying signal:** #1 JSON as a native data shape.
 - **Narration:** "Open one GIRR row in the inspector — `risk_value` is a ten-tenor JSON array, stored in place. No row explosion, no flattening, no JOIN tax. Your file shape, untouched. This is ReJSON, bundled in the Enterprise module set."
 - **Objection:** "We can store this in Oracle as JSON too."
-- **Rebuttal:** "Oracle JSON is parsed on read — sub-second pivots over 10M nested docs are not on the menu. ReJSON in Redis Enterprise gives you JSONPath partial updates *and* a search index over JSON fields. No other operational store offers both."
+- **Rebuttal:** "Oracle JSON is parsed on read — sub-second searches over 10M nested docs are not on the menu. ReJSON in Redis Enterprise gives you JSONPath partial updates *and* a search index over JSON fields. No other operational store offers both."
 - **Fallback:** If the inspector won't render the row, drop into a terminal and run `JSON.GET sens:{GIRR:USD-IRS}:01HZ...` so the bank sees the raw shape.
 
-## Step 5 — Pivot at speed (3 min)
+## Step 5 — Search at speed (3 min)
 
 - **Buying signal:** #2 Redis Query Engine on JSON.
 - **Narration:** "Same JSON document we showed in step 4 — Redis Query Engine indexed it, GROUPBY + REDUCE returns in 80 ms over 2M rows. Architecture proves <2s; 10M-row production scales linearly per-shard. Try that on your current store."
 - **Objection:** "We could do this in ClickHouse / Snowflake."
 - **Rebuttal:** "Those are columnar warehouses. They cannot run in-database SBM math, they cannot be the live calc engine, and they cannot store this shape without flattening. Redis is the *operational* layer that feeds them and serves your analysts in real time."
-- **Fallback:** If the pivot stalls past 1 s, drop the limit to 1M rows and re-run; narrate that the p99 latency in the histogram is the real number, not the single-query wall-clock.
+- **Fallback:** If the search stalls past 1 s, drop the limit to 1M rows and re-run; narrate that the p99 latency in the histogram is the real number, not the single-query wall-clock.
 
 ## Step 6 — SBM Delta calc (3 min)
 
@@ -73,7 +73,7 @@ Buying-signal numbers refer to the "Why Redis Enterprise" table in the spec.
 ## Step 8 — Concurrent workforce scenario (3 min)
 
 - **Buying signal:** #2 Redis Query Engine; #3 In-database compute; #10 Performance per node.
-- **Narration:** "200 simulated tenant analysts running mixed pivot + calc queries. Watch the p99 latency — it holds. Ops/sec per shard stays high, memory is stable, no thread contention. This is what multi-threaded Enterprise shards give you that OSS does not."
+- **Narration:** "200 simulated tenant analysts running mixed search + calc queries. Watch the p99 latency — it holds. Ops/sec per shard stays high, memory is stable, no thread contention. This is what multi-threaded Enterprise shards give you that OSS does not."
 - **Objection:** "We'd just scale our existing stack horizontally."
 - **Rebuttal:** "Your incumbent stack scales by adding JVM instances and load-balancing — every instance is a stateless replica of the calc logic but still hits the same Oracle bottleneck. Redis Enterprise scales by adding shards: each shard owns its slice of data, runs its own calc. Linear scale-out, hash-tag locality, no shared bottleneck."
 - **Fallback:** If loadgen flakes, narrate the previously captured load-test report from the asset pack; the numbers are the same.
@@ -81,7 +81,7 @@ Buying-signal numbers refer to the "Why Redis Enterprise" table in the spec.
 ## Step 9 — Extensibility (schema swap) (2 min)
 
 - **Buying signal:** #1 JSON shape flexibility; #3 Functions generalise.
-- **Narration:** "Live-swap the schema YAML. Rerun pivot and Equity + FX calcs on the new shape. No code changes, no redeploy — the entire pipeline (generator, ingest, indexes, calc) is config-driven."
+- **Narration:** "Live-swap the schema YAML. Rerun search and Equity + FX calcs on the new shape. No code changes, no redeploy — the entire pipeline (generator, ingest, indexes, calc) is config-driven."
 - **Objection:** "Schema changes always require code changes in our world."
 - **Rebuttal:** "Because your current pipeline has the schema *embedded* in the ETL code and the calc code. Here, the schema YAML drives `FT.CREATE`, the Functions' field bindings, and the UI. JSON-native storage means the document shape is data, not code. Day-2 schema changes are a YAML PR."
 - **Fallback:** If the swap fails mid-demo, switch to a pre-recorded clip and narrate the architecture — the message is "config-driven", not "live YAML edit drama".
@@ -105,7 +105,7 @@ Buying-signal numbers refer to the "Why Redis Enterprise" table in the spec.
 ## Step 12 — Close + Q&A (2 min)
 
 - **Buying signal:** Recap of all proven signals; sets up POC + procurement.
-- **Narration:** "Today you saw JSON-native storage, sub-second RQE pivots, in-database SBM compute via Redis Functions, multi-threaded shard scale-out, Auto Tiering for the 450M scale story, and HA failover — all inside the bank's perimeter. Next step is a scoped POC against one of your own desks; the asset pack covers procurement and Professional Services."
+- **Narration:** "Today you saw JSON-native storage, sub-second RQE searches, in-database SBM compute via Redis Functions, multi-threaded shard scale-out, Auto Tiering for the 450M scale story, and HA failover — all inside the bank's perimeter. Next step is a scoped POC against one of your own desks; the asset pack covers procurement and Professional Services."
 - **Objection:** "What's the realistic timeline to production?"
 - **Rebuttal:** "Two-week POC on one risk class with your own data, four-week pilot across GIRR + Equity + FX, eight-week production rollout via the K8s Operator. Professional Services scopes the Auto Tiering sizing and the Active-Active geo topology in parallel."
 - **Fallback:** If Q&A goes sideways, return to the buying-signal table in the deck — every answer ties back to one of the 13 signals.

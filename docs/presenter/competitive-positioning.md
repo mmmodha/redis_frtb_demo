@@ -12,7 +12,7 @@ The buying signals referenced (#1 .. #13) are defined in the "Why Redis Enterpri
 
 **What OSS Redis cannot do for this workload:**
 
-- **Single-threaded shards.** OSS Redis is single-threaded per shard. Enterprise shards are multi-threaded and the Enterprise proxy is multi-threaded — for the same FRTB ingest + concurrent-pivot workload you need 2–3× fewer Enterprise nodes (signal #10).
+- **Single-threaded shards.** OSS Redis is single-threaded per shard. Enterprise shards are multi-threaded and the Enterprise proxy is multi-threaded — for the same FRTB ingest + concurrent-search workload you need 2–3× fewer Enterprise nodes (signal #10).
 - **No Auto Tiering.** OSS holds the entire dataset in RAM. The 450M-row scale story does not exist on OSS — full stop. Auto Tiering (RAM + NVMe in one logical DB) is a Redis Enterprise *exclusive* (signal #5).
 - **No Active-Active CRDTs.** The bank's London / Hong Kong / New York / Singapore desks each need local-write latency. OSS Redis offers only async replication. Active-Active is Enterprise-exclusive (signal #12).
 - **No RBAC, no ACL UI, no TLS-by-default, no audit log SIEM integration.** Bolt-on at best on OSS. First-class on Enterprise (signals #7, #13).

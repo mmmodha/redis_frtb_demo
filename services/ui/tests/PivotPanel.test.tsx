@@ -159,7 +159,7 @@ describe("PivotPanel", () => {
     fetchMock.mockResolvedValueOnce({ ok: true, json: async () => pivotResponse() });
     renderPanel();
     fireEvent.click(screen.getByRole("button", { name: /run query/i }));
-    const table = await screen.findByRole("table", { name: /pivot results/i });
+    const table = await screen.findByRole("table", { name: /search results/i });
     const rows = within(table).getAllByRole("row");
     // header + 2 data rows
     expect(rows.length).toBe(3);
@@ -181,7 +181,7 @@ describe("PivotPanel", () => {
     renderPanel();
     fireEvent.click(screen.getByRole("button", { name: /run query/i }));
     await screen.findByText(/no sensitivities match these filters/i);
-    expect(screen.queryByRole("table", { name: /pivot results/i })).toBeNull();
+    expect(screen.queryByRole("table", { name: /search results/i })).toBeNull();
   });
 
   it("renders an error state when the fetch fails", async () => {
@@ -235,7 +235,7 @@ describe("PivotPanel", () => {
       .mockResolvedValueOnce({ ok: true, json: async () => pivotResponse({ total: 250 }) });
     renderPanel();
     fireEvent.click(screen.getByRole("button", { name: /run query/i }));
-    await screen.findByRole("table", { name: /pivot results/i });
+    await screen.findByRole("table", { name: /search results/i });
     fireEvent.click(screen.getByRole("button", { name: /next/i }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
     const url = String(fetchMock.mock.calls[1]![0]);
@@ -249,7 +249,7 @@ describe("PivotPanel", () => {
       .mockResolvedValueOnce({ ok: true, json: async () => pivotResponse({ total: 250 }) });
     renderPanel();
     fireEvent.click(screen.getByRole("button", { name: /run query/i }));
-    await screen.findByRole("table", { name: /pivot results/i });
+    await screen.findByRole("table", { name: /search results/i });
     expect(screen.getByRole("button", { name: /previous/i })).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: /next/i }));
     await waitFor(() => expect(screen.getByRole("button", { name: /previous/i })).toBeEnabled());
@@ -412,6 +412,6 @@ describe("PivotPanel", () => {
       expect(within(screen.getByTestId("latency-strip-headline")).getByText(/n = 0/)).toBeInTheDocument(),
     );
     // Empty-state text reappears on the SVG.
-    expect(screen.getByText(/Run a pivot to start collecting samples/i)).toBeInTheDocument();
+    expect(screen.getByText(/Run a search to start collecting samples/i)).toBeInTheDocument();
   });
 });

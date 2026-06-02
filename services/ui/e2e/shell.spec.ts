@@ -8,7 +8,7 @@ test.describe("UI shell", () => {
     await page.goto("/observability");
     await expect(page.getByRole("banner")).toContainText(/FRTB SBM/i);
     const nav = page.getByRole("navigation", { name: /primary/i });
-    for (const label of ["Connections", "Sources", "Ingest", "Pivot", "Calc", "Observability"]) {
+    for (const label of ["Connections", "Sources", "Ingest", "Search", "Calc", "Observability"]) {
       await expect(nav.getByRole("link", { name: label })).toBeVisible();
     }
   });

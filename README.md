@@ -10,7 +10,7 @@ Seven microservices, each fault-isolated, each killable without bringing down th
 
 | Service       | Purpose                                                                      |
 |---------------|------------------------------------------------------------------------------|
-| `ui`          | Next.js frontend — Connections, Ingest, Pivot, Calc, Observability panels    |
+| `ui`          | Next.js frontend — Connections, Ingest, Search, Calc, Observability panels   |
 | `api`         | Fastify gateway — proxies UI → Redis, owns the active-target router          |
 | `generator`   | Synthetic FRTB sensitivity producer — streams into Redis Streams             |
 | `source`      | File/upload ingestion — column-mapping wizard, CSV/JSONL/Parquet readers     |

@@ -11,7 +11,7 @@ const SECTIONS = [
   { to: "/connections", label: "Connections" },
   { to: "/sources", label: "Sources" },
   { to: "/ingest", label: "Ingest" },
-  { to: "/pivot", label: "Pivot" },
+  { to: "/pivot", label: "Search" },
   { to: "/calc", label: "Calc" },
   { to: "/observability", label: "Observability" },
   { to: "/explorer", label: "JSON Explorer" },
@@ -73,7 +73,7 @@ export function AppShell({ children }: AppShellProps) {
                   data-testid="pivot-burst-nav-pill"
                   role="status"
                   aria-live="polite"
-                  aria-label={`Pivot burst running, ${burst.done} of ${burst.total}`}
+                  aria-label={`Search burst running, ${burst.done} of ${burst.total}`}
                 >
                   {burst.done} / {burst.total}
                 </span>

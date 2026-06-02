@@ -10,7 +10,7 @@ const routes: Array<{ path: string; label: string; heading: RegExp }> = [
   { path: "/connections", label: "Connections", heading: /^Connections$/ },
   { path: "/sources", label: "Sources", heading: /^Sources$/ },
   { path: "/ingest", label: "Ingest", heading: /^Ingest$/ },
-  { path: "/pivot", label: "Pivot", heading: /^Pivot$/ },
+  { path: "/pivot", label: "Search", heading: /^Search$/ },
   { path: "/calc", label: "Calc", heading: /^Calc$/ },
   { path: "/observability", label: "Observability", heading: /^Observability$/ },
 ];

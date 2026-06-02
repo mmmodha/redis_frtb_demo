@@ -63,18 +63,18 @@ Each step lists: **Purpose · What to click · What to narrate · Acceptance cri
 
 - **Purpose:** Prove JSON-as-native. No row explosion.
 - **Click:**
-  1. Click **Pivot** → set Risk Class = `GIRR`, Bucket = `USD-IRS`, Sensitivity = `Delta` → **Run pivot**.
+  1. Click **Search** → set Risk Class = `GIRR`, Bucket = `USD-IRS`, Sensitivity = `Delta` → **Run query**.
   2. Click any returned row to expand → point at `risk_value: [...10 tenor sensitivities]`.
 - **Narrate:** *"Your file shape, untouched. Ten tenor sensitivities live inside one document as a JSON array. No row explosion, no JOIN tax, no flattening into 10× the storage."*
 - **Buying signal:** #1.
 - **Acceptance criterion proved:** `Redis stores GIRR rows with risk_value as a native JSON array (10 tenor points)`.
 - **Fallback:** Show pre-captured `docs/asset-pack/json-shape.png` in the asset pack.
 
-## Step 5 — Pivot at speed (3 min, live app)
+## Step 5 — Search at speed (3 min, live app)
 
 - **Purpose:** Redis Query Engine on JSON, sub-100ms over millions of rows.
 - **Click:**
-  1. Stay in **Pivot**. Run a GROUPBY pivot across all GIRR buckets, grouped by bucket + tenor.
+  1. Stay in **Search**. Run a GROUPBY query across all GIRR buckets, grouped by bucket + tenor.
   2. Run it three more times → watch the **p50 / p95 / p99** histogram tighten.
 - **Narrate:** *"Same JSON documents from step 4. Redis Query Engine indexed them. p99 under 250ms over 2M rows. Try that on a KV store. Try that on a columnar warehouse without ETL. Architecture proves <2s; 10M-row production scales linearly per-shard."*
 - **Buying signal:** #2.
@@ -196,7 +196,7 @@ Each step lists: **Purpose · What to click · What to narrate · Acceptance cri
 | 2a Connections + Sources | 1:00 | 3:00 |
 | 3 Ingest | 3:00 | 6:00 |
 | 4 Array shape | 1:00 | 7:00 |
-| 5 Pivot | 3:00 | 10:00 |
+| 5 Search | 3:00 | 10:00 |
 | 6 Delta calc (MVP) | 3:00 | 13:00 |
 | 7 Vega calc | 2:00 | 15:00 |
 | 8 Concurrent load | 3:00 | 18:00 |

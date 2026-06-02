@@ -27,9 +27,9 @@ describe("<App /> routes", () => {
     expect(screen.getByRole("heading", { name: /ingest/i, level: 1 })).toBeInTheDocument();
   });
 
-  it("renders the Pivot panel at /pivot", () => {
+  it("renders the Search panel at /pivot", () => {
     renderAt("/pivot");
-    expect(screen.getByRole("heading", { name: /pivot/i, level: 1 })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /search/i, level: 1 })).toBeInTheDocument();
   });
 
   it("renders the Calc panel at /calc", () => {
