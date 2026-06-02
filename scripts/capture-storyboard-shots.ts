@@ -228,11 +228,33 @@ async function renderStaticHtml(browser: Browser, html: string, outName: string)
   await ctx.close();
 }
 
+// Wave 5.33 — env-gated regression boundary. When CAPTURE_ONLY_NEW=1 the
+// existing 13-beat block is skipped so re-running the script only refreshes
+// the nine new PNGs added in Wave 5.32 (MANIFEST table). Default behaviour
+// (env unset) runs the full sweep so a clean-room re-capture still works.
+const CAPTURE_ONLY_NEW = process.env.CAPTURE_ONLY_NEW === "1";
+
 async function main() {
   const browser = await chromium.launch();
   const ctx = await browser.newContext({ viewport: VIEWPORT });
   const page = await ctx.newPage();
 
+  if (!CAPTURE_ONLY_NEW) {
+    await captureExistingBeats(browser, page);
+  }
+  await captureWave533Beats(browser, page);
+
+  await ctx.close();
+  await browser.close();
+  console.log(
+    CAPTURE_ONLY_NEW
+      ? "✅ Wave 5.33 — 9 new beats captured into "
+      : "✅ all 22 beats captured into ",
+    OUT,
+  );
+}
+
+async function captureExistingBeats(browser: Browser, page: Page) {
   // CalcPanel defaults to GIRR + Delta, so the "fresh-load landing" (beat-00)
   // and the "presenter explicitly selects GIRR + Delta" state (beat-01) are
   // intentionally visually identical. Coordinator confirmed in the Wave 5.26
@@ -347,10 +369,382 @@ async function main() {
 
   console.log("→ beat-11 closer slide (static HTML)");
   await renderStaticHtml(browser, closerSlideHtml(), "beat-11-closer");
+}
 
-  await ctx.close();
-  await browser.close();
-  console.log("✅ all 13 beats captured into", OUT);
+// ─────────────────────────────────────────────────────────────────────────────
+// Wave 5.33 — new beats (11 refine / 12 regime / 13 exclude / 14 typeahead)
+//
+// The four Wave 5.32 storyboard beats exercise UI surfaces that did not exist
+// in Wave 5.26: the bucket-subset pill row, the §21.6 regime segmented control,
+// the Advanced filters chip combobox, and the SuggestCombobox listbox. The api
+// surfaces that drive these beats (5.30a /suggest, 5.31a-c bucket_subset /
+// correlation_regime / exclude_* fields) are wired through Playwright route
+// interception so the captures are deterministic and match the MANIFEST
+// narrative verbatim regardless of the underlying api build, dataset jitter,
+// or hardware-dependent fanout latency. This mirrors the existing static-HTML
+// pattern used for beat-05 / beat-10-memory / beat-11-closer.
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface CalcSbmMockOptions {
+  charge: number;
+  fanout_ms: number;
+  total_ms: number;
+  buckets: Array<{ bucket: string; K_b: number; S_b: number; count: number }>;
+  discoveryQuery: string;
+  argTemplateSuffix: string;
+  regime?: { name: "low" | "medium" | "high"; factor: number; cap: number; note: string };
+  correlationRegime?: "low" | "medium" | "high";
+}
+
+function buildCalcSbmMock(opts: CalcSbmMockOptions) {
+  const dispatchedKeys = opts.buckets.map((b) => `sens:{GIRR:${b.bucket}}:_route`);
+  const body: Record<string, unknown> = {
+    charge: opts.charge,
+    per_bucket: opts.buckets.map((b) => ({ ...b, ms: 0 })),
+    total_ms: opts.total_ms,
+    shard_breakdown: opts.buckets.map((b) => ({ shard: b.bucket, buckets: [b.bucket], ms: 0 })),
+    fanout_ms: opts.fanout_ms,
+    commands: {
+      discovery: {
+        command: "FT.AGGREGATE",
+        index: "idx:sens",
+        query: opts.discoveryQuery,
+        groupby: ["@bucket"],
+        reducers: ["COUNT 0 AS n"],
+      },
+      fcall: {
+        command: "FCALL",
+        function: "sbm_delta_bucket",
+        library: "frtb",
+        arg_template: `FCALL sbm_delta_bucket 1 sens:{GIRR:<bucket>}:_route GIRR <bucket>${opts.argTemplateSuffix}`,
+        dispatched_keys: dispatchedKeys,
+      },
+      ...(opts.regime ? { regime: opts.regime } : {}),
+    },
+    ...(opts.correlationRegime ? { correlation_regime: opts.correlationRegime } : {}),
+  };
+  return body;
+}
+
+async function mockCalcOnce(page: Page, body: object) {
+  let consumed = false;
+  await page.route("**/calc/sbm", async (route) => {
+    if (consumed) {
+      await route.fallback();
+      return;
+    }
+    consumed = true;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(body),
+    });
+  });
+}
+
+async function clickCalculate(page: Page) {
+  await page.getByTestId("calc-cta").click();
+  await page.waitForSelector('[data-testid="calc-charge"]', { timeout: 20_000 });
+  await page.waitForTimeout(1100);
+}
+
+async function captureWave533Beats(browser: Browser, page: Page) {
+  // Canonical 11-bucket GIRR Delta baseline used by the before/off shots.
+  const ALL_BUCKETS = [
+    { bucket: "USD", K_b: 0.2139, S_b: 0.214, count: 65 },
+    { bucket: "EUR", K_b: 0.2811, S_b: 0.282, count: 66 },
+    { bucket: "GBP", K_b: 0.2509, S_b: -0.046, count: 57 },
+    { bucket: "JPY", K_b: 0.2843, S_b: 0.218, count: 71 },
+    { bucket: "CAD", K_b: 0.1277, S_b: 0.061, count: 55 },
+    { bucket: "AUD", K_b: 0.2464, S_b: 0.177, count: 70 },
+    { bucket: "CHF", K_b: 0.1350, S_b: -0.042, count: 58 },
+    { bucket: "SEK", K_b: 0.3069, S_b: -0.286, count: 69 },
+    { bucket: "NOK", K_b: 0.2443, S_b: 0.245, count: 59 },
+    { bucket: "NZD", K_b: 0.2085, S_b: -0.200, count: 61 },
+    { bucket: "OTHER", K_b: 0.1186, S_b: -0.061, count: 74 },
+  ];
+
+  // ── beat-11 refine ────────────────────────────────────────────────────────
+  console.log("→ beat-11-refine-before (GIRR Delta · all 11 buckets)");
+  await mockCalcOnce(
+    page,
+    buildCalcSbmMock({
+      charge: 0.6846,
+      fanout_ms: 174,
+      total_ms: 288,
+      buckets: ALL_BUCKETS,
+      discoveryQuery: "@risk_class:{GIRR}",
+      argTemplateSuffix: ' "" "" ""',
+    }),
+  );
+  await gotoCalc(page);
+  await setRiskClass(page, "GIRR");
+  await setSensitivity(page, "Delta");
+  await clickCalculate(page);
+  await page.locator('[data-testid="calc-charge"]').scrollIntoViewIfNeeded();
+  await page.waitForTimeout(200);
+  await snapPage(page, "beat-11-refine-before");
+
+  console.log("→ beat-11-refine-after (subset = CAD/SEK/JPY)");
+  // Toggle 8 pills off — keep CAD, SEK, JPY selected.
+  const KEEP = new Set(["CAD", "SEK", "JPY"]);
+  for (const b of ALL_BUCKETS) {
+    if (KEEP.has(b.bucket)) continue;
+    await page.locator(`[data-testid="refine-bucket-pill"][data-bucket="${b.bucket}"]`).click();
+  }
+  await page.waitForTimeout(200);
+  await mockCalcOnce(
+    page,
+    buildCalcSbmMock({
+      charge: 0.4187,
+      fanout_ms: 55,
+      total_ms: 121,
+      buckets: ALL_BUCKETS.filter((b) => KEEP.has(b.bucket)),
+      discoveryQuery: "@risk_class:{GIRR} @bucket:{CAD|SEK|JPY}",
+      argTemplateSuffix: ' "" "" ""',
+    }),
+  );
+  await clickCalculate(page);
+  await page.locator('[data-testid="calc-charge"]').scrollIntoViewIfNeeded();
+  await page.waitForTimeout(200);
+  await snapPage(page, "beat-11-refine-after");
+
+  // ── beat-12 regime ────────────────────────────────────────────────────────
+  console.log("→ beat-12-regime-low (Low selected · γ × 0.75)");
+  await gotoCalc(page);
+  await setRiskClass(page, "GIRR");
+  await setSensitivity(page, "Delta");
+  await page.locator('[data-testid="regime-option-low"]').click();
+  await page.waitForTimeout(150);
+  await mockCalcOnce(
+    page,
+    buildCalcSbmMock({
+      charge: 0.5391,
+      fanout_ms: 168,
+      total_ms: 281,
+      buckets: ALL_BUCKETS,
+      discoveryQuery: "@risk_class:{GIRR}",
+      argTemplateSuffix: ' "" "" ""',
+      regime: { name: "low", factor: 0.75, cap: 1.0, note: "γ × 0.75" },
+      correlationRegime: "low",
+    }),
+  );
+  await clickCalculate(page);
+  await page.locator('[data-testid="calc-charge"]').scrollIntoViewIfNeeded();
+  await page.waitForTimeout(200);
+  await snapPage(page, "beat-12-regime-low");
+
+  console.log("→ beat-12-regime-high (High selected · γ × 1.25, cap 1.0)");
+  await gotoCalc(page);
+  await setRiskClass(page, "GIRR");
+  await setSensitivity(page, "Delta");
+  await page.locator('[data-testid="regime-option-high"]').click();
+  await page.waitForTimeout(150);
+  await mockCalcOnce(
+    page,
+    buildCalcSbmMock({
+      charge: 0.8312,
+      fanout_ms: 171,
+      total_ms: 286,
+      buckets: ALL_BUCKETS,
+      discoveryQuery: "@risk_class:{GIRR}",
+      argTemplateSuffix: ' "" "" ""',
+      regime: { name: "high", factor: 1.25, cap: 1.0, note: "γ × 1.25, each ρ_bc capped at 1.0" },
+      correlationRegime: "high",
+    }),
+  );
+  await clickCalculate(page);
+  await page.locator('[data-testid="calc-charge"]').scrollIntoViewIfNeeded();
+  await page.waitForTimeout(200);
+  await snapPage(page, "beat-12-regime-high");
+
+  // ── beat-13 exclude ───────────────────────────────────────────────────────
+  console.log("→ beat-13-exclude-off (Advanced filters empty · arg_template baseline)");
+  await gotoCalc(page);
+  await setRiskClass(page, "GIRR");
+  await setSensitivity(page, "Delta");
+  await mockCalcOnce(
+    page,
+    buildCalcSbmMock({
+      charge: 0.6846,
+      fanout_ms: 174,
+      total_ms: 288,
+      buckets: ALL_BUCKETS,
+      discoveryQuery: "@risk_class:{GIRR}",
+      argTemplateSuffix: ' "" "" ""',
+    }),
+  );
+  await clickCalculate(page);
+  // Open the Advanced filters disclosure so the empty filter chips are visible.
+  await page.locator('[data-testid="advanced-filters-summary"]').click();
+  // Scroll to the per-bucket K_b chart so the captured viewport shows both
+  // the chart and the commands panel below it.
+  await page.locator('[data-testid="bucket-chart"]').scrollIntoViewIfNeeded();
+  await page.waitForTimeout(250);
+  await snapPage(page, "beat-13-exclude-off");
+
+  console.log("→ beat-13-exclude-on (RF_GIRR_05 chip · arg_template suffix RF_GIRR_05)");
+  await gotoCalc(page);
+  await setRiskClass(page, "GIRR");
+  await setSensitivity(page, "Delta");
+  // Open Advanced filters, focus the exclude-risk_factor input, type and Enter.
+  await page.locator('[data-testid="advanced-filters-summary"]').click();
+  const rfInput = page.locator('[data-testid="exclude-risk_factor"] input[role="combobox"]');
+  await rfInput.click();
+  await rfInput.fill("RF_GIRR_05");
+  await rfInput.press("Enter");
+  await page.waitForTimeout(200);
+  // Affected-bucket K_b drops materially: shave ~30% off the largest bucket.
+  const reducedBuckets = ALL_BUCKETS.map((b) =>
+    b.bucket === "SEK" ? { ...b, K_b: 0.2150, count: 62 } : b,
+  );
+  await mockCalcOnce(
+    page,
+    buildCalcSbmMock({
+      charge: 0.5827,
+      fanout_ms: 178,
+      total_ms: 292,
+      buckets: reducedBuckets,
+      discoveryQuery: "@risk_class:{GIRR}",
+      argTemplateSuffix: ' "" "" RF_GIRR_05',
+    }),
+  );
+  await clickCalculate(page);
+  await page.locator('[data-testid="bucket-chart"]').scrollIntoViewIfNeeded();
+  await page.waitForTimeout(250);
+  await snapPage(page, "beat-13-exclude-on");
+
+  // ── beat-14 typeahead ─────────────────────────────────────────────────────
+  console.log("→ beat-14-typeahead-dropdown (book combobox · RA prefix)");
+  await gotoCalc(page);
+  await setRiskClass(page, "GIRR");
+  await setSensitivity(page, "Delta");
+  await mockCalcOnce(
+    page,
+    buildCalcSbmMock({
+      charge: 0.6846,
+      fanout_ms: 174,
+      total_ms: 288,
+      buckets: ALL_BUCKETS,
+      discoveryQuery: "@risk_class:{GIRR}",
+      argTemplateSuffix: ' "" "" ""',
+    }),
+  );
+  await clickCalculate(page);
+  await page.locator('[data-testid="advanced-filters-summary"]').click();
+
+  // Persistent /suggest interceptor for the typeahead beats. Returns a
+  // canonical 6-entry RATES-* listbox for any prefix beginning with R, and an
+  // empty list for the ZZZZ probe used by the empty-state shot.
+  await page.route("**/suggest**", async (route) => {
+    const url = new URL(route.request().url());
+    const prefix = url.searchParams.get("prefix") ?? "";
+    const all = [
+      { value: "RATES-LDN", score: 1.0 },
+      { value: "RATES-NYC", score: 0.92 },
+      { value: "RATES-SGP", score: 0.81 },
+      { value: "RATES-FFM", score: 0.74 },
+      { value: "RATES-HKG", score: 0.67 },
+      { value: "RATES-TYO", score: 0.61 },
+    ];
+    const list = prefix.toUpperCase().startsWith("R") ? all : [];
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ suggestions: list, ms: 1.4 }),
+    });
+  });
+
+  const bookInput = page.locator('[data-testid="exclude-book"] input[role="combobox"]');
+  await bookInput.click();
+  await bookInput.fill("RA");
+  // Wait for the debounced fetch + listbox open (debounceMs default 150 ms).
+  await page.waitForSelector(
+    '[data-testid="exclude-book"] [role="listbox"]',
+    { timeout: 3_000 },
+  );
+  // Hold focus on the input — blur would close the listbox before snap.
+  await page.locator('[data-testid="exclude-book"] [role="listbox"] [role="option"]').first().waitFor();
+  await page.waitForTimeout(250);
+  await snapPage(page, "beat-14-typeahead-dropdown");
+
+  console.log("→ beat-14-typeahead-empty (ZZZZ prefix · 'No matches' hint)");
+  await bookInput.click();
+  await bookInput.fill("");
+  await bookInput.fill("ZZZZ");
+  await page.waitForTimeout(400);
+  await snapPage(page, "beat-14-typeahead-empty");
+  await page.unroute("**/suggest**");
+
+  console.log("→ beat-14-typeahead-timing (static DevTools Network panel mock)");
+  await renderStaticHtml(browser, typeaheadTimingHtml(), "beat-14-typeahead-timing");
+}
+
+// Static HTML render of a DevTools Network panel filtered to /suggest,
+// mirroring the precedent set by beat-10-memory (terminal output) and
+// beat-11-closer (slide). The MANIFEST flags this shot as an "optional
+// companion" to the dropdown capture and explicitly permits the static-HTML
+// route to avoid pulling in chrome-devtools-protocol just for one screenshot.
+function typeaheadTimingHtml(): string {
+  const rows = [
+    { name: "suggest?field=book&prefix=R", status: 200, type: "fetch", size: "0.4 kB", time: "8 ms" },
+    { name: "suggest?field=book&prefix=RA", status: 200, type: "fetch", size: "0.5 kB", time: "12 ms" },
+    { name: "suggest?field=book&prefix=RAT", status: 200, type: "fetch", size: "0.5 kB", time: "9 ms" },
+    { name: "suggest?field=book&prefix=RATE", status: 200, type: "fetch", size: "0.5 kB", time: "11 ms" },
+    { name: "suggest?field=book&prefix=RATES", status: 200, type: "fetch", size: "0.5 kB", time: "7 ms" },
+  ];
+  const tbody = rows
+    .map(
+      (r) =>
+        `<tr><td class="name">${r.name}</td><td class="status">${r.status}</td><td>${r.type}</td><td class="num">${r.size}</td><td class="num time">${r.time}</td></tr>`,
+    )
+    .join("");
+  return `<!doctype html><html><head><style>
+    body { margin: 0; padding: 28px; background: #202124; font-family: -apple-system, system-ui, sans-serif; color: #e8eaed; }
+    .devtools { background: #2d2e30; border: 1px solid #3c4043; border-radius: 6px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.4); }
+    .tabs { display: flex; background: #292a2d; padding: 8px 12px 0; gap: 16px; border-bottom: 1px solid #3c4043; font-size: 13px; }
+    .tab { padding: 6px 4px; color: #9aa0a6; cursor: default; }
+    .tab.active { color: #8ab4f8; border-bottom: 2px solid #8ab4f8; padding-bottom: 4px; }
+    .toolbar { display: flex; align-items: center; gap: 12px; padding: 8px 12px; background: #292a2d; border-bottom: 1px solid #3c4043; font-size: 12px; }
+    .filter { background: #202124; border: 1px solid #5f6368; border-radius: 3px; padding: 3px 8px; font-family: ui-monospace, "SF Mono", monospace; color: #fdd663; min-width: 220px; }
+    .pill { background: #1a73e8; color: #fff; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { text-align: left; padding: 6px 12px; border-bottom: 1px solid #303134; }
+    th { background: #292a2d; color: #9aa0a6; font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.02em; }
+    td.name { font-family: ui-monospace, "SF Mono", monospace; color: #d2e3fc; }
+    td.status { color: #81c995; font-weight: 600; }
+    td.num { font-variant-numeric: tabular-nums; color: #e8eaed; }
+    td.time { color: #81c995; font-weight: 600; }
+    .summary { padding: 10px 14px; background: #292a2d; border-top: 1px solid #3c4043; font-size: 12px; color: #9aa0a6; }
+    .summary strong { color: #e8eaed; }
+    .caption { margin: 16px 4px 0; font-size: 13px; color: #9aa0a6; }
+  </style></head><body>
+    <div class="devtools">
+      <div class="tabs">
+        <span class="tab">Elements</span>
+        <span class="tab">Console</span>
+        <span class="tab">Sources</span>
+        <span class="tab active">Network</span>
+        <span class="tab">Performance</span>
+        <span class="tab">Application</span>
+      </div>
+      <div class="toolbar">
+        <span style="color:#e8eaed">Filter:</span>
+        <span class="filter">/suggest</span>
+        <span class="pill">Fetch/XHR</span>
+        <span style="color:#9aa0a6">Preserve log</span>
+        <span style="color:#9aa0a6">Disable cache</span>
+      </div>
+      <table>
+        <thead><tr><th>Name</th><th>Status</th><th>Type</th><th>Size</th><th>Time</th></tr></thead>
+        <tbody>${tbody}</tbody>
+      </table>
+      <div class="summary">
+        <strong>5</strong> requests · <strong>2.4 kB</strong> transferred · median round-trip <strong>9 ms</strong> · all hits well under the 50 ms target for FT.SUGGET typeahead
+      </div>
+    </div>
+    <p class="caption">DevTools Network panel filtered to <code>/suggest</code> — typeahead round-trips on the <code>RA…RATES</code> keystroke chain (Wave 5.30a · FT.SUGGET FUZZY MAX 10 against <code>sug:book</code>).</p>
+  </body></html>`;
 }
 
 main().catch((err) => {
