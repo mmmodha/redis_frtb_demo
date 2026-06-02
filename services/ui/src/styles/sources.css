@@ -103,8 +103,8 @@
   background: var(--redis-bg-tertiary);
   color: var(--redis-text-primary);
   border: 1px solid var(--redis-border-primary);
-  border-radius: var(--radius);
-  padding: calc(var(--grid) * 1.25) calc(var(--grid) * 1.5);
+  border-radius: var(--radius-lg);
+  padding: calc(var(--grid) * 1.25) calc(var(--grid) * 1.75);
   min-height: 40px;
   font-size: 0.875rem;
 }

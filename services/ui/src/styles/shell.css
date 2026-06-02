@@ -502,3 +502,49 @@
 .bucket-chart__value { font-variant-numeric: tabular-nums; font-weight: 600; }
 .bucket-chart__meta { color: var(--text-muted, #8a8f99); font-size: 0.85em; }
 .bucket-chart__empty { color: var(--redis-text-secondary); font-style: italic; }
+
+/* Wave 5.34b: app-wide rounded dropdowns + more spacing. Native <select>
+   controls and the SuggestCombobox dropdown get a larger border-radius
+   (--radius-lg), more internal padding, and a consistent Redis hyper-red
+   focus ring. PanelCard / metric tile / button rounding (--radius) is
+   intentionally untouched. */
+select {
+  font-family: var(--font-body);
+  background: var(--redis-bg-tertiary);
+  color: var(--redis-text-primary);
+  border: 1px solid var(--redis-border-primary);
+  border-radius: var(--radius-lg);
+  padding: calc(var(--grid) * 1.25) calc(var(--grid) * 1.75);
+  min-height: 40px;
+  font-size: 0.875rem;
+}
+select:focus-visible {
+  border-color: var(--redis-hyper);
+  outline: 2px solid rgba(255, 68, 56, 0.4);
+  outline-offset: 1px;
+}
+
+.suggest-combobox input {
+  font-family: var(--font-body);
+  background: var(--redis-bg-tertiary);
+  color: var(--redis-text-primary);
+  border: 1px solid var(--redis-border-primary);
+  border-radius: var(--radius-lg);
+  padding: calc(var(--grid) * 1.25) calc(var(--grid) * 1.75);
+  min-height: 40px;
+  font-size: 0.875rem;
+}
+.suggest-combobox input:focus-visible {
+  border-color: var(--redis-hyper);
+  outline: 2px solid rgba(255, 68, 56, 0.4);
+  outline-offset: 1px;
+}
+.suggest-combobox__list {
+  background: var(--redis-bg-secondary);
+  border: 1px solid var(--redis-border-primary);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+.suggest-combobox__option {
+  padding: calc(var(--grid) * 1.25) calc(var(--grid) * 1.75);
+}

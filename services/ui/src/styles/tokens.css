@@ -18,6 +18,7 @@
   --redis-border-secondary: #3D5764;
 
   --radius: 5px;
+  --radius-lg: 10px;
   --grid: 8px;
 
   --font-body: "Space Grotesk", system-ui, -apple-system, "Segoe UI", sans-serif;
