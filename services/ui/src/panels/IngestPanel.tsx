@@ -13,6 +13,7 @@ import {
   type ObservabilityMemoryResponse,
 } from "../lib/api";
 import {
+  cancelAllGeneratorRuns,
   flushDb,
   listSources,
   startIngest,
@@ -93,6 +94,17 @@ export function IngestPanel() {
   const [flushPending, setFlushPending] = useState(false);
   const [flushBusy, setFlushBusy] = useState(false);
   const [flushBanner, setFlushBanner] = useState<string | null>(null);
+  // Wave 5.44 — Stop all runs button state. Mirrors the flush-db shape:
+  // `stopAllPending` drives the confirm modal, `stopAllBusy` disables the
+  // button mid-call, and `stopAllBanner` is the transient summary message.
+  const [stopAllPending, setStopAllPending] = useState(false);
+  const [stopAllBusy, setStopAllBusy] = useState(false);
+  const [stopAllBanner, setStopAllBanner] = useState<string | null>(null);
+  // Wave 5.44 — best-effort sync with the locally-tracked generator run. If
+  // the run the IngestPanel is currently showing happens to be in the
+  // cancelled list, we clear it immediately so the progress UI doesn't sit
+  // on "running" for the next polling tick.
+  const { run: trackedRun, clearRun: clearTrackedRun } = useGeneratorRun();
 
   const throughput = useRef<ChartSample[]>([]);
   const memorySeries = useRef<ChartSample[]>([]);
@@ -178,6 +190,32 @@ export function IngestPanel() {
     }
   }
 
+  // Wave 5.44 — Stop all runs confirm handler. POSTs /admin/cancel-all-runs,
+  // shows a transient banner with the cancelled count ("No active runs" when
+  // N=0), and best-effort clears the locally-tracked generator run if its
+  // run_id appears in the cancelled list. The error path reuses the existing
+  // telemetry error display; the banner auto-clears after 4s.
+  async function onStopAllConfirm() {
+    setStopAllPending(false);
+    setStopAllBusy(true);
+    setError(null);
+    try {
+      const r = await cancelAllGeneratorRuns();
+      const msg = r.cancelled === 0
+        ? "No active runs"
+        : `Stopped ${r.cancelled} run${r.cancelled === 1 ? "" : "s"}`;
+      setStopAllBanner(msg);
+      if (trackedRun?.runId && r.run_ids.includes(trackedRun.runId)) {
+        clearTrackedRun();
+      }
+      window.setTimeout(() => setStopAllBanner(null), 4000);
+    } catch (e) {
+      setError(`Stop all runs failed: ${(e as Error).message}`);
+    } finally {
+      setStopAllBusy(false);
+    }
+  }
+
   const tput = chartPath(throughput.current, 360, 80);
   const memPath = chartPath(memorySeries.current, 360, 80);
   const sampleKeys = keys?.sample ?? [];
@@ -237,9 +275,23 @@ export function IngestPanel() {
           >
             {flushBusy ? "Flushing…" : "Flush DB"}
           </button>
+          <button
+            type="button"
+            className="btn btn--danger"
+            onClick={() => setStopAllPending(true)}
+            disabled={stopAllBusy}
+            data-testid="stop-all-runs-btn"
+          >
+            {stopAllBusy ? "Stopping…" : "Stop all runs"}
+          </button>
           {flushBanner ? (
             <span className="ingest-admin__banner" data-testid="flush-db-banner" role="status">
               {flushBanner}
+            </span>
+          ) : null}
+          {stopAllBanner ? (
+            <span className="ingest-admin__banner" data-testid="stop-all-runs-banner" role="status">
+              {stopAllBanner}
             </span>
           ) : null}
         </div>
@@ -249,6 +301,13 @@ export function IngestPanel() {
         <FlushDbConfirmModal
           onCancel={() => setFlushPending(false)}
           onConfirm={onFlushConfirm}
+        />
+      ) : null}
+
+      {stopAllPending ? (
+        <StopAllRunsConfirmModal
+          onCancel={() => setStopAllPending(false)}
+          onConfirm={onStopAllConfirm}
         />
       ) : null}
 
@@ -741,6 +800,33 @@ function FlushDbConfirmModal(props: {
             Cancel
           </button>
           <button type="button" className="btn btn--danger" onClick={onConfirm} data-testid="flush-db-confirm">
+            Confirm
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Wave 5.44 — destructive-action confirmation for "Stop all runs". Same
+// dialog shape as FlushDbConfirmModal so the layout stays consistent.
+function StopAllRunsConfirmModal(props: {
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const { onCancel, onConfirm } = props;
+  return (
+    <div className="dialog-backdrop" role="dialog" aria-modal="true" aria-label="Stop all runs confirmation">
+      <div className="dialog sanity-modal--block" data-testid="stop-all-runs-modal">
+        <h2>Stop all active generator runs?</h2>
+        <div className="sanity-modal__body">
+          This cancels every run currently producing rows. Already-finished runs are unaffected.
+        </div>
+        <div className="dialog__actions">
+          <button type="button" className="btn" onClick={onCancel} data-testid="stop-all-runs-cancel">
+            Cancel
+          </button>
+          <button type="button" className="btn btn--danger" onClick={onConfirm} data-testid="stop-all-runs-confirm">
             Confirm
           </button>
         </div>

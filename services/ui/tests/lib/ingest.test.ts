@@ -6,6 +6,7 @@ import {
   startGeneratorStream,
   flushDb,
   cancelGenerator,
+  cancelAllGeneratorRuns,
   type ProgressFrame,
   type TerminalFrame,
 } from "../../src/lib/ingest";
@@ -195,6 +196,28 @@ describe("ingest api client", () => {
     await cancelGenerator("run-abc");
     const init = calls[0]!.init!;
     expect(calls[0]!.url).toMatch(/\/generator\/cancel\/run-abc$/);
+    expect(init.method).toBe("POST");
+    const headers = (init.headers ?? {}) as Record<string, string>;
+    expect(headers["content-type"]).toBe("application/json");
+    expect(typeof init.body).toBe("string");
+    expect(JSON.parse(init.body as string)).toEqual({});
+  });
+
+  // Wave 5.44 — cancelAllGeneratorRuns must POST /admin/cancel-all-runs with
+  // a parseable empty JSON body (same FST_ERR_CTP_EMPTY_JSON_BODY guard as
+  // flushDb / cancelGenerator) and return the parsed { ok, cancelled, run_ids }.
+  it("cancelAllGeneratorRuns POSTs /admin/cancel-all-runs with method, content-type and a parseable JSON body", async () => {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: typeof input === "string" ? input : input.toString(), init });
+      return new Response(JSON.stringify({ ok: true, cancelled: 2, run_ids: ["r-1", "r-2"] }), {
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+    const res = await cancelAllGeneratorRuns();
+    expect(res).toEqual({ ok: true, cancelled: 2, run_ids: ["r-1", "r-2"] });
+    const init = calls[0]!.init!;
+    expect(calls[0]!.url).toMatch(/\/admin\/cancel-all-runs$/);
     expect(init.method).toBe("POST");
     const headers = (init.headers ?? {}) as Record<string, string>;
     expect(headers["content-type"]).toBe("application/json");

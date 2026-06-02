@@ -491,6 +491,53 @@ export function registerGeneratorRoutes(
     entry.cancelFlag.cancelled = true;
     return { ok: true, cancelled: true, run_id: id };
   });
+
+  // Wave 5.44 — admin "stop all runs" escape hatch. Iterates `activeRuns`
+  // and flips the cancel flag on every entry currently `status === "running"`
+  // whose flag isn't already set. Idempotent: a follow-up call returns
+  // cancelled:0 because the previous call already marked the flags. No body
+  // required — Fastify accepts an empty POST and we never read req.body.
+  app.post("/admin/cancel-all-runs", async () => {
+    const run_ids: string[] = [];
+    for (const entry of activeRuns.values()) {
+      if (entry.status === "running" && !entry.cancelFlag.cancelled) {
+        entry.cancelFlag.cancelled = true;
+        run_ids.push(entry.run_id);
+      }
+    }
+    return { ok: true, cancelled: run_ids.length, run_ids };
+  });
+}
+
+// Wave 5.44 — test-only accessors for the module-local activeRuns registry.
+// Mirrors the resetBootstrapStatusForTests pattern in server.ts. Production
+// code paths never touch these.
+export interface TestActiveRun {
+  run_id: string;
+  status: "running" | "done" | "cancelled" | "error";
+  cancelFlag: { cancelled: boolean };
+}
+export function _testInsertActiveRun(run: TestActiveRun): void {
+  activeRuns.set(run.run_id, {
+    run_id: run.run_id,
+    status: run.status,
+    rows_done: 0,
+    rows_total: 0,
+    elapsed_ms: 0,
+    rows_per_sec: 0,
+    started_at_iso: new Date().toISOString(),
+    classes: [],
+    sensitivity_types: [],
+    cancelFlag: run.cancelFlag,
+  });
+}
+export function _testGetActiveRun(run_id: string): TestActiveRun | undefined {
+  const e = activeRuns.get(run_id);
+  if (!e) return undefined;
+  return { run_id: e.run_id, status: e.status, cancelFlag: e.cancelFlag };
+}
+export function _testResetActiveRuns(): void {
+  activeRuns.clear();
 }
 
 // PipelineClient is exported for the test stub to keep its mock shape aligned

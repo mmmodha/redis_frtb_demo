@@ -1,8 +1,13 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, beforeEach } from "vitest";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadSchema, type Schema } from "@frtb/schema";
 import { createServer } from "../src/server.ts";
+import {
+  _testInsertActiveRun,
+  _testGetActiveRun,
+  _testResetActiveRuns,
+} from "../src/routes/generator.ts";
 import { fakeRedis, type FakeRedis } from "./helpers/fake-redis.ts";
 
 // Re-use the generator's multi-class fixture (GIRR / EQUITY / FX). Sharing the
@@ -708,5 +713,87 @@ describe("POST /generator/start/stream (Wave 5.20c) — SSE progress + cancellat
     // Cancel landed before all rows were written.
     expect(finalRowsDone).toBeLessThan(5000);
     expect(fr.xadds.length).toBeLessThan(5000);
+  });
+});
+
+// Wave 5.44 — POST /admin/cancel-all-runs. Iterates the module-local
+// `activeRuns` registry and flips the cancel flag on every entry currently
+// `status === "running"`. Tests use the `_testInsertActiveRun` helper to seed
+// the registry deterministically (SSE-driven setup is timing-sensitive and
+// the route's behaviour is a pure scan of a Map).
+describe("POST /admin/cancel-all-runs (Wave 5.44) — admin stop all generator runs", () => {
+  let app: Awaited<ReturnType<typeof createServer>>;
+  beforeEach(() => { _testResetActiveRuns(); });
+  afterEach(async () => { if (app) await app.close(); _testResetActiveRuns(); });
+
+  it("returns ok:true with cancelled:0 and empty run_ids when no runs are active", async () => {
+    const schema = loadFixtureSchema();
+    const fr = pipelineFakeRedis();
+    app = await createServer({ redis: fr, schema });
+
+    const res = await app.inject({ method: "POST", url: "/admin/cancel-all-runs" });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ ok: true, cancelled: 0, run_ids: [] });
+  });
+
+  it("flips cancelFlag on every running entry and returns each run_id", async () => {
+    const schema = loadFixtureSchema();
+    const fr = pipelineFakeRedis();
+    app = await createServer({ redis: fr, schema });
+
+    const flagA = { cancelled: false };
+    const flagB = { cancelled: false };
+    _testInsertActiveRun({ run_id: "run-A", status: "running", cancelFlag: flagA });
+    _testInsertActiveRun({ run_id: "run-B", status: "running", cancelFlag: flagB });
+
+    const res = await app.inject({ method: "POST", url: "/admin/cancel-all-runs" });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { ok: boolean; cancelled: number; run_ids: string[] };
+    expect(body.ok).toBe(true);
+    expect(body.cancelled).toBe(2);
+    expect(body.run_ids.sort()).toEqual(["run-A", "run-B"]);
+
+    expect(_testGetActiveRun("run-A")!.cancelFlag.cancelled).toBe(true);
+    expect(_testGetActiveRun("run-B")!.cancelFlag.cancelled).toBe(true);
+  });
+
+  it("only cancels entries with status='running' — already-terminal runs are left alone", async () => {
+    const schema = loadFixtureSchema();
+    const fr = pipelineFakeRedis();
+    app = await createServer({ redis: fr, schema });
+
+    const flagRunning = { cancelled: false };
+    const flagDone = { cancelled: false };
+    _testInsertActiveRun({ run_id: "run-live", status: "running", cancelFlag: flagRunning });
+    _testInsertActiveRun({ run_id: "run-done", status: "done", cancelFlag: flagDone });
+
+    const res = await app.inject({ method: "POST", url: "/admin/cancel-all-runs" });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { ok: boolean; cancelled: number; run_ids: string[] };
+    expect(body.cancelled).toBe(1);
+    expect(body.run_ids).toEqual(["run-live"]);
+
+    expect(_testGetActiveRun("run-live")!.cancelFlag.cancelled).toBe(true);
+    // The already-terminal entry is untouched.
+    expect(_testGetActiveRun("run-done")!.cancelFlag.cancelled).toBe(false);
+  });
+
+  it("is idempotent — a follow-up call after every run is cancelled returns cancelled:0", async () => {
+    const schema = loadFixtureSchema();
+    const fr = pipelineFakeRedis();
+    app = await createServer({ redis: fr, schema });
+
+    _testInsertActiveRun({ run_id: "run-1", status: "running", cancelFlag: { cancelled: false } });
+    _testInsertActiveRun({ run_id: "run-2", status: "running", cancelFlag: { cancelled: false } });
+
+    const first = await app.inject({ method: "POST", url: "/admin/cancel-all-runs" });
+    expect((first.json() as { cancelled: number }).cancelled).toBe(2);
+
+    // Status is still "running" (the detached loop hasn't observed the flag
+    // yet); the route must skip these on the second call so we don't
+    // double-count an already-cancelled run.
+    const second = await app.inject({ method: "POST", url: "/admin/cancel-all-runs" });
+    expect(second.statusCode).toBe(200);
+    expect(second.json()).toEqual({ ok: true, cancelled: 0, run_ids: [] });
   });
 });

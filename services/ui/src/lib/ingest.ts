@@ -101,9 +101,15 @@ export interface GeneratorStreamHandle {
   cancel: () => Promise<void>;
 }
 
+// Wave 5.45 — if the client calls .cancel(), arm a watchdog so the UI does
+// not hang on "Cancelling…" forever if the server never delivers a terminal
+// frame. The default mirrors the server's own grace window.
+const DEFAULT_TERMINAL_TIMEOUT_MS = 30_000;
+
 export function startGeneratorStream(
   config: GeneratorConfig | undefined,
   handlers: GeneratorStreamHandlers,
+  opts?: { terminalTimeoutMs?: number },
 ): GeneratorStreamHandle {
   const body = config ? JSON.stringify(config) : "{}";
   const controller = new AbortController();
@@ -114,6 +120,17 @@ export function startGeneratorStream(
   // further reader errors so a server-closed-socket race does not surface as
   // "Failed to fetch" through handlers.onError after a successful run.
   let terminated = false;
+
+  // Wave 5.45 — watchdog armed by .cancel() so we synthesize an error if the
+  // server never sends the terminal frame.
+  const terminalTimeoutMs = opts?.terminalTimeoutMs ?? DEFAULT_TERMINAL_TIMEOUT_MS;
+  let terminalTimer: ReturnType<typeof setTimeout> | null = null;
+  const clearTerminalTimer = (): void => {
+    if (terminalTimer !== null) {
+      clearTimeout(terminalTimer);
+      terminalTimer = null;
+    }
+  };
 
   void (async () => {
     try {
@@ -153,6 +170,7 @@ export function startGeneratorStream(
                 // Set terminated BEFORE dispatching so the flag is honoured
                 // even if onTerminal throws.
                 terminated = true;
+                clearTerminalTimer();
                 handlers.onTerminal(parsed as unknown as TerminalFrame);
               } else {
                 handlers.onProgress(parsed as unknown as ProgressFrame);
@@ -166,6 +184,7 @@ export function startGeneratorStream(
         }
       }
     } catch (err) {
+      clearTerminalTimer();
       if (terminated) return;
       if (cancelledByClient) return;
       const e = err as Error;
@@ -180,7 +199,22 @@ export function startGeneratorStream(
       if (runId) {
         try { await cancelGenerator(runId); } catch { /* swallow — server may have already ended */ }
       }
-      try { controller.abort(); } catch { /* noop */ }
+      // Wave 5.45 — intentionally DO NOT call controller.abort() here.
+      // Aborting the fetch tears down the SSE socket before the server can
+      // deliver the terminal frame, which leaves the UI stuck on
+      // "Cancelling…". We rely on the server to honour the cancel flag and
+      // emit a terminal frame with cancelled:true. The watchdog below
+      // forces a synthetic error if that never happens.
+      if (!terminated && terminalTimer === null) {
+        terminalTimer = setTimeout(() => {
+          if (terminated) return;
+          terminated = true;
+          terminalTimer = null;
+          handlers.onError(new Error(
+            `generator cancel: terminal frame not received within ${terminalTimeoutMs}ms`,
+          ));
+        }, terminalTimeoutMs);
+      }
     },
   };
 }
@@ -209,6 +243,34 @@ export async function flushDb(): Promise<FlushDbResponse> {
     throw new Error(`api /admin/flush ${detail}`);
   }
   return (await res.json()) as FlushDbResponse;
+}
+
+// Wave 5.44 — POST /admin/cancel-all-runs. Iterates the api's in-process
+// `activeRuns` registry and flips the cancel flag on every entry currently
+// `status === "running"`. Used by the IngestPanel "Stop all runs" button.
+// Sends an empty JSON object body to dodge Fastify's FST_ERR_CTP_EMPTY_JSON_BODY
+// when content-type is application/json (same defensive shape as flushDb).
+export interface CancelAllGeneratorRunsResponse {
+  ok: true;
+  cancelled: number;
+  run_ids: string[];
+}
+
+export async function cancelAllGeneratorRuns(): Promise<CancelAllGeneratorRunsResponse> {
+  const res = await fetch(`${apiBase()}/admin/cancel-all-runs`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{}",
+  });
+  if (!res.ok) {
+    let detail = `${res.status}`;
+    try {
+      const err = (await res.json()) as { error?: string };
+      if (err && typeof err.error === "string") detail = `${res.status}: ${err.error}`;
+    } catch { /* response body not json */ }
+    throw new Error(`api /admin/cancel-all-runs ${detail}`);
+  }
+  return (await res.json()) as CancelAllGeneratorRunsResponse;
 }
 
 export async function cancelGenerator(runId: string): Promise<void> {
