@@ -11,6 +11,8 @@
 //   S_b   = Σ WS_k
 //   K_b²  = Σ WS_k² + ρ · ((Σ WS_k)² − Σ WS_k²)
 
+import { isRowExcluded, type RowExclude } from "./excludeCommon.ts";
+
 export interface VegaKbResult {
   K_b: number;
   S_b: number;
@@ -23,12 +25,16 @@ export interface VegaKbResult {
  * object), and `{ risk_value: ... }` wrappers (oracle-style input mirroring
  * the Lua kernel). `tenors` is required when any per-tenor object is
  * present so iteration order matches the Lua kernel.
+ * Wave 5.31c — optional `exclude` predicate drops rows whose book/trade_id/
+ * risk_factor matches the corresponding set, mirroring the Lua kernel's gate.
+ * Only applies when the row is the wrapper shape ({ risk_value, ... }).
  */
 export function computeKbVega(
   rows: ReadonlyArray<unknown>,
   weight: number,
   rho: number,
   tenors?: ReadonlyArray<string>,
+  exclude?: RowExclude,
 ): VegaKbResult {
   let sumWs = 0;
   let sumWsSq = 0;
@@ -37,6 +43,7 @@ export function computeKbVega(
     let rv: unknown = r;
     // Unwrap { risk_value } if a row object was passed instead of a value.
     if (r && typeof r === "object" && !Array.isArray(r)) {
+      if (isRowExcluded(r as Record<string, unknown>, exclude)) continue;
       const maybe = (r as { risk_value?: unknown }).risk_value;
       if (maybe !== undefined) rv = maybe;
     }

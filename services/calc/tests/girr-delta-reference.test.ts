@@ -76,4 +76,48 @@ describe("computeKbDelta (TS reference oracle)", () => {
     expect(out.WS[1]).toBe(0);
     expect(out.WS[0]).toBeCloseTo(GIRR_W[0]!, 12);
   });
+
+  // Wave 5.31c — exclude predicate. Rows matching any of the book / trade_id
+  // / risk_factor sets are dropped BEFORE contributing to WS / count, mirror
+  // of the Lua kernel's `_frtb_excluded` short-circuit. Order of check is
+  // book → trade_id → risk_factor (cheapest-cardinality first).
+  describe("Wave 5.31c: exclude predicate", () => {
+    it("drops rows whose book matches the exclude.book set", () => {
+      const rows = [
+        { sensitivity_type: "Delta", risk_value: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0], book: "A" },
+        { sensitivity_type: "Delta", risk_value: [2, 0, 0, 0, 0, 0, 0, 0, 0, 0], book: "B" },
+        { sensitivity_type: "Delta", risk_value: [4, 0, 0, 0, 0, 0, 0, 0, 0, 0], book: "C" },
+      ];
+      const out = computeKbDelta(rows, GIRR_W, 0.99, undefined, { book: new Set(["B"]) });
+      expect(out.count).toBe(2);
+      // sum_s[0] = 1 + 4 = 5 → WS[0] = 0.017 * 5
+      expect(out.WS[0]).toBeCloseTo(GIRR_W[0]! * 5, 12);
+    });
+
+    it("empty exclude (undefined) is byte-identical to omitting the parameter", () => {
+      const rows = [
+        { sensitivity_type: "Delta", risk_value: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], book: "A" },
+        { sensitivity_type: "Delta", risk_value: [10, 9, 8, 7, 6, 5, 4, 3, 2, 1], book: "B" },
+      ];
+      const a = computeKbDelta(rows, GIRR_W, 0.99);
+      const b = computeKbDelta(rows, GIRR_W, 0.99, undefined, undefined);
+      const c = computeKbDelta(rows, GIRR_W, 0.99, undefined, {});
+      expect(a.K_b).toBeCloseTo(b.K_b, 15);
+      expect(a.K_b).toBeCloseTo(c.K_b, 15);
+      expect(a.count).toBe(b.count);
+      expect(a.count).toBe(c.count);
+    });
+
+    it("trade_id and risk_factor sets also drop matching rows", () => {
+      const rows = [
+        { sensitivity_type: "Delta", risk_value: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0], trade_id: "T1", risk_factor: "F1" },
+        { sensitivity_type: "Delta", risk_value: [2, 0, 0, 0, 0, 0, 0, 0, 0, 0], trade_id: "T2", risk_factor: "F2" },
+        { sensitivity_type: "Delta", risk_value: [4, 0, 0, 0, 0, 0, 0, 0, 0, 0], trade_id: "T3", risk_factor: "F3" },
+      ];
+      const outTrade = computeKbDelta(rows, GIRR_W, 0.99, undefined, { trade_id: new Set(["T2"]) });
+      expect(outTrade.count).toBe(2);
+      const outFactor = computeKbDelta(rows, GIRR_W, 0.99, undefined, { risk_factor: new Set(["F1", "F3"]) });
+      expect(outFactor.count).toBe(1);
+    });
+  });
 });

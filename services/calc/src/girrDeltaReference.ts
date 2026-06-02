@@ -15,6 +15,8 @@
 // Only rows whose sensitivity_type === "Delta" contribute; Vega and Curvature
 // rows are silently skipped (the bucket function is single-purpose).
 
+import { isRowExcluded, type RowExclude } from "./excludeCommon.ts";
+
 export interface DeltaKbResult {
   K_b: number;
   S_b: number;
@@ -25,6 +27,10 @@ export interface DeltaKbResult {
 export interface DeltaRow {
   sensitivity_type: string;
   risk_value: unknown;
+  // Wave 5.31c — optional predicate fields used by `exclude` filtering.
+  book?: string;
+  trade_id?: string;
+  risk_factor?: string;
 }
 
 export function computeKbDelta(
@@ -37,12 +43,19 @@ export function computeKbDelta(
    * optional when callers only pass array-shaped fixtures (legacy / tests).
    */
   tenors?: ReadonlyArray<string>,
+  /**
+   * Wave 5.31c — optional row-exclusion predicate. Rows whose book/trade_id/
+   * risk_factor matches the corresponding set are skipped before contributing
+   * to sum_s / count, mirroring the Lua kernel's pre-aggregation gate.
+   */
+  exclude?: RowExclude,
 ): DeltaKbResult {
   const T = weights.length;
   const sumS = new Array<number>(T).fill(0); // raw sensi totals per tenor
   let count = 0;
   for (const row of rows) {
     if (!row || row.sensitivity_type !== "Delta") continue;
+    if (isRowExcluded(row, exclude)) continue;
     const rv = row.risk_value;
     if (Array.isArray(rv)) {
       for (let k = 0; k < T && k < rv.length; k++) {

@@ -17,7 +17,8 @@
 -- (5.16c) — FX has no bucket-13 specialisation.
 -- Only rows with sensitivity_type == "Curvature" contribute.
 
-local function _fx_curv_iter_bucket(risk_class, bucket)
+-- Wave 5.31c: args 3/4/5 carry the exclude_book / trade / factor CSV sets.
+local function _fx_curv_iter_bucket(risk_class, bucket, book_set, trade_set, factor_set)
   local pattern = 'sens:{' .. risk_class .. ':' .. bucket .. '}:*'
   local cursor = '0'
   local up_arr = {}
@@ -35,7 +36,8 @@ local function _fx_curv_iter_bucket(risk_class, bucket)
       end
       if raw then
         local ok, doc = pcall(cjson.decode, raw)
-        if ok and type(doc) == 'table' and doc.sensitivity_type == 'Curvature' then
+        if ok and type(doc) == 'table' and doc.sensitivity_type == 'Curvature'
+           and not _frtb_excluded(doc, book_set, trade_set, factor_set) then
           local rv = doc.risk_value
           if type(rv) == 'table' then
             local up = tonumber(rv.cvr_up)
@@ -79,9 +81,12 @@ redis.register_function('fx_curvature', function(keys, args)
   if not risk_class or not bucket then
     return redis.error_reply('fx_curvature: requires (risk_class, bucket) args')
   end
+  local book_set = _frtb_parse_csv_set(args[3])
+  local trade_set = _frtb_parse_csv_set(args[4])
+  local factor_set = _frtb_parse_csv_set(args[5])
   local rho = __FX_CURVATURE_RHO__
   local t0 = redis.call('TIME')
-  local up_arr, down_arr, count = _fx_curv_iter_bucket(risk_class, bucket)
+  local up_arr, down_arr, count = _fx_curv_iter_bucket(risk_class, bucket, book_set, trade_set, factor_set)
   local kb_up_sq = _fx_curv_kb_sq(up_arr, rho)
   local kb_down_sq = _fx_curv_kb_sq(down_arr, rho)
   if kb_up_sq < 0 then kb_up_sq = 0 end

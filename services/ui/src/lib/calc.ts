@@ -23,6 +23,14 @@ export interface CalcSbmRequest {
   // Wave 5.31b: omit to inherit the api default ("medium"). The UI only sends
   // a value when it's non-default so the commands panel stays clean.
   correlation_regime?: CorrelationRegime;
+  // Wave 5.31c: optional kernel-side row-exclusion predicate. Each list is
+  // marshalled into a CSV positional FCALL arg inside the api; omit entirely
+  // or send empty lists for the byte-identical pre-5.31c kernel path.
+  exclude?: {
+    book?: string[];
+    trade_id?: string[];
+    risk_factor?: string[];
+  };
 }
 
 export interface BucketResult {

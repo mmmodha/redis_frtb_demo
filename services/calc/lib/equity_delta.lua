@@ -15,7 +15,8 @@
 -- from config/schema/frtb-default.yaml.
 -- Only rows with sensitivity_type == "Delta" contribute.
 
-local function _eq_delta_iter_bucket(risk_class, bucket, w)
+-- Wave 5.31c: args 3/4/5 carry the exclude_book / trade / factor CSV sets.
+local function _eq_delta_iter_bucket(risk_class, bucket, w, book_set, trade_set, factor_set)
   local pattern = 'sens:{' .. risk_class .. ':' .. bucket .. '}:*'
   local cursor = '0'
   local sum_ws = 0.0
@@ -33,7 +34,8 @@ local function _eq_delta_iter_bucket(risk_class, bucket, w)
       end
       if raw then
         local ok, doc = pcall(cjson.decode, raw)
-        if ok and type(doc) == 'table' and doc.sensitivity_type == 'Delta' then
+        if ok and type(doc) == 'table' and doc.sensitivity_type == 'Delta'
+           and not _frtb_excluded(doc, book_set, trade_set, factor_set) then
           -- Wave 5.17a — Equity Delta risk_value reshape: production rows
           -- emit `{ spot: number }`; legacy / test fixtures may still emit a
           -- bare number. Read both shapes; rng-isolated reshape preserves
@@ -64,6 +66,9 @@ redis.register_function('equity_delta', function(keys, args)
   if not risk_class or not bucket then
     return redis.error_reply('equity_delta: requires (risk_class, bucket) args')
   end
+  local book_set = _frtb_parse_csv_set(args[3])
+  local trade_set = _frtb_parse_csv_set(args[4])
+  local factor_set = _frtb_parse_csv_set(args[5])
   local weights = __EQUITY_DELTA_WEIGHTS__
   local rho = __EQUITY_DELTA_RHO__
   local w = weights[bucket]
@@ -71,7 +76,7 @@ redis.register_function('equity_delta', function(keys, args)
     return redis.error_reply('equity_delta: no weight for bucket ' .. tostring(bucket))
   end
   local t0 = redis.call('TIME')
-  local sum_ws, sum_ws_sq, count = _eq_delta_iter_bucket(risk_class, bucket, w)
+  local sum_ws, sum_ws_sq, count = _eq_delta_iter_bucket(risk_class, bucket, w, book_set, trade_set, factor_set)
   local cross = sum_ws * sum_ws - sum_ws_sq
   if cross < 0 then cross = 0 end
   local kb_sq = sum_ws_sq + rho * cross

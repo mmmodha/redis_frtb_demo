@@ -19,7 +19,8 @@
 -- bare number. All three shapes iterate in declared tenor order so the
 -- floating-point summation is order-stable across the reshape.
 
-local function _vega_iter_bucket(risk_class, bucket, tenors)
+-- Wave 5.31c: args 3/4/5 carry the exclude_book / trade / factor CSV sets.
+local function _vega_iter_bucket(risk_class, bucket, tenors, book_set, trade_set, factor_set)
   local pattern = 'sens:{' .. risk_class .. ':' .. bucket .. '}:*'
   local cursor = '0'
   local sum_ws = 0.0
@@ -39,7 +40,8 @@ local function _vega_iter_bucket(risk_class, bucket, tenors)
       end
       if raw then
         local ok, doc = pcall(cjson.decode, raw)
-        if ok and type(doc) == 'table' and doc.sensitivity_type == 'Vega' then
+        if ok and type(doc) == 'table' and doc.sensitivity_type == 'Vega'
+           and not _frtb_excluded(doc, book_set, trade_set, factor_set) then
           local rv = doc.risk_value
           if type(rv) == 'table' then
             if rv[1] ~= nil then
@@ -85,9 +87,12 @@ redis.register_function('sbm_vega_bucket', function(keys, args)
   if not risk_class or not bucket then
     return redis.error_reply('sbm_vega_bucket: requires (risk_class, bucket) args')
   end
+  local book_set = _frtb_parse_csv_set(args[3])
+  local trade_set = _frtb_parse_csv_set(args[4])
+  local factor_set = _frtb_parse_csv_set(args[5])
   local tenors = __GIRR_TENORS__
   local t0 = redis.call('TIME')
-  local sum_ws, sum_ws_sq, count = _vega_iter_bucket(risk_class, bucket, tenors)
+  local sum_ws, sum_ws_sq, count = _vega_iter_bucket(risk_class, bucket, tenors, book_set, trade_set, factor_set)
   local rho = __GIRR_VEGA_RHO__
   local cross = sum_ws * sum_ws - sum_ws_sq
   if cross < 0 then cross = 0 end

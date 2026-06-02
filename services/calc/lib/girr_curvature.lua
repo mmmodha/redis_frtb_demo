@@ -23,7 +23,8 @@
 -- the girr_delta.lua substitution scheme.
 -- Only rows with sensitivity_type == "Curvature" contribute.
 
-local function _curv_iter_bucket(risk_class, bucket, T)
+-- Wave 5.31c: args 3/4/5 carry the exclude_book / trade / factor CSV sets.
+local function _curv_iter_bucket(risk_class, bucket, T, book_set, trade_set, factor_set)
   local pattern = 'sens:{' .. risk_class .. ':' .. bucket .. '}:*'
   local cursor = '0'
   local sum_up = {}
@@ -45,7 +46,8 @@ local function _curv_iter_bucket(risk_class, bucket, T)
       end
       if raw then
         local ok, doc = pcall(cjson.decode, raw)
-        if ok and type(doc) == 'table' and doc.sensitivity_type == 'Curvature' then
+        if ok and type(doc) == 'table' and doc.sensitivity_type == 'Curvature'
+           and not _frtb_excluded(doc, book_set, trade_set, factor_set) then
           local rv = doc.risk_value
           if type(rv) == 'table' then
             local up = rv.cvr_up
@@ -101,10 +103,13 @@ redis.register_function('girr_curvature', function(keys, args)
   if not risk_class or not bucket then
     return redis.error_reply('girr_curvature: requires (risk_class, bucket) args')
   end
+  local book_set = _frtb_parse_csv_set(args[3])
+  local trade_set = _frtb_parse_csv_set(args[4])
+  local factor_set = _frtb_parse_csv_set(args[5])
   local T = __GIRR_CURVATURE_TENORS__
   local rho = __GIRR_CURVATURE_RHO__
   local t0 = redis.call('TIME')
-  local sum_up, sum_down, count = _curv_iter_bucket(risk_class, bucket, T)
+  local sum_up, sum_down, count = _curv_iter_bucket(risk_class, bucket, T, book_set, trade_set, factor_set)
   local kb_up_sq = _curv_kb_sq(sum_up, rho)
   local kb_down_sq = _curv_kb_sq(sum_down, rho)
   if kb_up_sq < 0 then kb_up_sq = 0 end

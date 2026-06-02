@@ -75,6 +75,7 @@ async function seedDelta(
   bucket: string,
   riskValue: number[],
   sensitivity_type: string = "Delta",
+  extras: { book?: string; trade_id?: string; risk_factor?: string } = {},
 ): Promise<string> {
   const id = ulid();
   const key = `sens:{${rc}:${bucket}}:${id}`;
@@ -86,6 +87,7 @@ async function seedDelta(
     risk_value: riskValue,
     weight_ref: "girr_delta_weights",
     correlation_ref: "girr_rho_kl",
+    ...extras,
   };
   await redis.set(key, JSON.stringify(doc));
   return key;
@@ -213,5 +215,84 @@ describe("frtb.sbm_delta_bucket (GIRR Delta Redis Function)", () => {
     expect(out.count).toBe(0);
     expect(out.K_b).toBe(0);
     expect(out.S_b).toBe(0);
+  });
+
+  // Wave 5.31c — kernel-side exclude predicate. Verifies the shared Lua
+  // helpers (`_frtb_parse_csv_set` + `_frtb_excluded`) injected by the
+  // library loader land in scope for every registered function and that the
+  // book → trade_id → risk_factor short-circuit drops the right rows.
+  describe("Wave 5.31c: exclude predicate push-down", () => {
+    it.skipIf(!redisAvailable)("drops rows whose book is in the exclude_book CSV, matches the TS oracle", async () => {
+      await loadFrtbLibrary(redis, [buildGirrDeltaSnippet({ weights: GIRR_W, rho: GIRR_RHO })]);
+      const rowA = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+      const rowB = [2, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+      const rowC = [4, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+      await seedDelta("GIRR", "AUD", rowA, "Delta", { book: "BookA" });
+      await seedDelta("GIRR", "AUD", rowB, "Delta", { book: "BookB" });
+      await seedDelta("GIRR", "AUD", rowC, "Delta", { book: "BookC" });
+      const raw = (await redis.call(
+        "FCALL", "sbm_delta_bucket", "1", "sens:{GIRR:AUD}:_", "GIRR", "AUD",
+        "BookB", "", "",
+      )) as string;
+      const out = JSON.parse(raw) as { K_b: number; S_b: number; count: number };
+      const oracle = computeKbDelta(
+        [
+          { sensitivity_type: "Delta", risk_value: rowA, book: "BookA" },
+          { sensitivity_type: "Delta", risk_value: rowB, book: "BookB" },
+          { sensitivity_type: "Delta", risk_value: rowC, book: "BookC" },
+        ],
+        GIRR_W,
+        GIRR_RHO,
+        undefined,
+        { book: new Set(["BookB"]) },
+      );
+      expect(out.count).toBe(2);
+      expect(out.K_b).toBeCloseTo(oracle.K_b, 9);
+      expect(out.S_b).toBeCloseTo(oracle.S_b, 9);
+    });
+
+    it.skipIf(!redisAvailable)("empty exclude CSVs are byte-identical to the pre-5.31c kernel (regression gate)", async () => {
+      await loadFrtbLibrary(redis, [buildGirrDeltaSnippet({ weights: GIRR_W, rho: GIRR_RHO })]);
+      const rowA = [0.13, -0.42, 0.71, 1.05, -0.66, 0.33, -0.18, 0.92, -0.51, 0.27];
+      const rowB = [-0.04, 0.55, -0.31, 0.12, 0.84, -0.77, 0.46, -0.21, 0.18, -0.39];
+      await seedDelta("GIRR", "JPY", rowA);
+      await seedDelta("GIRR", "JPY", rowB);
+      // Pre-5.31c call shape (2 positional args).
+      const rawLegacy = (await redis.call(
+        "FCALL", "sbm_delta_bucket", "1", "sens:{GIRR:JPY}:_", "GIRR", "JPY"
+      )) as string;
+      // Post-5.31c call shape (5 positionals; 3 trailing empty CSVs).
+      const rawNew = (await redis.call(
+        "FCALL", "sbm_delta_bucket", "1", "sens:{GIRR:JPY}:_", "GIRR", "JPY", "", "", ""
+      )) as string;
+      const legacy = JSON.parse(rawLegacy) as { K_b: number; S_b: number; count: number };
+      const fresh = JSON.parse(rawNew) as { K_b: number; S_b: number; count: number };
+      expect(fresh.K_b).toBe(legacy.K_b);
+      expect(fresh.S_b).toBe(legacy.S_b);
+      expect(fresh.count).toBe(legacy.count);
+    });
+
+    it.skipIf(!redisAvailable)("trade_id and risk_factor CSVs short-circuit independently of book", async () => {
+      await loadFrtbLibrary(redis, [buildGirrDeltaSnippet({ weights: [1,1,1,1,1,1,1,1,1,1], rho: 0 })]);
+      await seedDelta("GIRR", "MXN", [1,0,0,0,0,0,0,0,0,0], "Delta", { trade_id: "T1", risk_factor: "F1" });
+      await seedDelta("GIRR", "MXN", [2,0,0,0,0,0,0,0,0,0], "Delta", { trade_id: "T2", risk_factor: "F2" });
+      await seedDelta("GIRR", "MXN", [4,0,0,0,0,0,0,0,0,0], "Delta", { trade_id: "T3", risk_factor: "F3" });
+      // Exclude T2 by trade_id; keep T1 + T3 → WS_b = 1 + 4 = 5 → K_b = 5 (ρ=0).
+      const raw = (await redis.call(
+        "FCALL", "sbm_delta_bucket", "1", "sens:{GIRR:MXN}:_", "GIRR", "MXN",
+        "", "T2", "",
+      )) as string;
+      const out = JSON.parse(raw) as { K_b: number; S_b: number; count: number };
+      expect(out.count).toBe(2);
+      expect(out.K_b).toBeCloseTo(5, 9);
+      // Now exclude F1 + F3 by risk_factor → only T2 survives.
+      const raw2 = (await redis.call(
+        "FCALL", "sbm_delta_bucket", "1", "sens:{GIRR:MXN}:_", "GIRR", "MXN",
+        "", "", "F1,F3",
+      )) as string;
+      const out2 = JSON.parse(raw2) as { K_b: number; S_b: number; count: number };
+      expect(out2.count).toBe(1);
+      expect(out2.K_b).toBeCloseTo(2, 9);
+    });
   });
 });

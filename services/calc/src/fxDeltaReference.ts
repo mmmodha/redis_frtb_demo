@@ -14,6 +14,8 @@
 // single-factor specialisation K_b = √Σ WS_k² (and to |WS| for single-row
 // buckets). Only rows whose sensitivity_type === "Delta" contribute.
 
+import { isRowExcluded, type RowExclude } from "./excludeCommon.ts";
+
 export interface FxDeltaKbResult {
   K_b: number;
   S_b: number;
@@ -23,18 +25,25 @@ export interface FxDeltaKbResult {
 export interface FxDeltaRow {
   sensitivity_type: string;
   risk_value: unknown;
+  // Wave 5.31c — optional predicate fields used by `exclude` filtering.
+  book?: string;
+  trade_id?: string;
+  risk_factor?: string;
 }
 
 export function computeKbFxDelta(
   rows: ReadonlyArray<FxDeltaRow>,
   weight: number,
   rho: number = 0,
+  // Wave 5.31c — see girrDeltaReference for the predicate contract.
+  exclude?: RowExclude,
 ): FxDeltaKbResult {
   let sumWs = 0;
   let sumWsSq = 0;
   let count = 0;
   for (const row of rows) {
     if (!row || row.sensitivity_type !== "Delta") continue;
+    if (isRowExcluded(row, exclude)) continue;
     // Wave 5.17a — `{ spot }` in production, bare number tolerated for legacy.
     const rv = row.risk_value;
     let v: unknown;

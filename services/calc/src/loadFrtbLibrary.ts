@@ -17,6 +17,43 @@ export interface FrtbLibrarySnippet {
 const LIBRARY_NAME = "frtb";
 const SHEBANG = `#!lua name=${LIBRARY_NAME}`;
 
+// Wave 5.31c — shared Lua predicate helpers injected once at library scope so
+// every kernel can apply the exclude filters without copy-pasting the parse +
+// check logic across nine .lua files. Each registered function captures these
+// locals via closure so they remain callable from inside redis.register_function
+// bodies. CSV is the wire format (kernel arg shape stays flat; no cjson.decode
+// per call). Order: book → trade_id → risk_factor — cheapest-cardinality first
+// per the locked design decision so the typical hit short-circuits fast.
+const FRTB_PRELUDE = `
+local function _frtb_parse_csv_set(csv)
+  if not csv or csv == '' then return nil end
+  local set = {}
+  local has = false
+  for token in string.gmatch(csv, '([^,]+)') do
+    set[token] = true
+    has = true
+  end
+  if not has then return nil end
+  return set
+end
+
+local function _frtb_excluded(doc, book_set, trade_set, factor_set)
+  if book_set then
+    local v = doc.book
+    if v and book_set[v] then return true end
+  end
+  if trade_set then
+    local v = doc.trade_id
+    if v and trade_set[v] then return true end
+  end
+  if factor_set then
+    local v = doc.risk_factor
+    if v and factor_set[v] then return true end
+  end
+  return false
+end
+`;
+
 export function buildFrtbLibrarySource(
   snippets: ReadonlyArray<FrtbLibrarySnippet>,
 ): string {
@@ -31,7 +68,7 @@ export function buildFrtbLibrarySource(
   const bodies = ordered.map((s) =>
     s.code.replace(/^#!lua\s+name=[^\n]*\n?/m, "").trim(),
   );
-  return [SHEBANG, "", ...bodies.map((b) => `${b}\n`)].join("\n");
+  return [SHEBANG, "", FRTB_PRELUDE.trim(), "", ...bodies.map((b) => `${b}\n`)].join("\n");
 }
 
 export interface LoadResult {

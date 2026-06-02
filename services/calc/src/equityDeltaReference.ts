@@ -15,6 +15,8 @@
 // Each row within a bucket represents a distinct issuer factor k; only rows
 // whose sensitivity_type === "Delta" contribute (Vega / Curvature skipped).
 
+import { isRowExcluded, type RowExclude } from "./excludeCommon.ts";
+
 export interface EquityDeltaKbResult {
   K_b: number;
   S_b: number;
@@ -25,12 +27,18 @@ export interface EquityDeltaKbResult {
 export interface EquityDeltaRow {
   sensitivity_type: string;
   risk_value: unknown;
+  // Wave 5.31c — optional predicate fields used by `exclude` filtering.
+  book?: string;
+  trade_id?: string;
+  risk_factor?: string;
 }
 
 export function computeKbEquityDelta(
   rows: ReadonlyArray<EquityDeltaRow>,
   weight: number,
   rho: number,
+  // Wave 5.31c — see girrDeltaReference for the predicate contract.
+  exclude?: RowExclude,
 ): EquityDeltaKbResult {
   const WS: number[] = [];
   let sumWs = 0;
@@ -38,6 +46,7 @@ export function computeKbEquityDelta(
   let count = 0;
   for (const row of rows) {
     if (!row || row.sensitivity_type !== "Delta") continue;
+    if (isRowExcluded(row, exclude)) continue;
     // Wave 5.17a — risk_value reshape: production rows emit `{ spot }`,
     // legacy / test fixtures may still emit a bare number. Accept both.
     const rv = row.risk_value;

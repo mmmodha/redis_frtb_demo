@@ -13,7 +13,8 @@
 -- numeric literals (ρ defaults to 0 → K_b = |Σ WS_k|).
 -- Only rows with sensitivity_type == "Vega" contribute.
 
-local function _fx_vega_iter_bucket(risk_class, bucket, w)
+-- Wave 5.31c: args 3/4/5 carry the exclude_book / trade / factor CSV sets.
+local function _fx_vega_iter_bucket(risk_class, bucket, w, book_set, trade_set, factor_set)
   local pattern = 'sens:{' .. risk_class .. ':' .. bucket .. '}:*'
   local cursor = '0'
   local sum_ws = 0.0
@@ -31,7 +32,8 @@ local function _fx_vega_iter_bucket(risk_class, bucket, w)
       end
       if raw then
         local ok, doc = pcall(cjson.decode, raw)
-        if ok and type(doc) == 'table' and doc.sensitivity_type == 'Vega' then
+        if ok and type(doc) == 'table' and doc.sensitivity_type == 'Vega'
+           and not _frtb_excluded(doc, book_set, trade_set, factor_set) then
           -- Wave 5.17a — see fx_delta.lua note. `{ spot }` in production,
           -- bare number tolerated for legacy fixtures.
           local rv = doc.risk_value
@@ -60,10 +62,13 @@ redis.register_function('fx_vega', function(keys, args)
   if not risk_class or not bucket then
     return redis.error_reply('fx_vega: requires (risk_class, bucket) args')
   end
+  local book_set = _frtb_parse_csv_set(args[3])
+  local trade_set = _frtb_parse_csv_set(args[4])
+  local factor_set = _frtb_parse_csv_set(args[5])
   local w = __FX_VEGA_WEIGHT__
   local rho = __FX_VEGA_RHO__
   local t0 = redis.call('TIME')
-  local sum_ws, sum_ws_sq, count = _fx_vega_iter_bucket(risk_class, bucket, w)
+  local sum_ws, sum_ws_sq, count = _fx_vega_iter_bucket(risk_class, bucket, w, book_set, trade_set, factor_set)
   local cross = sum_ws * sum_ws - sum_ws_sq
   if cross < 0 then cross = 0 end
   local kb_sq = sum_ws_sq + rho * cross

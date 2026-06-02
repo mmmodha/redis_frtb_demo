@@ -1,5 +1,6 @@
 import { Fragment, useEffect, useRef, useState, type CSSProperties, type KeyboardEvent } from "react";
 import { EnterpriseCallout, PanelCard, Sparkline, TimingStrip } from "../components";
+import { SuggestCombobox } from "../components/SuggestCombobox";
 import type { ShardTiming } from "../components/TimingStrip";
 import {
   postCalcSbm,
@@ -218,6 +219,13 @@ export function CalcPanel() {
   // on the wire (we don't send the field), preserving the pre-5.31b body
   // shape for default runs and keeping the commands panel clean.
   const [regime, setRegime] = useState<CorrelationRegime>("medium");
+  // Wave 5.31c: kernel-side row-exclusion predicate sets. Stored as Set<string>
+  // so add/remove via chips stays O(1). Empty sets are not serialised onto the
+  // wire — mirrors 5.31a/5.31b's "don't send the default" convention so the
+  // default-path body shape stays byte-identical to pre-5.31c.
+  const [excludeBooks, setExcludeBooks] = useState<Set<string>>(new Set());
+  const [excludeTrades, setExcludeTrades] = useState<Set<string>>(new Set());
+  const [excludeFactors, setExcludeFactors] = useState<Set<string>>(new Set());
 
   const isWave4 = riskClass !== "GIRR";
 
@@ -241,11 +249,19 @@ export function CalcPanel() {
       // 5.31a's "don't send the default" convention so the default-path wire
       // shape stays byte-identical to pre-5.31b.
       const sendRegime = regime !== "medium";
+      // Wave 5.31c: build the optional `exclude` only when at least one list
+      // is non-empty — same "don't send the default" convention.
+      const excludeBody: Record<string, string[]> = {};
+      if (excludeBooks.size > 0) excludeBody.book = Array.from(excludeBooks);
+      if (excludeTrades.size > 0) excludeBody.trade_id = Array.from(excludeTrades);
+      if (excludeFactors.size > 0) excludeBody.risk_factor = Array.from(excludeFactors);
+      const sendExclude = Object.keys(excludeBody).length > 0;
       const r = await postCalcSbm({
         risk_class: riskClass,
         sensitivity_type: sensitivityType,
         ...(subsetArr ? { bucket_subset: subsetArr } : {}),
         ...(sendRegime ? { correlation_regime: regime } : {}),
+        ...(sendExclude ? { exclude: excludeBody } : {}),
       });
       setResult(r);
       setResultContext({ riskClass, sensitivityType });
@@ -368,6 +384,14 @@ export function CalcPanel() {
             onReset={resetSubset}
           />
         ) : null}
+        <AdvancedFilters
+          books={excludeBooks}
+          trades={excludeTrades}
+          factors={excludeFactors}
+          onBooksChange={setExcludeBooks}
+          onTradesChange={setExcludeTrades}
+          onFactorsChange={setExcludeFactors}
+        />
       </PanelCard>
 
       {emptyError ? <CalcEmptyBanner err={emptyError} /> : null}
@@ -470,6 +494,157 @@ function CorrelationRegimeControl({
       <div className="calc-panel__regime-hint" data-testid="regime-hint">
         {activeHint}
       </div>
+    </div>
+  );
+}
+
+// Wave 5.31c: "Advanced filters" disclosure that hosts the three kernel-side
+// row-exclusion combos (book / trade_id / risk_factor). Collapsed by default
+// so the Calc panel stays uncluttered for the demo's happy path. Each combo
+// is a SuggestCombobox (from 5.30b) wired into a chip list — typing + Enter
+// or clicking a suggestion adds the value as a chip and clears the input;
+// clicking the × on a chip removes it. Empty chip lists are not sent on the
+// wire so the default-path /calc/sbm body stays byte-identical to pre-5.31c.
+function AdvancedFilters({
+  books,
+  trades,
+  factors,
+  onBooksChange,
+  onTradesChange,
+  onFactorsChange,
+}: {
+  books: Set<string>;
+  trades: Set<string>;
+  factors: Set<string>;
+  onBooksChange: (next: Set<string>) => void;
+  onTradesChange: (next: Set<string>) => void;
+  onFactorsChange: (next: Set<string>) => void;
+}) {
+  const total = books.size + trades.size + factors.size;
+  return (
+    <details className="calc-panel__advanced" data-testid="advanced-filters">
+      <summary className="calc-panel__advanced-summary" data-testid="advanced-filters-summary">
+        Advanced filters{total > 0 ? ` · ${total} excluded` : ""}
+      </summary>
+      <div className="calc-panel__advanced-body">
+        <ExcludeChipsCombobox
+          field="book"
+          label="Exclude books"
+          placeholder="e.g. RATES-LDN"
+          values={books}
+          onChange={onBooksChange}
+        />
+        <ExcludeChipsCombobox
+          field="trade_id"
+          label="Exclude trades"
+          placeholder="e.g. T0042"
+          values={trades}
+          onChange={onTradesChange}
+        />
+        <ExcludeChipsCombobox
+          field="risk_factor"
+          label="Exclude risk factors"
+          placeholder="e.g. RF_GIRR_05"
+          values={factors}
+          onChange={onFactorsChange}
+        />
+      </div>
+    </details>
+  );
+}
+
+// Wave 5.31c: single-field exclude widget — combobox above a chip row. The
+// combobox echoes whatever the user types into local `draft` state; on commit
+// (Enter or selecting a suggestion) the value is added to `values` and the
+// input is cleared so the user can keep adding more. Comma in the draft is
+// treated as a commit too — paste of "A,B,C" splits into 3 chips.
+function ExcludeChipsCombobox({
+  field,
+  label,
+  placeholder,
+  values,
+  onChange,
+}: {
+  field: "book" | "trade_id" | "risk_factor";
+  label: string;
+  placeholder?: string;
+  values: Set<string>;
+  onChange: (next: Set<string>) => void;
+}) {
+  const [draft, setDraft] = useState<string>("");
+
+  function commit(raw: string) {
+    // Comma split mirrors the kernel CSV wire format — a paste of "A,B,C"
+    // commits all three at once. Strips empties; preserves insertion order.
+    const tokens = raw.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+    if (tokens.length === 0) return;
+    const next = new Set(values);
+    for (const t of tokens) next.add(t);
+    onChange(next);
+    setDraft("");
+  }
+
+  function remove(value: string) {
+    const next = new Set(values);
+    next.delete(value);
+    onChange(next);
+  }
+
+  function onDraftChange(v: string) {
+    // Auto-commit when the draft ends with "," so paste of CSVs lands as chips.
+    if (v.endsWith(",")) {
+      commit(v.slice(0, -1));
+      return;
+    }
+    setDraft(v);
+  }
+
+  // Enter on the underlying combobox input either selects the active
+  // suggestion (SuggestCombobox preventDefaults) or — when no suggestion is
+  // active — bubbles unhandled. We catch that bubbled Enter at the wrapper
+  // level and commit whatever is currently in `draft` so the user can add
+  // free-text exclusions (e.g. a known book id that's not in /suggest).
+  function onWrapperKeyDown(e: KeyboardEvent<HTMLDivElement>) {
+    if (e.key === "Enter" && !e.defaultPrevented && draft.length > 0) {
+      e.preventDefault();
+      commit(draft);
+    }
+  }
+
+  return (
+    <div className="exclude-chips" data-testid={`exclude-${field}`} onKeyDown={onWrapperKeyDown}>
+      <label className="exclude-chips__label" htmlFor={`exclude-${field}-input`}>
+        {label}
+      </label>
+      <SuggestCombobox
+        field={field}
+        id={`exclude-${field}-input`}
+        value={draft}
+        onChange={onDraftChange}
+        placeholder={placeholder}
+      />
+      {values.size > 0 ? (
+        <ul
+          className="exclude-chips__list"
+          role="list"
+          aria-label={`Selected ${label.toLowerCase()}`}
+          data-testid={`exclude-${field}-chips`}
+        >
+          {Array.from(values).map((v) => (
+            <li key={v} className="exclude-chips__chip" data-testid="exclude-chip" data-value={v}>
+              <span>{v}</span>
+              <button
+                type="button"
+                className="exclude-chips__remove"
+                aria-label={`Remove ${v}`}
+                onClick={() => remove(v)}
+              >
+                ×
+              </button>
+            </li>
+          ))}
+        </ul>
+      ) : null}
     </div>
   );
 }

@@ -940,4 +940,198 @@ describe("POST /calc/sbm — MVP endpoint", () => {
       expect(body.correlation_regime).toBe("medium");
     });
   });
+
+  // Wave 5.31c: kernel-side row-exclusion predicate. The api marshals the
+  // optional `exclude` body into 3 positional CSV FCALL args (book / trade_id
+  // / risk_factor). The kernel's `_frtb_excluded` helper short-circuits in
+  // book→trade_id→risk_factor order. We assert wire shape, validation gates,
+  // and the byte-identical regression path when `exclude` is omitted.
+  describe("Wave 5.31c: exclude predicate push-down (book / trade_id / risk_factor)", () => {
+    it("forwards exclude lists as positional CSV args 5/6/7 in FCALL fan-out", async () => {
+      const fr = fakeRedis();
+      fr.setResponse("FT.AGGREGATE", ftAggregateReply(["USD-IRS"]));
+      fr.setResponse("FCALL", ["K_b", "1", "S_b", "1", "count", "1", "ms", "1"]);
+      app = await createServer({ redis: fr, correlations: { GIRR: { kind: "constant", value: 0 } } });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: {
+          risk_class: "GIRR",
+          sensitivity_type: "Delta",
+          exclude: {
+            book: ["RATES-LDN", "RATES-NYC"],
+            trade_id: ["T0042"],
+            risk_factor: ["RF_GIRR_05", "RF_GIRR_06"],
+          },
+        },
+      });
+      expect(res.statusCode).toBe(200);
+      const fc = fr.calls.find((c) => c.command === "FCALL");
+      expect(fc).toBeDefined();
+      // args: [funcName, "1", routeKey, risk_class, bucket, book_csv, trade_csv, factor_csv]
+      expect(fc!.args[5]).toBe("RATES-LDN,RATES-NYC");
+      expect(fc!.args[6]).toBe("T0042");
+      expect(fc!.args[7]).toBe("RF_GIRR_05,RF_GIRR_06");
+    });
+
+    it("regression: omitting `exclude` passes empty CSV strings — kernel takes the no-exclusion path", async () => {
+      const fr = fakeRedis();
+      fr.setResponse("FT.AGGREGATE", ftAggregateReply(["USD-IRS"]));
+      fr.setResponse("FCALL", ["K_b", "3", "S_b", "3", "count", "100", "ms", "5"]);
+      app = await createServer({ redis: fr, correlations: { GIRR: { kind: "constant", value: 0 } } });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: { risk_class: "GIRR", sensitivity_type: "Delta" },
+      });
+      expect(res.statusCode).toBe(200);
+      const fc = fr.calls.find((c) => c.command === "FCALL");
+      expect(fc).toBeDefined();
+      // Empty CSV positionals — kernel's `_frtb_parse_csv_set` returns nil and
+      // skips the predicate entirely (byte-identical to pre-5.31c).
+      expect(fc!.args[5]).toBe("");
+      expect(fc!.args[6]).toBe("");
+      expect(fc!.args[7]).toBe("");
+    });
+
+    it("commands.fcall.arg_template surfaces the new positional args for the UI commands panel", async () => {
+      const fr = fakeRedis();
+      fr.setResponse("FT.AGGREGATE", ftAggregateReply(["USD-IRS"]));
+      fr.setResponse("FCALL", ["K_b", "1", "S_b", "1", "count", "1", "ms", "1"]);
+      app = await createServer({ redis: fr, correlations: { GIRR: { kind: "constant", value: 0 } } });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: { risk_class: "GIRR", sensitivity_type: "Delta" },
+      });
+      expect(res.statusCode).toBe(200);
+      const tpl = res.json().commands.fcall.arg_template as string;
+      expect(tpl).toContain("<exclude_book_csv>");
+      expect(tpl).toContain("<exclude_trade_csv>");
+      expect(tpl).toContain("<exclude_factor_csv>");
+    });
+
+    it("de-duplicates exclude values inside a single field before CSV marshalling", async () => {
+      const fr = fakeRedis();
+      fr.setResponse("FT.AGGREGATE", ftAggregateReply(["USD-IRS"]));
+      fr.setResponse("FCALL", ["K_b", "1", "S_b", "1", "count", "1", "ms", "1"]);
+      app = await createServer({ redis: fr, correlations: { GIRR: { kind: "constant", value: 0 } } });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: {
+          risk_class: "GIRR",
+          sensitivity_type: "Delta",
+          exclude: { book: ["A", "B", "A"] },
+        },
+      });
+      expect(res.statusCode).toBe(200);
+      const fc = fr.calls.find((c) => c.command === "FCALL");
+      expect(fc!.args[5]).toBe("A,B");
+    });
+
+    it("rejects a non-array exclude.book with 400", async () => {
+      app = await createServer({ redis: fakeRedis() });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: {
+          risk_class: "GIRR",
+          sensitivity_type: "Delta",
+          exclude: { book: "not-an-array" },
+        },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toMatch(/exclude\.book/);
+    });
+
+    it("rejects an exclude.book value containing a comma with 400 (CSV delimiter clash)", async () => {
+      app = await createServer({ redis: fakeRedis() });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: {
+          risk_class: "GIRR",
+          sensitivity_type: "Delta",
+          exclude: { book: ["A,B"] },
+        },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toMatch(/comma/);
+    });
+
+    it("returns 413 when an exclude list exceeds 1,000 entries (Lua-memory guard)", async () => {
+      app = await createServer({ redis: fakeRedis() });
+      const tooMany = Array.from({ length: 1001 }, (_, i) => `B${i}`);
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: {
+          risk_class: "GIRR",
+          sensitivity_type: "Delta",
+          exclude: { trade_id: tooMany },
+        },
+      });
+      expect(res.statusCode).toBe(413);
+      expect(res.json().error).toMatch(/1000/);
+    });
+
+    it("composes with bucket_subset (F1) and correlation_regime (F2) without touching them", async () => {
+      // F1 narrows discovery; F2 scales γ; F3 sets CSV args 5/6/7. The three
+      // filters are independent layers per the locked design — this test
+      // proves the composition by asserting all three side-effects in one go.
+      const fr = fakeRedis();
+      fr.setResponse("FT.AGGREGATE", (args: unknown[]) => {
+        const q = String(args[1]);
+        if (q.includes("@bucket:{")) return ftAggregateReply(["USD", "EUR"]);
+        return ftAggregateReply(["USD", "EUR", "GBP"]);
+      });
+      fr.setResponse("FCALL", ["K_b", "2", "S_b", "2", "count", "10", "ms", "1"]);
+      app = await createServer({
+        redis: fr,
+        correlations: { GIRR: { kind: "constant", value: 0.5 } },
+      });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: {
+          risk_class: "GIRR",
+          sensitivity_type: "Delta",
+          bucket_subset: ["USD", "EUR"],
+          correlation_regime: "high",
+          exclude: { book: ["B1"], risk_factor: ["RF1"] },
+        },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      // F1: discovery query narrowed to the subset.
+      expect(String(body.commands.discovery.query)).toContain("@bucket:{USD|EUR}");
+      // F2: regime echoed back at the chosen value.
+      expect(body.correlation_regime).toBe("high");
+      expect(body.commands.regime).toMatchObject({ name: "high", factor: 1.25 });
+      // F3: the FCALL args carry the CSVs in the right slots.
+      const fcalls = fr.calls.filter((c) => c.command === "FCALL");
+      expect(fcalls).toHaveLength(2);
+      for (const fc of fcalls) {
+        expect(fc.args[5]).toBe("B1");
+        expect(fc.args[6]).toBe("");
+        expect(fc.args[7]).toBe("RF1");
+      }
+    });
+
+    it("rejects when `exclude` is not an object (e.g. an array)", async () => {
+      app = await createServer({ redis: fakeRedis() });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: {
+          risk_class: "GIRR",
+          sensitivity_type: "Delta",
+          exclude: ["not", "an", "object"],
+        },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toMatch(/object/);
+    });
+  });
 });

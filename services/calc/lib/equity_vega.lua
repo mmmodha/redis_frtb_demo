@@ -12,7 +12,8 @@
 -- bucket id) and __EQUITY_VEGA_RHO__ with numeric literals.
 -- Only rows with sensitivity_type == "Vega" contribute.
 
-local function _eq_vega_iter_bucket(risk_class, bucket, w)
+-- Wave 5.31c: args 3/4/5 carry the exclude_book / trade / factor CSV sets.
+local function _eq_vega_iter_bucket(risk_class, bucket, w, book_set, trade_set, factor_set)
   local pattern = 'sens:{' .. risk_class .. ':' .. bucket .. '}:*'
   local cursor = '0'
   local sum_ws = 0.0
@@ -30,7 +31,8 @@ local function _eq_vega_iter_bucket(risk_class, bucket, w)
       end
       if raw then
         local ok, doc = pcall(cjson.decode, raw)
-        if ok and type(doc) == 'table' and doc.sensitivity_type == 'Vega' then
+        if ok and type(doc) == 'table' and doc.sensitivity_type == 'Vega'
+           and not _frtb_excluded(doc, book_set, trade_set, factor_set) then
           -- Wave 5.17a — see equity_delta.lua note. risk_value is `{ spot }`
           -- in production; bare number tolerated for legacy / test fixtures.
           local rv = doc.risk_value
@@ -59,6 +61,9 @@ redis.register_function('equity_vega', function(keys, args)
   if not risk_class or not bucket then
     return redis.error_reply('equity_vega: requires (risk_class, bucket) args')
   end
+  local book_set = _frtb_parse_csv_set(args[3])
+  local trade_set = _frtb_parse_csv_set(args[4])
+  local factor_set = _frtb_parse_csv_set(args[5])
   local weights = __EQUITY_VEGA_WEIGHTS__
   local rho = __EQUITY_VEGA_RHO__
   local w = weights[bucket]
@@ -66,7 +71,7 @@ redis.register_function('equity_vega', function(keys, args)
     return redis.error_reply('equity_vega: no weight for bucket ' .. tostring(bucket))
   end
   local t0 = redis.call('TIME')
-  local sum_ws, sum_ws_sq, count = _eq_vega_iter_bucket(risk_class, bucket, w)
+  local sum_ws, sum_ws_sq, count = _eq_vega_iter_bucket(risk_class, bucket, w, book_set, trade_set, factor_set)
   local cross = sum_ws * sum_ws - sum_ws_sq
   if cross < 0 then cross = 0 end
   local kb_sq = sum_ws_sq + rho * cross

@@ -23,6 +23,12 @@ interface CalcBody {
   // Wave 5.31b: Basel MAR21.6 cross-bucket γ regime selector. Omitted defaults
   // to "medium" (factor 1.0) which is a no-op vs. pre-5.31b behaviour.
   correlation_regime?: CorrelationRegime;
+  // Wave 5.31c: optional kernel-side predicate push-down. Rows whose
+  // book/trade_id/risk_factor match any of these sets are skipped inside the
+  // per-bucket Lua kernel BEFORE contributing to K_b / S_b. Each list is
+  // marshalled into a CSV positional FCALL arg (args 3/4/5). Omitted or empty
+  // lists are byte-identical to the pre-5.31c kernel path.
+  exclude?: { book?: string[]; trade_id?: string[]; risk_factor?: string[] };
 }
 
 const ALLOWED_REGIME = new Set<CorrelationRegime>(["low", "medium", "high"]);
@@ -39,6 +45,14 @@ function escapeTag(v: string): string {
 // FT.AGGREGATE query string. Matches the implicit cap of the existing
 // "LIMIT 0 10000" — far more than any realistic bucket count per risk_class.
 const MAX_BUCKET_SUBSET = 256;
+
+// Wave 5.31c: per-list cap on the exclude predicate sets. Each list is
+// marshalled into a CSV FCALL arg; this protects Lua memory on hostile input
+// while sitting comfortably above any realistic demo case. Over the cap →
+// 413 Payload Too Large per the locked design decision.
+const MAX_EXCLUDE_LIST = 1000;
+type ExcludeKey = "book" | "trade_id" | "risk_factor";
+const EXCLUDE_KEYS: ExcludeKey[] = ["book", "trade_id", "risk_factor"];
 
 interface CalcOpts {
   // Map of risk_class → cross-bucket correlation γ_bc spec. Loaded from
@@ -264,6 +278,45 @@ export function registerCalcRoute(
       }
     }
     const regime: CorrelationRegime = (regimeRaw as CorrelationRegime | undefined) ?? "medium";
+
+    // Wave 5.31c: validate + marshal the optional `exclude` predicate. Each
+    // field is an array of non-empty strings without commas (the CSV
+    // delimiter); over MAX_EXCLUDE_LIST entries → 413 per the design decision.
+    // Missing/empty lists serialise to "" which the Lua kernel treats as
+    // "no exclusion" — byte-identical to the pre-5.31c kernel path.
+    const excludeRaw = req.body?.exclude;
+    const excludeCsv: Record<ExcludeKey, string> = { book: "", trade_id: "", risk_factor: "" };
+    if (excludeRaw !== undefined && excludeRaw !== null) {
+      if (typeof excludeRaw !== "object" || Array.isArray(excludeRaw)) {
+        reply.code(400);
+        return { error: "exclude must be an object with optional book/trade_id/risk_factor arrays" };
+      }
+      for (const key of EXCLUDE_KEYS) {
+        const list = (excludeRaw as Record<string, unknown>)[key];
+        if (list === undefined || list === null) continue;
+        if (!Array.isArray(list)) {
+          reply.code(400);
+          return { error: `exclude.${key} must be an array of non-empty strings` };
+        }
+        if (list.length > MAX_EXCLUDE_LIST) {
+          reply.code(413);
+          return { error: `exclude.${key} exceeds maximum of ${MAX_EXCLUDE_LIST} entries` };
+        }
+        const seen = new Set<string>();
+        for (const v of list) {
+          if (typeof v !== "string" || v.length === 0) {
+            reply.code(400);
+            return { error: `exclude.${key} must be an array of non-empty strings` };
+          }
+          if (v.includes(",")) {
+            reply.code(400);
+            return { error: `exclude.${key} values may not contain commas` };
+          }
+          seen.add(v);
+        }
+        excludeCsv[key] = Array.from(seen).join(",");
+      }
+    }
     const regimeFactor = CORRELATION_REGIME_FACTOR[regime];
     // CRITICAL — Curvature scaling order (§21.5(5) + §21.6): scale γ FIRST,
     // then square. Because reduceCurvatureCharge calls squareCorrelationSpec
@@ -363,13 +416,20 @@ export function registerCalcRoute(
       results = await Promise.all(
         buckets.map(async (b, i): Promise<BucketResult> => {
           const routeKey = dispatchedKeys[i]!;
+          // Wave 5.31c: positional args 3/4/5 are the exclude CSVs. Empty
+          // strings are passed through unconditionally so the FCALL arity is
+          // stable — the kernel's `_frtb_parse_csv_set` returns nil for "" and
+          // takes the short-circuit "no exclusion" path.
           const r = (await redis.call(
             "FCALL",
             funcName,
             "1",
             routeKey,
             risk_class,
-            b
+            b,
+            excludeCsv.book,
+            excludeCsv.trade_id,
+            excludeCsv.risk_factor
           )) as unknown;
           const parsed = parseBucketReply(r) ?? { bucket: "", K_b: 0, S_b: 0, count: 0, ms: 0 };
           parsed.bucket = b;
@@ -428,7 +488,10 @@ export function registerCalcRoute(
         command: "FCALL" as const,
         function: funcName,
         library: "frtb",
-        arg_template: `FCALL ${funcName} 1 sens:{${risk_class}:<bucket>}:_route ${risk_class} <bucket>`,
+        // Wave 5.31c: arg_template surfaces the three exclude CSV positionals
+        // so the UI commands panel makes the kernel-side predicate push-down
+        // visible to demo audiences — the pushdown is invisible without it.
+        arg_template: `FCALL ${funcName} 1 sens:{${risk_class}:<bucket>}:_route ${risk_class} <bucket> <exclude_book_csv> <exclude_trade_csv> <exclude_factor_csv>`,
         dispatched_keys: dispatchedKeys,
       },
       regime: {

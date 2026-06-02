@@ -23,6 +23,7 @@ import {
   squareCorrelationSpec,
   summariseDirection,
 } from "./curvatureCommon.ts";
+import { isRowExcluded, type RowExclude } from "./excludeCommon.ts";
 
 export interface FxCurvatureRow {
   sensitivity_type: string;
@@ -30,6 +31,10 @@ export interface FxCurvatureRow {
   // Shape A per docs/demo/curvature-scope.md §3a:
   //   { cvr_up: number, cvr_down: number } scalar per FX factor k.
   risk_value: unknown;
+  // Wave 5.31c — optional predicate fields used by `exclude` filtering.
+  book?: string;
+  trade_id?: string;
+  risk_factor?: string;
 }
 
 export interface FxCurvatureSchema {
@@ -40,6 +45,8 @@ export interface FxCurvatureSchema {
   crossBucketGammaDelta?: CurvatureGammaSpec;
   // Optional explicit bucket ordering; otherwise sorted ascending.
   bucketOrder?: string[];
+  // Wave 5.31c — optional row-exclusion predicate (mirrors the Lua kernel).
+  exclude?: RowExclude;
 }
 
 interface BucketAccum {
@@ -71,6 +78,7 @@ export function computeFxCurvatureCharge(
   for (const row of rows) {
     if (!row || row.sensitivity_type !== "Curvature") continue;
     if (typeof row.bucket !== "string" || row.bucket.length === 0) continue;
+    if (isRowExcluded(row, schema.exclude)) continue;
     const pair = readScalarPair(row.risk_value);
     if (!pair) continue;
     let accum = buckets.get(row.bucket);

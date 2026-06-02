@@ -21,7 +21,10 @@
 -- fixtures may still emit a plain `[v0, v1, ...]` array. Both shapes
 -- iterate in declared tenor order so floating-point summation is identical.
 
-local function _delta_iter_bucket(risk_class, bucket, weights, tenors)
+-- Wave 5.31c: args 3/4/5 carry the exclude_book / trade / factor CSV sets so
+-- the predicate is applied row-by-row inside the SCAN loop — rows matching
+-- any set never contribute to sum_s / row_count.
+local function _delta_iter_bucket(risk_class, bucket, weights, tenors, book_set, trade_set, factor_set)
   local pattern = 'sens:{' .. risk_class .. ':' .. bucket .. '}:*'
   local cursor = '0'
   local T = #weights
@@ -40,7 +43,8 @@ local function _delta_iter_bucket(risk_class, bucket, weights, tenors)
       end
       if raw then
         local ok, doc = pcall(cjson.decode, raw)
-        if ok and type(doc) == 'table' and doc.sensitivity_type == 'Delta' then
+        if ok and type(doc) == 'table' and doc.sensitivity_type == 'Delta'
+           and not _frtb_excluded(doc, book_set, trade_set, factor_set) then
           local rv = doc.risk_value
           if type(rv) == 'table' then
             if rv[1] ~= nil then
@@ -73,12 +77,15 @@ redis.register_function('sbm_delta_bucket', function(keys, args)
   if not risk_class or not bucket then
     return redis.error_reply('sbm_delta_bucket: requires (risk_class, bucket) args')
   end
+  local book_set = _frtb_parse_csv_set(args[3])
+  local trade_set = _frtb_parse_csv_set(args[4])
+  local factor_set = _frtb_parse_csv_set(args[5])
   local weights = __GIRR_DELTA_WEIGHTS__
   local rho = __GIRR_DELTA_RHO__
   local tenors = __GIRR_TENORS__
   local T = #weights
   local t0 = redis.call('TIME')
-  local sum_s, count = _delta_iter_bucket(risk_class, bucket, weights, tenors)
+  local sum_s, count = _delta_iter_bucket(risk_class, bucket, weights, tenors, book_set, trade_set, factor_set)
   local sum_ws = 0.0
   local sum_ws_sq = 0.0
   for k = 1, T do
