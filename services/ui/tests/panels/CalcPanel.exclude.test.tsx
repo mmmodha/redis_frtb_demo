@@ -38,7 +38,9 @@ describe("Wave 5.31c — Advanced filters (book / trade_id / risk_factor exclusi
     const details = screen.getByTestId("advanced-filters") as HTMLDetailsElement;
     expect(details).toBeInTheDocument();
     expect(details.open).toBe(false);
-    expect(screen.getByTestId("advanced-filters-summary").textContent).toBe("Advanced filters");
+    expect(screen.getByTestId("advanced-filters-summary").textContent).toBe(
+      "Filters · exclude rows from this calculation",
+    );
   });
 
   it("shows three exclude combos (book / trade_id / risk_factor) when expanded", () => {
@@ -63,7 +65,7 @@ describe("Wave 5.31c — Advanced filters (book / trade_id / risk_factor exclusi
     const sent = mockCalcWithCapture(baseResponse);
     render(<CalcPanel />);
     (screen.getByTestId("advanced-filters") as HTMLDetailsElement).open = true;
-    const bookInput = screen.getByLabelText(/Exclude books/i);
+    const bookInput = screen.getByLabelText(/^Book —/i);
     fireEvent.change(bookInput, { target: { value: "BookA" } });
     fireEvent.keyDown(bookInput, { key: "Enter" });
     await waitFor(() => {
@@ -79,7 +81,7 @@ describe("Wave 5.31c — Advanced filters (book / trade_id / risk_factor exclusi
     mockCalcWithCapture(baseResponse);
     render(<CalcPanel />);
     (screen.getByTestId("advanced-filters") as HTMLDetailsElement).open = true;
-    const tradeInput = screen.getByLabelText(/Exclude trades/i);
+    const tradeInput = screen.getByLabelText(/^Trade ID —/i);
     fireEvent.change(tradeInput, { target: { value: "T1,T2,T3," } });
     await waitFor(() => {
       const chips = within(screen.getByTestId("exclude-trade_id-chips")).getAllByTestId("exclude-chip");
@@ -91,7 +93,7 @@ describe("Wave 5.31c — Advanced filters (book / trade_id / risk_factor exclusi
     mockCalcWithCapture(baseResponse);
     render(<CalcPanel />);
     (screen.getByTestId("advanced-filters") as HTMLDetailsElement).open = true;
-    const factorInput = screen.getByLabelText(/Exclude risk factors/i);
+    const factorInput = screen.getByLabelText(/^Risk factor —/i);
     fireEvent.change(factorInput, { target: { value: "RF1,RF2," } });
     await waitFor(() => {
       const chips = within(screen.getByTestId("exclude-risk_factor-chips")).getAllByTestId("exclude-chip");
@@ -110,10 +112,12 @@ describe("Wave 5.31c — Advanced filters (book / trade_id / risk_factor exclusi
     mockCalcWithCapture(baseResponse);
     render(<CalcPanel />);
     (screen.getByTestId("advanced-filters") as HTMLDetailsElement).open = true;
-    fireEvent.change(screen.getByLabelText(/Exclude books/i), { target: { value: "A,B," } });
-    fireEvent.change(screen.getByLabelText(/Exclude trades/i), { target: { value: "T1," } });
+    fireEvent.change(screen.getByLabelText(/^Book —/i), { target: { value: "A,B," } });
+    fireEvent.change(screen.getByLabelText(/^Trade ID —/i), { target: { value: "T1," } });
     await waitFor(() => {
-      expect(screen.getByTestId("advanced-filters-summary").textContent).toBe("Advanced filters · 3 excluded");
+      expect(screen.getByTestId("advanced-filters-summary").textContent).toBe(
+        "Filters · exclude rows from this calculation · 3 excluded",
+      );
     });
   });
 });

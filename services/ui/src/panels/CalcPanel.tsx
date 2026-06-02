@@ -226,6 +226,10 @@ export function CalcPanel() {
   const [excludeBooks, setExcludeBooks] = useState<Set<string>>(new Set());
   const [excludeTrades, setExcludeTrades] = useState<Set<string>>(new Set());
   const [excludeFactors, setExcludeFactors] = useState<Set<string>>(new Set());
+  // Wave 5.48 — mirrors PivotPanel's fuzzy toggle. `false` ⇒ the exclude
+  // comboboxes stop fetching /suggest and the dropdown stays closed; they
+  // remain plain text inputs so the user can still commit free-text chips.
+  const [fuzzy, setFuzzy] = useState<boolean>(true);
 
   const isWave4 = riskClass !== "GIRR";
 
@@ -334,15 +338,26 @@ export function CalcPanel() {
       <PanelCard
         title="Calculate"
         actions={
-          <button
-            type="button"
-            className="calc-panel__cta"
-            onClick={onCalculate}
-            disabled={loading || (bucketSubset !== null && bucketSubset.size === 0)}
-            data-testid="calc-cta"
-          >
-            {loading ? "Calculating…" : "Calculate SBM risk charge"}
-          </button>
+          <>
+            <button
+              type="button"
+              className={`pivot-fuzzy-toggle ${fuzzy ? "is-on" : "is-off"}`}
+              data-testid="calc-fuzzy-toggle"
+              aria-pressed={fuzzy}
+              onClick={() => setFuzzy((v) => !v)}
+            >
+              <span data-testid="calc-fuzzy-hint">Fuzzy: {fuzzy ? "on" : "off"}</span>
+            </button>
+            <button
+              type="button"
+              className="calc-panel__cta"
+              onClick={onCalculate}
+              disabled={loading || (bucketSubset !== null && bucketSubset.size === 0)}
+              data-testid="calc-cta"
+            >
+              {loading ? "Calculating…" : "Calculate SBM risk charge"}
+            </button>
+          </>
         }
       >
         <div className="calc-panel__form">
@@ -391,6 +406,7 @@ export function CalcPanel() {
           onBooksChange={setExcludeBooks}
           onTradesChange={setExcludeTrades}
           onFactorsChange={setExcludeFactors}
+          fuzzy={fuzzy}
         />
       </PanelCard>
 
@@ -512,6 +528,7 @@ function AdvancedFilters({
   onBooksChange,
   onTradesChange,
   onFactorsChange,
+  fuzzy,
 }: {
   books: Set<string>;
   trades: Set<string>;
@@ -519,34 +536,42 @@ function AdvancedFilters({
   onBooksChange: (next: Set<string>) => void;
   onTradesChange: (next: Set<string>) => void;
   onFactorsChange: (next: Set<string>) => void;
+  fuzzy: boolean;
 }) {
   const total = books.size + trades.size + factors.size;
+  // Wave 5.48 — open by default when the user has either added chips or
+  // flipped fuzzy off, so the toggle and filters are discoverable. The
+  // pristine empty state (no chips, fuzzy=on) stays collapsed.
+  const openByDefault = total > 0 || !fuzzy;
   return (
-    <details className="calc-panel__advanced" data-testid="advanced-filters">
+    <details className="calc-panel__advanced" data-testid="advanced-filters" open={openByDefault}>
       <summary className="calc-panel__advanced-summary" data-testid="advanced-filters-summary">
-        Advanced filters{total > 0 ? ` · ${total} excluded` : ""}
+        Filters · exclude rows from this calculation{total > 0 ? ` · ${total} excluded` : ""}
       </summary>
       <div className="calc-panel__advanced-body">
         <ExcludeChipsCombobox
           field="book"
-          label="Exclude books"
+          label="Book — excluded from totals"
           placeholder="e.g. RATES-LDN"
           values={books}
           onChange={onBooksChange}
+          fuzzy={fuzzy}
         />
         <ExcludeChipsCombobox
           field="trade_id"
-          label="Exclude trades"
+          label="Trade ID — excluded from totals"
           placeholder="e.g. T0042"
           values={trades}
           onChange={onTradesChange}
+          fuzzy={fuzzy}
         />
         <ExcludeChipsCombobox
           field="risk_factor"
-          label="Exclude risk factors"
+          label="Risk factor — excluded from totals"
           placeholder="e.g. RF_GIRR_05"
           values={factors}
           onChange={onFactorsChange}
+          fuzzy={fuzzy}
         />
       </div>
     </details>
@@ -564,12 +589,14 @@ function ExcludeChipsCombobox({
   placeholder,
   values,
   onChange,
+  fuzzy,
 }: {
   field: "book" | "trade_id" | "risk_factor";
   label: string;
   placeholder?: string;
   values: Set<string>;
   onChange: (next: Set<string>) => void;
+  fuzzy: boolean;
 }) {
   const [draft, setDraft] = useState<string>("");
 
@@ -622,6 +649,7 @@ function ExcludeChipsCombobox({
         value={draft}
         onChange={onDraftChange}
         placeholder={placeholder}
+        fuzzy={fuzzy}
       />
       {values.size > 0 ? (
         <ul

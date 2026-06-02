@@ -213,15 +213,50 @@ describe("<SuggestCombobox />", () => {
     expect(abortReceived[0]!.aborted).toBe(true);
   });
 
-  it("Wave 5.38d — fuzzy={false} forwards &fuzzy=0 in the /suggest URL", async () => {
+  it("Wave 5.48 — fuzzy={false} suppresses the /suggest fetch entirely", async () => {
     fetchMock.mockResolvedValue(suggestOk(["A1"]));
     render(<Harness fuzzy={false} />);
     fireEvent.change(screen.getByRole("combobox"), { target: { value: "A" } });
+    // Wait past the debounce window — no fetch should be issued.
+    await new Promise((r) => setTimeout(r, 30));
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("Wave 5.48 — fuzzy={false} keeps the listbox closed even on focus + typing", async () => {
+    fetchMock.mockResolvedValue(suggestOk(["A1"]));
+    render(<Harness fuzzy={false} />);
+    const input = screen.getByRole("combobox") as HTMLInputElement;
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: "A" } });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(screen.queryByRole("listbox")).toBeNull();
+    expect(input).toHaveAttribute("aria-expanded", "false");
+    expect(input.getAttribute("aria-activedescendant") ?? "").toBe("");
+  });
+
+  it("Wave 5.48 — flipping fuzzy from false to true re-enables fetch + listbox on next keystroke", async () => {
+    fetchMock.mockResolvedValue(suggestOk(["A1", "A2"]));
+    function Wrapper() {
+      const [f, setF] = useState<boolean>(false);
+      return (
+        <>
+          <button data-testid="flip" onClick={() => setF(true)}>flip</button>
+          <Harness fuzzy={f} />
+        </>
+      );
+    }
+    render(<Wrapper />);
+    const input = screen.getByRole("combobox") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "A" } });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(screen.queryByRole("listbox")).toBeNull();
+    // Flip fuzzy on, then type one more letter.
+    fireEvent.click(screen.getByTestId("flip"));
+    fireEvent.change(input, { target: { value: "AB" } });
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
-    const url = String(fetchMock.mock.calls[0]![0]);
-    expect(url).toContain("/suggest?");
-    expect(url).toContain("fuzzy=0");
-    expect(url).not.toContain("fuzzy=1");
+    await screen.findByRole("listbox");
+    expect(input).toHaveAttribute("aria-expanded", "true");
   });
 });
 

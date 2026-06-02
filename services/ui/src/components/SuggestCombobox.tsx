@@ -52,9 +52,15 @@ export function SuggestCombobox(props: SuggestComboboxProps): JSX.Element {
   const cap = useMemo(() => Math.max(1, Math.min(50, maxSuggestions)), [maxSuggestions]);
 
   // Debounced fetch on value change. Empty prefix → clear suggestions, no fetch.
+  // Wave 5.48 — fuzzy=false means "no autocomplete at all": skip the network
+  // call entirely and keep the listbox closed regardless of focus / value.
   useEffect(() => {
     if (disabled) return;
     if (abortRef.current) { abortRef.current.abort(); abortRef.current = null; }
+    if (!fuzzy) {
+      setSuggestions([]); setStatus("idle"); setActive(-1); setOpen(false);
+      return;
+    }
     if (value === "") {
       setSuggestions([]); setStatus("idle"); setActive(-1);
       return;
@@ -100,9 +106,10 @@ export function SuggestCombobox(props: SuggestComboboxProps): JSX.Element {
   // Abort any in-flight fetch on unmount.
   useEffect(() => () => { if (abortRef.current) abortRef.current.abort(); }, []);
 
-  const showList = open && status !== "idle";
+  // Wave 5.48 — fuzzy=false forces the listbox closed regardless of focus / value.
+  const showList = fuzzy && open && status !== "idle";
   const optionId = (i: number): string => `${listboxId}-opt-${i}`;
-  const activeId = active >= 0 && status === "ok" ? optionId(active) : undefined;
+  const activeId = fuzzy && active >= 0 && status === "ok" ? optionId(active) : undefined;
 
   function selectAt(i: number): void {
     const s = suggestions[i];
@@ -160,8 +167,8 @@ export function SuggestCombobox(props: SuggestComboboxProps): JSX.Element {
         value={value}
         placeholder={placeholder}
         disabled={disabled}
-        onChange={(e) => { onChange(e.target.value); setOpen(true); }}
-        onFocus={() => { if (value !== "" && suggestions.length > 0) setOpen(true); }}
+        onChange={(e) => { onChange(e.target.value); if (fuzzy) setOpen(true); }}
+        onFocus={() => { if (fuzzy && value !== "" && suggestions.length > 0) setOpen(true); }}
         onBlur={() => { setTimeout(() => setOpen(false), 100); }}
         onKeyDown={onKeyDown}
       />
