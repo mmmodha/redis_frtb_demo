@@ -17,6 +17,7 @@ interface PivotQuery {
   sensitivity_type?: string;
   book?: string;
   trade_id?: string;
+  risk_factor?: string;
   limit?: string;
   offset?: string;
 }
@@ -40,6 +41,7 @@ export function registerPivotRoute(
     if (q.sensitivity_type) parts.push(`@sensitivity_type:{${escapeTag(q.sensitivity_type)}}`);
     if (q.book) parts.push(`@book:{${escapeTag(q.book)}}`);
     if (q.trade_id) parts.push(`@trade_id:{${escapeTag(q.trade_id)}}`);
+    if (q.risk_factor) parts.push(`@risk_factor:{${escapeTag(q.risk_factor)}}`);
     const query = parts.length === 0 ? "*" : parts.join(" ");
 
     // Wave 5.16t — resolve active redis per-request so a profile switch is

@@ -96,6 +96,37 @@ describe("PivotPanel", () => {
     expect(screen.getByRole("button", { name: /run query/i })).toBeEnabled();
   });
 
+  it("Wave 5.30b — renders trade_id and risk_factor combobox inputs", () => {
+    renderPanel();
+    expect(screen.getByLabelText(/trade id/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/risk factor/i)).toBeInTheDocument();
+    // book is now a combobox too — assert ARIA role.
+    expect(screen.getByRole("combobox", { name: /^book$/i })).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: /trade id/i })).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: /risk factor/i })).toBeInTheDocument();
+  });
+
+  it("Wave 5.30b — running with trade_id + risk_factor forwards them as URL params", async () => {
+    fetchMock.mockResolvedValueOnce({ ok: true, json: async () => pivotResponse({ total: 0, rows: [] }) });
+    renderPanel();
+    fireEvent.change(screen.getByLabelText(/trade id/i), { target: { value: "T0042" } });
+    fireEvent.change(screen.getByLabelText(/risk factor/i), { target: { value: "RF_GIRR_05" } });
+    fireEvent.click(screen.getByRole("button", { name: /run query/i }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    // The combobox debounce will eventually fire a /suggest call too; we only
+    // care that the /pivot call carried the new params.
+    const pivotCall = fetchMock.mock.calls.find((c) => String(c[0]).includes("/pivot?"));
+    expect(pivotCall).toBeDefined();
+    const url = String(pivotCall![0]);
+    expect(url).toContain("trade_id=T0042");
+    expect(url).toContain("risk_factor=RF_GIRR_05");
+  });
+
+  it("Wave 5.30b — renders a 'fuzzy: on' hint near the run buttons", () => {
+    renderPanel();
+    expect(screen.getByTestId("pivot-fuzzy-hint")).toHaveTextContent(/fuzzy:\s*on/i);
+  });
+
   it("renders the RedisQueryEngine EnterpriseCallout banner", () => {
     renderPanel();
     const callout = screen.getByTestId("enterprise-callout");

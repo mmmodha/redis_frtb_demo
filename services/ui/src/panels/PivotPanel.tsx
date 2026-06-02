@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { PanelCard } from "../components/PanelCard";
 import { EnterpriseCallout } from "../components/EnterpriseCallout";
 import { LatencyStrip } from "../components/LatencyStrip";
+import { SuggestCombobox } from "../components/SuggestCombobox";
 import { apiBase } from "../lib/api";
 import {
   EmptyTargetError,
@@ -20,6 +21,8 @@ export function PivotPanel(): JSX.Element {
   const [bucket, setBucket] = useState<string>("");
   const [sensType, setSensType] = useState<string>("");
   const [book, setBook] = useState<string>("");
+  const [tradeId, setTradeId] = useState<string>("");
+  const [riskFactor, setRiskFactor] = useState<string>("");
   const limit = DEFAULT_LIMIT;
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
@@ -47,6 +50,8 @@ export function PivotPanel(): JSX.Element {
     if (bucket) params.set("bucket", bucket);
     if (sensType) params.set("sensitivity_type", sensType);
     if (book) params.set("book", book);
+    if (tradeId) params.set("trade_id", tradeId);
+    if (riskFactor) params.set("risk_factor", riskFactor);
     params.set("limit", String(limit));
     params.set("offset", String(nextOffset));
     const url = `${apiBase().replace(/\/$/, "")}/pivot?${params.toString()}`;
@@ -92,6 +97,8 @@ export function PivotPanel(): JSX.Element {
       bucket,
       sensitivity_type: sensType,
       book,
+      trade_id: tradeId,
+      risk_factor: riskFactor,
       limit,
       offset: 0,
     };
@@ -126,6 +133,7 @@ export function PivotPanel(): JSX.Element {
         title="Filters"
         actions={
           <>
+            <small className="pivot-fuzzy-hint" data-testid="pivot-fuzzy-hint">fuzzy: on</small>
             <button type="button" onClick={() => void runAt(0)} disabled={loading || burst !== null}>
               {loading || burst !== null ? "Running…" : "Run query"}
             </button>
@@ -173,13 +181,28 @@ export function PivotPanel(): JSX.Element {
             ))}
           </select>
           <label htmlFor="pivot-book">Book</label>
-          <input
+          <SuggestCombobox
+            field="book"
             id="pivot-book"
-            aria-label="Book"
-            type="text"
             value={book}
-            onChange={(e) => setBook(e.target.value)}
+            onChange={setBook}
             placeholder="e.g. RATES-LDN"
+          />
+          <label htmlFor="pivot-trade-id">Trade ID</label>
+          <SuggestCombobox
+            field="trade_id"
+            id="pivot-trade-id"
+            value={tradeId}
+            onChange={setTradeId}
+            placeholder="e.g. T0042"
+          />
+          <label htmlFor="pivot-risk-factor">Risk factor</label>
+          <SuggestCombobox
+            field="risk_factor"
+            id="pivot-risk-factor"
+            value={riskFactor}
+            onChange={setRiskFactor}
+            placeholder="e.g. RF_GIRR_05"
           />
         </form>
       </PanelCard>

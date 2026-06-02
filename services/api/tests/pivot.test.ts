@@ -96,4 +96,20 @@ describe("GET /pivot", () => {
     const res = await app.inject({ method: "GET", url: "/pivot?offset=-1" });
     expect(res.statusCode).toBe(400);
   });
+
+  it("Wave 5.30b — risk_factor filter is escaped and appended to the FT.SEARCH query", async () => {
+    const fr = fakeRedis();
+    fr.setResponse("FT.SEARCH", ftSearchReply(0, []));
+    app = await createServer({ redis: fr });
+    const res = await app.inject({
+      method: "GET",
+      url: "/pivot?risk_factor=RF_GIRR_05&trade_id=T0042",
+    });
+    expect(res.statusCode).toBe(200);
+    const search = fr.calls.find((c) => c.command === "FT.SEARCH");
+    expect(search).toBeDefined();
+    const query = String(search!.args[1]);
+    expect(query).toContain("@risk_factor:{RF_GIRR_05}");
+    expect(query).toContain("@trade_id:{T0042}");
+  });
 });

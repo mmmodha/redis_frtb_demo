@@ -112,6 +112,29 @@ test.describe("/pivot — Query/Pivot panel", () => {
     expect(observedUrl).toContain("book=RATES-LDN");
   });
 
+  test("Wave 5.30b — typing one letter in the Book combobox renders mocked suggestions", async ({ page }) => {
+    await page.route("**/suggest**", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          suggestions: [
+            { value: "RATES-LDN", score: 1 },
+            { value: "RATES-NYC", score: 0.8 },
+          ],
+          ms: 1.2,
+        }),
+      });
+    });
+    await page.goto("/pivot");
+    const book = page.getByRole("combobox", { name: /^book$/i });
+    await book.click();
+    await book.fill("R");
+    const listbox = page.getByRole("listbox").first();
+    await expect(listbox).toBeVisible();
+    await expect(listbox.getByRole("option", { name: /RATES-LDN/ })).toBeVisible();
+  });
+
   test("pagination Next advances offset by limit", async ({ page }) => {
     let calls: string[] = [];
     await page.route(/\/pivot\?/, async (route) => {

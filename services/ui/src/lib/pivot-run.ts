@@ -17,6 +17,8 @@ export interface PivotRunFilters {
   bucket?: string;
   sensitivity_type?: string;
   book?: string;
+  trade_id?: string;
+  risk_factor?: string;
   limit?: number;
   offset?: number;
 }
@@ -35,6 +37,8 @@ export async function runPivot(
   if (filters.bucket) params.set("bucket", filters.bucket);
   if (filters.sensitivity_type) params.set("sensitivity_type", filters.sensitivity_type);
   if (filters.book) params.set("book", filters.book);
+  if (filters.trade_id) params.set("trade_id", filters.trade_id);
+  if (filters.risk_factor) params.set("risk_factor", filters.risk_factor);
   params.set("limit", String(filters.limit ?? 100));
   params.set("offset", String(filters.offset ?? 0));
   const url = `${apiBase().replace(/\/$/, "")}/pivot?${params.toString()}`;
