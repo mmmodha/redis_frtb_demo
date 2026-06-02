@@ -4,9 +4,12 @@ import { getActiveTarget } from "../active-target.ts";
 import { getBootstrapStatus } from "../bootstrap-status.ts";
 import { translateRedisError } from "../redis-errors.ts";
 import {
+  CORRELATION_REGIME_FACTOR,
   reduceCurvatureCharge,
   reduceRiskClassCharge,
+  scaleCorrelationSpec,
   type BucketResult,
+  type CorrelationRegime,
   type CorrelationSpec,
 } from "../sbm/reduce.ts";
 
@@ -17,7 +20,12 @@ interface CalcBody {
   // bucket-discovery to a caller-supplied subset so the second Calculate fans
   // out FCALL only over those buckets. Empty array or omitted = no narrowing.
   bucket_subset?: string[];
+  // Wave 5.31b: Basel MAR21.6 cross-bucket γ regime selector. Omitted defaults
+  // to "medium" (factor 1.0) which is a no-op vs. pre-5.31b behaviour.
+  correlation_regime?: CorrelationRegime;
 }
+
+const ALLOWED_REGIME = new Set<CorrelationRegime>(["low", "medium", "high"]);
 
 // Wave 5.31a: TAG-token escape for the discovery query string. Duplicates the
 // helper in routes/pivot.ts — kept inline rather than factored into a shared
@@ -245,6 +253,26 @@ export function registerCalcRoute(
       bucket_subset = Array.from(seen);
     }
 
+    // Wave 5.31b: validate optional correlation_regime (Basel MAR21.6). Default
+    // "medium" → factor 1.0 → scaleCorrelationSpec returns the spec unchanged
+    // → wire-shape regression is preserved vs. pre-5.31b.
+    const regimeRaw = req.body?.correlation_regime;
+    if (regimeRaw !== undefined && regimeRaw !== null) {
+      if (typeof regimeRaw !== "string" || !ALLOWED_REGIME.has(regimeRaw as CorrelationRegime)) {
+        reply.code(400);
+        return { error: "correlation_regime must be one of: low, medium, high" };
+      }
+    }
+    const regime: CorrelationRegime = (regimeRaw as CorrelationRegime | undefined) ?? "medium";
+    const regimeFactor = CORRELATION_REGIME_FACTOR[regime];
+    // CRITICAL — Curvature scaling order (§21.5(5) + §21.6): scale γ FIRST,
+    // then square. Because reduceCurvatureCharge calls squareCorrelationSpec
+    // on whatever we pass in, feeding it the scaled spec yields
+    //   (γ × factor)²  =  γ² × factor²
+    // which is the correct Basel interpretation. Scaling γ_curv directly
+    // (i.e. γ² × factor) would be wrong by a factor of `factor`.
+    const scaledCorr = scaleCorrelationSpec(corr, regimeFactor, 1.0);
+
     // Wave 5.16t — resolve the active redis client once per request so a
     // mid-flight target switch is picked up by the very next call.
     const redis = getRedis();
@@ -360,25 +388,32 @@ export function registerCalcRoute(
 
     // 3) Reduce per-bucket K_b/S_b → risk-class charge. Curvature follows the
     //    §21.5(5)/(5)(b) shape (γ² + ψ-gated cross terms); Delta/Vega use the
-    //    §21.4(5)/(7) shape. `corr` carries the Delta γ in both cases —
-    //    reduceCurvatureCharge squares it internally per §21.5(5). Curvature
-    //    also reports whether the §21.5(5)(b) clip-to-±K_b fallback fired so
-    //    the UI can render the regulatory branch beside the charge.
+    //    §21.4(5)/(7) shape. We pass `scaledCorr` — the §21.6 regime-scaled γ
+    //    spec — into BOTH paths so the cross-bucket term reflects the chosen
+    //    correlation regime. For Curvature, reduceCurvatureCharge squares the
+    //    spec internally; feeding it the already-scaled γ yields (γ·f)² which
+    //    is the correct interpretation (scale FIRST, then square).
     let charge: number;
     let curvatureBranch: "positive_interior" | "fallback_clipped_s" | undefined;
     if (leg === "curvature") {
-      const out = reduceCurvatureCharge(results, corr);
+      const out = reduceCurvatureCharge(results, scaledCorr);
       charge = out.charge;
       curvatureBranch = out.usedFallback ? "fallback_clipped_s" : "positive_interior";
     } else {
-      charge = reduceRiskClassCharge(results, corr);
+      charge = reduceRiskClassCharge(results, scaledCorr);
     }
     const total_ms = Number(process.hrtime.bigint() - t0) / 1e6;
 
-    // Wave 5.16m: observability — surface the exact Redis commands the route
-    // dispatched (FT.AGGREGATE for discovery, FCALL per bucket for fan-out)
-    // so the UI can render them verbatim for the demo. Read-only mirror of
-    // what was already executed; nothing extra is computed or invoked here.
+    // Wave 5.16m / 5.31b: observability — surface the exact Redis commands the
+    // route dispatched (FT.AGGREGATE for discovery, FCALL per bucket for
+    // fan-out) plus the §21.6 regime applied to γ_bc so the UI can render the
+    // full provenance verbatim for the demo. Read-only mirror; no extra work.
+    const regimeNote =
+      regime === "high"
+        ? "γ × 1.25, each ρ_bc capped at 1.0"
+        : regime === "low"
+        ? "γ × 0.75"
+        : "γ × 1.0 (no-op)";
     const commands = {
       discovery: {
         command: "FT.AGGREGATE" as const,
@@ -395,6 +430,12 @@ export function registerCalcRoute(
         library: "frtb",
         arg_template: `FCALL ${funcName} 1 sens:{${risk_class}:<bucket>}:_route ${risk_class} <bucket>`,
         dispatched_keys: dispatchedKeys,
+      },
+      regime: {
+        name: regime,
+        factor: regimeFactor,
+        cap: 1.0,
+        note: regimeNote,
       },
     };
 
@@ -418,6 +459,9 @@ export function registerCalcRoute(
       shard_breakdown: results.map((r) => ({ shard: r.bucket, buckets: [r.bucket], ms: r.ms })),
       // diagnostic — useful for the demo "look how parallel we are" callout
       fanout_ms: Math.round(fanoutMs * 1000) / 1000,
+      // Wave 5.31b: echo the regime that was actually applied so the UI badge
+      // shows what was computed, not what the user thought they requested.
+      correlation_regime: regime,
       commands,
       ...(curvatureBranch !== undefined ? { curvature_branch: curvatureBranch } : {}),
       ...(note ? { ok: true, note } : {}),

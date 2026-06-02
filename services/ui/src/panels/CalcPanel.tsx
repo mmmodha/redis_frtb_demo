@@ -6,6 +6,7 @@ import {
   type BucketResult,
   type CalcCommands,
   type CalcSbmResponse,
+  type CorrelationRegime,
   type SensitivityType,
 } from "../lib/calc";
 import { EmptyTargetError } from "../lib/empty-target";
@@ -24,6 +25,16 @@ const RISK_CLASS_OPTIONS: Array<{ value: RiskClass; label: string; live: boolean
 ];
 
 const SENSITIVITY_OPTIONS: SensitivityType[] = ["Delta", "Vega", "Curvature"];
+
+// Wave 5.31b: Basel MAR21.6 three-regime cross-bucket γ scaler. Med is the
+// default and a no-op vs. pre-5.31b math. The factor + label pair is what the
+// segmented control + hint render — kept in one place so the values can't
+// drift between API and UI.
+const REGIME_OPTIONS: Array<{ value: CorrelationRegime; label: string; factor: number; hint: string }> = [
+  { value: "low", label: "Low", factor: 0.75, hint: "γ × 0.75" },
+  { value: "medium", label: "Med", factor: 1.0, hint: "γ × 1.0" },
+  { value: "high", label: "High", factor: 1.25, hint: "γ × 1.25 (cap 1)" },
+];
 
 // Wave 5.18: standard tenor ordering for GIRR Delta/Vega risk_value arrays —
 // used as sparkline x-axis labels so hovers read "3M → 0.842".
@@ -203,6 +214,10 @@ export function CalcPanel() {
   // sends every bucket); `Set<string>` = user has interacted with the pills.
   // Carried across runs so a refine→Calculate cycle preserves the selection.
   const [bucketSubset, setBucketSubset] = useState<Set<string> | null>(null);
+  // Wave 5.31b: §21.6 cross-bucket γ regime. Med is the default and a no-op
+  // on the wire (we don't send the field), preserving the pre-5.31b body
+  // shape for default runs and keeping the commands panel clean.
+  const [regime, setRegime] = useState<CorrelationRegime>("medium");
 
   const isWave4 = riskClass !== "GIRR";
 
@@ -222,10 +237,15 @@ export function CalcPanel() {
         bucketSubset !== null &&
         bucketSubset.size < result.per_bucket.length;
       const subsetArr = sendSubset ? Array.from(bucketSubset!) : undefined;
+      // Wave 5.31b: only send `correlation_regime` when non-default — mirrors
+      // 5.31a's "don't send the default" convention so the default-path wire
+      // shape stays byte-identical to pre-5.31b.
+      const sendRegime = regime !== "medium";
       const r = await postCalcSbm({
         risk_class: riskClass,
         sensitivity_type: sensitivityType,
         ...(subsetArr ? { bucket_subset: subsetArr } : {}),
+        ...(sendRegime ? { correlation_regime: regime } : {}),
       });
       setResult(r);
       setResultContext({ riskClass, sensitivityType });
@@ -338,6 +358,7 @@ export function CalcPanel() {
             </select>
           </label>
         </div>
+        <CorrelationRegimeControl regime={regime} onChange={setRegime} />
         {result ? (
           <RefineBucketsRow
             buckets={result.per_bucket}
@@ -376,6 +397,79 @@ export function CalcPanel() {
           onToggleTable={toggleTable}
         />
       ) : null}
+    </div>
+  );
+}
+
+// Wave 5.31b: ARIA-compliant three-way segmented control for the Basel
+// MAR21.6 cross-bucket γ regime. ArrowLeft/ArrowRight cycle, Space/Enter
+// activate, Tab moves out per WAI-ARIA radiogroup pattern. The hint line
+// below shows the scaling factor so the user sees what's being applied
+// without opening the commands panel.
+function CorrelationRegimeControl({
+  regime,
+  onChange,
+}: {
+  regime: CorrelationRegime;
+  onChange: (next: CorrelationRegime) => void;
+}) {
+  const refs = useRef<Array<HTMLButtonElement | null>>([]);
+  const activeIdx = REGIME_OPTIONS.findIndex((o) => o.value === regime);
+  const activeHint = REGIME_OPTIONS[activeIdx]?.hint ?? "";
+
+  function onKeyDown(idx: number) {
+    return (e: KeyboardEvent<HTMLButtonElement>) => {
+      if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+        e.preventDefault();
+        const delta = e.key === "ArrowRight" ? 1 : -1;
+        const nextIdx = (idx + delta + REGIME_OPTIONS.length) % REGIME_OPTIONS.length;
+        const nextOpt = REGIME_OPTIONS[nextIdx]!;
+        onChange(nextOpt.value);
+        refs.current[nextIdx]?.focus();
+      } else if (e.key === " " || e.key === "Enter") {
+        e.preventDefault();
+        onChange(REGIME_OPTIONS[idx]!.value);
+      }
+    };
+  }
+
+  return (
+    <div className="calc-panel__regime" data-testid="correlation-regime">
+      <div className="calc-panel__regime-label" id="correlation-regime-label">
+        Correlation regime
+      </div>
+      <div
+        role="radiogroup"
+        aria-labelledby="correlation-regime-label"
+        className="calc-panel__regime-group"
+      >
+        {REGIME_OPTIONS.map((o, i) => {
+          const checked = o.value === regime;
+          return (
+            <button
+              key={o.value}
+              ref={(el) => {
+                refs.current[i] = el;
+              }}
+              type="button"
+              role="radio"
+              aria-checked={checked}
+              tabIndex={checked ? 0 : -1}
+              className="calc-panel__regime-option"
+              data-selected={checked ? "true" : "false"}
+              data-regime={o.value}
+              data-testid={`regime-option-${o.value}`}
+              onClick={() => onChange(o.value)}
+              onKeyDown={onKeyDown(i)}
+            >
+              {o.label}
+            </button>
+          );
+        })}
+      </div>
+      <div className="calc-panel__regime-hint" data-testid="regime-hint">
+        {activeHint}
+      </div>
     </div>
   );
 }
@@ -519,6 +613,27 @@ function CurvatureBranchPill({
   );
 }
 
+// Wave 5.31b: small inline badge that labels the Basel §21.6 regime that was
+// actually applied to the charge. Reads from `result.correlation_regime` so
+// the badge reflects what the api computed (not what the user clicked), which
+// matters when the user clicks Calculate without changing the default and the
+// api echoes "medium".
+function RegimeBadge({ regime }: { regime: CorrelationRegime }) {
+  const opt = REGIME_OPTIONS.find((o) => o.value === regime);
+  const label = opt?.label ?? regime;
+  const hint = opt?.hint ?? "";
+  return (
+    <span
+      className="charge-tile__regime-badge"
+      data-regime={regime}
+      data-testid="regime-badge"
+      title={`Basel MAR21.6 correlation regime — ${hint}`}
+    >
+      {label} ({hint})
+    </span>
+  );
+}
+
 // Wave 5.18: charge tile with a ~600ms ease-out count-up on fresh result.
 function AnimatedCharge({ value }: { value: number }) {
   const [displayed, setDisplayed] = useState<number>(() => (prefersReducedMotion() ? value : 0));
@@ -602,6 +717,9 @@ function CalcResult({
           <AnimatedCharge value={result.charge} />
           {result.curvature_branch ? (
             <CurvatureBranchPill branch={result.curvature_branch} />
+          ) : null}
+          {result.correlation_regime ? (
+            <RegimeBadge regime={result.correlation_regime} />
           ) : null}
         </div>
         <p className="calc-panel__basel-caption" data-testid="basel-caption">

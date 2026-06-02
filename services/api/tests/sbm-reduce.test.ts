@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { reduceCurvatureCharge, reduceRiskClassCharge } from "../src/sbm/reduce.ts";
+import {
+  CORRELATION_REGIME_FACTOR,
+  reduceCurvatureCharge,
+  reduceRiskClassCharge,
+  scaleCorrelationSpec,
+  type CorrelationSpec,
+} from "../src/sbm/reduce.ts";
 import { computeGirrCurvatureCharge } from "@frtb/calc/src/girrCurvatureReference.ts";
 import { computeEquityCurvatureCharge } from "@frtb/calc/src/equityCurvatureReference.ts";
 import { computeFxCurvatureCharge } from "@frtb/calc/src/fxCurvatureReference.ts";
@@ -295,5 +301,89 @@ describe("reduceCurvatureCharge — §21.5(5) + §21.5(5)(b) against the calc or
     const out = reduceCurvatureCharge(per, { kind: "constant", value: 0.5 });
     expect(out.usedFallback).toBe(false);
     expect(out.charge).toBeGreaterThan(0);
+  });
+});
+
+
+// Wave 5.31b: §21.6 cross-bucket γ regime scaler. Pure, non-mutating helper
+// that the route layer calls once per request before handing the spec to the
+// reducer. Identity at factor=1.0 (the medium-regime fast path) and
+// symmetric ±cap clamping for the high regime where γ can otherwise exceed 1.
+describe("scaleCorrelationSpec — Basel §21.6 regime scaler", () => {
+  it("returns the input reference unchanged when factor === 1.0", () => {
+    const spec: CorrelationSpec = { kind: "constant", value: 0.5 };
+    const out = scaleCorrelationSpec(spec, 1.0, 1.0);
+    expect(out).toBe(spec);
+  });
+
+  it("scales a constant spec by the factor", () => {
+    const out = scaleCorrelationSpec({ kind: "constant", value: 0.4 }, 0.75, 1.0);
+    expect(out).toEqual({ kind: "constant", value: 0.4 * 0.75 });
+  });
+
+  it("scales a matrix spec element-wise without mutating the input", () => {
+    const input: CorrelationSpec = {
+      kind: "matrix",
+      labels: ["A", "B"],
+      matrix: [
+        [1.0, 0.5],
+        [0.5, 1.0],
+      ],
+    };
+    const out = scaleCorrelationSpec(input, 0.75, 1.0);
+    // 0.5 × 0.75 = 0.375 (exactly representable in IEEE 754) avoids the FP
+    // drift you get from e.g. 0.4 × 0.75 = 0.30000000000000004.
+    expect(out).toEqual({
+      kind: "matrix",
+      labels: ["A", "B"],
+      matrix: [
+        [0.75, 0.375],
+        [0.375, 0.75],
+      ],
+    });
+    // Input must NOT be mutated — the route layer holds a long-lived reference
+    // to the YAML-loaded spec and a second request would otherwise see drift.
+    expect(input.matrix).toEqual([
+      [1.0, 0.5],
+      [0.5, 1.0],
+    ]);
+    expect(out).not.toBe(input);
+  });
+
+  it("caps high-regime overflow at 1.0 (0.95 × 1.25 = 1.1875 → 1.0)", () => {
+    const out = scaleCorrelationSpec({ kind: "constant", value: 0.95 }, 1.25, 1.0);
+    expect(out).toEqual({ kind: "constant", value: 1.0 });
+  });
+
+  it("clamps negative ρ symmetrically at -1.0 (-0.95 × 1.25 → -1.0)", () => {
+    const out = scaleCorrelationSpec({ kind: "constant", value: -0.95 }, 1.25, 1.0);
+    expect(out).toEqual({ kind: "constant", value: -1.0 });
+  });
+
+  it("matrix high-regime: per-cell cap and no input mutation", () => {
+    const input: CorrelationSpec = {
+      kind: "matrix",
+      labels: ["A", "B"],
+      matrix: [
+        [1.0, 0.9],
+        [0.9, 1.0],
+      ],
+    };
+    const out = scaleCorrelationSpec(input, 1.25, 1.0);
+    expect(out).toEqual({
+      kind: "matrix",
+      labels: ["A", "B"],
+      matrix: [
+        [1.0, 1.0],
+        [1.0, 1.0],
+      ],
+    });
+    expect(input.matrix[0]![1]).toBe(0.9);
+  });
+
+  it("CORRELATION_REGIME_FACTOR pins the Basel §21.6 numeric scalers", () => {
+    expect(CORRELATION_REGIME_FACTOR.low).toBe(0.75);
+    expect(CORRELATION_REGIME_FACTOR.medium).toBe(1.0);
+    expect(CORRELATION_REGIME_FACTOR.high).toBe(1.25);
   });
 });

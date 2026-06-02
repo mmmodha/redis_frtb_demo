@@ -20,6 +20,39 @@ export type CorrelationSpec =
   | { kind: "constant"; value: number }
   | { kind: "matrix"; labels: string[]; matrix: number[][] };
 
+// Wave 5.31b — Basel MAR21.6 three correlation regimes (low / medium / high).
+// Reporting under all three is a regulatory expectation; the cross-bucket γ
+// matrix is scaled uniformly by `CORRELATION_REGIME_FACTOR[regime]` and each
+// entry is then capped symmetrically at ±1 because correlations may not
+// exceed unity in magnitude (a 0.95 ρ × 1.25 = 1.1875 clamps back to 1.0).
+export type CorrelationRegime = "low" | "medium" | "high";
+export const CORRELATION_REGIME_FACTOR: Record<CorrelationRegime, number> = {
+  low: 0.75,
+  medium: 1.0,
+  high: 1.25,
+};
+
+// Pure, non-mutating γ scaler. Factor 1.0 returns the input unchanged (same
+// reference) so the medium-regime fast path is a no-op for the reducers. The
+// cap is applied symmetrically since negative correlations are valid (a
+// ρ = -0.95 with the high factor would otherwise clamp to -1.1875).
+export function scaleCorrelationSpec(
+  spec: CorrelationSpec,
+  factor: number,
+  cap: number = 1.0
+): CorrelationSpec {
+  if (factor === 1.0) return spec;
+  const clamp = (v: number) => Math.max(-cap, Math.min(cap, v * factor));
+  if (spec.kind === "constant") {
+    return { kind: "constant", value: clamp(spec.value) };
+  }
+  return {
+    kind: "matrix",
+    labels: spec.labels.slice(),
+    matrix: spec.matrix.map((row) => row.map(clamp)),
+  };
+}
+
 export interface BucketResult {
   bucket: string;
   K_b: number;

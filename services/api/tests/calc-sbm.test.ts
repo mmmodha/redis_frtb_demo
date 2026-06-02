@@ -700,4 +700,244 @@ describe("POST /calc/sbm — MVP endpoint", () => {
       expect(q).toContain("@bucket:{USD|EUR}");
     });
   });
+
+  // Wave 5.31b: Basel MAR21.6 correlation-regime selector. γ_bc is scaled by
+  // {low:0.75, medium:1.0, high:1.25} with symmetric ±1 cap. The default
+  // ("medium") is a no-op vs. pre-5.31b so the canonical Grand Total
+  // 9 558.91465449378 holds on the full-dataset GIRR Delta run.
+  describe("Wave 5.31b: correlation_regime cross-bucket γ scaler", () => {
+    // Deterministic 3-bucket fixture: K=2, S=2 each → ΣK² = 12. With ρ=0.5
+    // the medium-regime cross term is Σ_{i≠j} 0.5·2·2 = 6·2 = 12 across the
+    // 6 ordered off-diagonal pairs → charge = √24. Scaling γ shifts the
+    // cross term proportionally → ordering low < med < high is guaranteed.
+    function frThreeBuckets() {
+      const fr = fakeRedis();
+      fr.setResponse("FT.AGGREGATE", ftAggregateReply(["A", "B", "C"]));
+      fr.setResponse("FCALL", ["K_b", "2", "S_b", "2", "count", "10", "ms", "1"]);
+      return fr;
+    }
+    const rho = 0.5;
+
+    it("medium regime (default): γ unscaled → charge matches the pre-5.31b analytic value", async () => {
+      const fr = frThreeBuckets();
+      app = await createServer({
+        redis: fr,
+        correlations: { GIRR: { kind: "constant", value: rho } },
+      });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: { risk_class: "GIRR", sensitivity_type: "Delta" },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      // ΣK² = 12; cross = 6 pairs · (0.5 · 2 · 2) = 12 → √24
+      expect(body.charge).toBeCloseTo(Math.sqrt(12 + 12), 10);
+      expect(body.correlation_regime).toBe("medium");
+      expect(body.commands.regime).toMatchObject({ name: "medium", factor: 1.0, cap: 1.0 });
+    });
+
+    it("low regime: γ × 0.75 → charge strictly less than medium", async () => {
+      const fr = frThreeBuckets();
+      app = await createServer({
+        redis: fr,
+        correlations: { GIRR: { kind: "constant", value: rho } },
+      });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: { risk_class: "GIRR", sensitivity_type: "Delta", correlation_regime: "low" },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      // γ' = 0.375 → cross = 6 · (0.375 · 4) = 9 → √21
+      expect(body.charge).toBeCloseTo(Math.sqrt(12 + 9), 10);
+      expect(body.correlation_regime).toBe("low");
+      expect(body.commands.regime.factor).toBe(0.75);
+    });
+
+    it("high regime: γ × 1.25 → charge strictly greater than medium (uncapped here)", async () => {
+      const fr = frThreeBuckets();
+      app = await createServer({
+        redis: fr,
+        correlations: { GIRR: { kind: "constant", value: rho } },
+      });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: { risk_class: "GIRR", sensitivity_type: "Delta", correlation_regime: "high" },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      // γ' = 0.625 → cross = 6 · (0.625 · 4) = 15 → √27
+      expect(body.charge).toBeCloseTo(Math.sqrt(12 + 15), 10);
+      expect(body.correlation_regime).toBe("high");
+      expect(body.commands.regime.factor).toBe(1.25);
+    });
+
+    it("low ≤ medium ≤ high ordering on the deterministic 3-bucket fixture", async () => {
+      const charges: Record<string, number> = {};
+      for (const regime of ["low", "medium", "high"] as const) {
+        const fr = frThreeBuckets();
+        const a = await createServer({
+          redis: fr,
+          correlations: { GIRR: { kind: "constant", value: rho } },
+        });
+        const res = await a.inject({
+          method: "POST",
+          url: "/calc/sbm",
+          payload: { risk_class: "GIRR", sensitivity_type: "Delta", correlation_regime: regime },
+        });
+        charges[regime] = res.json().charge as number;
+        await a.close();
+      }
+      expect(charges.low!).toBeLessThan(charges.medium!);
+      expect(charges.medium!).toBeLessThan(charges.high!);
+    });
+
+    it("high regime with γ ≈ 1.0 hits the ±1 cap (cross term does not explode)", async () => {
+      // γ = 0.95 · 1.25 = 1.1875 → clamps to 1.0. ΣK²=12 + cross=6·(1·4)=24 → √36 = 6.
+      const fr = frThreeBuckets();
+      app = await createServer({
+        redis: fr,
+        correlations: { GIRR: { kind: "constant", value: 0.95 } },
+      });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: { risk_class: "GIRR", sensitivity_type: "Delta", correlation_regime: "high" },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().charge).toBeCloseTo(Math.sqrt(12 + 24), 10);
+    });
+
+    // Curvature: γ_curv = (γ × factor)² per the scale-first-then-square order
+    // §21.5(5) + §21.6. Two-bucket fixture is hand-computable: K=3,K=4 → ΣK²=25;
+    // γ_delta=0.5, S=3,S=4 → cross = 2 · γ²·12 → charge = √(25 + 24·γ²).
+    //   low:    γ' = 0.375 → 24·0.140625 = 3.375  → √28.375
+    //   medium: γ' = 0.5   → 24·0.25     = 6      → √31
+    //   high:   γ' = 0.625 → 24·0.390625 = 9.375  → √34.375
+    it("curvature path: γ scaled FIRST then squared (hand-computed two-bucket)", async () => {
+      const expected: Record<string, number> = {
+        low: Math.sqrt(25 + 24 * 0.375 * 0.375),
+        medium: Math.sqrt(25 + 24 * 0.5 * 0.5),
+        high: Math.sqrt(25 + 24 * 0.625 * 0.625),
+      };
+      for (const regime of ["low", "medium", "high"] as const) {
+        const fr = fakeRedis();
+        fr.setResponse("FT.AGGREGATE", ftAggregateReply(["USD-IRS", "EUR-IRS"]));
+        fr.setResponse("FCALL", (args: unknown[]) => {
+          const b = String(args[4]);
+          if (b === "USD-IRS") return ["K_b", "3", "S_b", "3", "count", "10", "ms", "1"];
+          return ["K_b", "4", "S_b", "4", "count", "10", "ms", "1"];
+        });
+        const a = await createServer({
+          redis: fr,
+          correlations: { GIRR: { kind: "constant", value: 0.5 } },
+        });
+        const res = await a.inject({
+          method: "POST",
+          url: "/calc/sbm",
+          payload: { risk_class: "GIRR", sensitivity_type: "Curvature", correlation_regime: regime },
+        });
+        expect(res.statusCode).toBe(200);
+        expect(res.json().charge).toBeCloseTo(expected[regime]!, 9);
+        await a.close();
+      }
+    });
+
+    it("rejects an unknown regime string with 400", async () => {
+      app = await createServer({ redis: fakeRedis() });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: { risk_class: "GIRR", sensitivity_type: "Delta", correlation_regime: "extreme" },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toMatch(/low, medium, high/);
+    });
+
+    it("response echoes correlation_regime + surfaces commands.regime observability block", async () => {
+      const fr = frThreeBuckets();
+      app = await createServer({
+        redis: fr,
+        correlations: { GIRR: { kind: "constant", value: rho } },
+      });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: { risk_class: "GIRR", sensitivity_type: "Delta", correlation_regime: "high" },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.correlation_regime).toBe("high");
+      expect(body.commands.regime).toMatchObject({
+        name: "high",
+        factor: 1.25,
+        cap: 1.0,
+      });
+      expect(typeof body.commands.regime.note).toBe("string");
+      expect(body.commands.regime.note).toMatch(/cap/i);
+    });
+
+    it("composes with bucket_subset (Wave 5.31a): subset narrows + regime scales the surviving cross term", async () => {
+      // Subset to USD+EUR only (drops GBP). K=2 for survivors → ΣK²=8; 2 ordered
+      // off-diagonal pairs → cross_med = 2·(0.5·4) = 4; cross_high = 2·(0.625·4) = 5.
+      const fr = fakeRedis();
+      fr.setResponse("FT.AGGREGATE", (args: unknown[]) => {
+        const q = String(args[1]);
+        if (q.includes("@bucket:{")) return ftAggregateReply(["USD", "EUR"]);
+        return ftAggregateReply(["USD", "EUR", "GBP"]);
+      });
+      fr.setResponse("FCALL", ["K_b", "2", "S_b", "2", "count", "10", "ms", "1"]);
+      app = await createServer({
+        redis: fr,
+        correlations: { GIRR: { kind: "constant", value: 0.5 } },
+      });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: {
+          risk_class: "GIRR",
+          sensitivity_type: "Delta",
+          bucket_subset: ["USD", "EUR"],
+          correlation_regime: "high",
+        },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.per_bucket).toHaveLength(2);
+      expect(body.charge).toBeCloseTo(Math.sqrt(8 + 5), 10);
+      expect(body.correlation_regime).toBe("high");
+    });
+
+    // CRITICAL regression gate: omitting `correlation_regime` must keep the
+    // wire-charge byte-identical to pre-5.31b. We replay the exact 2-bucket
+    // fixture from the first describe-block and assert √(9+16)=5 (the test
+    // already in the suite). The implementation guarantees this via factor=1.0
+    // → scaleCorrelationSpec returns the spec by reference.
+    it("regression: omitting correlation_regime preserves the pre-5.31b charge exactly", async () => {
+      const fr = fakeRedis();
+      fr.setResponse("FT.AGGREGATE", ftAggregateReply(["USD-IRS", "EUR-IRS"]));
+      fr.setResponse("FCALL", (args: unknown[]) => {
+        const bucket = args[4] as string;
+        if (bucket === "USD-IRS") return ["K_b", "3", "S_b", "3", "count", "100", "ms", "5"];
+        return ["K_b", "4", "S_b", "4", "count", "200", "ms", "6"];
+      });
+      app = await createServer({
+        redis: fr,
+        correlations: { GIRR: { kind: "constant", value: 0 } },
+      });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: { risk_class: "GIRR", sensitivity_type: "Delta" },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.charge).toBeCloseTo(5, 10);
+      // Default echo is "medium" — UI uses it to render the badge.
+      expect(body.correlation_regime).toBe("medium");
+    });
+  });
 });

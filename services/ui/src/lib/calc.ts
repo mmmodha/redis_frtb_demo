@@ -8,6 +8,11 @@ import { buildApiError } from "./empty-target";
 
 export type SensitivityType = "Delta" | "Vega" | "Curvature";
 
+// Wave 5.31b: Basel MAR21.6 cross-bucket γ regime selector. "medium" is the
+// pre-5.31b default; "low" scales γ by 0.75, "high" by 1.25 with each ρ_bc
+// capped symmetrically at ±1.0.
+export type CorrelationRegime = "low" | "medium" | "high";
+
 export interface CalcSbmRequest {
   risk_class: string;
   sensitivity_type: SensitivityType;
@@ -15,6 +20,9 @@ export interface CalcSbmRequest {
   // the api restricts the FT.AGGREGATE bucket discovery to this subset so only
   // those buckets get FCALL fan-out. Omit (or send []) for a full-portfolio run.
   bucket_subset?: string[];
+  // Wave 5.31b: omit to inherit the api default ("medium"). The UI only sends
+  // a value when it's non-default so the commands panel stays clean.
+  correlation_regime?: CorrelationRegime;
 }
 
 export interface BucketResult {
@@ -49,6 +57,13 @@ export interface CalcCommands {
     arg_template: string;
     dispatched_keys: string[];
   };
+  // Wave 5.31b: §21.6 regime block. Optional so older api responses still parse.
+  regime?: {
+    name: CorrelationRegime;
+    factor: number;
+    cap: number;
+    note: string;
+  };
 }
 
 export interface CalcSbmResponse {
@@ -62,6 +77,9 @@ export interface CalcSbmResponse {
   // §21.5(5) branch produced the charge — primary positive-interior path or
   // the §21.5(5)(b) S_b-clipped fallback when the interior went negative.
   curvature_branch?: "positive_interior" | "fallback_clipped_s";
+  // Wave 5.31b: echoed regime that was applied (low/medium/high). Optional
+  // for forward-compat with older api responses.
+  correlation_regime?: CorrelationRegime;
 }
 
 export async function postCalcSbm(body: CalcSbmRequest): Promise<CalcSbmResponse> {
