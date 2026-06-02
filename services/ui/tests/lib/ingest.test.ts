@@ -5,6 +5,7 @@ import {
   startGenerator,
   startGeneratorStream,
   flushDb,
+  cancelGenerator,
   type ProgressFrame,
   type TerminalFrame,
 } from "../../src/lib/ingest";
@@ -172,6 +173,28 @@ describe("ingest api client", () => {
     expect(res.ok).toBe(true);
     const init = calls[0]!.init!;
     expect(calls[0]!.url).toMatch(/\/admin\/flush$/);
+    expect(init.method).toBe("POST");
+    const headers = (init.headers ?? {}) as Record<string, string>;
+    expect(headers["content-type"]).toBe("application/json");
+    expect(typeof init.body).toBe("string");
+    expect(JSON.parse(init.body as string)).toEqual({});
+  });
+
+  // Wave 5.43 — cancelGenerator must send an empty JSON object body so Fastify
+  // does not 400 with FST_ERR_CTP_EMPTY_JSON_BODY when content-type is
+  // application/json. Without a body the cancel POST never reaches the handler
+  // and the pill is stuck on "cancelling".
+  it("cancelGenerator POSTs /generator/cancel/:id with a parseable empty JSON body", async () => {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: typeof input === "string" ? input : input.toString(), init });
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+    await cancelGenerator("run-abc");
+    const init = calls[0]!.init!;
+    expect(calls[0]!.url).toMatch(/\/generator\/cancel\/run-abc$/);
     expect(init.method).toBe("POST");
     const headers = (init.headers ?? {}) as Record<string, string>;
     expect(headers["content-type"]).toBe("application/json");

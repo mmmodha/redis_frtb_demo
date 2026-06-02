@@ -49,6 +49,7 @@ export async function startIngest(sourceId: string): Promise<IngestRunResponse> 
   const res = await fetch(`${apiBase()}/sources/${sourceId}/ingest`, {
     method: "POST",
     headers: { "content-type": "application/json" },
+    body: "{}",
   });
   if (!res.ok) throw new Error(`api /sources/${sourceId}/ingest ${res.status}`);
   return (await res.json()) as IngestRunResponse;
@@ -214,6 +215,7 @@ export async function cancelGenerator(runId: string): Promise<void> {
   const res = await fetch(`${apiBase()}/generator/cancel/${encodeURIComponent(runId)}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
+    body: "{}",
   });
   if (!res.ok && res.status !== 404) {
     throw new Error(`api /generator/cancel/${runId} ${res.status}`);
