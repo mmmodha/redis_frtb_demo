@@ -13,7 +13,24 @@ import {
 interface CalcBody {
   risk_class?: string;
   sensitivity_type?: string;
+  // Wave 5.31a: optional discovery-layer narrowing. Restricts the FT.AGGREGATE
+  // bucket-discovery to a caller-supplied subset so the second Calculate fans
+  // out FCALL only over those buckets. Empty array or omitted = no narrowing.
+  bucket_subset?: string[];
 }
+
+// Wave 5.31a: TAG-token escape for the discovery query string. Duplicates the
+// helper in routes/pivot.ts — kept inline rather than factored into a shared
+// module because it's three lines and the extraction cost outweighs the reuse.
+const TAG_SPECIALS = /[\s,.<>{}\[\]"':;!@#$%^&*()\-+=~|\/?]/g;
+function escapeTag(v: string): string {
+  return v.replace(TAG_SPECIALS, (m) => `\\${m}`);
+}
+
+// Wave 5.31a: cap the subset size so a pathological client can't blow up the
+// FT.AGGREGATE query string. Matches the implicit cap of the existing
+// "LIMIT 0 10000" — far more than any realistic bucket count per risk_class.
+const MAX_BUCKET_SUBSET = 256;
 
 interface CalcOpts {
   // Map of risk_class → cross-bucket correlation γ_bc spec. Loaded from
@@ -197,12 +214,51 @@ export function registerCalcRoute(
     const funcName = funcNameFor(risk_class, leg as Leg);
     const corr: CorrelationSpec = opts.correlations[risk_class] ?? { kind: "constant", value: 0 };
 
+    // Wave 5.31a: validate + normalise optional bucket_subset. Mirrors the
+    // risk_class uppercase-at-entry policy so the discovery query carries the
+    // canonical storage-shape form (GIRR currencies / FX pairs are stored
+    // UPPERCASE; Equity numeric strings are case-insensitive). An empty array
+    // is treated as "no subset" — same as omitting the field — to avoid the
+    // easy-to-misuse "match nothing" footgun.
+    const subsetRaw = req.body?.bucket_subset;
+    let bucket_subset: string[] = [];
+    if (subsetRaw !== undefined && subsetRaw !== null) {
+      if (!Array.isArray(subsetRaw)) {
+        reply.code(400);
+        return { error: "bucket_subset must be an array of non-empty strings" };
+      }
+      for (const v of subsetRaw) {
+        if (typeof v !== "string" || v.length === 0) {
+          reply.code(400);
+          return { error: "bucket_subset must be an array of non-empty strings" };
+        }
+      }
+      if (subsetRaw.length > MAX_BUCKET_SUBSET) {
+        reply.code(400);
+        return { error: `bucket_subset exceeds maximum of ${MAX_BUCKET_SUBSET} entries` };
+      }
+      const seen = new Set<string>();
+      for (const v of subsetRaw) {
+        const u = v.toUpperCase();
+        if (!seen.has(u)) seen.add(u);
+      }
+      bucket_subset = Array.from(seen);
+    }
+
     // Wave 5.16t — resolve the active redis client once per request so a
     // mid-flight target switch is picked up by the very next call.
     const redis = getRedis();
     const target_label = getActiveTarget().label;
 
     const t0 = process.hrtime.bigint();
+
+    // Wave 5.31a: build the discovery query string ONCE so the FT.AGGREGATE
+    // call and the observability `commands.discovery.query` mirror agree by
+    // construction. When a subset is supplied, push the @bucket TAG predicate
+    // alongside @risk_class so the index returns only the requested slice.
+    const discoveryQuery = bucket_subset.length > 0
+      ? `@risk_class:{${risk_class}} @bucket:{${bucket_subset.map(escapeTag).join("|")}}`
+      : `@risk_class:{${risk_class}}`;
 
     // 1) Discover buckets present for this risk_class — per-master fan-out.
     //    ioredis Cluster's coordinator does NOT aggregate FT.SEARCH / FT.AGGREGATE
@@ -218,7 +274,7 @@ export function registerCalcRoute(
         const aggReply = await node.call(
           "FT.AGGREGATE",
           "idx:sens",
-          `@risk_class:{${risk_class}}`,
+          discoveryQuery,
           "GROUPBY",
           "1",
           "@bucket",
@@ -327,7 +383,9 @@ export function registerCalcRoute(
       discovery: {
         command: "FT.AGGREGATE" as const,
         index: "idx:sens",
-        query: `@risk_class:{${risk_class}}`,
+        // Wave 5.31a: mirror the actual query string we just dispatched so the
+        // observability panel reflects subset narrowing verbatim.
+        query: discoveryQuery,
         groupby: ["@bucket"],
         reducers: ["COUNT 0 AS n"],
       },
@@ -340,12 +398,17 @@ export function registerCalcRoute(
       },
     };
 
-    // Wave 5.16t — empty-result hint: discovery returned zero buckets but
-    // the populated-index probe above let us through (num_docs > 0, so other
-    // risk classes have data on the target). Surface a friendly note so the
-    // UI can prompt "ingest data" instead of rendering charge=0 silently.
+    // Wave 5.16t / 5.31a — empty-result hint. Two distinct empty cases land
+    // here (the num_docs===0 case already 503'd above):
+    //   • subset-driven empty: caller asked for buckets that don't exist for
+    //     this risk_class → return a 200 with a subset-aware note rather than
+    //     silently rendering charge=0.
+    //   • no-subset empty: index is populated for other risk classes but this
+    //     one has no rows → existing "ingest data" prompt.
     const note = results.length === 0 && buckets.length === 0
-      ? `No sensitivities on '${target_label}' — ingest data to run calculations.`
+      ? bucket_subset.length > 0
+        ? `No buckets in subset [${bucket_subset.join(",")}] have data for risk_class ${risk_class} on '${target_label}'.`
+        : `No sensitivities on '${target_label}' — ingest data to run calculations.`
       : undefined;
 
     return {

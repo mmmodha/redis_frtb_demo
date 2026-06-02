@@ -481,4 +481,223 @@ describe("POST /calc/sbm — MVP endpoint", () => {
       expect(k).toMatch(/^sens:\{GIRR:[^}]+\}:_route$/);
     }
   });
+
+  // Wave 5.31a: optional `bucket_subset` narrows the discovery FT.AGGREGATE
+  // and only the surviving buckets get FCALL fan-out. FCALL/reduce internals
+  // are untouched — the subset feeds them naturally via the narrowed buckets.
+  describe("Wave 5.31a: bucket_subset discovery-layer filter", () => {
+    it("narrows the FT.AGGREGATE discovery query to @bucket:{B1|B2|B3}", async () => {
+      const fr = fakeRedis();
+      fr.setResponse("FT.AGGREGATE", ftAggregateReply(["USD", "EUR", "GBP"]));
+      fr.setResponse("FCALL", ["K_b", "1", "S_b", "1", "count", "10", "ms", "1"]);
+      app = await createServer({
+        redis: fr,
+        correlations: { GIRR: { kind: "constant", value: 0 } },
+      });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: {
+          risk_class: "GIRR",
+          sensitivity_type: "Delta",
+          bucket_subset: ["USD", "EUR", "GBP"],
+        },
+      });
+      expect(res.statusCode).toBe(200);
+      const agg = fr.calls.find((c) => c.command === "FT.AGGREGATE");
+      expect(agg).toBeDefined();
+      const q = String(agg!.args[1]);
+      expect(q).toContain("@risk_class:{GIRR}");
+      expect(q).toContain("@bucket:{USD|EUR|GBP}");
+      // commands.discovery.query mirrors the dispatched string verbatim.
+      expect(res.json().commands.discovery.query).toContain("@bucket:{USD|EUR|GBP}");
+    });
+
+    it("subset that intersects with populated data → math runs only over the surviving buckets", async () => {
+      // γ=0 → charge = √(Σ K_b²). Subset to USD+EUR only (K=3, K=4) → √(9+16)=5,
+      // while a full run over USD+EUR+GBP (K=3,4,5) would give √(9+16+25)=√50.
+      const fr = fakeRedis();
+      fr.setResponse("FT.AGGREGATE", (args: unknown[]) => {
+        const q = String(args[1]);
+        // The narrowed predicate restricts what the index returns.
+        if (q.includes("@bucket:{")) return ftAggregateReply(["USD", "EUR"]);
+        return ftAggregateReply(["USD", "EUR", "GBP"]);
+      });
+      fr.setResponse("FCALL", (args: unknown[]) => {
+        const b = String(args[4]);
+        if (b === "USD") return ["K_b", "3", "S_b", "3", "count", "10", "ms", "1"];
+        if (b === "EUR") return ["K_b", "4", "S_b", "4", "count", "10", "ms", "1"];
+        return ["K_b", "5", "S_b", "5", "count", "10", "ms", "1"];
+      });
+      app = await createServer({
+        redis: fr,
+        correlations: { GIRR: { kind: "constant", value: 0 } },
+      });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: {
+          risk_class: "GIRR",
+          sensitivity_type: "Delta",
+          bucket_subset: ["USD", "EUR"],
+        },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.per_bucket).toHaveLength(2);
+      expect(body.charge).toBeCloseTo(5, 10);
+      // FCALL only fired over the surviving buckets — not the full 3.
+      expect(fr.calls.filter((c) => c.command === "FCALL")).toHaveLength(2);
+    });
+
+    it("subset filtering all-missing buckets → 200 with empty per_bucket + subset-aware note", async () => {
+      const fr = fakeRedis();
+      // Discovery for the subset returns nothing — the named buckets don't exist.
+      fr.setResponse("FT.AGGREGATE", ftAggregateReply([]));
+      // Precondition probe sees a populated index (other risk classes have data).
+      fr.setResponse("FT.INFO", ["index_name", "idx:sens", "num_docs", "27000"]);
+      app = await createServer({
+        redis: fr,
+        correlations: { GIRR: { kind: "constant", value: 0 } },
+      });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: {
+          risk_class: "GIRR",
+          sensitivity_type: "Delta",
+          bucket_subset: ["AAA", "BBB"],
+        },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.per_bucket).toHaveLength(0);
+      expect(body.charge).toBe(0);
+      expect(body.note).toMatch(/No buckets in subset \[AAA,BBB\] have data for risk_class GIRR/);
+    });
+
+    it("num_docs === 0 + non-empty subset → still 503 (precondition wins)", async () => {
+      const fr = fakeRedis();
+      fr.setResponse("FT.AGGREGATE", ftAggregateReply([]));
+      fr.setResponse("FT.INFO", ["index_name", "idx:sens", "num_docs", "0"]);
+      app = await createServer({
+        redis: fr,
+        correlations: { GIRR: { kind: "constant", value: 0 } },
+      });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: {
+          risk_class: "GIRR",
+          sensitivity_type: "Delta",
+          bucket_subset: ["USD"],
+        },
+      });
+      expect(res.statusCode).toBe(503);
+      expect(res.json()).toMatchObject({ error: "no-data-or-index" });
+    });
+
+    it("empty subset [] is treated as no subset (identical to omitting the field)", async () => {
+      const fr = fakeRedis();
+      fr.setResponse("FT.AGGREGATE", ftAggregateReply(["USD", "EUR"]));
+      fr.setResponse("FCALL", ["K_b", "1", "S_b", "1", "count", "10", "ms", "1"]);
+      app = await createServer({
+        redis: fr,
+        correlations: { GIRR: { kind: "constant", value: 0 } },
+      });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: {
+          risk_class: "GIRR",
+          sensitivity_type: "Delta",
+          bucket_subset: [],
+        },
+      });
+      expect(res.statusCode).toBe(200);
+      const agg = fr.calls.find((c) => c.command === "FT.AGGREGATE");
+      expect(String(agg!.args[1])).toBe("@risk_class:{GIRR}");
+      expect(res.json().commands.discovery.query).toBe("@risk_class:{GIRR}");
+    });
+
+    it("rejects bucket_subset containing a non-string element with 400", async () => {
+      app = await createServer({ redis: fakeRedis() });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: {
+          risk_class: "GIRR",
+          sensitivity_type: "Delta",
+          bucket_subset: ["USD", 42, "EUR"],
+        },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toMatch(/array of non-empty strings/);
+    });
+
+    it("rejects bucket_subset over 256 entries with 400", async () => {
+      app = await createServer({ redis: fakeRedis() });
+      const tooMany = Array.from({ length: 257 }, (_, i) => `B${i}`);
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: {
+          risk_class: "GIRR",
+          sensitivity_type: "Delta",
+          bucket_subset: tooMany,
+        },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toMatch(/256/);
+    });
+
+    it("regression: omitting bucket_subset produces identical wire shape to pre-5.31a", async () => {
+      const fr = fakeRedis();
+      fr.setResponse("FT.AGGREGATE", ftAggregateReply(["USD", "EUR"]));
+      fr.setResponse("FCALL", ["K_b", "2", "S_b", "2", "count", "10", "ms", "1"]);
+      app = await createServer({
+        redis: fr,
+        correlations: { GIRR: { kind: "constant", value: 0 } },
+      });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: { risk_class: "GIRR", sensitivity_type: "Delta" },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      // Discovery query is the pre-5.31a single-predicate form.
+      expect(body.commands.discovery.query).toBe("@risk_class:{GIRR}");
+      const agg = fr.calls.find((c) => c.command === "FT.AGGREGATE");
+      expect(String(agg!.args[1])).toBe("@risk_class:{GIRR}");
+      // Known response keys are still all present, no surprise additions tied
+      // to subset handling (note/ok stay absent on the happy path).
+      expect(body).not.toHaveProperty("note");
+      expect(body).not.toHaveProperty("ok");
+    });
+
+    it("de-duplicates and uppercase-normalises subset values before query building", async () => {
+      const fr = fakeRedis();
+      fr.setResponse("FT.AGGREGATE", ftAggregateReply(["USD"]));
+      fr.setResponse("FCALL", ["K_b", "1", "S_b", "1", "count", "1", "ms", "1"]);
+      app = await createServer({
+        redis: fr,
+        correlations: { GIRR: { kind: "constant", value: 0 } },
+      });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: {
+          risk_class: "GIRR",
+          sensitivity_type: "Delta",
+          bucket_subset: ["usd", "USD", "eur"],
+        },
+      });
+      expect(res.statusCode).toBe(200);
+      const agg = fr.calls.find((c) => c.command === "FT.AGGREGATE");
+      const q = String(agg!.args[1]);
+      // de-duplicated to USD,EUR and uppercased; order preserved by Set insertion.
+      expect(q).toContain("@bucket:{USD|EUR}");
+    });
+  });
 });

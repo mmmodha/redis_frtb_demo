@@ -11,6 +11,10 @@ export type SensitivityType = "Delta" | "Vega" | "Curvature";
 export interface CalcSbmRequest {
   risk_class: string;
   sensitivity_type: SensitivityType;
+  // Wave 5.31a: optional discovery-layer narrowing. When present and non-empty,
+  // the api restricts the FT.AGGREGATE bucket discovery to this subset so only
+  // those buckets get FCALL fan-out. Omit (or send []) for a full-portfolio run.
+  bucket_subset?: string[];
 }
 
 export interface BucketResult {

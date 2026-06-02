@@ -199,6 +199,10 @@ export function CalcPanel() {
   // directly below the clicked row, nothing else.
   const [chartExpanded, setChartExpanded] = useState<Set<string>>(new Set());
   const [tableExpanded, setTableExpanded] = useState<Set<string>>(new Set());
+  // Wave 5.31a: optional discovery-layer subset. `null` = no subset (default,
+  // sends every bucket); `Set<string>` = user has interacted with the pills.
+  // Carried across runs so a refine→Calculate cycle preserves the selection.
+  const [bucketSubset, setBucketSubset] = useState<Set<string> | null>(null);
 
   const isWave4 = riskClass !== "GIRR";
 
@@ -206,16 +210,28 @@ export function CalcPanel() {
     setLoading(true);
     setError(null);
     setEmptyError(null);
-    setResult(null);
-    setResultContext(null);
     setSortKey(null);
     setChartExpanded(new Set());
     setTableExpanded(new Set());
     try {
-      const r = await postCalcSbm({ risk_class: riskClass, sensitivity_type: sensitivityType });
+      // Wave 5.31a: only send `bucket_subset` when the user has actively
+      // narrowed below the available bucket set — sending a full-list subset
+      // wastes bytes and clutters the "Redis commands executed" panel.
+      const sendSubset =
+        result !== null &&
+        bucketSubset !== null &&
+        bucketSubset.size < result.per_bucket.length;
+      const subsetArr = sendSubset ? Array.from(bucketSubset!) : undefined;
+      const r = await postCalcSbm({
+        risk_class: riskClass,
+        sensitivity_type: sensitivityType,
+        ...(subsetArr ? { bucket_subset: subsetArr } : {}),
+      });
       setResult(r);
       setResultContext({ riskClass, sensitivityType });
     } catch (e) {
+      setResult(null);
+      setResultContext(null);
       if (e instanceof EmptyTargetError) {
         setEmptyError(e);
       } else {
@@ -224,6 +240,21 @@ export function CalcPanel() {
     } finally {
       setLoading(false);
     }
+  }
+
+  function toggleSubsetBucket(bucket: string) {
+    setBucketSubset((prev) => {
+      // First interaction starts from "all selected" — the visible default.
+      const base = prev ?? new Set(result?.per_bucket.map((p) => p.bucket) ?? []);
+      const next = new Set(base);
+      if (next.has(bucket)) next.delete(bucket);
+      else next.add(bucket);
+      return next;
+    });
+  }
+
+  function resetSubset() {
+    setBucketSubset(null);
   }
 
   function makeToggle(setter: (fn: (prev: Set<string>) => Set<string>) => void) {
@@ -271,7 +302,7 @@ export function CalcPanel() {
             type="button"
             className="calc-panel__cta"
             onClick={onCalculate}
-            disabled={loading}
+            disabled={loading || (bucketSubset !== null && bucketSubset.size === 0)}
             data-testid="calc-cta"
           >
             {loading ? "Calculating…" : "Calculate SBM risk charge"}
@@ -307,6 +338,15 @@ export function CalcPanel() {
             </select>
           </label>
         </div>
+        {result ? (
+          <RefineBucketsRow
+            buckets={result.per_bucket}
+            riskClass={resultContext?.riskClass ?? riskClass}
+            subset={bucketSubset}
+            onToggle={toggleSubsetBucket}
+            onReset={resetSubset}
+          />
+        ) : null}
       </PanelCard>
 
       {emptyError ? <CalcEmptyBanner err={emptyError} /> : null}
@@ -336,6 +376,72 @@ export function CalcPanel() {
           onToggleTable={toggleTable}
         />
       ) : null}
+    </div>
+  );
+}
+
+// Wave 5.31a: "Refine buckets" multi-select pill row. Renders one pill per
+// bucket from the most recent /calc/sbm response, sorted by K_b descending to
+// match the per-bucket chart. `subset === null` means the user hasn't touched
+// the pills yet → every pill renders pre-selected (the visible default). Once
+// they click anything we switch to the explicit `Set` and toggle from there.
+function RefineBucketsRow({
+  buckets,
+  riskClass,
+  subset,
+  onToggle,
+  onReset,
+}: {
+  buckets: BucketResult[];
+  riskClass: RiskClass;
+  subset: Set<string> | null;
+  onToggle: (bucket: string) => void;
+  onReset: () => void;
+}) {
+  if (buckets.length === 0) return null;
+  const sorted = [...buckets].sort((a, b) => b.K_b - a.K_b);
+  const bClass = bucketClassFor(riskClass);
+  const isSelected = (b: string) => (subset === null ? true : subset.has(b));
+  const selectedCount = subset === null ? buckets.length : subset.size;
+  const dirty = subset !== null;
+  return (
+    <div className="refine-buckets" data-testid="refine-buckets">
+      <div className="refine-buckets__header">
+        <span className="refine-buckets__label">Refine buckets</span>
+        <span className="refine-buckets__count" data-testid="refine-buckets-count">
+          {selectedCount}/{buckets.length} selected
+        </span>
+        {dirty ? (
+          <button
+            type="button"
+            className="refine-buckets__reset"
+            onClick={onReset}
+            data-testid="refine-buckets-reset"
+          >
+            Reset to all
+          </button>
+        ) : null}
+      </div>
+      <div className="refine-buckets__pills" role="group" aria-label="Bucket subset">
+        {sorted.map((b) => {
+          const selected = isSelected(b.bucket);
+          return (
+            <button
+              key={b.bucket}
+              type="button"
+              className="bucket-pill refine-buckets__pill"
+              data-class={bClass}
+              data-selected={selected ? "true" : "false"}
+              data-testid="refine-bucket-pill"
+              data-bucket={b.bucket}
+              aria-pressed={selected}
+              onClick={() => onToggle(b.bucket)}
+            >
+              {b.bucket}
+            </button>
+          );
+        })}
+      </div>
     </div>
   );
 }
