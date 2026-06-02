@@ -233,25 +233,18 @@ async function main() {
   const ctx = await browser.newContext({ viewport: VIEWPORT });
   const page = await ctx.newPage();
 
-  console.log("→ beat-00 setup (CalcPanel landing — non-target selects)");
+  // CalcPanel defaults to GIRR + Delta, so the "fresh-load landing" (beat-00)
+  // and the "presenter explicitly selects GIRR + Delta" state (beat-01) are
+  // intentionally visually identical. Coordinator confirmed in the Wave 5.26
+  // follow-up that this duplication is acceptable; see MANIFEST.md.
+  console.log("→ beat-00 setup (CalcPanel landing / GIRR+Delta defaults)");
   await gotoCalc(page);
-  // CalcPanel ships GIRR + Delta as the default selection, so capturing a
-  // fresh load looks identical to beat-01's explicit GIRR+Delta selection.
-  // Park the selects on a non-target combo (Equity + Vega) for beat-00 so
-  // the presenter's "set risk-class = GIRR, sensitivity = Delta" action
-  // between beats is a real state change in the screenshot.
-  await setRiskClass(page, "Equity");
-  await setSensitivity(page, "Vega");
-  await page.waitForTimeout(250);
   await snapPage(page, "beat-00-setup");
 
   console.log("→ beat-01 bucket discovery (GIRR/Delta pre-Calculate)");
   await setRiskClass(page, "GIRR");
   await setSensitivity(page, "Delta");
-  // Blur the dropdown to drop its focus ring so the diff vs beat-00 is the
-  // committed select values, not transient focus styling.
-  await page.locator('[data-testid="calc-cta"]').focus();
-  await page.waitForTimeout(300);
+  await page.waitForTimeout(200);
   await snapPage(page, "beat-01-bucket-discovery");
 
   console.log("→ beat-02/03/04 GIRR Delta calculate");

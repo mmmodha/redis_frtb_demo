@@ -9,8 +9,8 @@ Each PNG corresponds to a beat reference in [`docs/demo/storyboard.md`](../../de
 
 | Filename | Beat | Canonical numbers / surface visible |
 | --- | --- | --- |
-| `beat-00-setup.png` | Setup (≤ 30 s, before first click) | CalcPanel landing with selects parked on Equity/Vega (non-target combo so the explicit GIRR+Delta selection in beat-01 is a visible state change). Active-target pill = `live-standalone` on `db.redis.io:14596`. |
-| `beat-01-bucket-discovery.png` | Beat 1 — Bucket discovery (§21.4(3) prep) | CalcPanel with `Risk class = GIRR`, `Sensitivity type = Delta`, pre-Calculate; Calculate CTA focused. |
+| `beat-00-setup.png` | Setup (≤ 30 s, before first click) | CalcPanel landing — default GIRR + Delta selects, pre-Calculate. **Byte-identical to `beat-01-bucket-discovery.png` by design** (see note below). Active-target pill = `live-standalone` on `db.redis.io:14596`. |
+| `beat-01-bucket-discovery.png` | Beat 1 — Bucket discovery (§21.4(3) prep) | CalcPanel with `Risk class = GIRR`, `Sensitivity type = Delta`, pre-Calculate. **Byte-identical to `beat-00-setup.png` by design** (CalcPanel defaults are GIRR + Delta, so the presenter's explicit selection produces no visible state change). |
 | `beat-02-calculate.png` | Beat 2 — One FCALL per bucket (§21.4(3), `WS_k = RW_k · s_k`) | Risk-class charge PanelCard + wallclock badge (`Total ≈ 288 ms · fanout ≈ 172 ms`) + 11-bucket K_b chart. |
 | `beat-03-kb-table.png` | Beat 3 — Within-bucket aggregation `K_b` (§21.4(4)) | Per-bucket K_b chart + breakdown table with CAD drilldown accordion expanded. GIRR Delta charge `0.6846`. |
 | `beat-04-girr-delta-charge.png` | Beat 4 — Cross-bucket reduce (§21.4(5)) | Tighter clip (~1208×750) framed on the Risk-class charge PanelCard: `AnimatedCharge` hero `0.6846`, wallclock badge above, basel-caption `GIRR · Delta · MAR21 §21.4(5) Cross-bucket reduce` below. |
@@ -48,6 +48,7 @@ non-UI beats (`beat-05`, `beat-10-memory`, `beat-11`) as static HTML.
 
 ## Notes
 
+- **`beat-00-setup.png` and `beat-01-bucket-discovery.png` are intentionally byte-identical (md5 `0112ee4d…`).** CalcPanel ships GIRR + Delta as its default risk class / sensitivity, so the storyboard's distinction between Beat 0 ("setup, no selection yet") and Beat 1 ("presenter selects GIRR + Delta, pre-Calculate") has no visible footprint in the UI. The duplication was confirmed acceptable by the Wave 5.26 coordinator; verifiers should treat this pair as expected, not a capture defect.
 - All 13 files are above the 30 KB asset-pack floor; the previous 67-byte
   `step-*.png` placeholders have been removed.
 - Per-bucket details captured live differ slightly from the storyboard's
