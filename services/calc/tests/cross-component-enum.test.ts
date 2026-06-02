@@ -17,7 +17,7 @@ import { Redis } from "ioredis";
 import { ulid } from "ulid";
 
 import { loadSchema } from "@frtb/schema";
-import { createRowGenerator } from "@frtb/generator/src/row-generator.ts";
+import { createRowGenerator } from "@frtb/generator";
 import { buildGirrDeltaSnippet } from "../src/girrDeltaSnippet.ts";
 import { buildGirrVegaSnippet } from "../src/girrVegaSnippet.ts";
 import { loadFrtbLibrary } from "../src/loadFrtbLibrary.ts";
