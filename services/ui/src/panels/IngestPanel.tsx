@@ -16,8 +16,11 @@ import {
   cancelAllGeneratorRuns,
   flushDb,
   listSources,
+  preflight,
+  rebuildIndexes,
   startIngest,
   type GeneratorConfig,
+  type PreflightResponse,
   type Source,
 } from "../lib/ingest";
 
@@ -70,6 +73,20 @@ function fmtInt(n: number): string {
   return Number.isFinite(n) ? Math.round(n).toLocaleString("en-US") : "—";
 }
 
+// Wave 5.47c — human label for the generator's stop_reason. The "rows" case
+// is the historical default and is intentionally suppressed at the call
+// site (only non-rows stops add the "stopped: …" suffix to the status line).
+function stopReasonLabel(reason: string): string {
+  switch (reason) {
+    case "memory": return "memory limit reached";
+    case "elapsed": return "time limit reached";
+    case "cancelled": return "cancelled";
+    case "error": return "error";
+    case "rows": return "row count reached";
+    default: return reason;
+  }
+}
+
 function seriesStats(samples: ChartSample[]): { current: number; min: number; max: number } {
   if (samples.length === 0) return { current: 0, min: 0, max: 0 };
   const vs = samples.map((s) => s.v);
@@ -78,6 +95,115 @@ function seriesStats(samples: ChartSample[]): { current: number; min: number; ma
     min: Math.min(...vs),
     max: Math.max(...vs),
   };
+}
+
+// Wave 5.47b — pre-flight check coordinator. Hoisted out of IngestPanel so
+// the SyntheticGeneratorCard can request a fresh probe through a submit gate
+// without duplicating cache + fetch state. Banner shows only when the api
+// explicitly returned ok=false; missing/empty responses are treated as
+// "unknown" (banner hidden, submit allowed) so existing tests that don't mock
+// /admin/preflight keep passing.
+const PREFLIGHT_STALENESS_MS = 30_000;
+
+interface PreflightState {
+  result: PreflightResponse | null;
+  lastRunAt: number;
+  rebuilding: boolean;
+  rebuildError: string | null;
+}
+
+interface PreflightHandle {
+  state: PreflightState;
+  runPreflight: () => Promise<PreflightResponse | null>;
+  rebuild: () => Promise<void>;
+  ensureFresh: () => Promise<PreflightResponse | null>;
+}
+
+function usePreflight(): PreflightHandle {
+  const [state, setState] = useState<PreflightState>({
+    result: null, lastRunAt: 0, rebuilding: false, rebuildError: null,
+  });
+  // Wave 5.47b — guard against an in-flight probe being clobbered by a stale
+  // mount-effect resolution after unmount; the ref also dedupes overlapping
+  // ensureFresh callers (e.g. mount-effect racing the submit gate).
+  const inflight = useRef<Promise<PreflightResponse | null> | null>(null);
+
+  const runPreflight = async (): Promise<PreflightResponse | null> => {
+    if (inflight.current) return inflight.current;
+    const p = (async (): Promise<PreflightResponse | null> => {
+      try {
+        const r = await preflight();
+        setState((s) => ({ ...s, result: r, lastRunAt: Date.now() }));
+        return r;
+      } catch {
+        setState((s) => ({ ...s, lastRunAt: Date.now() }));
+        return null;
+      } finally {
+        inflight.current = null;
+      }
+    })();
+    inflight.current = p;
+    return p;
+  };
+
+  const ensureFresh = async (): Promise<PreflightResponse | null> => {
+    const age = Date.now() - state.lastRunAt;
+    if (state.lastRunAt === 0 || age > PREFLIGHT_STALENESS_MS) {
+      return runPreflight();
+    }
+    return state.result;
+  };
+
+  const rebuild = async (): Promise<void> => {
+    setState((s) => ({ ...s, rebuilding: true, rebuildError: null }));
+    try {
+      const r = await rebuildIndexes();
+      if (!r.ok) {
+        setState((s) => ({ ...s, rebuilding: false, rebuildError: r.bootstrap.error ?? "rebuild failed" }));
+        return;
+      }
+      setState((s) => ({ ...s, rebuilding: false, rebuildError: null }));
+      await runPreflight();
+    } catch (e) {
+      setState((s) => ({ ...s, rebuilding: false, rebuildError: (e as Error).message }));
+    }
+  };
+
+  return { state, runPreflight, rebuild, ensureFresh };
+}
+
+function PreflightBanner(props: { state: PreflightState; onRebuild: () => void }) {
+  const { state, onRebuild } = props;
+  const r = state.result;
+  if (!r || r.ok !== false) return null;
+  const missing: string[] = [];
+  if (!r.checks.idx_sens.ok) {
+    const tail = r.checks.idx_sens.missing.length > 0 ? ` (${r.checks.idx_sens.missing.join(", ")})` : "";
+    missing.push(`idx:sens${tail}`);
+  }
+  if (!r.checks.frtb_library.ok) missing.push("frtb library");
+  if (!r.checks.stream.ok) missing.push("sensitivities:in stream");
+  return (
+    <div className="preflight-banner" role="status" data-testid="preflight-banner">
+      <div className="preflight-banner__body">
+        <strong>Pre-flight failed.</strong> Missing: {missing.join(", ")}.
+      </div>
+      <div className="preflight-banner__actions">
+        <button
+          type="button"
+          className="btn btn--secondary"
+          onClick={onRebuild}
+          disabled={state.rebuilding || !r.can_rebuild}
+          data-testid="preflight-rebuild-btn"
+        >
+          {state.rebuilding ? "Rebuilding…" : "Rebuild indexes"}
+        </button>
+        {state.rebuildError ? (
+          <span className="preflight-banner__error" role="alert">{state.rebuildError}</span>
+        ) : null}
+      </div>
+    </div>
+  );
 }
 
 export function IngestPanel() {
@@ -105,6 +231,8 @@ export function IngestPanel() {
   // cancelled list, we clear it immediately so the progress UI doesn't sit
   // on "running" for the next polling tick.
   const { run: trackedRun, clearRun: clearTrackedRun } = useGeneratorRun();
+  // Wave 5.47b — pre-flight banner + submit gate shared with SyntheticGeneratorCard.
+  const preflightHandle = usePreflight();
 
   const throughput = useRef<ChartSample[]>([]);
   const memorySeries = useRef<ChartSample[]>([]);
@@ -115,6 +243,14 @@ export function IngestPanel() {
     let cancelled = false;
     listSources().then((s) => { if (!cancelled) setSources(s); }).catch(() => { /* tolerate missing source-service */ });
     return () => { cancelled = true; };
+  }, []);
+
+  // Wave 5.47b — run pre-flight on mount so the banner can render before the
+  // user opens the synthetic generator form. Tolerate failures silently — a
+  // 404 or down api should not block the rest of the panel.
+  useEffect(() => {
+    void preflightHandle.runPreflight();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -194,6 +330,9 @@ export function IngestPanel() {
         setMemory(m);
         lastKeys.current = { t: Date.now(), dbsize: k.dbsize };
       } catch { /* tolerate transient refresh failure; next poll tick will catch up */ }
+      // Wave 5.47b — flush re-bootstraps server-side, so re-run preflight to
+      // refresh the banner state (typically clears it). Tolerate failures.
+      void preflightHandle.runPreflight();
     } catch (e) {
       setError(`Flush failed: ${(e as Error).message}`);
     } finally {
@@ -273,7 +412,9 @@ export function IngestPanel() {
         </div>
       </PanelCard>
 
-      <SyntheticGeneratorCard />
+      <PreflightBanner state={preflightHandle.state} onRebuild={() => { void preflightHandle.rebuild(); }} />
+
+      <SyntheticGeneratorCard preflightGate={preflightHandle.ensureFresh} />
 
       <PanelCard title="Admin actions">
         <div className="ingest-admin">
@@ -461,7 +602,8 @@ function fmtMB(n: number): string {
 // progress bar (running / cancelling) and the post-run success/cancelled
 // summary line. Wave 5.38a — state lives in GeneratorRunContext so it
 // survives route changes; the panel only owns form-validation errors.
-function SyntheticGeneratorCard() {
+function SyntheticGeneratorCard(props: { preflightGate?: () => Promise<PreflightResponse | null> }) {
+  const { preflightGate } = props;
   const [rows, setRows] = useState<number>(DEFAULT_GEN_ROWS);
   const [classes, setClasses] = useState<Set<string>>(() => new Set(GENERATOR_CLASSES));
   const [sensTypes, setSensTypes] = useState<Set<string>>(() => new Set(["Delta", "Vega"]));
@@ -475,6 +617,12 @@ function SyntheticGeneratorCard() {
   // canonical UPPER form); server resolves. All-zero / empty ⇒ omitted from
   // the request so the server falls back to round-robin via classes + rows.
   const [classSplit, setClassSplit] = useState<Record<string, string>>({});
+  // Wave 5.47c — optional stop conditions (rows / memory % / elapsed s).
+  // Empty strings ⇒ omitted from the request so the historical
+  // "stop at row count" behaviour is preserved.
+  const [stopRows, setStopRows] = useState<string>("");
+  const [stopMemPct, setStopMemPct] = useState<string>("");
+  const [stopElapsedSec, setStopElapsedSec] = useState<string>("");
   const { run, error: streamError, startRun, cancelRun, clearRun } = useGeneratorRun();
   const busy = run?.status === "running" || run?.status === "cancelling";
   const displayError = formError ?? streamError;
@@ -514,12 +662,52 @@ function SyntheticGeneratorCard() {
     else cfg.rows = rows;
     const tradeTrim = tradePool.trim();
     if (tradeTrim !== "") cfg.trade_pool_size = Number(tradeTrim);
+    // Wave 5.47c — assemble optional stop_when. Each field is validated to
+    // mirror the api guards (positive integers; memory_pct in 1..95;
+    // elapsed_seconds in 1..86400). Empty fields are dropped.
+    const stopWhen: { rows?: number; memory_pct?: number; elapsed_seconds?: number } = {};
+    const stopRowsTrim = stopRows.trim();
+    if (stopRowsTrim !== "") {
+      const n = Number(stopRowsTrim);
+      if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
+        return "Stop after rows must be a positive integer.";
+      }
+      stopWhen.rows = n;
+    }
+    const stopMemTrim = stopMemPct.trim();
+    if (stopMemTrim !== "") {
+      const n = Number(stopMemTrim);
+      if (!Number.isFinite(n) || !Number.isInteger(n) || n < 1 || n > 95) {
+        return "Stop at memory % must be an integer in 1..95.";
+      }
+      stopWhen.memory_pct = n;
+    }
+    const stopElapsedTrim = stopElapsedSec.trim();
+    if (stopElapsedTrim !== "") {
+      const n = Number(stopElapsedTrim);
+      if (!Number.isFinite(n) || n <= 0 || n > 86400) {
+        return "Stop after seconds must be a positive number ≤ 86400.";
+      }
+      stopWhen.elapsed_seconds = n;
+    }
+    if (Object.keys(stopWhen).length > 0) cfg.stop_when = stopWhen;
     return cfg;
   }
 
   async function runWithSanityCheck(cfg: GeneratorConfig | null, rowsForCheck: number) {
     setFormError(null);
     clearRun();
+    // Wave 5.47b — gate the run on pre-flight. ensureFresh re-probes when the
+    // last result is older than 30s (or has never run); a strict ok=false
+    // response blocks submit so the panel banner is the next thing the user
+    // sees. Null / missing fields are treated as "unknown" — allow through.
+    if (preflightGate) {
+      const pf = await preflightGate();
+      if (pf && pf.ok === false) {
+        setFormError("Pre-flight failed. Use the Rebuild indexes button above.");
+        return;
+      }
+    }
     let mem: ObservabilityMemoryResponse | null = null;
     try { mem = await getObservabilityMemory(); } catch { mem = null; }
     const est = mem ? computeSanity(rowsForCheck, mem) : null;
@@ -731,6 +919,55 @@ function SyntheticGeneratorCard() {
             />
           </div>
 
+          {/* Wave 5.47c — optional stop conditions. Whichever trips first
+              halts the run; leaving all three empty preserves the historical
+              "stop at row count" behaviour. */}
+          <fieldset
+            className="generator-form__fieldset"
+            data-testid="generator-stop-when"
+          >
+            <legend>Stop conditions <span className="generator-form__hint">(optional — first to trip wins)</span></legend>
+            <div className="generator-form__row">
+              <label htmlFor="gen-stop-rows">Stop after rows</label>
+              <input
+                id="gen-stop-rows"
+                type="number"
+                min={1}
+                placeholder="(use rows above)"
+                value={stopRows}
+                disabled={busy}
+                onChange={(e) => setStopRows(e.target.value)}
+              />
+            </div>
+            <div className="generator-form__row">
+              <label htmlFor="gen-stop-mem-pct">Stop at memory %</label>
+              <input
+                id="gen-stop-mem-pct"
+                type="number"
+                min={1}
+                max={95}
+                placeholder="off"
+                value={stopMemPct}
+                disabled={busy}
+                onChange={(e) => setStopMemPct(e.target.value)}
+              />
+              <span className="generator-form__hint">used_memory / maxmemory · polled every ~25 batches</span>
+            </div>
+            <div className="generator-form__row">
+              <label htmlFor="gen-stop-elapsed">Stop after seconds</label>
+              <input
+                id="gen-stop-elapsed"
+                type="number"
+                min={1}
+                max={86400}
+                placeholder="off"
+                value={stopElapsedSec}
+                disabled={busy}
+                onChange={(e) => setStopElapsedSec(e.target.value)}
+              />
+            </div>
+          </fieldset>
+
           <div className="generator-form__actions">
             <button type="submit" className="btn btn--secondary" disabled={busy}>
               {busy ? "Generating…" : "Generate"}
@@ -748,6 +985,9 @@ function SyntheticGeneratorCard() {
           <div className="generator-form__status" data-testid="generator-status">
             Done — {run.rowsDone} rows queued in {run.terminalMs ?? run.elapsedMs}ms
             {run.runId ? <> · run_id <code>{run.runId}</code></> : null}
+            {run.stopReason && run.stopReason !== "rows" ? (
+              <> · stopped: <span data-testid="generator-stop-reason">{stopReasonLabel(run.stopReason)}</span></>
+            ) : null}
           </div>
         ) : null}
         {run && run.status === "cancelled" ? (
