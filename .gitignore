@@ -25,3 +25,8 @@ Thumbs.db
 # Logs
 *.log
 npm-debug.log*
+
+# Playwright test artifacts
+services/ui/test-results/
+**/playwright-artifacts/trace.zip
+!docs/recordings/smoke-run-3/playwright-artifacts/trace.zip
