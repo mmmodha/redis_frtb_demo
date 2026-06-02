@@ -32,7 +32,23 @@ interface GeneratorStartBody {
   // the sum (or must equal `rows` if both are supplied). When absent, falls
   // back to round-robin via `classes` + `rows`.
   class_split?: Record<string, number>;
+  // Wave 5.47c — optional stop conditions. Whichever trips FIRST halts the
+  // run. If omitted, behaviour is exactly today's (defaults to rows).
+  stop_when?: {
+    rows?: number;
+    memory_pct?: number;
+    elapsed_seconds?: number;
+  };
 }
+
+// Wave 5.47c — resolved stop_when after validation; same shape as the input
+// stop_when but with each field guaranteed to be a valid positive number.
+interface StopWhen {
+  rows?: number;
+  memory_pct?: number;
+  elapsed_seconds?: number;
+}
+export type StopReason = "rows" | "memory" | "elapsed" | "cancelled" | "error";
 
 export interface GeneratorRoutesOpts {
   streamName?: string;
@@ -73,6 +89,9 @@ interface ActiveRun {
   cancelFlag: { cancelled: boolean };
   error?: string;
   terminal_at_ms?: number;
+  // Wave 5.47c — which condition halted the loop. Defaults to "rows" for
+  // backward compat (the historical "ran to row count" terminal).
+  stop_reason?: StopReason;
 }
 const activeRuns = new Map<string, ActiveRun>();
 
@@ -135,6 +154,7 @@ interface ParsedGeneratorRequest {
   tradePool: number | undefined;
   factorPool: number | undefined;
   picker: ClassPicker;
+  stopWhen: StopWhen;
 }
 interface ParsedGeneratorError {
   ok: false;
@@ -145,6 +165,55 @@ function parseGeneratorRequest(
   body: GeneratorStartBody,
   schema: Schema,
 ): ParsedGeneratorRequest | ParsedGeneratorError {
+  // Wave 5.47c — validate stop_when up front. Each numeric field must be a
+  // positive integer (elapsed_seconds may be a finite positive float). At
+  // least one of rows/memory_pct/elapsed_seconds must be present when
+  // stop_when is supplied.
+  const stopWhen: StopWhen = {};
+  if (body.stop_when !== undefined) {
+    if (typeof body.stop_when !== "object" || body.stop_when === null || Array.isArray(body.stop_when)) {
+      return { ok: false, status: 400, error: "stop_when must be an object" };
+    }
+    const sw = body.stop_when;
+    if (sw.rows !== undefined) {
+      if (
+        typeof sw.rows !== "number"
+        || !Number.isFinite(sw.rows)
+        || !Number.isInteger(sw.rows)
+        || sw.rows <= 0
+      ) {
+        return { ok: false, status: 400, error: "stop_when.rows must be a positive integer" };
+      }
+      stopWhen.rows = sw.rows;
+    }
+    if (sw.memory_pct !== undefined) {
+      if (
+        typeof sw.memory_pct !== "number"
+        || !Number.isFinite(sw.memory_pct)
+        || !Number.isInteger(sw.memory_pct)
+        || sw.memory_pct < 1
+        || sw.memory_pct > 95
+      ) {
+        return { ok: false, status: 400, error: "stop_when.memory_pct must be an integer in 1..95" };
+      }
+      stopWhen.memory_pct = sw.memory_pct;
+    }
+    if (sw.elapsed_seconds !== undefined) {
+      if (
+        typeof sw.elapsed_seconds !== "number"
+        || !Number.isFinite(sw.elapsed_seconds)
+        || sw.elapsed_seconds <= 0
+        || sw.elapsed_seconds > 86400
+      ) {
+        return { ok: false, status: 400, error: "stop_when.elapsed_seconds must be a positive number in 1..86400" };
+      }
+      stopWhen.elapsed_seconds = sw.elapsed_seconds;
+    }
+    if (stopWhen.rows === undefined && stopWhen.memory_pct === undefined && stopWhen.elapsed_seconds === undefined) {
+      return { ok: false, status: 400, error: "stop_when must contain at least one condition" };
+    }
+  }
+
   // class_split (if present) defines the per-class row counts. The total row
   // count is the sum and must agree with `rows` if both are supplied.
   let classSplitResolved: Array<{ klass: string; count: number }> | null = null;
@@ -181,7 +250,27 @@ function parseGeneratorRequest(
         error: `class_split totals ${sum} but rows is ${body.rows}; omit rows or set rows=${sum}`,
       };
     }
+    // Wave 5.47c — stop_when.rows is also checked against the class_split sum
+    // (mirrors the rows-vs-class_split rule).
+    if (stopWhen.rows !== undefined && stopWhen.rows !== sum) {
+      return {
+        ok: false,
+        status: 400,
+        error: `class_split totals ${sum} but stop_when.rows is ${stopWhen.rows}; omit stop_when.rows or set it to ${sum}`,
+      };
+    }
     rows = sum;
+  } else if (stopWhen.rows !== undefined) {
+    // Wave 5.47c — stop_when.rows is the row-stop condition. When body.rows
+    // is also provided they must agree; otherwise stop_when.rows wins.
+    if (body.rows !== undefined && body.rows !== stopWhen.rows) {
+      return {
+        ok: false,
+        status: 400,
+        error: `rows is ${body.rows} but stop_when.rows is ${stopWhen.rows}; omit one or set them equal`,
+      };
+    }
+    rows = stopWhen.rows;
   } else {
     rows = body.rows ?? DEFAULT_ROWS;
   }
@@ -240,7 +329,42 @@ function parseGeneratorRequest(
     ? sequencePicker(interleavedSequence(classSplitResolved))
     : roundRobinPicker(resolvedClasses);
 
-  return { ok: true, rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker };
+  return { ok: true, rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker, stopWhen };
+}
+
+// Wave 5.47c — parse Redis "INFO memory" text into the numeric fields used
+// by the memory_pct stop condition. Returns 0 for missing keys so callers
+// can fall back to other denominators.
+function parseInfoMemory(text: string): {
+  used_memory: number;
+  used_memory_rss: number;
+  total_system_memory: number;
+  maxmemory: number;
+} {
+  const get = (key: string): number => {
+    const m = new RegExp(`^${key}:(\\d+)`, "m").exec(text);
+    return m ? Number(m[1]) : 0;
+  };
+  return {
+    used_memory: get("used_memory"),
+    used_memory_rss: get("used_memory_rss"),
+    total_system_memory: get("total_system_memory"),
+    maxmemory: get("maxmemory"),
+  };
+}
+
+// Wave 5.47c — current memory pct from a parsed INFO memory snapshot.
+// Prefers used_memory / maxmemory when maxmemory > 0; otherwise falls back
+// to used_memory_rss / total_system_memory. Returns null when neither
+// denominator is available (so the stop check can no-op gracefully).
+function memoryPct(info: ReturnType<typeof parseInfoMemory>): number | null {
+  if (info.maxmemory > 0 && info.used_memory > 0) {
+    return (info.used_memory / info.maxmemory) * 100;
+  }
+  if (info.total_system_memory > 0 && info.used_memory_rss > 0) {
+    return (info.used_memory_rss / info.total_system_memory) * 100;
+  }
+  return null;
 }
 
 export function registerGeneratorRoutes(
@@ -265,10 +389,11 @@ export function registerGeneratorRoutes(
       reply.code(parsed.status);
       return { error: parsed.error };
     }
-    const { rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker } = parsed;
+    const { rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker, stopWhen } = parsed;
 
     const run_id = ulid();
     const t0 = process.hrtime.bigint();
+    const startedAtMs = Date.now();
 
     // Wave 5.16t — resolve active redis per-request so the generator writes
     // to the currently-active profile's stream.
@@ -286,8 +411,37 @@ export function registerGeneratorRoutes(
       { stream: streamName, batchSize: 200 },
     );
 
+    // Wave 5.47c — track which condition halts the loop. Defaults to "rows"
+    // for backward compat (the historical behaviour).
+    let stopReason: StopReason = "rows";
+    let lastMemPollBatchCount = 0;
+    let lastMemPollAtMs = startedAtMs;
+
     try {
       for (let i = 0; i < rows; i++) {
+        // Wave 5.47c — check active stop conditions BEFORE adding the next
+        // row so the terminal frame reflects "stopped at N rows".
+        if (stopWhen.elapsed_seconds !== undefined
+          && (Date.now() - startedAtMs) / 1000 >= stopWhen.elapsed_seconds) {
+          stopReason = "elapsed";
+          break;
+        }
+        if (stopWhen.memory_pct !== undefined) {
+          const dueByBatches = producer.batchCount - lastMemPollBatchCount >= 25;
+          const dueByTime = Date.now() - lastMemPollAtMs >= 1000;
+          if (dueByBatches && dueByTime) {
+            lastMemPollBatchCount = producer.batchCount;
+            lastMemPollAtMs = Date.now();
+            try {
+              const text = await redis.info("memory");
+              const pct = memoryPct(parseInfoMemory(text));
+              if (pct !== null && pct >= stopWhen.memory_pct) {
+                stopReason = "memory";
+                break;
+              }
+            } catch { /* tolerate transient INFO failure; next poll retries */ }
+          }
+        }
         const riskClass = picker.pick(i);
         const row = generator.generate(riskClass);
         await producer.add(row);
@@ -320,6 +474,7 @@ export function registerGeneratorRoutes(
       classes: resolvedClasses,
       sensitivity_types,
       ms: Math.round(ms * 1000) / 1000,
+      stop_reason: stopReason,
     };
   });
 
@@ -342,6 +497,8 @@ export function registerGeneratorRoutes(
     generator: ReturnType<typeof createRowGenerator>,
     producer: ReturnType<typeof createStreamProducer>,
     target_label: string,
+    stopWhen: StopWhen,
+    redis: RedisLike,
   ): Promise<void> => {
     const tick = (): void => {
       state.rows_done = producer.rowsSent;
@@ -349,9 +506,38 @@ export function registerGeneratorRoutes(
       state.elapsed_ms = Math.round(elapsed);
       state.rows_per_sec = elapsed > 0 ? Math.round((state.rows_done / elapsed) * 1000) : 0;
     };
+    // Wave 5.47c — stop-condition bookkeeping. `loopReason` records which
+    // active stop condition broke the loop; default is "rows" (ran to count).
+    let loopReason: StopReason = "rows";
+    const startedAtMs = Date.now();
+    let lastMemPollBatchCount = 0;
+    let lastMemPollAtMs = startedAtMs;
     try {
       for (let i = 0; i < rows; i++) {
         if (state.cancelFlag.cancelled) break;
+        // Wave 5.47c — check active stop conditions before each row so the
+        // terminal frame surfaces stop_reason at the row count when tripped.
+        if (stopWhen.elapsed_seconds !== undefined
+          && (Date.now() - startedAtMs) / 1000 >= stopWhen.elapsed_seconds) {
+          loopReason = "elapsed";
+          break;
+        }
+        if (stopWhen.memory_pct !== undefined) {
+          const dueByBatches = producer.batchCount - lastMemPollBatchCount >= 25;
+          const dueByTime = Date.now() - lastMemPollAtMs >= 1000;
+          if (dueByBatches && dueByTime) {
+            lastMemPollBatchCount = producer.batchCount;
+            lastMemPollAtMs = Date.now();
+            try {
+              const text = await redis.info("memory");
+              const pct = memoryPct(parseInfoMemory(text));
+              if (pct !== null && pct >= stopWhen.memory_pct) {
+                loopReason = "memory";
+                break;
+              }
+            } catch { /* tolerate transient INFO failure; next poll retries */ }
+          }
+        }
         const riskClass = picker.pick(i);
         const row = generator.generate(riskClass);
         await producer.add(row);
@@ -371,9 +557,16 @@ export function registerGeneratorRoutes(
       state.error = (errBody as { error?: string }).error ?? "redis error";
       tick();
     }
-    if (state.error) state.status = "error";
-    else if (state.cancelFlag.cancelled) state.status = "cancelled";
-    else state.status = "done";
+    if (state.error) {
+      state.status = "error";
+      state.stop_reason = "error";
+    } else if (state.cancelFlag.cancelled) {
+      state.status = "cancelled";
+      state.stop_reason = "cancelled";
+    } else {
+      state.status = "done";
+      state.stop_reason = loopReason;
+    }
     state.terminal_at_ms = Date.now();
   };
 
@@ -390,7 +583,7 @@ export function registerGeneratorRoutes(
       reply.code(parsed.status);
       return { error: parsed.error };
     }
-    const { rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker } = parsed;
+    const { rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker, stopWhen } = parsed;
 
     const run_id = ulid();
     const t0 = process.hrtime.bigint();
@@ -471,7 +664,7 @@ export function registerGeneratorRoutes(
 
     // Detached run — handle terminal frame + grace-eviction here so the
     // route handler can return immediately after writing the seed frame.
-    void runGenerator(state, t0, rows, picker, generator, producer, target_label)
+    void runGenerator(state, t0, rows, picker, generator, producer, target_label, stopWhen, redis)
       .then(() => {
         if (interval) { clearInterval(interval); interval = null; }
         const msPrecise = Math.round(state.elapsed_ms * 1000) / 1000;
@@ -482,6 +675,9 @@ export function registerGeneratorRoutes(
           rows_queued: state.rows_done,
           ms: msPrecise,
           cancelled,
+          // Wave 5.47c — additive terminal-frame field. Existing
+          // done/cancelled/error flags are preserved for backward compat.
+          stop_reason: state.stop_reason ?? (state.error ? "error" : cancelled ? "cancelled" : "rows"),
         };
         if (state.error) terminalFrame.error = state.error;
         if (clientConnected) {
@@ -535,6 +731,10 @@ export function registerGeneratorRoutes(
       classes: entry.classes,
       sensitivity_types: entry.sensitivity_types,
       ...(entry.error ? { error: entry.error } : {}),
+      // Wave 5.47c — surface the resolved stop_reason on terminal entries so
+      // late-arriving clients (post-refresh) can render the same label as
+      // the SSE terminal frame.
+      ...(entry.stop_reason ? { stop_reason: entry.stop_reason } : {}),
     };
   });
 

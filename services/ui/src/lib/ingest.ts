@@ -22,6 +22,16 @@ export interface IngestRunResponse {
 // Wave 5.47d — optional `class_split` overrides round-robin with explicit
 // per-class row counts; the server interleaves them so progress events show
 // a consistent mix.
+// Wave 5.47c — optional stop conditions; whichever trips first halts a run.
+// Mirrors the StopWhen shape on the api route.
+export interface StopWhen {
+  rows?: number;
+  memory_pct?: number;
+  elapsed_seconds?: number;
+}
+
+export type StopReason = "rows" | "memory" | "elapsed" | "cancelled" | "error";
+
 export interface GeneratorConfig {
   rows?: number;
   classes?: string[];
@@ -30,6 +40,7 @@ export interface GeneratorConfig {
   trade_pool_size?: number;
   factor_pool_size?: number;
   class_split?: Record<string, number>;
+  stop_when?: StopWhen;
 }
 
 export interface GeneratorStartResponse extends IngestRunResponse {
@@ -37,6 +48,7 @@ export interface GeneratorStartResponse extends IngestRunResponse {
   classes?: string[];
   sensitivity_types?: string[];
   ms?: number;
+  stop_reason?: StopReason;
 }
 
 export async function listSources(): Promise<Source[]> {
@@ -95,6 +107,9 @@ export interface TerminalFrame {
   ms: number;
   cancelled: boolean;
   error?: string;
+  // Wave 5.47c — which stop condition halted the run. Additive: older api
+  // builds simply omit it and the UI falls back to the legacy flags.
+  stop_reason?: StopReason;
 }
 export interface GeneratorStreamHandlers {
   onProgress: (frame: ProgressFrame) => void;
@@ -283,6 +298,52 @@ export async function cancelAllGeneratorRuns(): Promise<CancelAllGeneratorRunsRe
   return (await res.json()) as CancelAllGeneratorRunsResponse;
 }
 
+// Wave 5.47b — GET /admin/preflight. Returns per-check status so the
+// IngestPanel can render a banner before a generator run starts. The api
+// route is read-only; we keep the client shape mirrored to the response so
+// the UI can list missing pieces without bespoke parsing.
+export interface PreflightResponse {
+  ok: boolean;
+  checks: {
+    idx_sens: { ok: boolean; missing: string[] };
+    frtb_library: { ok: boolean; loaded: boolean };
+    stream: { ok: boolean; exists: boolean };
+  };
+  can_rebuild: boolean;
+}
+
+export async function preflight(): Promise<PreflightResponse> {
+  const res = await fetch(`${apiBase()}/admin/preflight`);
+  if (!res.ok) throw new Error(`api /admin/preflight ${res.status}`);
+  return (await res.json()) as PreflightResponse;
+}
+
+// Wave 5.47b — POST /admin/rebuild-indexes. Re-runs bootstrapFrtb on the
+// active client. Sends body:"{}" to dodge FST_ERR_CTP_EMPTY_JSON_BODY, the
+// same defensive shape flushDb / cancelAllGeneratorRuns use.
+export interface RebuildIndexesResponse {
+  ok: boolean;
+  ms: number;
+  bootstrap: { ok: boolean; error?: string };
+}
+
+export async function rebuildIndexes(): Promise<RebuildIndexesResponse> {
+  const res = await fetch(`${apiBase()}/admin/rebuild-indexes`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{}",
+  });
+  if (!res.ok) {
+    let detail = `${res.status}`;
+    try {
+      const err = (await res.json()) as { error?: string };
+      if (err && typeof err.error === "string") detail = `${res.status}: ${err.error}`;
+    } catch { /* response body not json */ }
+    throw new Error(`api /admin/rebuild-indexes ${detail}`);
+  }
+  return (await res.json()) as RebuildIndexesResponse;
+}
+
 export async function cancelGenerator(runId: string): Promise<void> {
   const res = await fetch(`${apiBase()}/generator/cancel/${encodeURIComponent(runId)}`, {
     method: "POST",
@@ -306,6 +367,9 @@ export interface GeneratorRunStatus {
   rows_per_sec: number;
   elapsed_ms: number;
   error?: string;
+  // Wave 5.47c — surfaced on terminal entries by /generator/runs/:id/status
+  // so post-refresh clients can render the same stop-reason label.
+  stop_reason?: StopReason;
 }
 
 export interface ActiveGeneratorRun {

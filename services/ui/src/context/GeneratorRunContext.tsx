@@ -31,6 +31,7 @@ import {
   type GeneratorRunStatus,
   type GeneratorStreamHandle,
   type ProgressFrame,
+  type StopReason,
   type TerminalFrame,
 } from "../lib/ingest";
 
@@ -60,6 +61,10 @@ export interface GeneratorRunState {
   runId: string | null;
   status: "running" | "cancelling" | "done" | "cancelled" | "error";
   terminalMs?: number;
+  // Wave 5.47c — which stop condition halted the run, when known. Surfaced
+  // by the SSE terminal frame and by /generator/runs/:id/status on a
+  // post-refresh reconnect.
+  stopReason?: StopReason;
 }
 
 export interface GeneratorRunContextValue {
@@ -124,6 +129,7 @@ function statusToRunState(s: GeneratorRunStatus): GeneratorRunState {
     runId: s.run_id,
     status: mapped,
     terminalMs: isTerminalStatus(s.status) ? s.elapsed_ms : undefined,
+    stopReason: s.stop_reason,
   };
 }
 
@@ -272,6 +278,10 @@ export function GeneratorRunProvider({ children }: { children: ReactNode }): JSX
           runId: f.run_id,
           status: f.cancelled ? "cancelled" : "done",
           terminalMs: f.ms,
+          // Wave 5.47c — fall back to legacy flags for older api builds that
+          // do not yet emit stop_reason on the terminal frame.
+          stopReason: f.stop_reason
+            ?? (f.error ? "error" : f.cancelled ? "cancelled" : "rows"),
         });
         if (f.error) setError(f.error);
         streamRef.current = null;
