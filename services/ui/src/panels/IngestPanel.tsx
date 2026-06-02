@@ -471,6 +471,10 @@ function SyntheticGeneratorCard() {
   const [formError, setFormError] = useState<string | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [pending, setPending] = useState<PendingSubmit | null>(null);
+  // Wave 5.47d — explicit per-class row targets. Keyed by class label (not
+  // canonical UPPER form); server resolves. All-zero / empty ⇒ omitted from
+  // the request so the server falls back to round-robin via classes + rows.
+  const [classSplit, setClassSplit] = useState<Record<string, string>>({});
   const { run, error: streamError, startRun, cancelRun, clearRun } = useGeneratorRun();
   const busy = run?.status === "running" || run?.status === "cancelling";
   const displayError = formError ?? streamError;
@@ -487,13 +491,27 @@ function SyntheticGeneratorCard() {
     if (sensTypes.size === 0) return "Select at least one sensitivity type.";
     const seedTrim = seed.trim();
     const seedValue: string | number = /^-?\d+$/.test(seedTrim) ? Number(seedTrim) : seedTrim;
+    // Wave 5.47d — collect non-zero per-class targets for selected classes.
+    // Empty / all-zero ⇒ omit so the server uses round-robin.
+    const splitOut: Record<string, number> = {};
+    for (const c of classes) {
+      const raw = classSplit[c];
+      if (raw === undefined || raw.trim() === "") continue;
+      const n = Number(raw);
+      if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0) {
+        return `Per-class target for ${c} must be a non-negative integer.`;
+      }
+      if (n > 0) splitOut[c] = n;
+    }
+    const hasSplit = Object.keys(splitOut).length > 0;
     const cfg: GeneratorConfig = {
-      rows,
       classes: Array.from(classes),
       sensitivity_types: Array.from(sensTypes),
       seed: seedValue,
       factor_pool_size: factorPool,
     };
+    if (hasSplit) cfg.class_split = splitOut;
+    else cfg.rows = rows;
     const tradeTrim = tradePool.trim();
     if (tradeTrim !== "") cfg.trade_pool_size = Number(tradeTrim);
     return cfg;
@@ -515,7 +533,13 @@ function SyntheticGeneratorCard() {
     clearRun();
     const built = buildAdvancedConfig();
     if (typeof built === "string") { setFormError(built); return; }
-    await runWithSanityCheck(built, built.rows ?? DEFAULT_GEN_ROWS);
+    // Wave 5.47d — when class_split is set, the effective row count is the
+    // sum; otherwise it's the explicit `rows` field. Pass that to the sanity
+    // check so headroom math reflects what the server will actually queue.
+    const effectiveRows = built.class_split
+      ? Object.values(built.class_split).reduce((a, b) => a + b, 0)
+      : built.rows ?? DEFAULT_GEN_ROWS;
+    await runWithSanityCheck(built, effectiveRows);
   }
 
   async function onGenerateDefaults() {
@@ -524,6 +548,19 @@ function SyntheticGeneratorCard() {
 
   function onRandomSeed() {
     setSeed(String(Math.floor(Math.random() * 1_000_000_000)));
+  }
+
+  // Wave 5.47d — populate per-class targets with an even split of `rows`
+  // across the currently-selected classes. Any remainder lands on the first
+  // class so the totals sum to `rows` exactly.
+  function onEvenSplit(): void {
+    const selected = Array.from(classes);
+    if (selected.length === 0) return;
+    const base = Math.floor(rows / selected.length);
+    const remainder = rows - base * selected.length;
+    const next: Record<string, string> = {};
+    selected.forEach((c, i) => { next[c] = String(base + (i === 0 ? remainder : 0)); });
+    setClassSplit(next);
   }
 
   function onCancelRun(): void {
@@ -597,6 +634,43 @@ function SyntheticGeneratorCard() {
                 {c}
               </label>
             ))}
+          </fieldset>
+
+          {/* Wave 5.47d — per-class row targets. Empty / all-zero ⇒ server
+              falls back to round-robin via classes + rows. */}
+          <fieldset className="generator-form__group" disabled={busy} data-testid="generator-class-split">
+            <legend>Per-class targets</legend>
+            <button
+              type="button"
+              className="btn btn--secondary"
+              onClick={onEvenSplit}
+              disabled={busy || classes.size === 0}
+              data-testid="generator-even-split-btn"
+            >
+              Even split
+            </button>
+            <table className="generator-form__split-table">
+              <tbody>
+                {Array.from(classes).map((c) => (
+                  <tr key={c}>
+                    <td><label htmlFor={`gen-split-${c}`}>{c}</label></td>
+                    <td>
+                      <input
+                        id={`gen-split-${c}`}
+                        type="number"
+                        min={0}
+                        step={1}
+                        placeholder="0"
+                        value={classSplit[c] ?? ""}
+                        disabled={busy}
+                        onChange={(e) => setClassSplit((prev) => ({ ...prev, [c]: e.target.value }))}
+                      />
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <span className="generator-form__hint">leave blank / all zero to use Rows + round-robin</span>
           </fieldset>
 
           <fieldset className="generator-form__group" disabled={busy}>

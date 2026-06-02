@@ -19,6 +19,9 @@ export interface IngestRunResponse {
 
 // Wave 5.17b — body shape for POST /generator/start. Mirrors the Fastify
 // route's GeneratorStartBody in services/api/src/routes/generator.ts.
+// Wave 5.47d — optional `class_split` overrides round-robin with explicit
+// per-class row counts; the server interleaves them so progress events show
+// a consistent mix.
 export interface GeneratorConfig {
   rows?: number;
   classes?: string[];
@@ -26,6 +29,7 @@ export interface GeneratorConfig {
   seed?: string | number;
   trade_pool_size?: number;
   factor_pool_size?: number;
+  class_split?: Record<string, number>;
 }
 
 export interface GeneratorStartResponse extends IngestRunResponse {

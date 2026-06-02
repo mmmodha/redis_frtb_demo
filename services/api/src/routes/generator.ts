@@ -27,6 +27,11 @@ interface GeneratorStartBody {
   // risk_factor fields. Defaults preserve smoke-run-16 byte-equivalence.
   trade_pool_size?: number;
   factor_pool_size?: number;
+  // Wave 5.47d — explicit per-class row counts. When present, the generator
+  // draws each class exactly the configured count and the total row count is
+  // the sum (or must equal `rows` if both are supplied). When absent, falls
+  // back to round-robin via `classes` + `rows`.
+  class_split?: Record<string, number>;
 }
 
 export interface GeneratorRoutesOpts {
@@ -82,6 +87,162 @@ type PipelineClient = {
   };
 };
 
+// Wave 5.47d — class-sequence pickers. Both return the class to use for the
+// i-th row. Round-robin keeps the existing modulo behaviour (O(1) per pick,
+// no allocation). The Bresenham-style interleaver expands a class_split map
+// so progress events show a consistent mix instead of "all GIRR then all FX".
+interface ClassPicker {
+  pick(i: number): string;
+}
+function roundRobinPicker(resolvedClasses: string[]): ClassPicker {
+  return { pick: (i) => resolvedClasses[i % resolvedClasses.length]! };
+}
+// Largest-deficit interleaver: at each output slot, advance the class whose
+// next placement is earliest on the fractional timeline (placed+0.5)/count.
+// Deterministic and produces an even mix (e.g. {GIRR:100, FX:50} → GFGG FGGF…).
+function interleavedSequence(splits: Array<{ klass: string; count: number }>): string[] {
+  const active = splits.filter((s) => s.count > 0);
+  let total = 0;
+  for (const s of active) total += s.count;
+  const out: string[] = new Array(total);
+  const placed: number[] = active.map(() => 0);
+  for (let i = 0; i < total; i++) {
+    let bestIdx = -1;
+    let bestKey = Infinity;
+    for (let j = 0; j < active.length; j++) {
+      if (placed[j]! >= active[j]!.count) continue;
+      const key = (placed[j]! + 0.5) / active[j]!.count;
+      if (key < bestKey) { bestKey = key; bestIdx = j; }
+    }
+    out[i] = active[bestIdx]!.klass;
+    placed[bestIdx]!++;
+  }
+  return out;
+}
+function sequencePicker(seq: string[]): ClassPicker {
+  return { pick: (i) => seq[i]! };
+}
+
+// Wave 5.47d — shared request parser. Validates rows / classes /
+// sensitivity_types / pool sizes / class_split and returns the resolved
+// values used by both the non-streaming and streaming routes. Returning a
+// discriminated union keeps the call sites flat (status + body).
+interface ParsedGeneratorRequest {
+  ok: true;
+  rows: number;
+  resolvedClasses: string[];
+  sensitivity_types: string[];
+  tradePool: number | undefined;
+  factorPool: number | undefined;
+  picker: ClassPicker;
+}
+interface ParsedGeneratorError {
+  ok: false;
+  status: number;
+  error: string;
+}
+function parseGeneratorRequest(
+  body: GeneratorStartBody,
+  schema: Schema,
+): ParsedGeneratorRequest | ParsedGeneratorError {
+  // class_split (if present) defines the per-class row counts. The total row
+  // count is the sum and must agree with `rows` if both are supplied.
+  let classSplitResolved: Array<{ klass: string; count: number }> | null = null;
+  if (body.class_split !== undefined) {
+    if (typeof body.class_split !== "object" || body.class_split === null || Array.isArray(body.class_split)) {
+      return { ok: false, status: 400, error: "class_split must be an object mapping risk class → count" };
+    }
+    const entries = Object.entries(body.class_split);
+    if (entries.length === 0) {
+      return { ok: false, status: 400, error: "class_split cannot be empty if provided" };
+    }
+    const resolved: Array<{ klass: string; count: number }> = [];
+    for (const [klass, count] of entries) {
+      if (typeof count !== "number" || !Number.isFinite(count) || !Number.isInteger(count) || count < 0) {
+        return { ok: false, status: 400, error: `class_split[${klass}] must be a non-negative integer` };
+      }
+      const upper = String(klass).toUpperCase();
+      const canonical = schema.risk_classes[upper] ? upper : schema.risk_classes[klass] ? klass : null;
+      if (!canonical) {
+        return { ok: false, status: 400, error: `unknown risk class: ${klass}` };
+      }
+      resolved.push({ klass: canonical, count });
+    }
+    classSplitResolved = resolved;
+  }
+
+  let rows: number;
+  if (classSplitResolved) {
+    const sum = classSplitResolved.reduce((acc, s) => acc + s.count, 0);
+    if (body.rows !== undefined && body.rows !== sum) {
+      return {
+        ok: false,
+        status: 400,
+        error: `class_split totals ${sum} but rows is ${body.rows}; omit rows or set rows=${sum}`,
+      };
+    }
+    rows = sum;
+  } else {
+    rows = body.rows ?? DEFAULT_ROWS;
+  }
+  // Wave 5.20c — hard MAX_ROWS cap removed; the cluster sanity check in the
+  // UI is the user-facing guardrail. Only structural validation remains here.
+  if (
+    typeof rows !== "number"
+    || !Number.isFinite(rows)
+    || !Number.isInteger(rows)
+    || rows <= 0
+    || rows > Number.MAX_SAFE_INTEGER
+  ) {
+    return { ok: false, status: 400, error: "rows must be a positive integer" };
+  }
+
+  let resolvedClasses: string[];
+  if (classSplitResolved) {
+    // When class_split is provided it fully determines the class set; the
+    // top-level `classes` field is ignored to avoid ambiguous behaviour.
+    resolvedClasses = classSplitResolved.map((s) => s.klass);
+  } else {
+    const classes = body.classes && body.classes.length > 0 ? body.classes : [...DEFAULT_CLASSES];
+    for (const c of classes) {
+      const upper = String(c).toUpperCase();
+      if (!schema.risk_classes[upper] && !schema.risk_classes[c]) {
+        return { ok: false, status: 400, error: `unknown risk class: ${c}` };
+      }
+    }
+    // Resolve to the canonical key (UPPERCASE) used everywhere downstream —
+    // mirrors the calc.ts §Wave 5.15l convention.
+    resolvedClasses = classes.map((c) => {
+      const upper = String(c).toUpperCase();
+      return schema.risk_classes[upper] ? upper : c;
+    });
+  }
+
+  const sensitivity_types = body.sensitivity_types && body.sensitivity_types.length > 0
+    ? body.sensitivity_types
+    : [...DEFAULT_SENSITIVITY_TYPES];
+
+  // Wave 5.17a — validate pool sizes if provided (1..10000 / 1..256).
+  const tradePool = body.trade_pool_size;
+  if (tradePool !== undefined) {
+    if (typeof tradePool !== "number" || !Number.isFinite(tradePool) || tradePool < 1 || tradePool > 10000) {
+      return { ok: false, status: 400, error: "trade_pool_size must be a number in 1..10000" };
+    }
+  }
+  const factorPool = body.factor_pool_size;
+  if (factorPool !== undefined) {
+    if (typeof factorPool !== "number" || !Number.isFinite(factorPool) || factorPool < 1 || factorPool > 256) {
+      return { ok: false, status: 400, error: "factor_pool_size must be a number in 1..256" };
+    }
+  }
+
+  const picker: ClassPicker = classSplitResolved
+    ? sequencePicker(interleavedSequence(classSplitResolved))
+    : roundRobinPicker(resolvedClasses);
+
+  return { ok: true, rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker };
+}
+
 export function registerGeneratorRoutes(
   app: FastifyInstance,
   getRedis: () => RedisLike,
@@ -99,41 +260,12 @@ export function registerGeneratorRoutes(
     }
 
     const body = (req.body ?? {}) as GeneratorStartBody;
-    const rows = body.rows ?? DEFAULT_ROWS;
-    // Wave 5.20c — hard MAX_ROWS cap removed; the cluster sanity check
-    // (services/ui/src/panels/IngestPanel.tsx computeSanity) is the
-    // user-facing guardrail. Only structural validation remains here.
-    if (
-      typeof rows !== "number"
-      || !Number.isFinite(rows)
-      || !Number.isInteger(rows)
-      || rows <= 0
-      || rows > Number.MAX_SAFE_INTEGER
-    ) {
-      reply.code(400);
-      return { error: "rows must be a positive integer" };
+    const parsed = parseGeneratorRequest(body, schema);
+    if (!parsed.ok) {
+      reply.code(parsed.status);
+      return { error: parsed.error };
     }
-
-    const classes = body.classes && body.classes.length > 0
-      ? body.classes
-      : [...DEFAULT_CLASSES];
-    for (const c of classes) {
-      const upper = String(c).toUpperCase();
-      if (!schema.risk_classes[upper] && !schema.risk_classes[c]) {
-        reply.code(400);
-        return { error: `unknown risk class: ${c}` };
-      }
-    }
-    // Resolve to the canonical key (UPPERCASE) used everywhere downstream —
-    // mirrors the calc.ts §Wave 5.15l convention.
-    const resolvedClasses = classes.map((c) => {
-      const upper = String(c).toUpperCase();
-      return schema.risk_classes[upper] ? upper : c;
-    });
-
-    const sensitivity_types = body.sensitivity_types && body.sensitivity_types.length > 0
-      ? body.sensitivity_types
-      : [...DEFAULT_SENSITIVITY_TYPES];
+    const { rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker } = parsed;
 
     const run_id = ulid();
     const t0 = process.hrtime.bigint();
@@ -142,22 +274,6 @@ export function registerGeneratorRoutes(
     // to the currently-active profile's stream.
     const redis = getRedis();
     const target_label = getActiveTarget().label;
-
-    // Wave 5.17a — validate pool sizes if provided (1..10000 / 1..256).
-    const tradePool = body.trade_pool_size;
-    if (tradePool !== undefined) {
-      if (typeof tradePool !== "number" || !Number.isFinite(tradePool) || tradePool < 1 || tradePool > 10000) {
-        reply.code(400);
-        return { error: "trade_pool_size must be a number in 1..10000" };
-      }
-    }
-    const factorPool = body.factor_pool_size;
-    if (factorPool !== undefined) {
-      if (typeof factorPool !== "number" || !Number.isFinite(factorPool) || factorPool < 1 || factorPool > 256) {
-        reply.code(400);
-        return { error: "factor_pool_size must be a number in 1..256" };
-      }
-    }
 
     const generator = createRowGenerator(schema, {
       seed: body.seed,
@@ -172,7 +288,7 @@ export function registerGeneratorRoutes(
 
     try {
       for (let i = 0; i < rows; i++) {
-        const riskClass = resolvedClasses[i % resolvedClasses.length]!;
+        const riskClass = picker.pick(i);
         const row = generator.generate(riskClass);
         await producer.add(row);
       }
@@ -222,7 +338,7 @@ export function registerGeneratorRoutes(
     state: ActiveRun,
     t0: bigint,
     rows: number,
-    resolvedClasses: string[],
+    picker: ClassPicker,
     generator: ReturnType<typeof createRowGenerator>,
     producer: ReturnType<typeof createStreamProducer>,
     target_label: string,
@@ -236,7 +352,7 @@ export function registerGeneratorRoutes(
     try {
       for (let i = 0; i < rows; i++) {
         if (state.cancelFlag.cancelled) break;
-        const riskClass = resolvedClasses[i % resolvedClasses.length]!;
+        const riskClass = picker.pick(i);
         const row = generator.generate(riskClass);
         await producer.add(row);
         tick();
@@ -269,51 +385,12 @@ export function registerGeneratorRoutes(
     }
 
     const body = (req.body ?? {}) as GeneratorStartBody;
-    const rows = body.rows ?? DEFAULT_ROWS;
-    if (
-      typeof rows !== "number"
-      || !Number.isFinite(rows)
-      || !Number.isInteger(rows)
-      || rows <= 0
-      || rows > Number.MAX_SAFE_INTEGER
-    ) {
-      reply.code(400);
-      return { error: "rows must be a positive integer" };
+    const parsed = parseGeneratorRequest(body, schema);
+    if (!parsed.ok) {
+      reply.code(parsed.status);
+      return { error: parsed.error };
     }
-
-    const classes = body.classes && body.classes.length > 0
-      ? body.classes
-      : [...DEFAULT_CLASSES];
-    for (const c of classes) {
-      const upper = String(c).toUpperCase();
-      if (!schema.risk_classes[upper] && !schema.risk_classes[c]) {
-        reply.code(400);
-        return { error: `unknown risk class: ${c}` };
-      }
-    }
-    const resolvedClasses = classes.map((c) => {
-      const upper = String(c).toUpperCase();
-      return schema.risk_classes[upper] ? upper : c;
-    });
-
-    const sensitivity_types = body.sensitivity_types && body.sensitivity_types.length > 0
-      ? body.sensitivity_types
-      : [...DEFAULT_SENSITIVITY_TYPES];
-
-    const tradePool = body.trade_pool_size;
-    if (tradePool !== undefined) {
-      if (typeof tradePool !== "number" || !Number.isFinite(tradePool) || tradePool < 1 || tradePool > 10000) {
-        reply.code(400);
-        return { error: "trade_pool_size must be a number in 1..10000" };
-      }
-    }
-    const factorPool = body.factor_pool_size;
-    if (factorPool !== undefined) {
-      if (typeof factorPool !== "number" || !Number.isFinite(factorPool) || factorPool < 1 || factorPool > 256) {
-        reply.code(400);
-        return { error: "factor_pool_size must be a number in 1..256" };
-      }
-    }
+    const { rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker } = parsed;
 
     const run_id = ulid();
     const t0 = process.hrtime.bigint();
@@ -394,7 +471,7 @@ export function registerGeneratorRoutes(
 
     // Detached run — handle terminal frame + grace-eviction here so the
     // route handler can return immediately after writing the seed frame.
-    void runGenerator(state, t0, rows, resolvedClasses, generator, producer, target_label)
+    void runGenerator(state, t0, rows, picker, generator, producer, target_label)
       .then(() => {
         if (interval) { clearInterval(interval); interval = null; }
         const msPrecise = Math.round(state.elapsed_ms * 1000) / 1000;
