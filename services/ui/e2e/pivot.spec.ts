@@ -58,7 +58,7 @@ test.describe("/pivot — Query/Pivot panel", () => {
     expect(lastUrl).toContain("bucket=USD-IRS");
     expect(lastUrl).toContain("sensitivity_type=Delta");
 
-    await expect(page.getByTestId("latency-histogram")).toContainText(/11\.7\s*ms/);
+    await expect(page.getByTestId("latency-strip")).toContainText(/11\.7/);
   });
 
   test("bucket dropdown options change with the selected risk_class", async ({ page }) => {

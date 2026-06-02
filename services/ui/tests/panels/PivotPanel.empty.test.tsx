@@ -3,6 +3,7 @@ import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { PivotPanel } from "../../src/panels/PivotPanel";
 import { PivotBurstProvider } from "../../src/context/PivotBurstContext";
+import { PivotHistoryProvider } from "../../src/context/PivotHistoryContext";
 
 vi.mock("../../src/components/PanelCard", () => ({
   PanelCard: ({ title, children, actions }: any) => (
@@ -33,9 +34,11 @@ vi.mock("../../src/components/MetricTile", () => ({
 function renderPanel() {
   return render(
     <PivotBurstProvider>
-      <MemoryRouter>
-        <PivotPanel />
-      </MemoryRouter>
+      <PivotHistoryProvider>
+        <MemoryRouter>
+          <PivotPanel />
+        </MemoryRouter>
+      </PivotHistoryProvider>
     </PivotBurstProvider>,
   );
 }

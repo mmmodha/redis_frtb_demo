@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { PanelCard } from "../components/PanelCard";
 import { EnterpriseCallout } from "../components/EnterpriseCallout";
-import { MetricTile } from "../components/MetricTile";
+import { LatencyStrip } from "../components/LatencyStrip";
 import { apiBase } from "../lib/api";
 import {
   EmptyTargetError,
@@ -11,30 +11,22 @@ import {
 import type { PivotResp } from "../lib/pivot";
 import { BUCKETS_BY_RISK_CLASS, RISK_CLASSES, SENSITIVITY_TYPES } from "../lib/buckets";
 import { usePivotBurst } from "../context/PivotBurstContext";
+import { usePivotHistory } from "../context/PivotHistoryContext";
 
 const DEFAULT_LIMIT = 100;
-const HIST_WINDOW = 100;
-
-function percentile(values: number[], p: number): number {
-  if (values.length === 0) return 0;
-  const sorted = [...values].sort((a, b) => a - b);
-  const idx = Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length));
-  return Math.round((sorted[idx] ?? 0) * 1000) / 1000;
-}
 
 export function PivotPanel(): JSX.Element {
   const [riskClass, setRiskClass] = useState<string>("");
   const [bucket, setBucket] = useState<string>("");
   const [sensType, setSensType] = useState<string>("");
   const [book, setBook] = useState<string>("");
-  const [offset, setOffset] = useState<number>(0);
   const limit = DEFAULT_LIMIT;
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [emptyError, setEmptyError] = useState<EmptyTargetError | null>(null);
-  const [result, setResult] = useState<PivotResp | null>(null);
-  const [serverMs, setServerMs] = useState<number[]>([]);
-  const [clientMs, setClientMs] = useState<number[]>([]);
+  // Wave 5.22 — result/serverMs/clientMs/offset live in the global
+  // PivotHistoryContext so the strip chart survives route changes.
+  const { result, serverMs, clientMs, offset, push, setOffset, reset } = usePivotHistory();
   // Wave 5.21g — burst lives in the global PivotBurstContext so the loop
   // survives route changes (and AppShell can render a nav pill).
   const { burst, startBurst } = usePivotBurst();
@@ -70,10 +62,8 @@ export function PivotPanel(): JSX.Element {
         throw new Error(`Pivot failed (HTTP ${res.status})`);
       }
       const body = (await res.json()) as PivotResp;
-      setResult(body);
       setOffset(nextOffset);
-      setServerMs((prev) => [...prev.slice(-(HIST_WINDOW - 1)), body.ms]);
-      setClientMs((prev) => [...prev.slice(-(HIST_WINDOW - 1)), Math.round((t1 - t0) * 1000) / 1000]);
+      push(body.ms, Math.round((t1 - t0) * 1000) / 1000, body);
       return true;
     } catch (e) {
       if (e instanceof EmptyTargetError) {
@@ -82,7 +72,6 @@ export function PivotPanel(): JSX.Element {
         const msg = e instanceof Error ? e.message : "Failed to load pivot";
         setError(msg);
       }
-      setResult(null);
       return false;
     } finally {
       setLoading(false);
@@ -110,10 +99,8 @@ export function PivotPanel(): JSX.Element {
       total: n,
       filters,
       onIteration: (body, ms) => {
-        setResult(body);
         setOffset(0);
-        setServerMs((prev) => [...prev.slice(-(HIST_WINDOW - 1)), body.ms]);
-        setClientMs((prev) => [...prev.slice(-(HIST_WINDOW - 1)), ms]);
+        push(body.ms, ms, body);
       },
       onError: (err) => {
         if (err instanceof EmptyTargetError) {
@@ -121,7 +108,6 @@ export function PivotPanel(): JSX.Element {
         } else {
           setError(err.message || "Failed to load pivot");
         }
-        setResult(null);
       },
     });
   }
@@ -225,20 +211,20 @@ export function PivotPanel(): JSX.Element {
         </div>
       )}
 
-      <PanelCard title="Latency histogram (last 100 runs)">
-        <div data-testid="latency-histogram" className="pivot-latency">
-          <p className="pivot-latency__last">
-            {result ? <>Last query: <strong>{result.ms}</strong> ms (server-reported)</> : <em>No runs yet.</em>}
-          </p>
-          <div className="pivot-latency__grid">
-            <MetricTile label="server p50" value={percentile(serverMs, 50)} unit="ms" />
-            <MetricTile label="server p95" value={percentile(serverMs, 95)} unit="ms" />
-            <MetricTile label="server p99" value={percentile(serverMs, 99)} unit="ms" />
-            <MetricTile label="client p50" value={percentile(clientMs, 50)} unit="ms" />
-            <MetricTile label="client p95" value={percentile(clientMs, 95)} unit="ms" />
-            <MetricTile label="client p99" value={percentile(clientMs, 99)} unit="ms" />
-          </div>
-        </div>
+      <PanelCard
+        title="Latency strip (last 100 runs)"
+        actions={
+          <button
+            type="button"
+            onClick={reset}
+            aria-label="Reset latency history"
+            className="latency-strip__reset"
+          >
+            Reset
+          </button>
+        }
+      >
+        <LatencyStrip server={serverMs} client={clientMs} />
       </PanelCard>
 
       {emptyError !== null && (

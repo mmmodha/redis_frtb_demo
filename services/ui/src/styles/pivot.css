@@ -25,3 +25,76 @@
   font-size: 0.85em;
   color: var(--redis-text-secondary);
 }
+
+
+/* Wave 5.22 — Latency strip chart. Hand-rolled SVG; bar/refline colours pull
+   from existing Redis brand tokens (and the same green/amber literals already
+   used across connections.css / shell.css — no *new* colours introduced). */
+.latency-strip {
+  display: grid;
+  gap: 0.5rem;
+}
+.latency-strip__headline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  align-items: baseline;
+  font-size: 0.85em;
+  color: var(--redis-text-secondary);
+}
+.latency-strip__headline strong {
+  color: var(--redis-text-primary);
+  font-weight: 600;
+}
+.latency-strip__p99--amber {
+  color: #f0b429;
+}
+.latency-strip__p99--green {
+  color: #5BD37B;
+}
+.latency-strip__count {
+  margin-left: auto;
+  color: var(--redis-text-muted);
+}
+.latency-strip__reset {
+  font-size: 0.85em;
+  min-height: 32px;
+  padding: 0 calc(var(--grid) * 1.5);
+}
+.latency-strip__svg {
+  display: block;
+  width: 100%;
+  max-width: 720px;
+  height: auto;
+  background: var(--redis-bg-secondary);
+  border: 1px solid var(--redis-border-primary);
+  border-radius: var(--radius);
+}
+.latency-strip__empty-text {
+  fill: var(--redis-text-muted);
+}
+.latency-strip__bar--server {
+  fill: var(--redis-hyper);
+}
+.latency-strip__bar--client {
+  fill: var(--redis-hyper);
+  opacity: 0.6;
+}
+.latency-strip__refline line {
+  stroke: var(--redis-border-secondary);
+}
+.latency-strip__refline text {
+  fill: var(--redis-text-secondary);
+}
+.latency-strip__refline--p99.latency-strip__refline--amber line {
+  stroke: #f0b429;
+}
+.latency-strip__refline--p99.latency-strip__refline--amber text {
+  fill: #f0b429;
+}
+.latency-strip__refline--p99.latency-strip__refline--green line {
+  stroke: #5BD37B;
+}
+.latency-strip__refline--p99.latency-strip__refline--green text {
+  fill: #5BD37B;
+}

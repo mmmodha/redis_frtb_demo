@@ -3,6 +3,7 @@ import { render, screen, fireEvent, waitFor, within } from "@testing-library/rea
 import { MemoryRouter } from "react-router-dom";
 import { PivotPanel } from "../src/panels/PivotPanel";
 import { PivotBurstProvider } from "../src/context/PivotBurstContext";
+import { PivotHistoryProvider } from "../src/context/PivotHistoryContext";
 
 // Shell components (owned by task 1) are mocked so this unit test runs in
 // isolation. Production composition is asserted by the Playwright e2e suite.
@@ -22,23 +23,22 @@ vi.mock("../src/components/EnterpriseCallout", () => ({
     <aside data-testid="enterprise-callout" data-signal={signal}>{children}</aside>
   ),
 }));
-vi.mock("../src/components/MetricTile", () => ({
-  MetricTile: ({ label, value, unit }: any) => (
-    <div data-testid="metric-tile" data-label={label}>
-      <span>{label}</span>
-      <strong>{value}</strong>
-      <span>{unit}</span>
-    </div>
-  ),
-}));
+
+function Providers({ children }: { children: React.ReactNode }) {
+  return (
+    <PivotBurstProvider>
+      <PivotHistoryProvider>
+        <MemoryRouter>{children}</MemoryRouter>
+      </PivotHistoryProvider>
+    </PivotBurstProvider>
+  );
+}
 
 function renderPanel() {
   return render(
-    <PivotBurstProvider>
-      <MemoryRouter>
-        <PivotPanel />
-      </MemoryRouter>
-    </PivotBurstProvider>
+    <Providers>
+      <PivotPanel />
+    </Providers>,
   );
 }
 
@@ -215,18 +215,18 @@ describe("PivotPanel", () => {
     await waitFor(() => expect(btn).toBeEnabled());
   });
 
-  it("updates the latency histogram with client-observed and server-reported ms per run", async () => {
+  it("updates the latency strip with client-observed and server-reported ms per run", async () => {
     fetchMock.mockResolvedValueOnce({ ok: true, json: async () => pivotResponse({ ms: 11.1 }) });
     renderPanel();
     fireEvent.click(screen.getByRole("button", { name: /run query/i }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalled());
-    const hist = await screen.findByTestId("latency-histogram");
-    // server ms is reported, client ms is measured (non-zero)
-    expect(hist).toHaveTextContent(/11\.1\s*ms/);
-    expect(within(hist).getByText(/server p50/i)).toBeInTheDocument();
-    expect(within(hist).getByText(/server p95/i)).toBeInTheDocument();
-    expect(within(hist).getByText(/server p99/i)).toBeInTheDocument();
-    expect(within(hist).getByText(/client p50/i)).toBeInTheDocument();
+    const strip = await screen.findByTestId("latency-strip");
+    const headline = within(strip).getByTestId("latency-strip-headline");
+    // server ms is reported in the headline; sample count reflects the single run
+    expect(headline).toHaveTextContent(/11\.1/);
+    expect(headline).toHaveTextContent(/server/i);
+    expect(headline).toHaveTextContent(/p50\/p95\/p99/i);
+    expect(headline).toHaveTextContent(/n = 1/);
   });
 
   it("pagination Next button advances offset by limit and re-fetches", async () => {
@@ -255,7 +255,7 @@ describe("PivotPanel", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: /previous/i })).toBeEnabled());
   });
 
-  it("Run 100x button fires 100 sequential pivots and populates the histogram", async () => {
+  it("Run 100x button fires 100 sequential pivots and populates the strip", async () => {
     // Stub every call with a small randomised latency so percentiles are non-zero.
     fetchMock.mockImplementation(async () => ({
       ok: true,
@@ -344,31 +344,25 @@ describe("PivotPanel", () => {
         ),
     );
     const { rerender } = render(
-      <PivotBurstProvider>
-        <MemoryRouter>
-          <PivotPanel />
-        </MemoryRouter>
-      </PivotBurstProvider>,
+      <Providers>
+        <PivotPanel />
+      </Providers>,
     );
     fireEvent.click(screen.getByRole("button", { name: /run 100x/i }));
-    // Replace the panel with a different route element — provider stays mounted.
+    // Replace the panel with a different route element — providers stay mounted.
     rerender(
-      <PivotBurstProvider>
-        <MemoryRouter>
-          <div data-testid="other-route">other</div>
-        </MemoryRouter>
-      </PivotBurstProvider>,
+      <Providers>
+        <div data-testid="other-route">other</div>
+      </Providers>,
     );
     expect(screen.getByTestId("other-route")).toBeInTheDocument();
     // Wait two ticks so the loop advances a few iterations while unmounted.
     await new Promise((r) => setTimeout(r, 40));
     // Remount the panel — bar should show the latest done value from context.
     rerender(
-      <PivotBurstProvider>
-        <MemoryRouter>
-          <PivotPanel />
-        </MemoryRouter>
-      </PivotBurstProvider>,
+      <Providers>
+        <PivotPanel />
+      </Providers>,
     );
     const bar = await screen.findByRole("progressbar", { name: /burst progress/i });
     await waitFor(() => {
@@ -376,5 +370,48 @@ describe("PivotPanel", () => {
       expect(v).toBeGreaterThan(0);
     });
   });
-});
 
+  it("Wave 5.22 — latency strip history survives PivotPanel unmount/remount", async () => {
+    fetchMock.mockResolvedValueOnce({ ok: true, json: async () => pivotResponse({ ms: 17.2 }) });
+    const { rerender } = render(
+      <Providers>
+        <PivotPanel />
+      </Providers>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /run query/i }));
+    await waitFor(() =>
+      expect(within(screen.getByTestId("latency-strip-headline")).getByText(/n = 1/)).toBeInTheDocument(),
+    );
+    // Unmount the panel — provider stays mounted.
+    rerender(
+      <Providers>
+        <div data-testid="other-route">other</div>
+      </Providers>,
+    );
+    expect(screen.getByTestId("other-route")).toBeInTheDocument();
+    // Remount — the strip should still report the one collected sample.
+    rerender(
+      <Providers>
+        <PivotPanel />
+      </Providers>,
+    );
+    const headline = await screen.findByTestId("latency-strip-headline");
+    expect(headline).toHaveTextContent(/n = 1/);
+    expect(headline).toHaveTextContent(/17\.2/);
+  });
+
+  it("Wave 5.22 — Reset clears the latency history", async () => {
+    fetchMock.mockResolvedValueOnce({ ok: true, json: async () => pivotResponse({ ms: 21 }) });
+    renderPanel();
+    fireEvent.click(screen.getByRole("button", { name: /run query/i }));
+    await waitFor(() =>
+      expect(within(screen.getByTestId("latency-strip-headline")).getByText(/n = 1/)).toBeInTheDocument(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /reset latency history/i }));
+    await waitFor(() =>
+      expect(within(screen.getByTestId("latency-strip-headline")).getByText(/n = 0/)).toBeInTheDocument(),
+    );
+    // Empty-state text reappears on the SVG.
+    expect(screen.getByText(/Run a pivot to start collecting samples/i)).toBeInTheDocument();
+  });
+});
