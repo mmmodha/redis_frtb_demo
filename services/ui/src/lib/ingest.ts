@@ -184,6 +184,31 @@ export function startGeneratorStream(
   };
 }
 
+// Wave 5.38c — POST /admin/flush. Wipes the active Redis database (FLUSHDB)
+// and returns timing for the success banner. The IngestPanel guards the call
+// behind a confirmation modal; this client is intentionally thin.
+export interface FlushDbResponse {
+  ok: boolean;
+  ms: number;
+  target_label: string;
+}
+
+export async function flushDb(): Promise<FlushDbResponse> {
+  const res = await fetch(`${apiBase()}/admin/flush`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+  });
+  if (!res.ok) {
+    let detail = `${res.status}`;
+    try {
+      const err = (await res.json()) as { error?: string };
+      if (err && typeof err.error === "string") detail = `${res.status}: ${err.error}`;
+    } catch { /* response body not json */ }
+    throw new Error(`api /admin/flush ${detail}`);
+  }
+  return (await res.json()) as FlushDbResponse;
+}
+
 export async function cancelGenerator(runId: string): Promise<void> {
   const res = await fetch(`${apiBase()}/generator/cancel/${encodeURIComponent(runId)}`, {
     method: "POST",

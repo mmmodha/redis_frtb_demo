@@ -21,6 +21,7 @@ import { registerObservabilityRoutes } from "./routes/observability.ts";
 import { registerSourcesProxyRoutes } from "./routes/sources-proxy.ts";
 import { registerLoadgenProxyRoutes } from "./routes/loadgen-proxy.ts";
 import { registerGeneratorRoutes } from "./routes/generator.ts";
+import { registerAdminRoutes } from "./routes/admin.ts";
 import { registerInternalTargetRoutes } from "./routes/internal-target.ts";
 import * as inflight from "./inflight-registry.ts";
 import { corsHeadersForRequest } from "./cors-headers.ts";
@@ -190,6 +191,7 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
     sseProgressIntervalMs: opts.generatorSseProgressIntervalMs,
     corsAllowed,
   });
+  registerAdminRoutes(app, getRedis);
 
   // Wave 5.16t — auto-bootstrap on every active-target change. The hook is
   // registered before the connections store so the very first profile-switch

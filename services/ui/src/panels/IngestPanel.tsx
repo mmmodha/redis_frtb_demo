@@ -13,6 +13,7 @@ import {
   type ObservabilityMemoryResponse,
 } from "../lib/api";
 import {
+  flushDb,
   listSources,
   startIngest,
   type GeneratorConfig,
@@ -86,6 +87,12 @@ export function IngestPanel() {
   const [loaded, setLoaded] = useState(false);
   const [busy, setBusy] = useState(false);
   const [lastAction, setLastAction] = useState<string | null>(null);
+  // Wave 5.38c — Flush DB button state. `flushPending` drives the
+  // confirmation modal; `flushBanner` is the transient success message; the
+  // error path reuses the existing telemetry error display.
+  const [flushPending, setFlushPending] = useState(false);
+  const [flushBusy, setFlushBusy] = useState(false);
+  const [flushBanner, setFlushBanner] = useState<string | null>(null);
 
   const throughput = useRef<ChartSample[]>([]);
   const memorySeries = useRef<ChartSample[]>([]);
@@ -146,6 +153,31 @@ export function IngestPanel() {
     } finally { setBusy(false); }
   }
 
+  // Wave 5.38c — Flush DB confirm handler. Calls POST /admin/flush, then
+  // refetches /observability/keys + /observability/memory immediately so the
+  // dbsize and memory tiles drop without waiting for the 1s poll tick. The
+  // success banner auto-clears after 4s.
+  async function onFlushConfirm() {
+    setFlushPending(false);
+    setFlushBusy(true);
+    setError(null);
+    try {
+      const r = await flushDb();
+      setFlushBanner(`Flushed in ${r.ms}ms`);
+      try {
+        const [k, m] = await Promise.all([getObservabilityKeys("sens:"), getObservabilityMemory()]);
+        setKeys(k);
+        setMemory(m);
+        lastKeys.current = { t: Date.now(), dbsize: k.dbsize };
+      } catch { /* tolerate transient refresh failure; next poll tick will catch up */ }
+      window.setTimeout(() => setFlushBanner(null), 4000);
+    } catch (e) {
+      setError(`Flush failed: ${(e as Error).message}`);
+    } finally {
+      setFlushBusy(false);
+    }
+  }
+
   const tput = chartPath(throughput.current, 360, 80);
   const memPath = chartPath(memorySeries.current, 360, 80);
   const sampleKeys = keys?.sample ?? [];
@@ -194,6 +226,31 @@ export function IngestPanel() {
 
       <SyntheticGeneratorCard />
 
+      <PanelCard title="Admin actions">
+        <div className="ingest-admin">
+          <button
+            type="button"
+            className="btn btn--danger"
+            onClick={() => setFlushPending(true)}
+            disabled={flushBusy}
+            data-testid="flush-db-btn"
+          >
+            {flushBusy ? "Flushing…" : "Flush DB"}
+          </button>
+          {flushBanner ? (
+            <span className="ingest-admin__banner" data-testid="flush-db-banner" role="status">
+              {flushBanner}
+            </span>
+          ) : null}
+        </div>
+      </PanelCard>
+
+      {flushPending ? (
+        <FlushDbConfirmModal
+          onCancel={() => setFlushPending(false)}
+          onConfirm={onFlushConfirm}
+        />
+      ) : null}
 
       <div className="metric-row">
         <MetricTile label="Total rows" value={fmtInt(dbsize)} unit="keys" status={loaded && !error ? "live" : "pending"} />
@@ -658,6 +715,34 @@ function SanityCheckModal(props: {
           ) : (
             <button type="button" className="btn btn--primary" onClick={onProceed}>Proceed</button>
           )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Wave 5.38c — destructive-action confirmation. Mirrors the SanityCheckModal
+// shape (dialog-backdrop + .dialog) so styling stays consistent; Confirm uses
+// btn--danger to telegraph the data-loss intent.
+function FlushDbConfirmModal(props: {
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const { onCancel, onConfirm } = props;
+  return (
+    <div className="dialog-backdrop" role="dialog" aria-modal="true" aria-label="Flush DB confirmation">
+      <div className="dialog sanity-modal--block" data-testid="flush-db-modal">
+        <h2>Flush the active Redis database?</h2>
+        <div className="sanity-modal__body">
+          This will delete all sensitivities and the input stream. The index will be empty until the next ingest.
+        </div>
+        <div className="dialog__actions">
+          <button type="button" className="btn" onClick={onCancel} data-testid="flush-db-cancel">
+            Cancel
+          </button>
+          <button type="button" className="btn btn--danger" onClick={onConfirm} data-testid="flush-db-confirm">
+            Confirm
+          </button>
         </div>
       </div>
     </div>

@@ -17,11 +17,13 @@ export interface FakeRedis {
     cursor: string | number,
     ...args: unknown[]
   ) => Promise<[string, string[]]>;
+  flushdb: () => Promise<string>;
   // Response stubs the test sets up.
   setResponse: (command: string, response: unknown | ((args: unknown[]) => unknown)) => void;
   setScan: (cursor: string, keys: string[]) => void;
   setDbsize: (n: number) => void;
   setInfo: (text: string) => void;
+  setFlushdbError: (err: Error | null) => void;
 }
 
 type Responder = unknown | ((args: unknown[]) => unknown);
@@ -32,6 +34,7 @@ export function fakeRedis(): FakeRedis {
   const scans = new Map<string, [string, string[]]>();
   let dbsizeVal = 0;
   let infoText = "# Memory\nused_memory:1048576\nused_memory_human:1M\n";
+  let flushdbErr: Error | null = null;
 
   const fr: FakeRedis = {
     calls,
@@ -57,6 +60,11 @@ export function fakeRedis(): FakeRedis {
       const key = String(cursor);
       return scans.get(key) ?? ["0", []];
     },
+    async flushdb() {
+      calls.push({ command: "FLUSHDB", args: [] });
+      if (flushdbErr) throw flushdbErr;
+      return "OK";
+    },
     setResponse(command, response) {
       responses.set(command.toUpperCase(), response);
     },
@@ -68,6 +76,9 @@ export function fakeRedis(): FakeRedis {
     },
     setInfo(text) {
       infoText = text;
+    },
+    setFlushdbError(err) {
+      flushdbErr = err;
     },
   };
   return fr;

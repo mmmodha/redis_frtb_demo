@@ -7,4 +7,5 @@ export interface RedisLike {
   dbsize(): Promise<number>;
   info(...args: unknown[]): Promise<string>;
   scan(cursor: string | number, ...args: unknown[]): Promise<[string, string[]]>;
+  flushdb(): Promise<string>;
 }
