@@ -364,7 +364,7 @@ function SyntheticGeneratorCard() {
   }
 
   function buildAdvancedConfig(): GeneratorConfig | string {
-    if (!Number.isFinite(rows) || rows < 100 || rows > 2000) return "Rows must be between 100 and 2000.";
+    if (!Number.isFinite(rows) || rows < 100 || rows > 100_000_000) return "Rows must be between 100 and 100,000,000.";
     if (classes.size === 0) return "Select at least one risk class.";
     if (sensTypes.size === 0) return "Select at least one sensitivity type.";
     const seedTrim = seed.trim();
@@ -512,7 +512,7 @@ function SyntheticGeneratorCard() {
               id="gen-rows"
               type="number"
               min={100}
-              max={2000}
+              max={100_000_000}
               value={rows}
               disabled={busy}
               onChange={(e) => setRows(Number(e.target.value) || 0)}
