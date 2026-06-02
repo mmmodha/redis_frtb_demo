@@ -9,12 +9,68 @@
 }
 .observability__error { color: var(--redis-hyper); }
 
-/* ShardMetricsStrip — Wave 4.6 live tile grid driven by SSE. */
-.shard-metrics-strip { display: grid; gap: var(--grid); }
-.shard-metrics-strip__error {
-  color: var(--redis-hyper);
+/* Wave 5.51 — page header with refresh cadence controls + status badge. */
+.observability__header {
+  display: flex;
+  align-items: center;
+  gap: var(--grid);
+  flex-wrap: wrap;
+  margin-bottom: var(--grid);
+}
+.observability__header h1 { margin: 0; flex: 0 0 auto; }
+.observability__controls {
+  display: flex;
+  align-items: center;
+  gap: calc(var(--grid) * 1.5);
+  margin-left: auto;
+  flex-wrap: wrap;
+}
+.observability__refresh-label {
+  font-size: 0.75rem;
+  color: var(--redis-text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.observability__refresh-select {
+  background: var(--redis-bg-tertiary);
+  color: var(--redis-text-primary);
+  border: 1px solid var(--redis-border-primary);
+  border-radius: var(--radius);
+  padding: 4px 8px;
+  font-family: inherit;
   font-size: 0.8125rem;
 }
+.observability__updated {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--redis-text-secondary);
+  background: var(--redis-bg-tertiary);
+  border: 1px solid var(--redis-border-secondary);
+  border-radius: var(--radius);
+  padding: 2px 8px;
+}
+.observability__updated--off { opacity: 0.65; }
+.observability__updated-pulse {
+  display: inline-block;
+  animation: obs-updated-pulse 480ms ease-out;
+}
+@keyframes obs-updated-pulse {
+  0%   { opacity: 0.45; }
+  60%  { opacity: 1; }
+  100% { opacity: 1; }
+}
+.observability__refresh-error {
+  font-size: 0.75rem;
+  color: var(--redis-hyper);
+  background: rgba(220, 56, 47, 0.08);
+  border: 1px solid rgba(220, 56, 47, 0.35);
+  border-radius: var(--radius);
+  padding: 2px 8px;
+}
+
+/* ShardMetricsStrip — Wave 4.6 live tile grid, now fed by parent polling. */
+.shard-metrics-strip { display: grid; gap: var(--grid); }
 .shard-metrics-strip__grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));

@@ -1,20 +1,14 @@
-// Live shard metrics strip — subscribes to /observability/shards/stream and
-// renders one tile per primary shard. Used in the Observability panel to
-// power the Wave 4.2 "200 concurrent analysts" demo moment.
-import { useEffect, useState } from "react";
+// Live shard metrics strip — renders one tile per primary shard. As of
+// Wave 5.51 this is a pure presentational component: the parent
+// Observability page owns the polling loop and passes the latest shards
+// array down. The EventSource subscription was retired so the page has one
+// consistent refresh cadence across every metric.
+import type { ObservabilityShard } from "../lib/api";
 
-export interface Shard {
-  shardId: string;
-  role: string;
-  opsPerSec: number;
-  slotCount: number;
-  usedMemoryBytes: number;
-  netInBytes: number;
-  netOutBytes: number;
-}
+export type Shard = ObservabilityShard;
 
 export interface ShardMetricsStripProps {
-  streamUrl?: string;
+  shards: readonly Shard[];
 }
 
 const NUMBER_FMT = new Intl.NumberFormat("en-US");
@@ -31,38 +25,9 @@ function formatBytes(bytes: number): string {
   return `${v.toFixed(2)} ${units[i]}`;
 }
 
-export function ShardMetricsStrip({
-  streamUrl = "/observability/shards/stream",
-}: ShardMetricsStripProps) {
-  const [shards, setShards] = useState<Shard[]>([]);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (typeof EventSource === "undefined") return;
-    const es = new EventSource(streamUrl);
-    es.onmessage = (e: MessageEvent) => {
-      try {
-        const parsed = JSON.parse(e.data) as Shard[];
-        if (Array.isArray(parsed)) setShards(parsed);
-      } catch {
-        // ignore malformed frame; next tick may recover
-      }
-    };
-    es.onerror = () => {
-      setError("stream disconnected");
-    };
-    return () => {
-      es.close();
-    };
-  }, [streamUrl]);
-
+export function ShardMetricsStrip({ shards }: ShardMetricsStripProps) {
   return (
     <div className="shard-metrics-strip" data-testid="shard-metrics-strip">
-      {error ? (
-        <div className="shard-metrics-strip__error" role="alert">
-          {error}
-        </div>
-      ) : null}
       <div className="shard-metrics-strip__grid">
         {shards.map((s) => (
           <div key={s.shardId} className="shard-tile" data-testid="shard-tile">
