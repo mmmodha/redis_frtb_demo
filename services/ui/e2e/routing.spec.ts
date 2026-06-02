@@ -11,7 +11,7 @@ const routes: Array<{ path: string; label: string; heading: RegExp }> = [
   { path: "/sources", label: "Sources", heading: /^Sources$/ },
   { path: "/ingest", label: "Ingest", heading: /^Ingest$/ },
   { path: "/pivot", label: "Search", heading: /^Search$/ },
-  { path: "/calc", label: "Calc", heading: /^Calc$/ },
+  { path: "/calc", label: "Calculation", heading: /^Calculation$/ },
   { path: "/observability", label: "Observability", heading: /^Observability$/ },
 ];
 
@@ -24,7 +24,7 @@ for (const route of routes) {
 
 test("clicking nav links routes between panels", async ({ page }) => {
   await page.goto("/observability");
-  await page.getByRole("navigation", { name: /primary/i }).getByRole("link", { name: "Calc" }).click();
+  await page.getByRole("navigation", { name: /primary/i }).getByRole("link", { name: "Calculation" }).click();
   await expect(page).toHaveURL(/\/calc$/);
-  await expect(page.getByRole("heading", { name: /^Calc$/, level: 1 })).toBeVisible();
+  await expect(page.getByRole("heading", { name: /^Calculation$/, level: 1 })).toBeVisible();
 });

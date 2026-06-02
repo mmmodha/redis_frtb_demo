@@ -39,7 +39,7 @@ test.describe("Calc panel — happy path", () => {
     });
 
     await page.goto("/calc");
-    await expect(page.getByRole("heading", { name: /^Calc$/, level: 1 })).toBeVisible();
+    await expect(page.getByRole("heading", { name: /^Calculation$/, level: 1 })).toBeVisible();
 
     const calculate = page.getByRole("button", { name: /calculate sbm risk charge/i });
     await calculate.click();

@@ -63,9 +63,9 @@ afterEach(() => {
 });
 
 describe("<CalcPanel />", () => {
-  it("renders the Calc heading and a dominant Calculate SBM risk charge button", () => {
+  it("renders the Calculation heading and a dominant Calculate SBM risk charge button", () => {
     render(<CalcPanel />);
-    expect(screen.getByRole("heading", { name: /^Calc$/, level: 1 })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /^Calculation$/, level: 1 })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /calculate sbm risk charge/i })).toBeInTheDocument();
   });
 

@@ -314,7 +314,7 @@ export function CalcPanel() {
 
   return (
     <div className="calc-panel">
-      <h1>Calc</h1>
+      <h1>Calculation</h1>
       <p className="calc-panel__lead">
         SBM risk charge — Delta or Vega, computed inside Redis via map-reduce across hash-tagged buckets.
       </p>

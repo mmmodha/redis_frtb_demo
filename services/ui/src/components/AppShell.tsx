@@ -12,7 +12,7 @@ const SECTIONS = [
   { to: "/sources", label: "Sources" },
   { to: "/ingest", label: "Ingest" },
   { to: "/pivot", label: "Search" },
-  { to: "/calc", label: "Calc" },
+  { to: "/calc", label: "Calculation" },
   { to: "/observability", label: "Observability" },
   { to: "/explorer", label: "JSON Explorer" },
 ] as const;

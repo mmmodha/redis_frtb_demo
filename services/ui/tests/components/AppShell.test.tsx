@@ -36,7 +36,7 @@ describe("<AppShell />", () => {
   it("renders a left rail with the 6 locked navigation sections", () => {
     renderShell();
     const nav = screen.getByRole("navigation", { name: /primary/i });
-    const labels = ["Connections", "Sources", "Ingest", "Search", "Calc", "Observability"];
+    const labels = ["Connections", "Sources", "Ingest", "Search", "Calculation", "Observability"];
     for (const label of labels) {
       expect(within(nav).getByRole("link", { name: label })).toBeInTheDocument();
     }
