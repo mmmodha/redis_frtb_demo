@@ -665,6 +665,12 @@ async function captureWave533Beats(browser: Browser, page: Page) {
   );
   // Hold focus on the input — blur would close the listbox before snap.
   await page.locator('[data-testid="exclude-book"] [role="listbox"] [role="option"]').first().waitFor();
+  // Wave 5.35 scroll-fixup: Wave 5.34's bigger selects push the Exclude books
+  // combobox toward the bottom of the .app-shell__main scroller, and since
+  // html/body are capped at 100vh, the listbox renders below the fullPage
+  // 1440×900 frame. Scroll the listbox into the captured viewport so the
+  // dropdown surface is visible (the input stays in view immediately above).
+  await page.locator('[data-testid="exclude-book"] [role="listbox"]').scrollIntoViewIfNeeded();
   await page.waitForTimeout(250);
   await snapPage(page, "beat-14-typeahead-dropdown");
 
