@@ -548,3 +548,67 @@ select:focus-visible {
 .suggest-combobox__option {
   padding: calc(var(--grid) * 1.25) calc(var(--grid) * 1.75);
 }
+
+
+/* Wave 5.36: fix form layout after 5.34b enlarged the controls.
+   .pivot-filters / .calc-panel__form / .calc-panel__field were referenced
+   in TSX but had no CSS rules, so the forms relied on browser-default
+   inline/block flow which broke once selects went to 40px min-height. */
+
+/* PivotPanel Filters form: 12 children (6 label + 6 control pairs).
+   Two-column grid keeps each label aligned with its control on the same row. */
+.pivot-filters {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  column-gap: calc(var(--grid) * 2);
+  row-gap: calc(var(--grid) * 1.25);
+  align-items: center;
+}
+.pivot-filters > label {
+  font-size: 0.8125rem;
+  color: var(--redis-text-secondary);
+  font-weight: 500;
+  white-space: nowrap;
+}
+.pivot-filters > select,
+.pivot-filters > .suggest-combobox {
+  width: 100%;
+  min-width: 0;
+}
+
+/* CalcPanel form: two side-by-side stacked label+select pairs. */
+.calc-panel__form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  column-gap: calc(var(--grid) * 2);
+  row-gap: calc(var(--grid) * 1.5);
+  margin-bottom: calc(var(--grid) * 1.5);
+}
+.calc-panel__field {
+  display: flex;
+  flex-direction: column;
+  gap: calc(var(--grid) * 0.75);
+  position: relative;
+}
+.calc-panel__field > span {
+  font-size: 0.8125rem;
+  color: var(--redis-text-secondary);
+  font-weight: 500;
+}
+.calc-panel__field > select {
+  width: 100%;
+}
+
+/* SuggestCombobox: float the listbox so opening it doesn't push form rows. */
+.suggest-combobox {
+  position: relative;
+}
+.suggest-combobox__list {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 50;
+  max-height: 280px;
+  overflow-y: auto;
+}
