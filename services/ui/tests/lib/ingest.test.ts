@@ -4,6 +4,7 @@ import {
   startIngest,
   startGenerator,
   startGeneratorStream,
+  flushDb,
   type ProgressFrame,
   type TerminalFrame,
 } from "../../src/lib/ingest";
@@ -155,5 +156,26 @@ describe("ingest api client", () => {
     expect(terminals).toHaveLength(0);
     expect(errors).toHaveLength(1);
     expect(errors[0]!.message).toMatch(/failed to fetch/i);
+  });
+
+  // Wave 5.42 — flushDb must send an empty JSON object body so Fastify does
+  // not 400 with FST_ERR_CTP_EMPTY_JSON_BODY when content-type is application/json.
+  it("flushDb POSTs /admin/flush with a parseable empty JSON body", async () => {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: typeof input === "string" ? input : input.toString(), init });
+      return new Response(JSON.stringify({ ok: true, ms: 3, target_label: "redis-primary" }), {
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+    const res = await flushDb();
+    expect(res.ok).toBe(true);
+    const init = calls[0]!.init!;
+    expect(calls[0]!.url).toMatch(/\/admin\/flush$/);
+    expect(init.method).toBe("POST");
+    const headers = (init.headers ?? {}) as Record<string, string>;
+    expect(headers["content-type"]).toBe("application/json");
+    expect(typeof init.body).toBe("string");
+    expect(JSON.parse(init.body as string)).toEqual({});
   });
 });

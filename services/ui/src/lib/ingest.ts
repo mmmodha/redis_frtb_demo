@@ -197,6 +197,7 @@ export async function flushDb(): Promise<FlushDbResponse> {
   const res = await fetch(`${apiBase()}/admin/flush`, {
     method: "POST",
     headers: { "content-type": "application/json" },
+    body: "{}",
   });
   if (!res.ok) {
     let detail = `${res.status}`;
