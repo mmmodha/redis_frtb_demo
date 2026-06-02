@@ -647,6 +647,23 @@ function SyntheticGeneratorCard(props: { preflightGate?: () => Promise<Preflight
   const busy = run?.status === "running" || run?.status === "cancelling";
   const displayError = formError ?? streamError;
 
+  // Wave 5.50 — live sum of the per-class targets table. class_split is
+  // "active" when ≥1 selected-class input is a positive integer; invalid /
+  // blank / zero values don't count. When active the Rows input is disabled
+  // (the server ignores `rows` once `class_split` is set) and the live sum
+  // surfaces both as a hint next to Rows and below the per-class table.
+  const classSplitSum = useMemo(() => {
+    let sum = 0;
+    for (const c of classes) {
+      const raw = classSplit[c];
+      if (raw === undefined || raw.trim() === "") continue;
+      const n = Number(raw);
+      if (Number.isFinite(n) && Number.isInteger(n) && n > 0) sum += n;
+    }
+    return sum;
+  }, [classes, classSplit]);
+  const classSplitActive = classSplitSum > 0;
+
   function toggleMember(prev: Set<string>, value: string): Set<string> {
     const next = new Set(prev);
     if (next.has(value)) next.delete(value); else next.add(value);
@@ -869,9 +886,14 @@ function SyntheticGeneratorCard(props: { preflightGate?: () => Promise<Preflight
               min={100}
               max={100_000_000}
               value={rows}
-              disabled={busy}
+              disabled={busy || classSplitActive}
               onChange={(e) => setRows(Number(e.target.value) || 0)}
             />
+            {classSplitActive ? (
+              <span className="generator-form__hint" data-testid="gen-rows-hint">
+                Controlled by per-class targets below — sum = {classSplitSum}
+              </span>
+            ) : null}
           </div>
 
           <fieldset className="generator-form__group" disabled={busy}>
@@ -891,9 +913,12 @@ function SyntheticGeneratorCard(props: { preflightGate?: () => Promise<Preflight
           </fieldset>
 
           {/* Wave 5.47d — per-class row targets. Empty / all-zero ⇒ server
-              falls back to round-robin via classes + rows. */}
+              falls back to round-robin via classes + rows.
+              Wave 5.50 — legend renamed to "Per-class row targets"; live sum
+              line surfaces below the table to disambiguate vs the Rows
+              field above (which is disabled while class_split is active). */}
           <fieldset className="generator-form__group" disabled={busy} data-testid="generator-class-split">
-            <legend>Per-class targets</legend>
+            <legend>Per-class row targets</legend>
             <button
               type="button"
               className="btn btn--secondary"
@@ -924,7 +949,14 @@ function SyntheticGeneratorCard(props: { preflightGate?: () => Promise<Preflight
                 ))}
               </tbody>
             </table>
-            <span className="generator-form__hint">leave blank / all zero to use Rows + round-robin</span>
+            <span className="generator-form__hint" data-testid="class-split-sum">
+              {classSplitActive
+                ? `Sum: ${classSplitSum} rows`
+                : "Sum: 0 rows (using Rows + round-robin)"}
+            </span>
+            {!classSplitActive ? (
+              <span className="generator-form__hint">leave blank / all zero to use Rows + round-robin</span>
+            ) : null}
           </fieldset>
 
           <fieldset className="generator-form__group" disabled={busy}>
