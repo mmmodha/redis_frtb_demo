@@ -218,3 +218,37 @@ export async function cancelGenerator(runId: string): Promise<void> {
     throw new Error(`api /generator/cancel/${runId} ${res.status}`);
   }
 }
+
+// Wave 5.40b — single-run status (used by GeneratorRunContext to reconnect
+// after a refresh) and orphan-discovery list (active runs the UI is not yet
+// tracking). 404 from /generator/runs/:id/status is normalised to null so
+// callers can treat "stale localStorage entry" as a non-error.
+export interface GeneratorRunStatus {
+  run_id: string;
+  status: "running" | "done" | "cancelled" | "error";
+  rows_done: number;
+  rows_total: number;
+  rows_per_sec: number;
+  elapsed_ms: number;
+  error?: string;
+}
+
+export interface ActiveGeneratorRun {
+  run_id: string;
+  status: string;
+  rows_done: number;
+  rows_total: number;
+}
+
+export async function getGeneratorRunStatus(run_id: string): Promise<GeneratorRunStatus | null> {
+  const res = await fetch(`${apiBase()}/generator/runs/${encodeURIComponent(run_id)}/status`);
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`api /generator/runs/${run_id}/status ${res.status}`);
+  return (await res.json()) as GeneratorRunStatus;
+}
+
+export async function getActiveGeneratorRuns(): Promise<{ active: ActiveGeneratorRun[] }> {
+  const res = await fetch(`${apiBase()}/generator/runs`);
+  if (!res.ok) throw new Error(`api /generator/runs ${res.status}`);
+  return (await res.json()) as { active: ActiveGeneratorRun[] };
+}

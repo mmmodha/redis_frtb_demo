@@ -137,4 +137,21 @@ describe("<AppShell />", () => {
     renderShellWithGenerator(idle, "/calc");
     expect(screen.queryByTestId("generator-run-nav-pill")).toBeNull();
   });
+
+  it("Wave 5.40b — generator nav pill renders during polling-mode resumption (same shape as SSE)", () => {
+    // After a refresh the provider reconnects via polling against
+    // GET /generator/runs/:id/status. The pill consumes the same `run` shape
+    // and must render identically — verify with a polling-style value.
+    const polling: GeneratorRunContextValue = {
+      run: makeRunningGenerator(420, 1000),
+      error: null,
+      startRun: () => {},
+      cancelRun: () => {},
+      clearRun: () => {},
+    };
+    renderShellWithGenerator(polling, "/calc");
+    const pill = screen.getByTestId("generator-run-nav-pill");
+    expect(pill).toHaveTextContent("420 / 1000");
+    expect(pill).toHaveAttribute("aria-label", "Generator running, 420 of 1000");
+  });
 });
