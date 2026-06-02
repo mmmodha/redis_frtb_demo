@@ -6,6 +6,11 @@ import {
   PivotBurstContext,
   type PivotBurstContextValue,
 } from "../../src/context/PivotBurstContext";
+import {
+  GeneratorRunContext,
+  type GeneratorRunContextValue,
+  type GeneratorRunState,
+} from "../../src/context/GeneratorRunContext";
 
 function renderShell(initialPath = "/observability") {
   return render(
@@ -30,6 +35,32 @@ function renderShellWithBurst(
       </MemoryRouter>
     </PivotBurstContext.Provider>,
   );
+}
+
+function renderShellWithGenerator(
+  generatorValue: GeneratorRunContextValue,
+  initialPath = "/calc",
+) {
+  return render(
+    <GeneratorRunContext.Provider value={generatorValue}>
+      <MemoryRouter initialEntries={[initialPath]}>
+        <AppShell>
+          <div data-testid="slot">slot-content</div>
+        </AppShell>
+      </MemoryRouter>
+    </GeneratorRunContext.Provider>,
+  );
+}
+
+function makeRunningGenerator(rowsDone = 50, rowsTotal = 200): GeneratorRunState {
+  return {
+    rowsTotal,
+    rowsDone,
+    elapsedMs: 100,
+    rowsPerSec: 500,
+    runId: "01HXGEN",
+    status: "running",
+  };
 }
 
 describe("<AppShell />", () => {
@@ -74,5 +105,36 @@ describe("<AppShell />", () => {
     };
     renderShellWithBurst(idle, "/calc");
     expect(screen.queryByTestId("pivot-burst-nav-pill")).toBeNull();
+  });
+
+  it("Wave 5.38a — renders the generator run nav pill on non-ingest routes when run is running, hides it on /ingest and when run is null", () => {
+    const running: GeneratorRunContextValue = {
+      run: makeRunningGenerator(50, 200),
+      error: null,
+      startRun: () => {},
+      cancelRun: () => {},
+      clearRun: () => {},
+    };
+    const r1 = renderShellWithGenerator(running, "/calc");
+    const pill = screen.getByTestId("generator-run-nav-pill");
+    expect(pill).toHaveTextContent("50 / 200");
+    expect(pill).toHaveAttribute("role", "status");
+    expect(pill).toHaveAttribute("aria-live", "polite");
+    expect(pill).toHaveAttribute("aria-label", "Generator running, 50 of 200");
+    r1.unmount();
+
+    const r2 = renderShellWithGenerator(running, "/ingest");
+    expect(screen.queryByTestId("generator-run-nav-pill")).toBeNull();
+    r2.unmount();
+
+    const idle: GeneratorRunContextValue = {
+      run: null,
+      error: null,
+      startRun: () => {},
+      cancelRun: () => {},
+      clearRun: () => {},
+    };
+    renderShellWithGenerator(idle, "/calc");
+    expect(screen.queryByTestId("generator-run-nav-pill")).toBeNull();
   });
 });

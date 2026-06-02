@@ -7,6 +7,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { IngestPanel } from "../../src/panels/IngestPanel";
+import { GeneratorRunProvider } from "../../src/context/GeneratorRunContext";
 
 vi.mock("../../src/components/PanelCard", () => ({
   PanelCard: ({ title, children, actions }: any) => (
@@ -28,7 +29,9 @@ vi.mock("../../src/components/MetricTile", () => ({
 function renderPanel() {
   return render(
     <MemoryRouter>
-      <IngestPanel />
+      <GeneratorRunProvider>
+        <IngestPanel />
+      </GeneratorRunProvider>
     </MemoryRouter>,
   );
 }

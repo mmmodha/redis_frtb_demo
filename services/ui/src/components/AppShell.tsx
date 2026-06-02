@@ -5,6 +5,7 @@ import { BootstrapStatusOverlay } from "./BootstrapStatusOverlay";
 import { LockoutBanner } from "./LockoutBanner";
 import { useBootstrapStatus } from "../hooks/useBootstrapStatus";
 import { getActiveTarget, type ActiveTarget } from "../lib/connections";
+import { GeneratorRunContext } from "../context/GeneratorRunContext";
 import { PivotBurstContext } from "../context/PivotBurstContext";
 
 const SECTIONS = [
@@ -26,9 +27,15 @@ export function AppShell({ children }: AppShellProps) {
   const [state, setState] = useState<ActiveTargetState>("disconnected");
   const { phase: bootstrapPhase } = useBootstrapStatus();
   const burstCtx = useContext(PivotBurstContext);
+  const generatorCtx = useContext(GeneratorRunContext);
   const location = useLocation();
   const burst = burstCtx?.burst ?? null;
   const showBurstPill = burst !== null && location.pathname !== "/pivot";
+  const generatorRun = generatorCtx?.run ?? null;
+  const showGeneratorPill =
+    generatorRun !== null &&
+    generatorRun.status === "running" &&
+    location.pathname !== "/ingest";
 
   const refreshTarget = useCallback(async () => {
     try {
@@ -76,6 +83,17 @@ export function AppShell({ children }: AppShellProps) {
                   aria-label={`Search burst running, ${burst.done} of ${burst.total}`}
                 >
                   {burst.done} / {burst.total}
+                </span>
+              )}
+              {s.to === "/ingest" && showGeneratorPill && generatorRun !== null && (
+                <span
+                  className="app-shell__nav-pill"
+                  data-testid="generator-run-nav-pill"
+                  role="status"
+                  aria-live="polite"
+                  aria-label={`Generator running, ${generatorRun.rowsDone} of ${generatorRun.rowsTotal}`}
+                >
+                  {generatorRun.rowsDone} / {generatorRun.rowsTotal}
                 </span>
               )}
             </li>
