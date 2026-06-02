@@ -233,25 +233,48 @@ async function main() {
   const ctx = await browser.newContext({ viewport: VIEWPORT });
   const page = await ctx.newPage();
 
-  console.log("→ beat-00 setup (CalcPanel defaults)");
+  console.log("→ beat-00 setup (CalcPanel landing — non-target selects)");
   await gotoCalc(page);
+  // CalcPanel ships GIRR + Delta as the default selection, so capturing a
+  // fresh load looks identical to beat-01's explicit GIRR+Delta selection.
+  // Park the selects on a non-target combo (Equity + Vega) for beat-00 so
+  // the presenter's "set risk-class = GIRR, sensitivity = Delta" action
+  // between beats is a real state change in the screenshot.
+  await setRiskClass(page, "Equity");
+  await setSensitivity(page, "Vega");
+  await page.waitForTimeout(250);
   await snapPage(page, "beat-00-setup");
 
   console.log("→ beat-01 bucket discovery (GIRR/Delta pre-Calculate)");
   await setRiskClass(page, "GIRR");
   await setSensitivity(page, "Delta");
-  await page.waitForTimeout(200);
+  // Blur the dropdown to drop its focus ring so the diff vs beat-00 is the
+  // committed select values, not transient focus styling.
+  await page.locator('[data-testid="calc-cta"]').focus();
+  await page.waitForTimeout(300);
   await snapPage(page, "beat-01-bucket-discovery");
 
   console.log("→ beat-02/03/04 GIRR Delta calculate");
   await calculateAndSettle(page);
   await snapPage(page, "beat-02-calculate");
-  // beat-04 — focus on the Risk-class charge PanelCard. Scroll it into view
-  // and full-page-shot the viewport (keeps surrounding context so the file
-  // weight stays above the 30 KB asset-pack threshold).
-  await page.locator('[data-testid="calc-charge"]').scrollIntoViewIfNeeded();
+  // beat-04 — tighter framing on the Risk-class charge PanelCard. Use the
+  // PanelCard's bounding box plus a small margin so the hero number, branch
+  // pill (when present), wallclock badge, and basel-caption are all in
+  // frame, but the per-bucket chart below is cropped out.
+  const heroPanelLocator = page
+    .locator('[data-testid="calc-charge"]')
+    .locator('xpath=ancestor::section[contains(@class, "panel-card")][1]');
+  await heroPanelLocator.scrollIntoViewIfNeeded();
   await page.waitForTimeout(200);
-  await snapPage(page, "beat-04-girr-delta-charge", false);
+  const box = await heroPanelLocator.boundingBox();
+  if (!box) throw new Error("beat-04: could not find Risk-class charge PanelCard bounding box");
+  const clip = {
+    x: Math.max(0, box.x - 32),
+    y: Math.max(0, box.y - 140),
+    width: Math.min(VIEWPORT.width - Math.max(0, box.x - 32), box.width + 64),
+    height: box.height + 560,
+  };
+  await page.screenshot({ path: resolve(OUT, "beat-04-girr-delta-charge.png"), clip });
 
   // Beat 3 — open CAD drilldown via the per-bucket breakdown table.
   await openBucketDrilldown(page, "CAD");
