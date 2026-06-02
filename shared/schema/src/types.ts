@@ -38,6 +38,11 @@ export interface RiskClassConfig {
   risk_weights_ref: string;
   intra_bucket_correlation_ref: string;
   cross_bucket_correlation_ref: string;
+  // Optional per-bucket sampling weights for the synthetic generator.
+  // Keyed by the bucket value (must appear in `buckets.values`); buckets
+  // absent from the map default to weight 0. Non-negative numbers; need
+  // not sum to 1 — the generator normalises. Missing map → uniform draw.
+  bucket_weights?: Record<string, number>;
 }
 
 export interface FrtbBinding {

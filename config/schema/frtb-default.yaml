@@ -191,6 +191,21 @@ risk_classes:
     buckets:
       naming: currency
       values: [USD, EUR, GBP, JPY, CHF, CAD, AUD, SEK, NOK, NZD, OTHER]
+    # Wave 5.47a — illustrative currency-dominance weights (need not sum to 1;
+    # generator normalises). Drives the synthetic generator's per-bucket
+    # frequency only — risk weights and correlations are unaffected.
+    bucket_weights:
+      USD: 0.32
+      EUR: 0.22
+      GBP: 0.10
+      JPY: 0.10
+      CHF: 0.05
+      CAD: 0.05
+      AUD: 0.05
+      SEK: 0.04
+      NOK: 0.03
+      NZD: 0.02
+      OTHER: 0.02
     tenor:
       count: 10
       nodes: ["3M", "6M", "1Y", "2Y", "3Y", "5Y", "10Y", "15Y", "20Y", "30Y"]
@@ -222,6 +237,24 @@ risk_classes:
     buckets:
       naming: sector_quality
       values: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16"]
+    # Wave 5.47a — buckets 1–8 are IG sectors, 9–16 are HY; bank books skew IG.
+    bucket_weights:
+      "1": 0.10
+      "2": 0.10
+      "3": 0.10
+      "4": 0.08
+      "5": 0.08
+      "6": 0.07
+      "7": 0.07
+      "8": 0.07
+      "9": 0.05
+      "10": 0.05
+      "11": 0.05
+      "12": 0.05
+      "13": 0.04
+      "14": 0.04
+      "15": 0.03
+      "16": 0.02
     tenor:
       count: 5
       nodes: ["0.5Y", "1Y", "3Y", "5Y", "10Y"]
@@ -254,6 +287,33 @@ risk_classes:
       values: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
                "11", "12", "13", "14", "15", "16", "17", "18", "19", "20",
                "21", "22", "23", "24", "25"]
+    # Wave 5.47a — senior tranches (low buckets) dominate; long tail rare.
+    bucket_weights:
+      "1": 0.08
+      "2": 0.08
+      "3": 0.07
+      "4": 0.07
+      "5": 0.06
+      "6": 0.06
+      "7": 0.05
+      "8": 0.05
+      "9": 0.04
+      "10": 0.04
+      "11": 0.04
+      "12": 0.04
+      "13": 0.03
+      "14": 0.03
+      "15": 0.03
+      "16": 0.03
+      "17": 0.03
+      "18": 0.02
+      "19": 0.02
+      "20": 0.02
+      "21": 0.02
+      "22": 0.02
+      "23": 0.02
+      "24": 0.02
+      "25": 0.03
     tenor:
       count: 5
       nodes: ["0.5Y", "1Y", "3Y", "5Y", "10Y"]
@@ -283,6 +343,24 @@ risk_classes:
     buckets:
       naming: ctp_bucket
       values: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16"]
+    # Wave 5.47a — CTP exposures concentrated in mainstream index series.
+    bucket_weights:
+      "1": 0.10
+      "2": 0.10
+      "3": 0.09
+      "4": 0.08
+      "5": 0.08
+      "6": 0.07
+      "7": 0.07
+      "8": 0.05
+      "9": 0.05
+      "10": 0.05
+      "11": 0.05
+      "12": 0.05
+      "13": 0.04
+      "14": 0.04
+      "15": 0.04
+      "16": 0.04
     tenor:
       count: 5
       nodes: ["0.5Y", "1Y", "3Y", "5Y", "10Y"]
@@ -313,6 +391,21 @@ risk_classes:
     buckets:
       naming: equity_bucket
       values: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13"]
+    # Wave 5.47a — peak around large-cap developed (buckets 1, 2, 11).
+    bucket_weights:
+      "1": 0.18
+      "2": 0.18
+      "3": 0.05
+      "4": 0.04
+      "5": 0.10
+      "6": 0.10
+      "7": 0.05
+      "8": 0.05
+      "9": 0.03
+      "10": 0.05
+      "11": 0.10
+      "12": 0.05
+      "13": 0.02
     risk_weights_ref: equity_weights
     intra_bucket_correlation_ref: equity_rho
     cross_bucket_correlation_ref: equity_gamma
@@ -343,6 +436,19 @@ risk_classes:
     buckets:
       naming: commodity_bucket
       values: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"]
+    # Wave 5.47a — energy + precious metals dominate bank commodity books.
+    bucket_weights:
+      "1": 0.20
+      "2": 0.20
+      "3": 0.10
+      "4": 0.05
+      "5": 0.10
+      "6": 0.10
+      "7": 0.05
+      "8": 0.05
+      "9": 0.05
+      "10": 0.05
+      "11": 0.05
     tenor:
       count: 5
       nodes: ["0.25Y", "0.5Y", "1Y", "2Y", "5Y"]
@@ -369,6 +475,19 @@ risk_classes:
     buckets:
       naming: fx_pair_bucket
       values: ["EURUSD", "GBPUSD", "USDJPY", "USDCHF", "AUDUSD", "USDCAD", "NZDUSD", "EURGBP", "EURJPY", "GBPJPY", "OTHER"]
+    # Wave 5.47a — major pairs dominate FX exposure on a typical bank book.
+    bucket_weights:
+      EURUSD: 0.30
+      GBPUSD: 0.15
+      USDJPY: 0.15
+      USDCHF: 0.06
+      AUDUSD: 0.07
+      USDCAD: 0.06
+      NZDUSD: 0.03
+      EURGBP: 0.05
+      EURJPY: 0.05
+      GBPJPY: 0.03
+      OTHER: 0.05
     risk_weights_ref: fx_weights
     intra_bucket_correlation_ref: fx_rho
     cross_bucket_correlation_ref: fx_gamma

@@ -63,6 +63,14 @@ interface ClassPlan {
   buckets: readonly string[];
   tenorNodes?: readonly string[];
   ops: Op[];
+  // Wave 5.47a — when the schema provides `risk_classes.<C>.bucket_weights`,
+  // we precompute the cumulative distribution over `buckets` so the per-row
+  // bucket pick consumes exactly one rng() draw — same call-count as the
+  // uniform `(rng() * buckets.length) | 0` it replaces, preserving the
+  // main-rng tick budget for downstream rv_*/tag/numeric ops. Absent buckets
+  // get weight 0; missing or all-zero map → falls back to uniform.
+  bucketCdf?: number[];
+  bucketCdfTotal?: number;
 }
 
 export function createRowGenerator(
@@ -137,7 +145,23 @@ export function createRowGenerator(
         ops.push({ k: "array_numeric", name: dimName, len: tenorNodes?.length ?? 1 });
       }
     }
-    plan = { buckets: cls.buckets.values, tenorNodes, ops };
+    let bucketCdf: number[] | undefined;
+    let bucketCdfTotal: number | undefined;
+    if (cls.bucket_weights) {
+      const cdf = new Array<number>(cls.buckets.values.length);
+      let acc = 0;
+      for (let i = 0; i < cls.buckets.values.length; i++) {
+        const raw = cls.bucket_weights[cls.buckets.values[i]!];
+        const w = typeof raw === "number" && raw > 0 ? raw : 0;
+        acc += w;
+        cdf[i] = acc;
+      }
+      if (acc > 0) {
+        bucketCdf = cdf;
+        bucketCdfTotal = acc;
+      }
+    }
+    plan = { buckets: cls.buckets.values, tenorNodes, ops, bucketCdf, bucketCdfTotal };
     plans.set(riskClass, plan);
     return plan;
   }
@@ -146,7 +170,21 @@ export function createRowGenerator(
     generate(riskClass: string): SensitivityRow {
       const plan = planFor(riskClass);
       const buckets = plan.buckets;
-      const bucket = buckets[(rng() * buckets.length) | 0]!;
+      // Wave 5.47a — weighted bucket pick when the schema declared
+      // `bucket_weights`; otherwise the historical uniform pick. Both
+      // branches consume exactly one rng() draw so the main-rng sequence
+      // is unchanged for the no-weights case (preserves byte-equivalence
+      // with earlier fixtures and the rng-isolation test suite).
+      let bucket: string;
+      if (plan.bucketCdf && plan.bucketCdfTotal) {
+        const r = rng() * plan.bucketCdfTotal;
+        const cdf = plan.bucketCdf;
+        let idx = 0;
+        while (idx < cdf.length - 1 && r >= cdf[idx]!) idx++;
+        bucket = buckets[idx]!;
+      } else {
+        bucket = buckets[(rng() * buckets.length) | 0]!;
+      }
       // Pre-pick the sensitivity_type for this row so the rv_array/rv_scalar
       // handlers can branch on it (the sens_type op may come AFTER risk_value
       // in the dimension list — we cannot rely on op execution order).
