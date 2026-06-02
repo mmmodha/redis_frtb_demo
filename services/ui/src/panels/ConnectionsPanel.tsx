@@ -1,7 +1,7 @@
 // Wave 3.5A — Connections panel. CRUD + Test + Activate for Redis Enterprise
 // cluster profiles. First panel the bank sees in the demo (step 2a).
 //
-// Surfaces three buying-signal callouts at the top (perimeter / module bundle
+// Surfaces three business-value callouts at the top (perimeter / module bundle
 // / TLS+ACL), then a card per profile. Active profile gets a brand-red border
 // and an "Active" badge — matches the redis-brand-ui status-language.
 

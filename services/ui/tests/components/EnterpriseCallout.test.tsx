@@ -3,9 +3,9 @@ import { render, screen } from "@testing-library/react";
 import { EnterpriseCallout } from "../../src/components/EnterpriseCallout";
 
 describe("<EnterpriseCallout />", () => {
-  it("renders the signal name and a 'buying signal' marker", () => {
+  it("renders the signal name and a 'business value' marker", () => {
     render(<EnterpriseCallout signal="ObservabilityModule" />);
-    expect(screen.getByText(/buying signal/i)).toBeInTheDocument();
+    expect(screen.getByText(/business value/i)).toBeInTheDocument();
     expect(screen.getByText(/ObservabilityModule/)).toBeInTheDocument();
   });
 

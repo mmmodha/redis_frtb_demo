@@ -2,7 +2,7 @@
 
 Sales-vehicle demo proving Redis Enterprise Software (RS) is the right substrate
 for a Tier-1 bank's FRTB-SA market-risk tooling. See the workspace `spec` note for the full
-narrative and the 13 Redis Enterprise buying signals each demo moment lands.
+narrative and the 13 Redis Enterprise business-value moments each demo step lands.
 
 ## Architecture (high level)
 

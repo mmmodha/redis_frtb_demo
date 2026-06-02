@@ -17,7 +17,7 @@ const DEMO_STEPS = [
 ];
 
 const TP_REQUIRED_FIELDS = [
-  '**Buying signal',
+  '**Business value',
   '**Narration',
   '**Objection',
   '**Rebuttal',

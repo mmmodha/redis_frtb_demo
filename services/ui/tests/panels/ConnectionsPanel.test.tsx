@@ -21,7 +21,7 @@ vi.mock("../../src/components/PanelCard", () => ({
 vi.mock("../../src/components/EnterpriseCallout", () => ({
   EnterpriseCallout: ({ signal, children }: any) => (
     <aside data-testid="enterprise-callout" data-signal={signal}>
-      <span>buying signal: {signal}</span>
+      <span>business value: {signal}</span>
       {children}
     </aside>
   ),
@@ -80,7 +80,7 @@ describe("<ConnectionsPanel/>", () => {
     });
   }
 
-  it("renders the Connections heading and the 3 buying-signal callouts", async () => {
+  it("renders the Connections heading and the 3 business-value callouts", async () => {
     setRoutes(
       routeJson(/\/redis\/active-target$/, "GET", { host: "h", port: 1, tls: false, db: 0, label: "demo-cluster" }),
       routeJson(/\/connections$/, "GET", []),

@@ -17,7 +17,7 @@ vi.mock("../src/components/PanelCard", () => ({
 vi.mock("../src/components/EnterpriseCallout", () => ({
   EnterpriseCallout: ({ signal, children }: any) => (
     <aside data-testid="enterprise-callout" data-signal={signal}>
-      <span>buying signal: {signal}</span>
+      <span>business value: {signal}</span>
       {children}
     </aside>
   ),

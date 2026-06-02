@@ -23,7 +23,7 @@ test.describe("Connections panel — happy path", () => {
     );
   });
 
-  test("loads + lists clusters + shows active badge + 3 buying-signal callouts", async ({ page }) => {
+  test("loads + lists clusters + shows active badge + 3 business-value callouts", async ({ page }) => {
     await page.route("**/redis/active-target", (route) =>
       route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ host: "redis-1.lab", port: 12000, tls: true, db: 0, label: "demo-cluster" }) }),
     );
@@ -37,7 +37,7 @@ test.describe("Connections panel — happy path", () => {
     await expect(page.getByText("scale-cluster")).toBeVisible();
     await expect(page.getByText(/redis-1\.lab:12000/)).toBeVisible();
 
-    // Three buying-signal callouts (natural-language copy):
+    // Three business-value callouts (natural-language copy):
     await expect(page.getByText(/Deploy in your perimeter/i)).toBeVisible();
     await expect(page.getByText(/Module bundle/i)).toBeVisible();
     await expect(page.getByText(/TLS \+ ACL \+ data sovereignty/i)).toBeVisible();

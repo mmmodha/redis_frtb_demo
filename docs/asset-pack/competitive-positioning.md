@@ -2,7 +2,7 @@
 
 How to position Redis Enterprise against the stores the bank is already running or evaluating. Each section names a competitor, the workload-specific weakness vs Redis Enterprise, and a one-line rebuttal the SA can deliver verbatim.
 
-The buying signals referenced (#1 .. #13) are defined in the "Why Redis Enterprise" table of the spec.
+The business-value moments referenced (#1 .. #13) are defined in the "Why Redis Enterprise" table of the spec.
 
 ---
 

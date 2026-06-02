@@ -114,6 +114,6 @@ describe("<Observability />", () => {
     await waitFor(() => {
       expect(screen.getByText(/ObservabilityModule/)).toBeInTheDocument();
     });
-    expect(screen.getByText(/buying signal/i)).toBeInTheDocument();
+    expect(screen.getByText(/business value/i)).toBeInTheDocument();
   });
 });

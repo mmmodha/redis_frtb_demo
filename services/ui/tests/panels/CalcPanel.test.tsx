@@ -96,7 +96,7 @@ describe("<CalcPanel />", () => {
 
   it("renders three EnterpriseCallout banners for in-database compute / map-reduce / hash-tag locality", () => {
     render(<CalcPanel />);
-    const callouts = screen.getAllByText(/buying signal/i);
+    const callouts = screen.getAllByText(/business value/i);
     expect(callouts.length).toBeGreaterThanOrEqual(3);
     expect(screen.getByText("In-database compute")).toBeInTheDocument();
     expect(screen.getByText("Map-Reduce")).toBeInTheDocument();

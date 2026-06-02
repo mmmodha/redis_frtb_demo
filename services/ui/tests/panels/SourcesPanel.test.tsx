@@ -17,7 +17,7 @@ vi.mock("../../src/components/PanelCard", () => ({
 vi.mock("../../src/components/EnterpriseCallout", () => ({
   EnterpriseCallout: ({ signal, children }: { signal: string; children?: React.ReactNode }) => (
     <aside data-testid="enterprise-callout" data-signal={signal}>
-      <span>buying signal: {signal}</span>
+      <span>business value: {signal}</span>
       {children}
     </aside>
   ),
@@ -60,7 +60,7 @@ describe("SourcesPanel", () => {
     vi.restoreAllMocks();
   });
 
-  it("renders the Sources heading, drag-drop zone, and 3 EnterpriseCallout buying-signal banners", async () => {
+  it("renders the Sources heading, drag-drop zone, and 3 EnterpriseCallout business-value banners", async () => {
     fetchMock.mockImplementation(async () => jsonResponse([]));
     renderPanel();
     expect(screen.getByRole("heading", { name: /^Sources$/i, level: 1 })).toBeInTheDocument();
