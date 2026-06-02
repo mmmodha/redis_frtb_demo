@@ -45,7 +45,14 @@ interface FetchOpts {
 }
 
 function mockFetch(opts: FetchOpts = {}) {
-  const { flushOk = true, flushBody = { ok: true, ms: 7, target_label: "redis-primary" }, flushStatus = 200 } = opts;
+  const {
+    flushOk = true,
+    // Wave 5.46 — default mock now mirrors the api's post-flush bootstrap
+    // success response so banner assertions exercise the "indexes rebuilt"
+    // copy by default. Tests that need the failure branch override flushBody.
+    flushBody = { ok: true, ms: 7, target_label: "redis-primary", bootstrap: { ok: true } },
+    flushStatus = 200,
+  } = opts;
   const fetchMock = vi.fn();
   fetchMock.mockImplementation(async (input: RequestInfo, init?: RequestInit) => {
     const url = String(input);
@@ -115,8 +122,9 @@ describe("IngestPanel — Flush DB button (Wave 5.38c)", () => {
       );
       expect(posted).toBeDefined();
     });
+    // Wave 5.46 — banner advertises the rebuilt index when bootstrap.ok=true.
     const banner = await screen.findByTestId("flush-db-banner");
-    expect(banner).toHaveTextContent(/flushed in 7ms/i);
+    expect(banner).toHaveTextContent(/flushed in 7ms · indexes rebuilt/i);
   });
 
   it("surfaces a flush error in the telemetry error display", async () => {
@@ -127,5 +135,28 @@ describe("IngestPanel — Flush DB button (Wave 5.38c)", () => {
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toMatch(/flush failed/i);
     expect(alert.textContent).toMatch(/no active target/i);
+  });
+
+  // Wave 5.46 — bootstrap failure path: flush itself returned 200 but the
+  // post-flush bootstrap (idx:sens + frtb library rebuild) failed. The UI
+  // surfaces the bootstrap error via the same telemetry error display the
+  // raw-flush failure uses, and does NOT show the success banner.
+  it("surfaces bootstrap.ok=false from a 200 flush response as an error", async () => {
+    fetchMock = mockFetch({
+      flushBody: {
+        ok: true,
+        ms: 11,
+        target_label: "redis-primary",
+        bootstrap: { ok: false, error: "FT.CREATE failed" },
+      },
+    });
+    renderPanel();
+    fireEvent.click(await screen.findByTestId("flush-db-btn"));
+    fireEvent.click(within(await screen.findByTestId("flush-db-modal")).getByTestId("flush-db-confirm"));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(/flush failed/i);
+    expect(alert.textContent).toMatch(/bootstrap/i);
+    expect(alert.textContent).toMatch(/ft\.create failed/i);
+    expect(screen.queryByTestId("flush-db-banner")).not.toBeInTheDocument();
   });
 });

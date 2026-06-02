@@ -196,7 +196,7 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
     terminalGraceMs: opts.generatorTerminalGraceMs,
     corsAllowed,
   });
-  registerAdminRoutes(app, getRedis);
+  registerAdminRoutes(app, getRedis, { schema: opts.schema });
 
   // Wave 5.16t — auto-bootstrap on every active-target change. The hook is
   // registered before the connections store so the very first profile-switch

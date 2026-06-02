@@ -175,14 +175,25 @@ export function IngestPanel() {
     setError(null);
     try {
       const r = await flushDb();
-      setFlushBanner(`Flushed in ${r.ms}ms`);
+      // Wave 5.46 — the api re-runs bootstrapFrtb after FLUSHDB. When it
+      // succeeds the banner advertises the rebuilt index so the presenter
+      // knows the next Calculate will not 412; when it fails we surface
+      // the bootstrap error via the existing error display.
+      if (r.bootstrap && !r.bootstrap.ok) {
+        setError(`Flush failed: bootstrap ${r.bootstrap.error ?? "failed"}`);
+      } else {
+        const banner = r.bootstrap?.ok
+          ? `Flushed in ${r.ms}ms · indexes rebuilt`
+          : `Flushed in ${r.ms}ms`;
+        setFlushBanner(banner);
+        window.setTimeout(() => setFlushBanner(null), 4000);
+      }
       try {
         const [k, m] = await Promise.all([getObservabilityKeys("sens:"), getObservabilityMemory()]);
         setKeys(k);
         setMemory(m);
         lastKeys.current = { t: Date.now(), dbsize: k.dbsize };
       } catch { /* tolerate transient refresh failure; next poll tick will catch up */ }
-      window.setTimeout(() => setFlushBanner(null), 4000);
     } catch (e) {
       setError(`Flush failed: ${(e as Error).message}`);
     } finally {

@@ -222,10 +222,16 @@ export function startGeneratorStream(
 // Wave 5.38c — POST /admin/flush. Wipes the active Redis database (FLUSHDB)
 // and returns timing for the success banner. The IngestPanel guards the call
 // behind a confirmation modal; this client is intentionally thin.
+//
+// Wave 5.46 — the api now re-runs bootstrapFrtb after FLUSHDB to rebuild
+// idx:sens + the frtb library, and reports the outcome under `bootstrap`.
+// Optional so older api builds (or the schema-missing branch) stay
+// backward-compatible with the existing client shape.
 export interface FlushDbResponse {
   ok: boolean;
   ms: number;
   target_label: string;
+  bootstrap?: { ok: boolean; error?: string };
 }
 
 export async function flushDb(): Promise<FlushDbResponse> {
