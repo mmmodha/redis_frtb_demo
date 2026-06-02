@@ -151,6 +151,9 @@ export async function bootstrapFrtb(
           "GROUPBY", "1", `@${fieldName}`,
           "LIMIT", "0", "100000",
           "DIALECT", "2",
+          // Wave 5.41: explicit per-call TIMEOUT — at 1M+ rows the implicit
+          // module default lets backfill hang the bootstrap on cold caches.
+          "TIMEOUT", "30000",
         )) as unknown[];
         if (!Array.isArray(aggReply)) continue;
         for (let i = 1; i < aggReply.length; i++) {

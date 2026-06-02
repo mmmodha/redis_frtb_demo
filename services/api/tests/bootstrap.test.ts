@@ -184,6 +184,17 @@ describe("bootstrap — Step 3 backfill suggesters", () => {
       action: "backfilled",
       counts: { book: 3, trade_id: 2, risk_factor: 1 },
     });
+
+    // Wave 5.41: every suggester FT.AGGREGATE carries an explicit TIMEOUT
+    // 30000 so a cold-cache backfill at 1M+ rows cannot hang bootstrap
+    // behind the module's implicit default.
+    const aggs = recorded.filter((c) => c.command === "FT.AGGREGATE");
+    expect(aggs.length).toBeGreaterThan(0);
+    for (const agg of aggs) {
+      const ti = agg.args.indexOf("TIMEOUT");
+      expect(ti).toBeGreaterThan(-1);
+      expect(agg.args[ti + 1]).toBe("30000");
+    }
   });
 
   it("skips FT.AGGREGATE/FT.SUGADD when FT.SUGLEN reports a populated dictionary (idempotent on restart)", async () => {

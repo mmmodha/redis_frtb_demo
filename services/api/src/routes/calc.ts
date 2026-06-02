@@ -350,6 +350,12 @@ export function registerCalcRoute(
     //    single call exactly as before.
     const queryNodes = resolveQueryNodes(redis);
     const bucketSet = new Set<string>();
+    // Wave 5.41: explicit TIMEOUT on the discovery FT.AGGREGATE so a slow
+    // cluster surfaces as a captured error (and a 502 below) rather than
+    // hanging the request behind the implicit module default. The `catch`
+    // captures the error in `discoveryError` so the FT.AGGREGATE failure
+    // isn't silently swallowed into a misleading charge=0 result.
+    let discoveryError: string | null = null;
     try {
       for (const node of queryNodes) {
         const aggReply = await node.call(
@@ -363,7 +369,9 @@ export function registerCalcRoute(
           "0",
           "10000",
           "DIALECT",
-          "2"
+          "2",
+          "TIMEOUT",
+          "30000"
         );
         for (const b of parseBucketsFromAggregate(aggReply)) bucketSet.add(b);
       }
@@ -373,7 +381,15 @@ export function registerCalcRoute(
         reply.code(translated.status);
         return translated.body;
       }
-      throw err;
+      const errMsg = err instanceof Error ? err.message : String(err);
+      discoveryError = errMsg;
+      app.log.warn({
+        evt: "calc-discovery-failed",
+        err: errMsg,
+        query: discoveryQuery,
+        risk_class,
+        target_label,
+      });
     }
     const buckets = Array.from(bucketSet);
 
@@ -385,15 +401,20 @@ export function registerCalcRoute(
     //     num_docs is zero (or FT.INFO errors because no index exists),
     //     surface a 503 so callers don't mistake "no data" for a genuine
     //     sbm_charge=0.
-    if (buckets.length === 0) {
-      let numDocs = 0;
+    //
+    // Wave 5.41: numDocs is now lifted out of the empty-buckets branch so
+    // the new 502 "discovery-failed" path below shares the same probe.
+    let numDocs: number | null = null;
+    if (buckets.length === 0 || discoveryError) {
+      let probed = 0;
       try {
         const infoReply = await redis.call("FT.INFO", "idx:sens");
-        numDocs = parseFtInfoNumDocs(infoReply);
+        probed = parseFtInfoNumDocs(infoReply);
       } catch {
-        numDocs = 0;
+        probed = 0;
       }
-      if (numDocs === 0) {
+      numDocs = probed;
+      if (buckets.length === 0 && numDocs === 0) {
         reply.code(503);
         return {
           error: "no-data-or-index",
@@ -402,6 +423,18 @@ export function registerCalcRoute(
           hint: "ensure idx:sens exists on all masters and stream has been ingested",
         };
       }
+    }
+
+    // Wave 5.41: FT.AGGREGATE failed BUT idx:sens has data → surface the
+    // upstream failure as 502 so the caller sees the underlying reason
+    // instead of a misleading "No sensitivities" 200 with charge=0.
+    if (discoveryError && numDocs !== null && numDocs > 0) {
+      reply.code(502);
+      return {
+        error: "discovery-failed",
+        reason: discoveryError,
+        hint: "FT.AGGREGATE on idx:sens failed — see api warn log",
+      };
     }
 
     // 2) Fan out one FCALL per bucket — runs slot-local on the owning shard

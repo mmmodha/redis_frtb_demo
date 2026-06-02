@@ -287,6 +287,89 @@ describe("POST /calc/sbm — MVP endpoint", () => {
     });
   });
 
+  // Wave 5.41: explicit per-call TIMEOUT on the discovery FT.AGGREGATE so a
+  // slow cluster surfaces as a captured 502 instead of an indefinite hang
+  // behind the module's implicit default. Locked in the call-args mirror so
+  // any future refactor that drops the TIMEOUT pair regresses this test.
+  it("Wave 5.41: discovery FT.AGGREGATE carries TIMEOUT 30000 in its arg list", async () => {
+    const fr = fakeRedis();
+    fr.setResponse("FT.AGGREGATE", ftAggregateReply(["USD-IRS"]));
+    fr.setResponse("FCALL", ["K_b", "1", "S_b", "1", "count", "1", "ms", "1"]);
+    app = await createServer({ redis: fr, correlations: { GIRR: { kind: "constant", value: 0 } } });
+    const res = await app.inject({
+      method: "POST",
+      url: "/calc/sbm",
+      payload: { risk_class: "GIRR", sensitivity_type: "Delta" },
+    });
+    expect(res.statusCode).toBe(200);
+    const agg = fr.calls.find((c) => c.command === "FT.AGGREGATE");
+    expect(agg).toBeDefined();
+    const args = agg!.args;
+    const ti = args.indexOf("TIMEOUT");
+    expect(ti).toBeGreaterThan(-1);
+    expect(args[ti + 1]).toBe("30000");
+  });
+
+  // Wave 5.41: when FT.AGGREGATE throws but FT.INFO reports a populated
+  // index (num_docs > 0), the route surfaces 502 "discovery-failed" with the
+  // upstream error message — replacing the previous silent fall-through that
+  // returned 200 + charge=0 and masked the real cause.
+  it("Wave 5.41: 502 discovery-failed when FT.AGGREGATE throws and FT.INFO num_docs > 0", async () => {
+    const fr = fakeRedis();
+    fr.setResponse("FT.AGGREGATE", () => {
+      throw new Error("Search timeout exceeded");
+    });
+    fr.setResponse("FT.INFO", ["index_name", "idx:sens", "num_docs", "1000000"]);
+    app = await createServer({ redis: fr, correlations: { GIRR: { kind: "constant", value: 0 } } });
+    const res = await app.inject({
+      method: "POST",
+      url: "/calc/sbm",
+      payload: { risk_class: "GIRR", sensitivity_type: "Delta" },
+    });
+    expect(res.statusCode).toBe(502);
+    const body = res.json();
+    expect(body).toMatchObject({
+      error: "discovery-failed",
+      reason: "Search timeout exceeded",
+    });
+    expect(typeof body.hint).toBe("string");
+    expect(body.hint).toMatch(/FT\.AGGREGATE/);
+    // FCALL must NOT fire when discovery failed.
+    expect(fr.calls.find((c) => c.command === "FCALL")).toBeUndefined();
+  });
+
+  // Wave 5.41: the same throw path also emits a structured warn log with
+  // evt=calc-discovery-failed so ops can correlate the 502 with the
+  // underlying Redis error in the api log stream.
+  it("Wave 5.41: warn-log captures evt: calc-discovery-failed on the throw path", async () => {
+    const fr = fakeRedis();
+    fr.setResponse("FT.AGGREGATE", () => {
+      throw new Error("Search timeout exceeded");
+    });
+    fr.setResponse("FT.INFO", ["index_name", "idx:sens", "num_docs", "1000000"]);
+    app = await createServer({ redis: fr, correlations: { GIRR: { kind: "constant", value: 0 } } });
+    const warnings: unknown[] = [];
+    // Fastify's no-op logger still exposes `warn`; replace it with a capturing
+    // spy so we can assert the event shape without flipping `logger: true`
+    // (which would spam stdout for the whole suite).
+    (app.log as unknown as { warn: (obj: unknown) => void }).warn = (obj: unknown) => {
+      warnings.push(obj);
+    };
+    const res = await app.inject({
+      method: "POST",
+      url: "/calc/sbm",
+      payload: { risk_class: "GIRR", sensitivity_type: "Delta" },
+    });
+    expect(res.statusCode).toBe(502);
+    const hit = warnings.find(
+      (w) => typeof w === "object" && w !== null && (w as { evt?: string }).evt === "calc-discovery-failed",
+    ) as Record<string, unknown> | undefined;
+    expect(hit).toBeDefined();
+    expect(hit!.err).toBe("Search timeout exceeded");
+    expect(hit!.risk_class).toBe("GIRR");
+    expect(String(hit!.query)).toContain("@risk_class:{GIRR}");
+  });
+
   // Wave 5.15d.1: in cluster mode the FT.AGGREGATE coordinator does NOT
   // aggregate replies across shards (only FT.INFO does). The route must fan
   // out FT.AGGREGATE per master via redis.nodes("master") and union the
