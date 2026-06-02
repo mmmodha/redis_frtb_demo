@@ -98,3 +98,29 @@
 .latency-strip__refline--p99.latency-strip__refline--green text {
   fill: #5BD37B;
 }
+
+
+/* Wave 5.38d — Fuzzy toggle pill. Sits in the Filters card actions next to
+   Run query / Run 100x; small footprint, defers visual weight to the run
+   buttons. */
+.pivot-fuzzy-toggle {
+  display: inline-flex;
+  align-items: center;
+  min-height: 32px;
+  padding: 0 calc(var(--grid) * 1.5);
+  font-size: 0.85em;
+  border: 1px solid var(--redis-border-primary);
+  border-radius: var(--radius);
+  background: var(--redis-bg-secondary);
+  color: var(--redis-text-secondary);
+  cursor: pointer;
+}
+.pivot-fuzzy-toggle.is-on {
+  background: rgba(255, 68, 56, 0.12);
+  color: var(--redis-text-primary);
+  border-color: var(--redis-hyper, #ff4438);
+}
+.pivot-fuzzy-toggle.is-off {
+  background: var(--redis-bg-secondary);
+  color: var(--redis-text-muted);
+}

@@ -127,6 +127,16 @@ describe("PivotPanel", () => {
     expect(screen.getByTestId("pivot-fuzzy-hint")).toHaveTextContent(/fuzzy:\s*on/i);
   });
 
+  it("Wave 5.38d — fuzzy toggle flips text and aria-pressed on click", () => {
+    renderPanel();
+    const toggle = screen.getByTestId("pivot-fuzzy-toggle");
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTestId("pivot-fuzzy-hint")).toHaveTextContent(/fuzzy:\s*on/i);
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByTestId("pivot-fuzzy-hint")).toHaveTextContent(/fuzzy:\s*off/i);
+  });
+
   it("renders the RedisQueryEngine EnterpriseCallout banner", () => {
     renderPanel();
     const callout = screen.getByTestId("enterprise-callout");

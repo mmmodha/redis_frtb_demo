@@ -23,6 +23,7 @@ export function PivotPanel(): JSX.Element {
   const [book, setBook] = useState<string>("");
   const [tradeId, setTradeId] = useState<string>("");
   const [riskFactor, setRiskFactor] = useState<string>("");
+  const [fuzzy, setFuzzy] = useState<boolean>(true);
   const limit = DEFAULT_LIMIT;
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
@@ -133,7 +134,15 @@ export function PivotPanel(): JSX.Element {
         title="Filters"
         actions={
           <>
-            <small className="pivot-fuzzy-hint" data-testid="pivot-fuzzy-hint">fuzzy: on</small>
+            <button
+              type="button"
+              className={`pivot-fuzzy-toggle ${fuzzy ? "is-on" : "is-off"}`}
+              data-testid="pivot-fuzzy-toggle"
+              aria-pressed={fuzzy}
+              onClick={() => setFuzzy((v) => !v)}
+            >
+              <span data-testid="pivot-fuzzy-hint">Fuzzy: {fuzzy ? "on" : "off"}</span>
+            </button>
             <button type="button" onClick={() => void runAt(0)} disabled={loading || burst !== null}>
               {loading || burst !== null ? "Running…" : "Run query"}
             </button>
@@ -187,6 +196,7 @@ export function PivotPanel(): JSX.Element {
             value={book}
             onChange={setBook}
             placeholder="e.g. RATES-LDN"
+            fuzzy={fuzzy}
           />
           <label htmlFor="pivot-trade-id">Trade ID</label>
           <SuggestCombobox
@@ -195,6 +205,7 @@ export function PivotPanel(): JSX.Element {
             value={tradeId}
             onChange={setTradeId}
             placeholder="e.g. T0042"
+            fuzzy={fuzzy}
           />
           <label htmlFor="pivot-risk-factor">Risk factor</label>
           <SuggestCombobox
@@ -203,6 +214,7 @@ export function PivotPanel(): JSX.Element {
             value={riskFactor}
             onChange={setRiskFactor}
             placeholder="e.g. RF_GIRR_05"
+            fuzzy={fuzzy}
           />
         </form>
       </PanelCard>

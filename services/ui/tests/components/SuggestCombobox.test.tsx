@@ -3,7 +3,11 @@ import { useState } from "react";
 import { act, render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { SuggestCombobox } from "../../src/components/SuggestCombobox";
 
-function Harness({ initial = "", debounceMs = 10 }: { initial?: string; debounceMs?: number }) {
+function Harness({
+  initial = "",
+  debounceMs = 10,
+  fuzzy,
+}: { initial?: string; debounceMs?: number; fuzzy?: boolean }) {
   const [v, setV] = useState<string>(initial);
   return (
     <SuggestCombobox
@@ -12,6 +16,7 @@ function Harness({ initial = "", debounceMs = 10 }: { initial?: string; debounce
       onChange={setV}
       debounceMs={debounceMs}
       label="Book"
+      fuzzy={fuzzy}
     />
   );
 }
@@ -206,6 +211,17 @@ describe("<SuggestCombobox />", () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
     // First signal must have been aborted.
     expect(abortReceived[0]!.aborted).toBe(true);
+  });
+
+  it("Wave 5.38d — fuzzy={false} forwards &fuzzy=0 in the /suggest URL", async () => {
+    fetchMock.mockResolvedValue(suggestOk(["A1"]));
+    render(<Harness fuzzy={false} />);
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "A" } });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const url = String(fetchMock.mock.calls[0]![0]);
+    expect(url).toContain("/suggest?");
+    expect(url).toContain("fuzzy=0");
+    expect(url).not.toContain("fuzzy=1");
   });
 });
 

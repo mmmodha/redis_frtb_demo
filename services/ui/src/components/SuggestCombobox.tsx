@@ -19,6 +19,7 @@ export interface SuggestComboboxProps {
   debounceMs?: number;
   disabled?: boolean;
   className?: string;
+  fuzzy?: boolean;
 }
 
 interface Suggestion { value: string; score: number }
@@ -32,6 +33,7 @@ export function SuggestCombobox(props: SuggestComboboxProps): JSX.Element {
     debounceMs = 150,
     disabled = false,
     className,
+    fuzzy = true,
   } = props;
 
   const reactId = useId();
@@ -62,7 +64,7 @@ export function SuggestCombobox(props: SuggestComboboxProps): JSX.Element {
       abortRef.current = controller;
       setStatus("loading"); setOpen(true);
       const base = apiBase().replace(/\/$/, "");
-      const url = `${base}/suggest?field=${encodeURIComponent(field)}&prefix=${encodeURIComponent(value)}&fuzzy=1&max=${cap}`;
+      const url = `${base}/suggest?field=${encodeURIComponent(field)}&prefix=${encodeURIComponent(value)}&fuzzy=${fuzzy ? 1 : 0}&max=${cap}`;
       fetch(url, { signal: controller.signal })
         .then(async (res) => {
           if (res.status === 503) {
@@ -93,7 +95,7 @@ export function SuggestCombobox(props: SuggestComboboxProps): JSX.Element {
         });
     }, debounceMs);
     return () => { clearTimeout(timer); };
-  }, [value, field, cap, debounceMs, disabled]);
+  }, [value, field, cap, debounceMs, disabled, fuzzy]);
 
   // Abort any in-flight fetch on unmount.
   useEffect(() => () => { if (abortRef.current) abortRef.current.abort(); }, []);
