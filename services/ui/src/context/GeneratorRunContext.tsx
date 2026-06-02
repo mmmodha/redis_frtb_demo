@@ -47,6 +47,11 @@ const STORAGE_KEY = "generator-active-run";
 const POLL_INTERVAL_MS = 500;
 const TERMINAL_GRACE_MS = 30_000;
 
+// Wave 5.45 — auto-dismiss windows for the nav pill / terminal summary so
+// the bar disappears on its own after a run completes. Exported for tests.
+export const AUTO_DISMISS_DONE_MS = 6_000;
+export const AUTO_DISMISS_ERROR_MS = 12_000;
+
 export interface GeneratorRunState {
   rowsTotal: number;
   rowsDone: number;
@@ -133,12 +138,33 @@ export function GeneratorRunProvider({ children }: { children: ReactNode }): JSX
   const pollRef = useRef<{ runId: string; interval: ReturnType<typeof setInterval> } | null>(null);
   const graceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const writtenRunIdRef = useRef<string | null>(null);
+  // Wave 5.45 — auto-dismiss timer for the terminal summary. Cleared by
+  // startRun (so a new run renders immediately) and by unmount.
+  const dismissTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const stopPolling = useCallback(() => {
     if (pollRef.current) {
       clearInterval(pollRef.current.interval);
       pollRef.current = null;
     }
+  }, []);
+
+  const clearDismissTimer = useCallback(() => {
+    if (dismissTimerRef.current !== null) {
+      clearTimeout(dismissTimerRef.current);
+      dismissTimerRef.current = null;
+    }
+  }, []);
+
+  const scheduleDismiss = useCallback((ms: number) => {
+    if (dismissTimerRef.current !== null) {
+      clearTimeout(dismissTimerRef.current);
+    }
+    dismissTimerRef.current = setTimeout(() => {
+      dismissTimerRef.current = null;
+      setRun(null);
+      setError(null);
+    }, ms);
   }, []);
 
   const startPolling = useCallback((runId: string, seed: GeneratorRunStatus) => {
@@ -168,6 +194,10 @@ export function GeneratorRunProvider({ children }: { children: ReactNode }): JSX
           if (status.error) setError(status.error);
           stopPolling();
           clearStored();
+          // Wave 5.45 — auto-dismiss the terminal summary.
+          scheduleDismiss(
+            status.status === "error" || status.error ? AUTO_DISMISS_ERROR_MS : AUTO_DISMISS_DONE_MS,
+          );
         } else {
           setRun((prev) => {
             const next = statusToRunState(status);
@@ -181,7 +211,7 @@ export function GeneratorRunProvider({ children }: { children: ReactNode }): JSX
     };
     const interval = setInterval(() => { void tick(); }, POLL_INTERVAL_MS);
     pollRef.current = { runId, interval };
-  }, [stopPolling]);
+  }, [stopPolling, scheduleDismiss]);
 
   const clearRun = useCallback(() => {
     setRun(null);
@@ -200,6 +230,9 @@ export function GeneratorRunProvider({ children }: { children: ReactNode }): JSX
       clearTimeout(graceTimerRef.current);
       graceTimerRef.current = null;
     }
+    // Wave 5.45 — a manual start also clears any pending auto-dismiss timer
+    // from a previous terminal run so the new run renders immediately.
+    clearDismissTimer();
     writtenRunIdRef.current = null;
     const initialRows = cfg?.rows ?? DEFAULT_GEN_ROWS;
     setRun({
@@ -246,15 +279,20 @@ export function GeneratorRunProvider({ children }: { children: ReactNode }): JSX
         // next mount doesn't try to reconnect to a finished run.
         clearStored();
         writtenRunIdRef.current = null;
+        // Wave 5.45 — auto-dismiss the pill once the terminal summary has
+        // been on screen for the configured window.
+        scheduleDismiss(f.error ? AUTO_DISMISS_ERROR_MS : AUTO_DISMISS_DONE_MS);
       },
       onError: (e: Error) => {
         setError(e.message);
         setRun((prev) => (prev ? { ...prev, status: "error" } : prev));
         streamRef.current = null;
+        // Wave 5.45 — auto-dismiss the error summary.
+        scheduleDismiss(AUTO_DISMISS_ERROR_MS);
       },
     });
     streamRef.current = handle;
-  }, []);
+  }, [clearDismissTimer, scheduleDismiss]);
 
   const cancelRun = useCallback(() => {
     setRun((prev) => (prev && prev.status === "running" ? { ...prev, status: "cancelling" } : prev));
@@ -354,6 +392,12 @@ export function GeneratorRunProvider({ children }: { children: ReactNode }): JSX
       if (graceTimerRef.current) {
         clearTimeout(graceTimerRef.current);
         graceTimerRef.current = null;
+      }
+      // Wave 5.45 — clear any pending auto-dismiss so we don't setState on
+      // an unmounted provider.
+      if (dismissTimerRef.current !== null) {
+        clearTimeout(dismissTimerRef.current);
+        dismissTimerRef.current = null;
       }
     };
   }, []);

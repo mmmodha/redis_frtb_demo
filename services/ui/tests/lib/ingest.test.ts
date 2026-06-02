@@ -224,4 +224,42 @@ describe("ingest api client", () => {
     expect(typeof init.body).toBe("string");
     expect(JSON.parse(init.body as string)).toEqual({});
   });
+
+  // Wave 5.45 — startGeneratorStream().cancel() must NOT abort the underlying
+  // fetch. Aborting the SSE socket before the server can flush the terminal
+  // frame is what left the UI stuck on "Cancelling…". The client now flips
+  // the server-side cancel flag (POST /generator/cancel/:id) and waits for
+  // the server to emit the terminal frame instead.
+  it("startGeneratorStream().cancel() does NOT abort the underlying fetch", async () => {
+    let capturedSignal: AbortSignal | undefined;
+    const body = new ReadableStream<Uint8Array>({
+      // Hold the SSE socket open without emitting any frames so runId stays
+      // null and cancel() only exercises the no-abort path (no /generator/cancel
+      // POST is made when runId is null).
+      pull(_controller) { /* keep stream open */ },
+    });
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/generator\/start\/stream$/.test(url)) {
+        capturedSignal = init?.signal ?? undefined;
+        return new Response(body, { headers: { "content-type": "text/event-stream" } });
+      }
+      return new Response("{}", { headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+
+    const handle = startGeneratorStream(undefined, {
+      onProgress: () => {},
+      onTerminal: () => {},
+      onError: () => {},
+    });
+    // Let the async fetch kick off so the signal is captured.
+    await new Promise((r) => setTimeout(r, 10));
+    expect(capturedSignal).toBeDefined();
+    expect(capturedSignal!.aborted).toBe(false);
+
+    await handle.cancel();
+    // The cancel path must not abort the SSE fetch — the server is expected
+    // to deliver the terminal frame on its own.
+    expect(capturedSignal!.aborted).toBe(false);
+  });
 });

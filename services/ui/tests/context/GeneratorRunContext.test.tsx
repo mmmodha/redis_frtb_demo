@@ -5,6 +5,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { act, render, waitFor } from "@testing-library/react";
 import {
+  AUTO_DISMISS_DONE_MS,
+  AUTO_DISMISS_ERROR_MS,
   GeneratorRunProvider,
   useGeneratorRun,
   type GeneratorRunContextValue,
@@ -266,5 +268,234 @@ describe("<GeneratorRunProvider /> — Wave 5.40b reconnect", () => {
     });
     const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "{}");
     expect(stored.run_id).toBe("01HXNEW");
+  });
+});
+
+// Wave 5.45 — auto-dismiss timer for the terminal summary so the pill clears
+// itself a few seconds after a run finishes / is cancelled / errors.
+describe("<GeneratorRunProvider /> — Wave 5.45 auto-dismiss", () => {
+  beforeEach(() => {
+    vi.stubGlobal("localStorage", makeMemoryStorage());
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  // Builds a stub fetch that returns a real Response with a ReadableStream
+  // body for /generator/start/stream so the SSE reader inside
+  // startGeneratorStream sees actual chunks, while every other URL gets a
+  // benign JSON 200. Each call gets a fresh body so a follow-up startRun in
+  // the same test doesn't trip on a locked / already-consumed stream.
+  function stubStreamFetch(chunks: string[]) {
+    const enc = new TextEncoder();
+    const makeBody = (): ReadableStream<Uint8Array> => new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const c of chunks) controller.enqueue(enc.encode(c));
+        controller.close();
+      },
+    });
+    vi.stubGlobal("fetch", (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (/\/generator\/start\/stream$/.test(url)) {
+        return new Response(makeBody(), { headers: { "content-type": "text/event-stream" } });
+      }
+      if (/\/generator\/runs$/.test(url)) {
+        return new Response(JSON.stringify({ active: [] }), {
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("{}", { headers: { "content-type": "application/json" } });
+    }) as typeof fetch);
+  }
+
+  // Drains promise microtasks so the streaming reader inside
+  // startGeneratorStream advances even under fake timers.
+  async function pumpMicrotasks(n = 10): Promise<void> {
+    for (let i = 0; i < n; i++) await Promise.resolve();
+  }
+
+  it("SSE onTerminal with cancelled:true clears run after AUTO_DISMISS_DONE_MS", async () => {
+    stubStreamFetch([
+      `data: ${JSON.stringify({ run_id: "rcc", done: true, rows_queued: 42, ms: 100, cancelled: true })}\n\n`,
+    ]);
+    const ui = renderProvider();
+    // Drain the mount-time orphan-discovery promise.
+    await act(async () => { await pumpMicrotasks(); });
+
+    vi.useFakeTimers();
+    act(() => { ui.value.startRun(null); });
+    await act(async () => { await pumpMicrotasks(20); });
+    expect(ui.value.run?.status).toBe("cancelled");
+
+    // Just before the dismiss window — still visible.
+    await act(async () => { vi.advanceTimersByTime(AUTO_DISMISS_DONE_MS - 100); });
+    expect(ui.value.run).not.toBeNull();
+
+    // Past the window — pill clears itself.
+    await act(async () => { vi.advanceTimersByTime(200); });
+    expect(ui.value.run).toBeNull();
+  });
+
+  it("SSE onTerminal with error clears run after AUTO_DISMISS_ERROR_MS", async () => {
+    stubStreamFetch([
+      `data: ${JSON.stringify({ run_id: "rerr", done: true, rows_queued: 0, ms: 5, cancelled: false, error: "boom" })}\n\n`,
+    ]);
+    const ui = renderProvider();
+    await act(async () => { await pumpMicrotasks(); });
+
+    vi.useFakeTimers();
+    act(() => { ui.value.startRun(null); });
+    await act(async () => { await pumpMicrotasks(20); });
+    expect(ui.value.run?.status).toBe("done");
+    expect(ui.value.error).toBe("boom");
+
+    // The DONE window must NOT clear it — error uses the longer window.
+    await act(async () => { vi.advanceTimersByTime(AUTO_DISMISS_DONE_MS + 500); });
+    expect(ui.value.run).not.toBeNull();
+
+    // Cross the ERROR threshold.
+    await act(async () => {
+      vi.advanceTimersByTime(AUTO_DISMISS_ERROR_MS - AUTO_DISMISS_DONE_MS);
+    });
+    expect(ui.value.run).toBeNull();
+    expect(ui.value.error).toBeNull();
+  });
+
+  it("polling-mode terminal (cancelled) clears run after AUTO_DISMISS_DONE_MS", async () => {
+    // First /status call returns running so the provider enters startPolling;
+    // the next tick returns cancelled so the polling-mode terminal branch
+    // fires and schedules the auto-dismiss timer. Fake timers are armed
+    // before mount so the scheduleDismiss setTimeout is the FAKE one.
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ run_id: "rpoll", rows_total: 200, started_at: Date.now() }));
+    let statusCalls = 0;
+    vi.stubGlobal("fetch", (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (/\/generator\/runs\/[^/]+\/status$/.test(url)) {
+        statusCalls += 1;
+        if (statusCalls === 1) {
+          return new Response(
+            JSON.stringify({ run_id: "rpoll", status: "running", rows_done: 50, rows_total: 200, rows_per_sec: 1000, elapsed_ms: 50 }),
+            { headers: { "content-type": "application/json" } },
+          );
+        }
+        return new Response(
+          JSON.stringify({ run_id: "rpoll", status: "cancelled", rows_done: 88, rows_total: 200, rows_per_sec: 0, elapsed_ms: 150 }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (/\/generator\/runs$/.test(url)) {
+        return new Response(JSON.stringify({ active: [] }), {
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("{}", { headers: { "content-type": "application/json" } });
+    }) as typeof fetch);
+
+    vi.useFakeTimers();
+    const ui = renderProvider();
+    // Mount effect's async fetch needs microtask drains under fake timers.
+    await act(async () => { await pumpMicrotasks(20); });
+    expect(ui.value.run?.status).toBe("running");
+
+    // Advance one polling interval (500ms in the provider) so the next /status
+    // call fires and routes through the polling-mode terminal branch.
+    await act(async () => {
+      vi.advanceTimersByTime(500);
+      await pumpMicrotasks(20);
+    });
+    expect(ui.value.run?.status).toBe("cancelled");
+
+    // Auto-dismiss timer was armed with the fake setTimeout; advance past it.
+    await act(async () => { vi.advanceTimersByTime(AUTO_DISMISS_DONE_MS + 100); });
+    expect(ui.value.run).toBeNull();
+  });
+
+  it("startRun during the dismiss window clears the previous timer and keeps the new run rendered", async () => {
+    // First stream emits a terminal frame so the dismiss timer is armed; the
+    // second startRun gets a stream that stays open without emitting frames
+    // so the new run sticks in "running" while we verify the OLD dismiss
+    // timer was cleared.
+    const enc = new TextEncoder();
+    let streamCalls = 0;
+    vi.stubGlobal("fetch", (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (/\/generator\/start\/stream$/.test(url)) {
+        streamCalls += 1;
+        if (streamCalls === 1) {
+          const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(enc.encode(
+                `data: ${JSON.stringify({ run_id: "rfirst", done: true, rows_queued: 1, ms: 1, cancelled: false })}\n\n`,
+              ));
+              controller.close();
+            },
+          });
+          return new Response(body, { headers: { "content-type": "text/event-stream" } });
+        }
+        // Hold the second stream open indefinitely.
+        const body = new ReadableStream<Uint8Array>({ pull() { /* idle */ } });
+        return new Response(body, { headers: { "content-type": "text/event-stream" } });
+      }
+      if (/\/generator\/runs$/.test(url)) {
+        return new Response(JSON.stringify({ active: [] }), {
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("{}", { headers: { "content-type": "application/json" } });
+    }) as typeof fetch);
+
+    const ui = renderProvider();
+    await act(async () => { await pumpMicrotasks(); });
+
+    vi.useFakeTimers();
+    act(() => { ui.value.startRun(null); });
+    await act(async () => { await pumpMicrotasks(20); });
+    expect(ui.value.run?.status).toBe("done");
+
+    // Halfway through the dismiss window kick off a new run.
+    await act(async () => { vi.advanceTimersByTime(AUTO_DISMISS_DONE_MS / 2); });
+    expect(ui.value.run).not.toBeNull();
+    act(() => { ui.value.startRun(null); });
+    expect(ui.value.run?.status).toBe("running");
+    expect(ui.value.run?.runId).toBeNull();
+
+    // Advance past the moment the ORIGINAL dismiss timer would have fired.
+    // The second stream is idle (no frames), so if the old timer is still
+    // armed it would null the run.
+    await act(async () => {
+      vi.advanceTimersByTime(AUTO_DISMISS_DONE_MS);
+      await pumpMicrotasks(5);
+    });
+    expect(ui.value.run).not.toBeNull();
+    expect(ui.value.run?.status).toBe("running");
+  });
+
+  it("unmount during the dismiss window does not setState on an unmounted provider", async () => {
+    stubStreamFetch([
+      `data: ${JSON.stringify({ run_id: "rumnt", done: true, rows_queued: 0, ms: 0, cancelled: true })}\n\n`,
+    ]);
+    const errors: unknown[] = [];
+    const errSpy = vi.spyOn(console, "error").mockImplementation((...args) => { errors.push(args); });
+
+    const ui = renderProvider();
+    await act(async () => { await pumpMicrotasks(); });
+
+    vi.useFakeTimers();
+    act(() => { ui.value.startRun(null); });
+    await act(async () => { await pumpMicrotasks(20); });
+    expect(ui.value.run?.status).toBe("cancelled");
+
+    // Halfway through the dismiss window unmount, then keep advancing
+    // — the dismiss timer must NOT fire on the unmounted provider.
+    await act(async () => { vi.advanceTimersByTime(AUTO_DISMISS_DONE_MS / 2); });
+    ui.unmount();
+    await act(async () => { vi.advanceTimersByTime(AUTO_DISMISS_DONE_MS); });
+
+    // React's setState-after-unmount surface is `console.error` — check no
+    // such warning showed up.
+    expect(errors).toHaveLength(0);
+    errSpy.mockRestore();
   });
 });
