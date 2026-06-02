@@ -39,18 +39,36 @@ export interface GeneratorRoutesOpts {
   // hijacked SSE response carries the matching access-control-allow-origin
   // header that the cors plugin's onSend hook can't inject for a hijack.
   corsAllowed?: true | string | string[];
+  // Wave 5.40a — grace window (ms) during which a terminal run remains
+  // queryable via GET /generator/runs/:id/status so a refresh right after
+  // completion still surfaces the summary. Tests dial this down.
+  terminalGraceMs?: number;
 }
 
 const DEFAULT_ROWS = 200;
 const DEFAULT_CLASSES = ["GIRR", "Equity", "FX"] as const;
 const DEFAULT_SENSITIVITY_TYPES = ["Delta", "Vega"] as const;
 
-// Wave 5.20c — module-local registry of in-flight streaming runs. The cancel
-// endpoint and client-disconnect handler flip `cancelFlag.cancelled`; the
-// generation loop checks the flag at each row boundary and exits cleanly,
-// emitting a terminal frame with `cancelled: true`. Entries are evicted when
-// the run completes or is cancelled.
-interface ActiveRun { cancelFlag: { cancelled: boolean } }
+// Wave 5.40a — module-local registry of in-flight + recently-terminal runs.
+// The generation loop runs as a detached promise that owns the lifecycle of
+// these entries; the SSE handler is now a pure transport that pipes the
+// state into frames and stops writing on client disconnect. Cancellation is
+// only triggered explicitly via POST /generator/cancel/:run_id (closing the
+// browser tab no longer cancels the run — see Wave 5.40 spec).
+interface ActiveRun {
+  run_id: string;
+  status: "running" | "done" | "cancelled" | "error";
+  rows_done: number;
+  rows_total: number;
+  elapsed_ms: number;
+  rows_per_sec: number;
+  started_at_iso: string;
+  classes: string[];
+  sensitivity_types: string[];
+  cancelFlag: { cancelled: boolean };
+  error?: string;
+  terminal_at_ms?: number;
+}
 const activeRuns = new Map<string, ActiveRun>();
 
 // The producer accepts an ioredis Redis|Cluster client — the only surface it
@@ -189,11 +207,60 @@ export function registerGeneratorRoutes(
     };
   });
 
-  // Wave 5.20c — streaming variant that emits SSE progress frames every
-  // ~progressIntervalMs and a terminal completion frame. Same body shape as
-  // /generator/start; mirrors the setInterval-driven writer in
-  // observability.ts /observability/shards/stream.
+  // Wave 5.40a — streaming variant. The generation loop runs as a DETACHED
+  // promise that owns the lifecycle of an `activeRuns` entry; the SSE handler
+  // is a pure transport that pipes state into frames and stops writing on
+  // client disconnect WITHOUT cancelling the run (refresh-survival, see Wave
+  // 5.40 spec). Cancellation only happens via POST /generator/cancel/:run_id
+  // or via a producer/redis error.
   const progressIntervalMs = opts.sseProgressIntervalMs ?? 200;
+  const terminalGraceMs = opts.terminalGraceMs ?? 30_000;
+
+  // Detached generator loop. Mutates `state` in place; resolves when the run
+  // reaches a terminal status (done/cancelled/error). Never throws.
+  const runGenerator = async (
+    state: ActiveRun,
+    t0: bigint,
+    rows: number,
+    resolvedClasses: string[],
+    generator: ReturnType<typeof createRowGenerator>,
+    producer: ReturnType<typeof createStreamProducer>,
+    target_label: string,
+  ): Promise<void> => {
+    const tick = (): void => {
+      state.rows_done = producer.rowsSent;
+      const elapsed = Number(process.hrtime.bigint() - t0) / 1e6;
+      state.elapsed_ms = Math.round(elapsed);
+      state.rows_per_sec = elapsed > 0 ? Math.round((state.rows_done / elapsed) * 1000) : 0;
+    };
+    try {
+      for (let i = 0; i < rows; i++) {
+        if (state.cancelFlag.cancelled) break;
+        const riskClass = resolvedClasses[i % resolvedClasses.length]!;
+        const row = generator.generate(riskClass);
+        await producer.add(row);
+        tick();
+      }
+      await producer.flush();
+      await producer.close();
+      tick();
+    } catch (err) {
+      try { await producer.close(); } catch { /* swallow flush-on-close error */ }
+      const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
+      const msg = err instanceof Error ? err.message : String(err);
+      app.log.warn({ evt: "generator-stream", run_id: state.run_id, err: msg });
+      const errBody = translated
+        ? translated.body
+        : { error: `redis unreachable: ${msg}` };
+      state.error = (errBody as { error?: string }).error ?? "redis error";
+      tick();
+    }
+    if (state.error) state.status = "error";
+    else if (state.cancelFlag.cancelled) state.status = "cancelled";
+    else state.status = "done";
+    state.terminal_at_ms = Date.now();
+  };
+
   app.post<{ Body: GeneratorStartBody }>("/generator/start/stream", async (req, reply) => {
     if (!schema) {
       app.log.warn({ evt: "generator-stream", err: "schema-missing" });
@@ -249,12 +316,23 @@ export function registerGeneratorRoutes(
     }
 
     const run_id = ulid();
-    const cancelFlag = { cancelled: false };
-    activeRuns.set(run_id, { cancelFlag });
-
     const t0 = process.hrtime.bigint();
     const redis = getRedis();
     const target_label = getActiveTarget().label;
+
+    const state: ActiveRun = {
+      run_id,
+      status: "running",
+      rows_done: 0,
+      rows_total: rows,
+      elapsed_ms: 0,
+      rows_per_sec: 0,
+      started_at_iso: new Date().toISOString(),
+      classes: resolvedClasses,
+      sensitivity_types,
+      cancelFlag: { cancelled: false },
+    };
+    activeRuns.set(run_id, state);
 
     // Open the SSE channel before kicking off generation so the client
     // immediately sees `run_id` in the first progress frame.
@@ -268,14 +346,40 @@ export function registerGeneratorRoutes(
     });
     reply.hijack();
 
-    // Client-disconnect halts the run server-side (closing the browser tab,
-    // network drop, AbortController on the UI side). Listen on `reply.raw`
-    // (the response socket) — `req.raw` fires `close` as soon as Fastify
-    // finishes consuming the inbound JSON body, which would flip the cancel
-    // flag before the generation loop even starts.
-    const onClose = (): void => { cancelFlag.cancelled = true; };
-    reply.raw.on("close", onClose);
-    reply.raw.on("error", onClose);
+    // Wave 5.40a — client disconnect (browser refresh, tab close, network
+    // drop) ONLY stops writing SSE frames. The run continues server-side and
+    // the client recovers via GET /generator/runs/:id/status.
+    let clientConnected = true;
+    let interval: ReturnType<typeof setInterval> | null = null;
+    const stopWriting = (): void => {
+      if (!clientConnected) return;
+      clientConnected = false;
+      if (interval) { clearInterval(interval); interval = null; }
+    };
+    reply.raw.on("close", stopWriting);
+    reply.raw.on("error", stopWriting);
+
+    const writeFrame = (obj: unknown): void => {
+      if (!clientConnected) return;
+      try { reply.raw.write(`data: ${JSON.stringify(obj)}\n\n`); }
+      catch { stopWriting(); }
+    };
+    // Seed frame so the client has the run_id even when generation completes
+    // before the first interval tick (small synthetic batches).
+    writeFrame({ run_id, rows_done: 0, rows_total: rows, elapsed_ms: 0, rows_per_sec: 0 });
+
+    const emitProgress = (): void => {
+      if (!clientConnected) return;
+      if (state.status !== "running") return;
+      writeFrame({
+        run_id,
+        rows_done: state.rows_done,
+        rows_total: rows,
+        elapsed_ms: state.elapsed_ms,
+        rows_per_sec: state.rows_per_sec,
+      });
+    };
+    interval = setInterval(emitProgress, progressIntervalMs);
 
     const generator = createRowGenerator(schema, {
       seed: body.seed,
@@ -288,66 +392,95 @@ export function registerGeneratorRoutes(
       { stream: streamName, batchSize: 200 },
     );
 
-    const writeFrame = (obj: unknown): void => {
-      try { reply.raw.write(`data: ${JSON.stringify(obj)}\n\n`); }
-      catch { cancelFlag.cancelled = true; }
-    };
-    // Seed frame so the client has the run_id even when generation completes
-    // before the first interval tick (small synthetic batches).
-    writeFrame({ run_id, rows_done: 0, rows_total: rows, elapsed_ms: 0, rows_per_sec: 0 });
-
-    const emitProgress = (): void => {
-      if (cancelFlag.cancelled) return;
-      const rows_done = producer.rowsSent;
-      const elapsed_ms = Number(process.hrtime.bigint() - t0) / 1e6;
-      const rows_per_sec = elapsed_ms > 0 ? Math.round((rows_done / elapsed_ms) * 1000) : 0;
-      writeFrame({
-        run_id,
-        rows_done,
-        rows_total: rows,
-        elapsed_ms: Math.round(elapsed_ms),
-        rows_per_sec,
+    // Detached run — handle terminal frame + grace-eviction here so the
+    // route handler can return immediately after writing the seed frame.
+    void runGenerator(state, t0, rows, resolvedClasses, generator, producer, target_label)
+      .then(() => {
+        if (interval) { clearInterval(interval); interval = null; }
+        const msPrecise = Math.round(state.elapsed_ms * 1000) / 1000;
+        const cancelled = state.status === "cancelled";
+        const terminalFrame: Record<string, unknown> = {
+          run_id,
+          done: true,
+          rows_queued: state.rows_done,
+          ms: msPrecise,
+          cancelled,
+        };
+        if (state.error) terminalFrame.error = state.error;
+        if (clientConnected) {
+          try { reply.raw.write(`data: ${JSON.stringify(terminalFrame)}\n\n`); } catch { /* socket gone */ }
+          try { reply.raw.end(); } catch { /* socket already closed */ }
+          clientConnected = false;
+        }
+        if (!state.error) {
+          app.log.info({ evt: "generator-stream", run_id, rows_queued: state.rows_done, cancelled, classes: resolvedClasses, ms: state.elapsed_ms });
+        }
+        // Grace-eviction: keep the entry around for late-arriving clients
+        // (refresh right after completion) so /runs/:id/status still works.
+        setTimeout(() => { activeRuns.delete(run_id); }, terminalGraceMs).unref?.();
+      })
+      .catch((err: unknown) => {
+        // Defensive: runGenerator catches all producer errors internally, so
+        // this should never fire. Log + force-evict so a stuck entry can't
+        // linger in `activeRuns`.
+        const msg = err instanceof Error ? err.message : String(err);
+        app.log.error({ evt: "generator-stream", run_id, err: msg, stage: "detached" });
+        state.status = "error";
+        state.error = msg;
+        state.terminal_at_ms = Date.now();
+        if (interval) { clearInterval(interval); interval = null; }
+        if (clientConnected) {
+          try { reply.raw.end(); } catch { /* */ }
+          clientConnected = false;
+        }
+        setTimeout(() => { activeRuns.delete(run_id); }, terminalGraceMs).unref?.();
       });
+  });
+
+  // Wave 5.40a — status endpoint for a single run. Returns the public slice
+  // of ActiveRun (no cancelFlag internals). 404 if the run is unknown OR has
+  // already been grace-evicted.
+  app.get<{ Params: { id: string } }>("/generator/runs/:id/status", async (req, reply) => {
+    const id = req.params.id;
+    const entry = activeRuns.get(id);
+    if (!entry) {
+      reply.code(404);
+      return { error: "unknown run_id" };
+    }
+    return {
+      run_id: entry.run_id,
+      status: entry.status,
+      rows_done: entry.rows_done,
+      rows_total: entry.rows_total,
+      rows_per_sec: entry.rows_per_sec,
+      elapsed_ms: entry.elapsed_ms,
+      started_at_iso: entry.started_at_iso,
+      classes: entry.classes,
+      sensitivity_types: entry.sensitivity_types,
+      ...(entry.error ? { error: entry.error } : {}),
     };
-    const interval = setInterval(emitProgress, progressIntervalMs);
+  });
 
-    let errBody: { status: number; body: unknown } | null = null;
-    try {
-      for (let i = 0; i < rows; i++) {
-        if (cancelFlag.cancelled) break;
-        const riskClass = resolvedClasses[i % resolvedClasses.length]!;
-        const row = generator.generate(riskClass);
-        await producer.add(row);
+  // Wave 5.40a — orphan-discovery endpoint. The UI hits this on mount to
+  // adopt runs whose SSE stream died across a refresh.
+  app.get("/generator/runs", async () => {
+    const active: Array<{ run_id: string; status: string; rows_done: number; rows_total: number }> = [];
+    for (const entry of activeRuns.values()) {
+      if (entry.status === "running") {
+        active.push({
+          run_id: entry.run_id,
+          status: entry.status,
+          rows_done: entry.rows_done,
+          rows_total: entry.rows_total,
+        });
       }
-      await producer.flush();
-      await producer.close();
-    } catch (err) {
-      try { await producer.close(); } catch { /* swallow flush-on-close error */ }
-      const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
-      const msg = err instanceof Error ? err.message : String(err);
-      app.log.warn({ evt: "generator-stream", run_id, err: msg });
-      errBody = translated
-        ? { status: translated.status, body: translated.body }
-        : { status: 502, body: { error: `redis unreachable: ${msg}` } };
     }
-
-    clearInterval(interval);
-    const ms = Number(process.hrtime.bigint() - t0) / 1e6;
-    const rows_queued = producer.rowsSent;
-    const cancelled = cancelFlag.cancelled;
-    if (errBody) {
-      writeFrame({ run_id, done: true, rows_queued, ms: Math.round(ms * 1000) / 1000, cancelled, error: (errBody.body as { error?: string }).error ?? "redis error" });
-    } else {
-      writeFrame({ run_id, done: true, rows_queued, ms: Math.round(ms * 1000) / 1000, cancelled });
-      app.log.info({ evt: "generator-stream", run_id, rows_queued, cancelled, classes: resolvedClasses, ms });
-    }
-    try { reply.raw.end(); } catch { /* socket already closed */ }
-    activeRuns.delete(run_id);
+    return { active };
   });
 
   // Wave 5.20c — cancel a streaming run by id. Flips the cancel flag; the
-  // generation loop notices at the next row boundary, drains the in-flight
-  // batch, and emits a terminal frame with `cancelled: true`.
+  // detached generation loop notices at the next row boundary, drains the
+  // in-flight batch, and transitions to terminal status "cancelled".
   app.post<{ Params: { run_id: string } }>("/generator/cancel/:run_id", async (req, reply) => {
     const id = req.params.run_id;
     const entry = activeRuns.get(id);

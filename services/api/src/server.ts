@@ -100,6 +100,10 @@ export interface CreateServerOpts {
   // (default 200ms). Tests dial this down so cancellation lands before a
   // small synthetic batch completes.
   generatorSseProgressIntervalMs?: number;
+  // Wave 5.40a — grace window (ms) during which a terminal generator run
+  // remains queryable via GET /generator/runs/:id/status. Default 30s.
+  // Tests dial this down to verify grace-eviction.
+  generatorTerminalGraceMs?: number;
   // Wave 5.16g — explicit override for the CORS allow-list. When unset the
   // server reads `ALLOWED_ORIGINS` from the environment (comma-separated, or
   // `*` for any origin) and falls back to http://localhost:3000 — the nginx
@@ -189,6 +193,7 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
   registerObservabilityRoutes(app, getRedis, { sseIntervalMs: opts.sseIntervalMs, corsAllowed });
   registerGeneratorRoutes(app, getRedis, opts.schema, {
     sseProgressIntervalMs: opts.generatorSseProgressIntervalMs,
+    terminalGraceMs: opts.generatorTerminalGraceMs,
     corsAllowed,
   });
   registerAdminRoutes(app, getRedis);

@@ -234,6 +234,24 @@ function delayedPipelineFakeRedis(): PipelineFakeRedis {
   return base;
 }
 
+// Wave 5.40a — slower variant for timing-sensitive detached-run tests. Adds
+// a real timeout between batches so the run stays "running" long enough for
+// the test to observe orphan-discovery / cancel / status-while-running.
+function slowPipelineFakeRedis(perBatchMs = 5): PipelineFakeRedis {
+  const base = pipelineFakeRedis();
+  const origPipeline = base.pipeline.bind(base);
+  base.pipeline = () => {
+    const p = origPipeline();
+    const origExec = p.exec.bind(p);
+    p.exec = async () => {
+      await new Promise<void>((r) => setTimeout(r, perBatchMs));
+      return origExec();
+    };
+    return p;
+  };
+  return base;
+}
+
 describe("POST /generator/start/stream (Wave 5.20c) — SSE progress + cancellation", () => {
   let app: Awaited<ReturnType<typeof createServer>>;
   afterEach(async () => { if (app) await app.close(); });
@@ -372,9 +390,172 @@ describe("POST /generator/start/stream (Wave 5.20c) — SSE progress + cancellat
     expect(res.json()).toEqual({ ok: false, error: "unknown run_id" });
   });
 
-  it("client-disconnect halts the run server-side", async () => {
+  // Wave 5.40a — refresh-survival. The old behaviour (client-disconnect
+  // flipped cancelFlag) is reversed: a client disconnect now ONLY stops
+  // writing SSE frames; the detached generator loop keeps producing rows
+  // until natural completion. The client recovers via /generator/runs/:id/status.
+  it("client-disconnect does NOT halt the run server-side (refresh-survival)", async () => {
     const schema = loadFixtureSchema();
     const fr = delayedPipelineFakeRedis();
+    app = await createServer({ redis: fr, schema, generatorSseProgressIntervalMs: 5 });
+    await app.listen({ port: 0, host: "127.0.0.1" });
+    const addr = app.server.address();
+    if (!addr || typeof addr === "string") throw new Error("no addr");
+    const port = addr.port;
+
+    const http = await import("node:http");
+    const req = http.request({
+      host: "127.0.0.1",
+      port,
+      path: "/generator/start/stream",
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "text/event-stream" },
+    });
+    req.write(JSON.stringify({ rows: 600 }));
+    req.end();
+
+    const res = await new Promise<import("http").IncomingMessage>((resolveRes) => req.on("response", resolveRes));
+    let buf = "";
+    let runId: string | undefined;
+    await new Promise<void>((r) => {
+      res.on("data", (c: Buffer) => {
+        buf += c.toString();
+        const frames = parseSseFrames(buf);
+        if (frames.length >= 1 && typeof frames[0]!.run_id === "string") {
+          runId = frames[0]!.run_id as string;
+          // Abort the client connection mid-run.
+          req.destroy();
+          r();
+        }
+      });
+    });
+    expect(runId).toBeTruthy();
+
+    // Run continues server-side. Poll /runs/:id/status until it reaches
+    // terminal "done". With 600 rows + setImmediate per batch we expect
+    // completion within a few hundred ms.
+    let statusJson: { status?: string; rows_done?: number; rows_total?: number } | null = null;
+    for (let i = 0; i < 100; i++) {
+      const statusRes = await app.inject({ method: "GET", url: `/generator/runs/${runId}/status` });
+      expect(statusRes.statusCode).toBe(200);
+      statusJson = statusRes.json() as typeof statusJson;
+      if (statusJson?.status === "done") break;
+      await new Promise<void>((r) => setTimeout(r, 20));
+    }
+    expect(statusJson?.status).toBe("done");
+    expect(statusJson?.rows_done).toBe(600);
+    expect(statusJson?.rows_total).toBe(600);
+    // All 600 rows actually queued, despite the client disconnect.
+    expect(fr.xadds.length).toBe(600);
+  });
+
+  it("GET /generator/runs/:id/status returns 404 for an unknown id", async () => {
+    const schema = loadFixtureSchema();
+    const fr = pipelineFakeRedis();
+    app = await createServer({ redis: fr, schema });
+
+    const res = await app.inject({ method: "GET", url: "/generator/runs/01HXNOTAREAL/status" });
+    expect(res.statusCode).toBe(404);
+    expect(res.json().error).toMatch(/unknown run_id/);
+  });
+
+  it("GET /generator/runs/:id/status reflects running progress before completion", async () => {
+    const schema = loadFixtureSchema();
+    const fr = delayedPipelineFakeRedis();
+    app = await createServer({ redis: fr, schema, generatorSseProgressIntervalMs: 5 });
+
+    const streamPromise = app.inject({
+      method: "POST",
+      url: "/generator/start/stream",
+      payload: { rows: 600 },
+      headers: { accept: "text/event-stream" },
+      payloadAsStream: true,
+    });
+    await new Promise<void>((r) => setImmediate(r));
+    await new Promise<void>((r) => setImmediate(r));
+    const streamRes = await streamPromise;
+    const stream = streamRes.stream() as unknown as NodeJS.ReadableStream;
+
+    let pre = "";
+    let runId: string | undefined;
+    const onData = (chunk: Buffer | string): void => {
+      pre += chunk.toString();
+      if (!runId) {
+        const frames = parseSseFrames(pre);
+        if (frames.length > 0 && typeof frames[0]!.run_id === "string") {
+          runId = frames[0]!.run_id as string;
+        }
+      }
+    };
+    stream.on("data", onData);
+    for (let i = 0; i < 50 && !runId; i++) await new Promise<void>((r) => setImmediate(r));
+    expect(runId).toBeTruthy();
+
+    // Poll status while the run is still in flight.
+    let sawRunning = false;
+    for (let i = 0; i < 50; i++) {
+      const statusRes = await app.inject({ method: "GET", url: `/generator/runs/${runId}/status` });
+      expect(statusRes.statusCode).toBe(200);
+      const j = statusRes.json();
+      expect(j.run_id).toBe(runId);
+      expect(j.rows_total).toBe(600);
+      expect(typeof j.rows_done).toBe("number");
+      if (j.status === "running") sawRunning = true;
+      if (j.status === "done") break;
+      await new Promise<void>((r) => setTimeout(r, 5));
+    }
+    expect(sawRunning).toBe(true);
+    // Drain to let the run finish so afterEach close is clean.
+    await collectStream(stream);
+  });
+
+  it("GET /generator/runs lists active runs", async () => {
+    const schema = loadFixtureSchema();
+    const fr = delayedPipelineFakeRedis();
+    app = await createServer({ redis: fr, schema, generatorSseProgressIntervalMs: 5 });
+
+    const streamPromise = app.inject({
+      method: "POST",
+      url: "/generator/start/stream",
+      payload: { rows: 600 },
+      headers: { accept: "text/event-stream" },
+      payloadAsStream: true,
+    });
+    await new Promise<void>((r) => setImmediate(r));
+    await new Promise<void>((r) => setImmediate(r));
+    const streamRes = await streamPromise;
+    const stream = streamRes.stream() as unknown as NodeJS.ReadableStream;
+
+    let pre = "";
+    let runId: string | undefined;
+    stream.on("data", (chunk: Buffer | string) => {
+      pre += chunk.toString();
+      if (!runId) {
+        const frames = parseSseFrames(pre);
+        if (frames.length > 0 && typeof frames[0]!.run_id === "string") {
+          runId = frames[0]!.run_id as string;
+        }
+      }
+    });
+    for (let i = 0; i < 50 && !runId; i++) await new Promise<void>((r) => setImmediate(r));
+    expect(runId).toBeTruthy();
+
+    const runsRes = await app.inject({ method: "GET", url: "/generator/runs" });
+    expect(runsRes.statusCode).toBe(200);
+    const j = runsRes.json() as { active: Array<{ run_id: string; status: string }> };
+    expect(Array.isArray(j.active)).toBe(true);
+    const found = j.active.find((e) => e.run_id === runId);
+    expect(found).toBeTruthy();
+    expect(found!.status).toBe("running");
+
+    await collectStream(stream);
+  });
+
+  it("GET /generator/runs returns active runs after client disconnect (orphan discovery)", async () => {
+    const schema = loadFixtureSchema();
+    // Use the slow pipeline so the run stays "running" long enough for the
+    // post-disconnect /runs probe to observe it.
+    const fr = slowPipelineFakeRedis(5);
     app = await createServer({ redis: fr, schema, generatorSseProgressIntervalMs: 5 });
     await app.listen({ port: 0, host: "127.0.0.1" });
     const addr = app.server.address();
@@ -394,22 +575,138 @@ describe("POST /generator/start/stream (Wave 5.20c) — SSE progress + cancellat
 
     const res = await new Promise<import("http").IncomingMessage>((resolveRes) => req.on("response", resolveRes));
     let buf = "";
+    let runId: string | undefined;
     await new Promise<void>((r) => {
       res.on("data", (c: Buffer) => {
         buf += c.toString();
-        if (parseSseFrames(buf).length >= 1) {
-          // Abort the client connection.
+        const frames = parseSseFrames(buf);
+        if (frames.length >= 1 && typeof frames[0]!.run_id === "string") {
+          runId = frames[0]!.run_id as string;
           req.destroy();
           r();
         }
       });
     });
-    // Give the server time to notice the close + drain.
-    await new Promise<void>((r) => setTimeout(r, 50));
-    const xaddsAtClose = fr.xadds.length;
-    await new Promise<void>((r) => setTimeout(r, 100));
-    // No further XADDs after the client disconnected.
-    expect(fr.xadds.length).toBe(xaddsAtClose);
-    expect(fr.xadds.length).toBeLessThan(2000);
+    expect(runId).toBeTruthy();
+
+    // Give the server a tick to notice the close — run should still be running.
+    await new Promise<void>((r) => setTimeout(r, 10));
+    const runsRes = await app.inject({ method: "GET", url: "/generator/runs" });
+    expect(runsRes.statusCode).toBe(200);
+    const j = runsRes.json() as { active: Array<{ run_id: string; status: string }> };
+    const found = j.active.find((e) => e.run_id === runId);
+    expect(found).toBeTruthy();
+    expect(found!.status).toBe("running");
+
+    // Let the run finish so the afterEach close is clean.
+    for (let i = 0; i < 100; i++) {
+      const st = await app.inject({ method: "GET", url: `/generator/runs/${runId}/status` });
+      if (st.statusCode === 200 && (st.json() as { status: string }).status === "done") break;
+      await new Promise<void>((r) => setTimeout(r, 20));
+    }
+  });
+
+  it("terminal-grace: status is queryable after completion, then evicted", async () => {
+    const schema = loadFixtureSchema();
+    const fr = pipelineFakeRedis();
+    app = await createServer({
+      redis: fr,
+      schema,
+      generatorSseProgressIntervalMs: 5,
+      generatorTerminalGraceMs: 100,
+    });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/generator/start/stream",
+      payload: { rows: 10, seed: "wave-5.40a-grace" },
+      headers: { accept: "text/event-stream" },
+      payloadAsStream: true,
+    });
+    const body = await collectStream(res.stream() as unknown as NodeJS.ReadableStream);
+    const frames = parseSseFrames(body);
+    const runId = frames[0]!.run_id as string;
+    expect(typeof runId).toBe("string");
+
+    // Immediately after completion, the entry is still queryable.
+    const inGrace = await app.inject({ method: "GET", url: `/generator/runs/${runId}/status` });
+    expect(inGrace.statusCode).toBe(200);
+    const inGraceJson = inGrace.json();
+    expect(inGraceJson.status).toBe("done");
+    expect(inGraceJson.rows_done).toBe(10);
+
+    // After the grace window, the entry is evicted → 404.
+    await new Promise<void>((r) => setTimeout(r, 200));
+    const evicted = await app.inject({ method: "GET", url: `/generator/runs/${runId}/status` });
+    expect(evicted.statusCode).toBe(404);
+  });
+
+  it("POST /generator/cancel works for a detached run (no SSE client attached)", async () => {
+    const schema = loadFixtureSchema();
+    // Slower pipeline + larger row count so cancel definitively lands before
+    // the natural completion of the detached run.
+    const fr = slowPipelineFakeRedis(5);
+    app = await createServer({
+      redis: fr,
+      schema,
+      generatorSseProgressIntervalMs: 5,
+      generatorTerminalGraceMs: 5_000,
+    });
+    await app.listen({ port: 0, host: "127.0.0.1" });
+    const addr = app.server.address();
+    if (!addr || typeof addr === "string") throw new Error("no addr");
+    const port = addr.port;
+
+    const http = await import("node:http");
+    const req = http.request({
+      host: "127.0.0.1",
+      port,
+      path: "/generator/start/stream",
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "text/event-stream" },
+    });
+    req.write(JSON.stringify({ rows: 5000 }));
+    req.end();
+
+    const res = await new Promise<import("http").IncomingMessage>((resolveRes) => req.on("response", resolveRes));
+    let buf = "";
+    let runId: string | undefined;
+    await new Promise<void>((r) => {
+      res.on("data", (c: Buffer) => {
+        buf += c.toString();
+        const frames = parseSseFrames(buf);
+        if (frames.length >= 1 && typeof frames[0]!.run_id === "string") {
+          runId = frames[0]!.run_id as string;
+          req.destroy();
+          r();
+        }
+      });
+    });
+    expect(runId).toBeTruthy();
+    // Brief pause so the server actually has the run going.
+    await new Promise<void>((r) => setTimeout(r, 10));
+
+    // Cancel the detached run — there is no SSE client attached.
+    const cancelRes = await app.inject({ method: "POST", url: `/generator/cancel/${runId}` });
+    expect(cancelRes.statusCode).toBe(200);
+    expect(cancelRes.json()).toEqual({ ok: true, cancelled: true, run_id: runId });
+
+    // Poll until terminal.
+    let finalStatus: string | undefined;
+    let finalRowsDone = -1;
+    for (let i = 0; i < 100; i++) {
+      const st = await app.inject({ method: "GET", url: `/generator/runs/${runId}/status` });
+      if (st.statusCode === 200) {
+        const j = st.json() as { status: string; rows_done: number };
+        finalStatus = j.status;
+        finalRowsDone = j.rows_done;
+        if (j.status !== "running") break;
+      }
+      await new Promise<void>((r) => setTimeout(r, 20));
+    }
+    expect(finalStatus).toBe("cancelled");
+    // Cancel landed before all rows were written.
+    expect(finalRowsDone).toBeLessThan(5000);
+    expect(fr.xadds.length).toBeLessThan(5000);
   });
 });
