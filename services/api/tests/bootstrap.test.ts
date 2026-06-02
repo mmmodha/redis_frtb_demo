@@ -36,7 +36,13 @@ function fakeStandalone(recorded: RecordedCall[]): RedisLike {
 
 function fakeCluster(nodeIds: string[], recorded: RecordedCall[]): RedisLike {
   const nodes = nodeIds.map((id) => fakeNode(id, recorded));
-  return { nodes: (_role: string) => nodes } as unknown as RedisLike;
+  // Wave 5.30a — Step 3 SUGLEN/SUGADD route through the cluster client
+  // directly (NOT per-master). The fake cluster routes those calls to the
+  // first node so the recorder still picks them up under a real shard id.
+  return {
+    nodes: (_role: string) => nodes,
+    call: (command: string, ...args: unknown[]) => (nodes[0] as { call: (c: string, ...a: unknown[]) => Promise<unknown> }).call(command, ...args),
+  } as unknown as RedisLike;
 }
 
 // Wave 5.16f1: bootstrap now registers all 9 (risk_class × leg) snippets
@@ -113,7 +119,92 @@ describe("bootstrap — bootstrapFrtb (standalone)", () => {
         nodes: 1,
         functions: result.functions.functions,
       },
+      {
+        service: "api",
+        bootstrap: "suggesters",
+        action: "backfilled",
+        counts: { book: 0, trade_id: 0, risk_factor: 0 },
+      },
     ]);
+  });
+});
+
+// Wave 5.30a — Step 3 backfill suite. Drives bootstrapFrtb against a fake
+// that returns canned FT.AGGREGATE replies for each suggester field, then
+// asserts the right SUGLEN/SUGADD argv lands on the client.
+function fakeStandaloneWithReplies(
+  recorded: RecordedCall[],
+  replies: Record<string, unknown>,
+): RedisLike {
+  return {
+    async call(command: string, ...args: unknown[]) {
+      const cmd = String(command).toUpperCase();
+      recorded.push({ node: "standalone", command: cmd, args });
+      if (cmd === "FT.AGGREGATE") {
+        const field = String(args[4] ?? "").replace(/^@/, "");
+        return replies[`agg:${field}`] ?? "OK";
+      }
+      if (cmd === "FT.SUGLEN") return replies[`len:${String(args[0])}`] ?? 0;
+      return "OK";
+    },
+  } as unknown as RedisLike;
+}
+
+describe("bootstrap — Step 3 backfill suggesters", () => {
+  it("issues FT.SUGADD once per distinct value per field and logs the counts", async () => {
+    const schema = loadSchema(SCHEMA_PATH);
+    const recorded: RecordedCall[] = [];
+    const r = fakeStandaloneWithReplies(recorded, {
+      // FT.AGGREGATE reply layout: [total, [field, value], [field, value], ...]
+      "agg:book": [3, ["book", "BOOK-A"], ["book", "BOOK-B"], ["book", "BOOK-C"]],
+      "agg:trade_id": [2, ["trade_id", "T0001"], ["trade_id", "T0002"]],
+      "agg:risk_factor": [1, ["risk_factor", "RF_GIRR_01"]],
+      "len:sug:book": 0,
+      "len:sug:trade_id": 0,
+      "len:sug:risk_factor": 0,
+    });
+    const logs: Record<string, unknown>[] = [];
+    await bootstrapFrtb(r, schema, (e) => logs.push(e));
+
+    const sugadds = recorded.filter((c) => c.command === "FT.SUGADD");
+    expect(sugadds).toHaveLength(6);
+    const bookValues = sugadds.filter((c) => c.args[0] === "sug:book").map((c) => c.args[1]);
+    expect(bookValues.sort()).toEqual(["BOOK-A", "BOOK-B", "BOOK-C"]);
+    const tradeValues = sugadds.filter((c) => c.args[0] === "sug:trade_id").map((c) => c.args[1]);
+    expect(tradeValues.sort()).toEqual(["T0001", "T0002"]);
+    const factorValues = sugadds.filter((c) => c.args[0] === "sug:risk_factor").map((c) => c.args[1]);
+    expect(factorValues).toEqual(["RF_GIRR_01"]);
+    // Every SUGADD writes a score of "1" (no INCR — replace semantics so the
+    // backfill is idempotent on re-run).
+    for (const c of sugadds) expect(c.args[2]).toBe("1");
+
+    const last = logs[logs.length - 1]!;
+    expect(last).toMatchObject({
+      bootstrap: "suggesters",
+      action: "backfilled",
+      counts: { book: 3, trade_id: 2, risk_factor: 1 },
+    });
+  });
+
+  it("skips FT.AGGREGATE/FT.SUGADD when FT.SUGLEN reports a populated dictionary (idempotent on restart)", async () => {
+    const schema = loadSchema(SCHEMA_PATH);
+    const recorded: RecordedCall[] = [];
+    const r = fakeStandaloneWithReplies(recorded, {
+      "len:sug:book": 5,
+      "len:sug:trade_id": 7,
+      "len:sug:risk_factor": 3,
+    });
+    const logs: Record<string, unknown>[] = [];
+    await bootstrapFrtb(r, schema, (e) => logs.push(e));
+
+    expect(recorded.filter((c) => c.command === "FT.SUGADD")).toHaveLength(0);
+    expect(recorded.filter((c) => c.command === "FT.AGGREGATE")).toHaveLength(0);
+    const last = logs[logs.length - 1]!;
+    expect(last).toMatchObject({
+      bootstrap: "suggesters",
+      action: "backfilled",
+      counts: { book: 5, trade_id: 7, risk_factor: 3 },
+    });
   });
 });
 

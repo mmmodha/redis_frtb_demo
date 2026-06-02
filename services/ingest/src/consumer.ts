@@ -109,6 +109,19 @@ export async function processBatch(
       const key = buildKey(hashTag, ulid);
       const doc = buildDoc(msg);
       pipeline.call("JSON.SET", key, "$", JSON.stringify(doc));
+      // Wave 5.30a — autocomplete suggester live-populate. INCR bumps the
+      // score on duplicate values so frequent terms rank higher in FT.SUGGET.
+      // Pipelined alongside JSON.SET (and before XACK) so a SUGADD failure
+      // rolls back the ack and the row is redelivered.
+      if (doc.book) {
+        pipeline.call("FT.SUGADD", "sug:book", String(doc.book), "1", "INCR");
+      }
+      if (doc.trade_id) {
+        pipeline.call("FT.SUGADD", "sug:trade_id", String(doc.trade_id), "1", "INCR");
+      }
+      if (doc.risk_factor) {
+        pipeline.call("FT.SUGADD", "sug:risk_factor", String(doc.risk_factor), "1", "INCR");
+      }
       pipeline.xack(opts.stream, opts.group, entryId);
       processed++;
     }

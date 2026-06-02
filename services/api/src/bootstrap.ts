@@ -119,6 +119,67 @@ export async function bootstrapFrtb(
     functions,
   });
 
+  // Step 3 (Wave 5.30a): backfill the three autocomplete suggesters from
+  // idx:sens. FT.AGGREGATE GROUPBY pulls every distinct value for each
+  // tenant field (book / trade_id / risk_factor); FT.SUGADD writes them into
+  // `sug:<field>`. The reads fan out per-master because FT.AGGREGATE on a
+  // cluster only hits the slot the routing key landed on; the writes use
+  // the cluster client directly so ioredis routes each SUGADD to the single
+  // shard that owns the suggester key (per-master duplication would create
+  // three inconsistent copies). Idempotent on restart: gated by FT.SUGLEN —
+  // a non-empty dictionary is left untouched so re-running bootstrap after a
+  // crash is a no-op for the suggester layer.
+  const sugCounts: Record<string, number> = { book: 0, trade_id: 0, risk_factor: 0 };
+  for (const fieldName of ["book", "trade_id", "risk_factor"] as const) {
+    const sugKey = `sug:${fieldName}`;
+    let existing = 0;
+    try {
+      const lenReply = await client.call("FT.SUGLEN", sugKey);
+      existing = Number(lenReply) || 0;
+    } catch {
+      existing = 0;
+    }
+    if (existing > 0) {
+      sugCounts[fieldName] = existing;
+      continue;
+    }
+    const distinct = new Set<string>();
+    for (const node of nodes) {
+      try {
+        const aggReply = (await node.call(
+          "FT.AGGREGATE", "idx:sens", "*",
+          "GROUPBY", "1", `@${fieldName}`,
+          "LIMIT", "0", "100000",
+          "DIALECT", "2",
+        )) as unknown[];
+        if (!Array.isArray(aggReply)) continue;
+        for (let i = 1; i < aggReply.length; i++) {
+          const row = aggReply[i];
+          if (!Array.isArray(row)) continue;
+          for (let j = 0; j < row.length; j += 2) {
+            const k = String(row[j]).replace(/^@/, "");
+            if (k === fieldName) {
+              const v = String(row[j + 1]);
+              if (v.length > 0) distinct.add(v);
+            }
+          }
+        }
+      } catch {
+        // Index missing on this shard / cold start — skip; the live ingest
+        // hook will populate the suggester as rows arrive.
+      }
+    }
+    for (const value of distinct) {
+      try {
+        await client.call("FT.SUGADD", sugKey, value, "1");
+      } catch {
+        // A single bad value should not abort the whole backfill.
+      }
+    }
+    sugCounts[fieldName] = distinct.size;
+  }
+  log({ service: "api", bootstrap: "suggesters", action: "backfilled", counts: sugCounts });
+
   return {
     index: { nodes: nodes.length },
     functions: { nodes: nodes.length, functions },

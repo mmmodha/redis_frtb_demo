@@ -121,6 +121,90 @@ describe("consumer pure helpers", () => {
 });
 
 
+// Wave 5.30a — unit suite for the per-row SUGADD hook. Drives processBatch
+// with a stub client that records every pipeline call so the test can assert
+// the exact sequence (JSON.SET → SUGADD×N → XACK) without booting a real
+// Redis Stack. Uses processBatch directly because xreadgroup is the only
+// non-pipeline call and is straightforward to stub.
+interface RecordedPipelineCall { command: string; args: unknown[] }
+function pipelineStub(record: RecordedPipelineCall[]): ReturnType<Redis["pipeline"]> {
+  const pl = {
+    call(command: string, ...args: unknown[]) {
+      record.push({ command: command.toUpperCase(), args });
+      return pl;
+    },
+    xack(stream: string, group: string, id: string) {
+      record.push({ command: "XACK", args: [stream, group, id] });
+      return pl;
+    },
+    async exec() {
+      return record.map(() => [null, "OK"] as [Error | null, unknown]);
+    },
+  };
+  return pl as unknown as ReturnType<Redis["pipeline"]>;
+}
+
+describe("consumer SUGADD live-populate hook [Wave 5.30a]", () => {
+  it("emits one SUGADD per non-null tenant field per row, between JSON.SET and XACK", async () => {
+    const record: RecordedPipelineCall[] = [];
+    const stub = {
+      pipeline: () => pipelineStub(record),
+      async xreadgroup(..._a: unknown[]) {
+        // Two rows: first has all three fields, second has only trade_id.
+        return [[
+          "sensitivities:in",
+          [
+            ["1-0", [
+              "risk_class", "GIRR",
+              "bucket", "USD",
+              "_hash_tag", "GIRR:USD",
+              "_id", "01HZA",
+              "payload", JSON.stringify({ trade_id: "T0001", risk_factor: "RF_GIRR_01", book: "RATES-LDN" }),
+            ]],
+            ["2-0", [
+              "risk_class", "EQUITY",
+              "bucket", "1",
+              "_hash_tag", "EQUITY:1",
+              "_id", "01HZB",
+              "payload", JSON.stringify({ trade_id: "T0002" }),
+            ]],
+          ],
+        ]];
+      },
+    } as unknown as Redis;
+    const n = await processBatch(stub, { stream: "sensitivities:in", group: "ingest", consumerName: "c1" }, ">");
+    expect(n).toBe(2);
+
+    const sugadds = record.filter((r) => r.command === "FT.SUGADD");
+    // Row 1 contributes 3 (book + trade_id + risk_factor), row 2 contributes 1 (trade_id only) = 4 total.
+    expect(sugadds).toHaveLength(4);
+    // Each carries the value, score "1", and INCR mode.
+    for (const c of sugadds) {
+      expect(c.args[2]).toBe("1");
+      expect(c.args[3]).toBe("INCR");
+    }
+    const bookCalls = sugadds.filter((c) => c.args[0] === "sug:book");
+    expect(bookCalls).toHaveLength(1);
+    expect(bookCalls[0]!.args[1]).toBe("RATES-LDN");
+    const tradeCalls = sugadds.filter((c) => c.args[0] === "sug:trade_id");
+    expect(tradeCalls.map((c) => c.args[1]).sort()).toEqual(["T0001", "T0002"]);
+    const factorCalls = sugadds.filter((c) => c.args[0] === "sug:risk_factor");
+    expect(factorCalls.map((c) => c.args[1])).toEqual(["RF_GIRR_01"]);
+
+    // Order check: every SUGADD must appear AFTER its preceding JSON.SET and
+    // BEFORE the matching XACK so a SUGADD pipeline-level failure prevents
+    // the entry leaving the PEL.
+    const jsonSetIdxs = record.map((r, i) => (r.command === "JSON.SET" ? i : -1)).filter((i) => i >= 0);
+    const sugIdxs = record.map((r, i) => (r.command === "FT.SUGADD" ? i : -1)).filter((i) => i >= 0);
+    const xackIdxs = record.map((r, i) => (r.command === "XACK" ? i : -1)).filter((i) => i >= 0);
+    expect(jsonSetIdxs).toHaveLength(2);
+    expect(xackIdxs).toHaveLength(2);
+    // First row block: JSON.SET[0] < every SUGADD for that row < XACK[0].
+    expect(sugIdxs[0]).toBeGreaterThan(jsonSetIdxs[0]!);
+    expect(sugIdxs[2]).toBeLessThan(xackIdxs[0]!);
+  });
+});
+
 // Integration tests run only when JSON.SET is available on the local Redis.
 // Per Wave 1 follow-up #1, use it.skipIf() not the legacy if-guard pattern so
 // coverage stays visible. In CI / on demo workstations redis-stack-server is
