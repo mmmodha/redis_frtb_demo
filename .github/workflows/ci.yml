@@ -20,7 +20,7 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 20
     services:
       redis-stack:
@@ -97,7 +97,7 @@ jobs:
           retention-days: 7
 
   testcontainers:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
     # GitHub-hosted runners ship a working Docker daemon at
     # /var/run/docker.sock, so the four it.skipIf(!HAS_DOCKER) tests
