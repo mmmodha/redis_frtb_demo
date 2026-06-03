@@ -12,6 +12,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@frtb/redis-client": "^0.0.1",
     "commander": "^12.1.0",
     "ioredis": "^5.4.2",
     "pino": "^9.5.0",
