@@ -135,6 +135,12 @@ jobs:
           sudo apt-get install -y redis-stack-server
           dpkg -l redis-stack-server | tail -1
           which redis-stack-server
+          echo "--- /opt/redis-stack layout ---"
+          ls -la /opt/redis-stack/ 2>/dev/null || echo "no /opt/redis-stack"
+          ls -la /opt/redis-stack/bin/ 2>/dev/null || echo "no /opt/redis-stack/bin"
+          ls -la /opt/redis-stack/lib/ 2>/dev/null || echo "no /opt/redis-stack/lib"
+          echo "--- dpkg -L ---"
+          dpkg -L redis-stack-server | grep -E "\.so$|/bin/" | head -30
       - name: Verify Docker is available (required for testcontainers tests)
         run: |
           docker info
