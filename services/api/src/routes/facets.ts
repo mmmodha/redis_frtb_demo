@@ -4,11 +4,15 @@ import { getActiveTarget } from "../active-target.ts";
 import { getBootstrapStatus } from "../bootstrap-status.ts";
 import { translateRedisError } from "../redis-errors.ts";
 
-// Wave 5.56 — facet counts backing the Search / Calc / JSON Explorer
-// dropdowns. Single FT.AGGREGATE pulls (risk_class, bucket, sensitivity_type)
-// group counts in one round trip so the UI can hide classes/buckets/sens-types
-// that have zero rows in the active index instead of presenting all 7×16×3
-// hardcoded combinations.
+// Wave 5.56 / 5.66 — facet counts backing the Search / Calc / JSON Explorer
+// dropdowns. FT.AGGREGATE ... GROUPBY on Redis Search 8 only returns the input
+// count when WITHCURSOR is not specified, so we drive a cursor and drain pages
+// of grouped (risk_class, bucket, sensitivity_type) counts before tallying.
+// UI hides classes/buckets/sens-types that report zero rows in the active
+// index instead of presenting all 7×16×3 hardcoded combinations.
+
+const CURSOR_PAGE = 1000;
+const MAX_GROUPS = 50000;
 
 interface FacetsResponseOk {
   ok: true;
@@ -31,10 +35,19 @@ interface FacetsResponseEmpty {
   bucket_by_risk_class: Record<string, Record<string, number>>;
 }
 
-// FT.AGGREGATE reply for `GROUPBY 3 ... REDUCE COUNT 0 AS n` on RESP2 is a
-// flat array: [num_groups, [field, val, field, val, ...], [field, val, ...]].
-// Older Redis Stack builds emit a single-element array containing just the
-// count when no rows match — guard against both shapes.
+// FT.AGGREGATE ... WITHCURSOR / FT.CURSOR READ each return [result, cursor_id].
+// result is the standard aggregate payload [N, row1, row2, ...] where each row
+// is a flat [field, val, ...] array. Older builds occasionally elide the
+// cursor wrapper when no rows exist; we then treat the raw payload as the
+// result with cursor_id=0. Search 8 also occasionally returns just [N] on the
+// first page (no rows) and only emits rows through subsequent FT.CURSOR READs.
+function parseCursorReply(raw: unknown): { result: unknown; cursorId: number } {
+  if (Array.isArray(raw) && raw.length === 2) {
+    return { result: raw[0], cursorId: Number(raw[1]) || 0 };
+  }
+  return { result: raw, cursorId: 0 };
+}
+
 function parseAggregateRows(raw: unknown): Array<Record<string, string>> {
   if (!Array.isArray(raw) || raw.length < 2) return [];
   const out: Array<Record<string, string>> = [];
@@ -50,6 +63,15 @@ function parseAggregateRows(raw: unknown): Array<Record<string, string>> {
     out.push(m);
   }
   return out;
+}
+
+async function deleteCursor(redis: RedisLike, cursorId: number): Promise<void> {
+  if (cursorId === 0) return;
+  try {
+    await redis.call("FT.CURSOR", "DEL", "idx:sens", String(cursorId));
+  } catch {
+    /* best-effort cleanup */
+  }
 }
 
 function isUnknownIndexError(err: unknown): boolean {
@@ -79,9 +101,10 @@ export function registerFacetsRoute(
     const target_label = getActiveTarget().label;
     const t0 = process.hrtime.bigint();
 
-    let raw: unknown;
+    const rows: Array<Record<string, string>> = [];
+    let cursorId = 0;
     try {
-      raw = await redis.call(
+      const first = await redis.call(
         "FT.AGGREGATE",
         "idx:sens",
         "*",
@@ -95,13 +118,32 @@ export function registerFacetsRoute(
         "0",
         "AS",
         "n",
-        "LIMIT",
-        "0",
-        "10000",
+        "WITHCURSOR",
+        "COUNT",
+        String(CURSOR_PAGE),
         "DIALECT",
         "2",
       );
+      const parsed = parseCursorReply(first);
+      cursorId = parsed.cursorId;
+      for (const r of parseAggregateRows(parsed.result)) rows.push(r);
+
+      while (cursorId !== 0 && rows.length < MAX_GROUPS) {
+        const next = await redis.call(
+          "FT.CURSOR",
+          "READ",
+          "idx:sens",
+          String(cursorId),
+          "COUNT",
+          String(CURSOR_PAGE),
+        );
+        const np = parseCursorReply(next);
+        cursorId = np.cursorId;
+        for (const r of parseAggregateRows(np.result)) rows.push(r);
+      }
     } catch (err) {
+      await deleteCursor(redis, cursorId);
+      cursorId = 0;
       const ms = Math.round((Number(process.hrtime.bigint() - t0) / 1e6) * 1000) / 1000;
       // The spec asks for a 200 empty-index shape when idx:sens is missing,
       // overriding the 412 translateRedisError would otherwise return.
@@ -116,8 +158,11 @@ export function registerFacetsRoute(
       throw err;
     }
 
+    // Drained successfully; close out a still-open cursor when we bailed on
+    // the MAX_GROUPS guard rather than reading to completion.
+    await deleteCursor(redis, cursorId);
+
     const ms = Math.round((Number(process.hrtime.bigint() - t0) / 1e6) * 1000) / 1000;
-    const rows = parseAggregateRows(raw);
 
     if (rows.length === 0) {
       return emptyResponse(target_label, ms);
