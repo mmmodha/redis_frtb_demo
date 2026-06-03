@@ -1,6 +1,12 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import { createServer } from "../../src/server.ts";
 import { fakeRedis } from "../helpers/fake-redis.ts";
+import { __resetFacetsCacheForTests } from "../../src/routes/facets.ts";
+import {
+  setActiveTarget,
+  setActiveTargetLabel,
+  resetActiveTarget,
+} from "../../src/active-target.ts";
 
 // FT.AGGREGATE RESP2 shape for GROUPBY ... REDUCE COUNT 0 AS n:
 //   [ num_groups, [field, val, field, val, ...], [field, val, ...] ]
@@ -25,8 +31,18 @@ function cursorReply(rows: Array<Record<string, string | number>>, cursorId: num
 describe("GET /facets", () => {
   let app: Awaited<ReturnType<typeof createServer>>;
 
+  beforeEach(() => {
+    // Wave 5.67 — the route now caches the body for 30 s keyed by active-
+    // target identity. Tests share the default identity (127.0.0.1:6379),
+    // so without this reset a body cached by an earlier case would serve
+    // the next case before its fake-redis was consulted.
+    __resetFacetsCacheForTests();
+  });
+
   afterEach(async () => {
     if (app) await app.close();
+    resetActiveTarget();
+    vi.useRealTimers();
   });
 
   it("aggregates FT.AGGREGATE rows into risk_class / sensitivity_type / bucket_by_risk_class counts", async () => {
@@ -209,5 +225,135 @@ describe("GET /facets", () => {
 
     const res = await app.inject({ method: "GET", url: "/facets" });
     expect(res.statusCode).toBe(500);
+  });
+
+  // Wave 5.67 — short-TTL (30 s) response cache.
+
+  it("serves the second back-to-back call from cache without calling FT.AGGREGATE", async () => {
+    const fr = fakeRedis();
+    fr.setResponse(
+      "FT.AGGREGATE",
+      cursorReply(
+        [{ risk_class: "GIRR", bucket: "USD-IRS", sensitivity_type: "Delta", n: 10 }],
+        0,
+      ),
+    );
+    app = await createServer({ redis: fr });
+
+    const r1 = await app.inject({ method: "GET", url: "/facets" });
+    expect(r1.statusCode).toBe(200);
+    const b1 = r1.json();
+    expect(b1.ok).toBe(true);
+    expect(b1.cached).toBe(false);
+
+    const r2 = await app.inject({ method: "GET", url: "/facets" });
+    expect(r2.statusCode).toBe(200);
+    const b2 = r2.json();
+    expect(b2.ok).toBe(true);
+    expect(b2.cached).toBe(true);
+    expect(b2.total_rows).toBe(b1.total_rows);
+    expect(b2.risk_class).toEqual(b1.risk_class);
+
+    // Only the first call should have hit FT.AGGREGATE.
+    const aggCalls = fr.calls.filter((c) => c.command === "FT.AGGREGATE");
+    expect(aggCalls.length).toBe(1);
+  });
+
+  it("invalidates the cache when active-target identity changes (cached=false on second call)", async () => {
+    const fr = fakeRedis();
+    fr.setResponse(
+      "FT.AGGREGATE",
+      cursorReply(
+        [{ risk_class: "GIRR", bucket: "USD-IRS", sensitivity_type: "Delta", n: 1 }],
+        0,
+      ),
+    );
+    app = await createServer({ redis: fr });
+
+    const r1 = await app.inject({ method: "GET", url: "/facets" });
+    expect(r1.json().cached).toBe(false);
+
+    // Identity switch — different host/port. onActiveTargetChange fires and
+    // clears the cache.
+    setActiveTarget({
+      host: "other-host",
+      port: 6380,
+      tls: false,
+      db: 0,
+      label: "other-cluster",
+    });
+
+    const r2 = await app.inject({ method: "GET", url: "/facets" });
+    const b2 = r2.json();
+    expect(b2.ok).toBe(true);
+    expect(b2.cached).toBe(false);
+    const aggCalls = fr.calls.filter((c) => c.command === "FT.AGGREGATE");
+    expect(aggCalls.length).toBe(2);
+  });
+
+  it("preserves the cache across a label-only rename of the active target", async () => {
+    setActiveTarget({
+      host: "h1",
+      port: 6379,
+      tls: false,
+      db: 0,
+      label: "original-label",
+    });
+    // First call after the setActiveTarget above primes the cache; the
+    // identity-change listener has already cleared any stale entry.
+    const fr = fakeRedis();
+    fr.setResponse(
+      "FT.AGGREGATE",
+      cursorReply(
+        [{ risk_class: "FX", bucket: "USD", sensitivity_type: "Delta", n: 7 }],
+        0,
+      ),
+    );
+    app = await createServer({ redis: fr });
+
+    const r1 = await app.inject({ method: "GET", url: "/facets" });
+    expect(r1.json().cached).toBe(false);
+    expect(r1.json().target_label).toBe("original-label");
+
+    // Label-only rename — must NOT bump credsGeneration / fire listeners,
+    // so the cached body is still valid and returned with cached=true.
+    setActiveTargetLabel("renamed-label");
+
+    const r2 = await app.inject({ method: "GET", url: "/facets" });
+    const b2 = r2.json();
+    expect(b2.cached).toBe(true);
+    const aggCalls = fr.calls.filter((c) => c.command === "FT.AGGREGATE");
+    expect(aggCalls.length).toBe(1);
+  });
+
+  it("re-drains FT.AGGREGATE after the 30 s TTL expires", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-03T00:00:00Z"));
+
+    const fr = fakeRedis();
+    fr.setResponse(
+      "FT.AGGREGATE",
+      cursorReply(
+        [{ risk_class: "EQUITY", bucket: "1", sensitivity_type: "Vega", n: 3 }],
+        0,
+      ),
+    );
+    app = await createServer({ redis: fr });
+
+    const r1 = await app.inject({ method: "GET", url: "/facets" });
+    expect(r1.json().cached).toBe(false);
+
+    // Within TTL — still cached.
+    vi.advanceTimersByTime(29_000);
+    const r2 = await app.inject({ method: "GET", url: "/facets" });
+    expect(r2.json().cached).toBe(true);
+
+    // Past TTL — fresh drain.
+    vi.advanceTimersByTime(2_000);
+    const r3 = await app.inject({ method: "GET", url: "/facets" });
+    expect(r3.json().cached).toBe(false);
+
+    const aggCalls = fr.calls.filter((c) => c.command === "FT.AGGREGATE");
+    expect(aggCalls.length).toBe(2);
   });
 });

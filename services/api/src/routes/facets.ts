@@ -1,6 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import type { RedisLike } from "../redis-like.ts";
-import { getActiveTarget } from "../active-target.ts";
+import { getActiveTarget, onActiveTargetChange } from "../active-target.ts";
 import { getBootstrapStatus } from "../bootstrap-status.ts";
 import { translateRedisError } from "../redis-errors.ts";
 
@@ -10,9 +10,20 @@ import { translateRedisError } from "../redis-errors.ts";
 // of grouped (risk_class, bucket, sensitivity_type) counts before tallying.
 // UI hides classes/buckets/sens-types that report zero rows in the active
 // index instead of presenting all 7×16×3 hardcoded combinations.
+//
+// Wave 5.67 — Short-TTL (30 s) in-process cache. Re-opening Search / Calc /
+// JSON Explorer in quick succession used to pay the full cursor drain
+// (~2-3 s on 220k rows) each time. We cache the response body keyed by the
+// active-target IDENTITY tuple (host/port/db/tls/clusterMode) — label is
+// intentionally excluded so a rename of the currently-active profile does
+// NOT invalidate the cache. `setActiveTarget` (identity / creds rotation)
+// fires `onActiveTargetChange`, which clears the cache immediately. No
+// generator-finish event exists today; a fresh ingest will be picked up by
+// the next call after TTL expiry.
 
 const CURSOR_PAGE = 1000;
 const MAX_GROUPS = 50000;
+const CACHE_TTL_MS = 30_000;
 
 interface FacetsResponseOk {
   ok: true;
@@ -22,6 +33,7 @@ interface FacetsResponseOk {
   risk_class: Record<string, number>;
   sensitivity_type: Record<string, number>;
   bucket_by_risk_class: Record<string, Record<string, number>>;
+  cached: boolean;
 }
 
 interface FacetsResponseEmpty {
@@ -33,6 +45,30 @@ interface FacetsResponseEmpty {
   risk_class: Record<string, number>;
   sensitivity_type: Record<string, number>;
   bucket_by_risk_class: Record<string, Record<string, number>>;
+  cached: boolean;
+}
+
+type FacetsBody = FacetsResponseOk | FacetsResponseEmpty;
+
+function identityKey(): string {
+  const t = getActiveTarget();
+  return `${t.host}|${t.port}|${t.db ?? 0}|${t.tls ? 1 : 0}|${t.clusterMode ? 1 : 0}`;
+}
+
+let cache: { key: string; body: FacetsBody; expiresAt: number } | null = null;
+
+// Identity / creds rotation fires onActiveTargetChange (setActiveTargetLabel
+// intentionally does NOT, so renames preserve the cache). Registered at
+// module load — listeners are stored in a Set so this is idempotent across
+// repeated server instantiations in tests.
+onActiveTargetChange(() => {
+  cache = null;
+});
+
+// Exported for tests so module-global cache state can be reset between cases
+// without restarting the test runner.
+export function __resetFacetsCacheForTests(): void {
+  cache = null;
 }
 
 // FT.AGGREGATE ... WITHCURSOR / FT.CURSOR READ each return [result, cursor_id].
@@ -89,6 +125,7 @@ function emptyResponse(target_label: string, ms: number): FacetsResponseEmpty {
     risk_class: {},
     sensitivity_type: {},
     bucket_by_risk_class: {},
+    cached: false,
   };
 }
 
@@ -97,9 +134,16 @@ export function registerFacetsRoute(
   getRedis: () => RedisLike,
 ): void {
   app.get("/facets", async (_req, reply) => {
+    const t0 = process.hrtime.bigint();
+    const key = identityKey();
+    const now = Date.now();
+    if (cache && cache.key === key && cache.expiresAt > now) {
+      const ms = Math.round((Number(process.hrtime.bigint() - t0) / 1e6) * 1000) / 1000;
+      return { ...cache.body, ms, cached: true };
+    }
+
     const redis = getRedis();
     const target_label = getActiveTarget().label;
-    const t0 = process.hrtime.bigint();
 
     const rows: Array<Record<string, string>> = [];
     let cursorId = 0;
@@ -148,8 +192,12 @@ export function registerFacetsRoute(
       // The spec asks for a 200 empty-index shape when idx:sens is missing,
       // overriding the 412 translateRedisError would otherwise return.
       if (isUnknownIndexError(err)) {
-        return emptyResponse(target_label, ms);
+        const body = emptyResponse(target_label, ms);
+        cache = { key, body, expiresAt: Date.now() + CACHE_TTL_MS };
+        return body;
       }
+      // Transient / translatable errors must NOT be cached — a 412 during
+      // bootstrap should not stick around for 30 s after the index comes up.
       const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
       if (translated) {
         reply.code(translated.status);
@@ -165,7 +213,9 @@ export function registerFacetsRoute(
     const ms = Math.round((Number(process.hrtime.bigint() - t0) / 1e6) * 1000) / 1000;
 
     if (rows.length === 0) {
-      return emptyResponse(target_label, ms);
+      const body = emptyResponse(target_label, ms);
+      cache = { key, body, expiresAt: Date.now() + CACHE_TTL_MS };
+      return body;
     }
 
     const risk_class: Record<string, number> = {};
@@ -196,7 +246,9 @@ export function registerFacetsRoute(
       risk_class,
       sensitivity_type,
       bucket_by_risk_class,
+      cached: false,
     };
+    cache = { key, body, expiresAt: Date.now() + CACHE_TTL_MS };
     return body;
   });
 }
