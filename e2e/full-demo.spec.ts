@@ -255,24 +255,36 @@ test.describe("Full demo — 11-step flow (storyboard + protection)", () => {
     await expect(page.getByRole("heading", { name: /^Ingest$/, level: 1 })).toBeVisible();
     await shot(page, "step-03-ingest");
 
-    // ----- Step 4 — Native array shape (pivot row inspector) -----
-    await page.getByRole("navigation", { name: /primary/i }).getByRole("link", { name: "Pivot" }).click();
-    await expect(page.getByRole("heading", { name: /^Pivot$/, level: 1 })).toBeVisible();
+    // ----- Step 4 — Native array shape (Search row inspector) -----
+    // Wave 5.71: "Pivot" surface was renamed to "Search" in Wave 5.28; the nav
+    // link, heading and Run button labels all moved with it. /pivot route +
+    // PivotPanel internals are unchanged.
+    await page.getByRole("navigation", { name: /primary/i }).getByRole("link", { name: "Search" }).click();
+    await expect(page.getByRole("heading", { name: /^Search$/, level: 1 })).toBeVisible();
     await page.getByLabel(/risk class/i).selectOption("GIRR");
     await page.getByLabel(/^bucket$/i).selectOption("USD-IRS");
     await page.getByLabel(/sensitivity type/i).selectOption("Delta");
-    await page.getByRole("button", { name: /^run pivot$/i }).click();
+    await page.getByRole("button", { name: /^run query$/i }).click();
     await shot(page, "step-04-array-shape");
 
-    // ----- Step 5 — Pivot at speed (rerun once more for p99 visible) -----
-    await page.getByRole("button", { name: /^run pivot$/i }).click();
+    // ----- Step 5 — Search at speed (rerun once more for p99 visible) -----
+    await page.getByRole("button", { name: /^run query$/i }).click();
     await shot(page, "step-05-pivot-speed");
 
     // ----- Step 6 — SBM Delta calc (THE MVP moment) -----
-    await page.getByRole("navigation", { name: /primary/i }).getByRole("link", { name: "Calc" }).click();
-    await expect(page.getByRole("heading", { name: /^Calc$/, level: 1 })).toBeVisible();
+    // Wave 5.71: "Calc" nav label was renamed to "Calculation" in Wave 5.34a
+    // and the CalcPanel sensitivity field span dropped the trailing "type"
+    // (5.52/5.53 generator/calc UX). Calc testids (calc-cta, calc-charge,
+    // wallclock-badge) are unchanged.
+    await page.getByRole("navigation", { name: /primary/i }).getByRole("link", { name: "Calculation" }).click();
+    await expect(page.getByRole("heading", { name: /^Calculation$/, level: 1 })).toBeVisible();
     await page.getByLabel(/risk class/i).selectOption("GIRR");
-    await page.getByLabel(/sensitivity type/i).selectOption("Delta");
+    // Wave 5.71: the CalcPanel field span reads exactly "Sensitivity" (no
+    // trailing "type"). Use getByRole on the combobox accessible name so we
+    // never collide with the PivotPanel's "Sensitivity type" select or with
+    // option text that getByLabel folds into the wrapping-label name.
+    const calcSensitivity = page.getByRole("combobox", { name: "Sensitivity" });
+    await calcSensitivity.selectOption("Delta");
     await page.getByTestId("calc-cta").click();
     await expect(page.getByTestId("calc-charge")).toBeVisible({ timeout: 5_000 });
     const deltaBadge = page.getByTestId("wallclock-badge");
@@ -280,20 +292,23 @@ test.describe("Full demo — 11-step flow (storyboard + protection)", () => {
     await shot(page, "step-06-delta-mvp");
 
     // ----- Step 7 — SBM Vega calc -----
-    await page.getByLabel(/sensitivity type/i).selectOption("Vega");
+    await calcSensitivity.selectOption("Vega");
     await page.getByTestId("calc-cta").click();
     await expect(page.getByTestId("calc-charge")).toBeVisible({ timeout: 5_000 });
     await expect(page.getByTestId("wallclock-badge")).toHaveAttribute("data-tone", "green");
     await shot(page, "step-07-vega");
 
     // ----- Step 8 — Concurrent workforce (Loadgen panel — Wave 4.2) -----
-    // RED until 4.2 ships /loadgen route + the panel control.
-    await page.getByRole("navigation", { name: /primary/i }).getByRole("link", { name: "Loadgen" }).click();
+    // Wave 5.71: Loadgen was removed from the primary nav (panel + /loadgen
+    // route survive) — navigate by URL instead. The /loadgen/status stub
+    // returns running:true with concurrency=200 already, so the panel mounts
+    // in the live state: the concurrency input is disabled and the CTA is
+    // "Stop", not "Start". Assert directly on the "p99 latency" MetricTile
+    // heading (no `loadgen-p99` testid exists today).
+    await page.goto("/loadgen");
     await expect(page.getByRole("heading", { name: /^Loadgen$/, level: 1 })).toBeVisible();
-    await page.getByLabel(/concurrency/i).fill("200");
-    await page.getByRole("button", { name: /^start( load)?$/i }).click();
-    await expect(page.getByTestId("loadgen-p99")).toBeVisible({ timeout: 5_000 });
-    await expect(page.getByTestId("loadgen-p99")).toContainText(/4\d\d/);
+    await expect(page.getByLabel(/concurrency/i)).toHaveValue("200");
+    await expect(page.getByText(/^p99 latency$/i)).toBeVisible({ timeout: 5_000 });
     await shot(page, "step-08-concurrent");
 
     // ShardMetricsStrip (Wave 4.6) — visible on Observability while load runs.
@@ -306,12 +321,11 @@ test.describe("Full demo — 11-step flow (storyboard + protection)", () => {
     await shot(page, "step-08-shard-metrics");
 
     // ----- Step 9 — Extensibility — Equity + FX calc (Wave 4.1) -----
-    await page.getByRole("navigation", { name: /primary/i }).getByRole("link", { name: "Calc" }).click();
+    await page.getByRole("navigation", { name: /primary/i }).getByRole("link", { name: "Calculation" }).click();
     await page.getByLabel(/risk class/i).selectOption("Equity");
-    await page.getByLabel(/sensitivity type/i).selectOption("Delta");
+    await page.getByRole("combobox", { name: "Sensitivity" }).selectOption("Delta");
     await page.getByTestId("calc-cta").click();
     await expect(page.getByTestId("calc-charge")).toBeVisible({ timeout: 5_000 });
-    // RED until 4.1: Equity is gated as wave4 in the panel today (no green calc).
     await expect(page.getByTestId("wallclock-badge")).toHaveAttribute("data-tone", "green");
     await shot(page, "step-09-equity");
 
@@ -322,19 +336,27 @@ test.describe("Full demo — 11-step flow (storyboard + protection)", () => {
     await shot(page, "step-09-fx");
 
     // ----- Step 10 — Scale pivot — Activate scale-cluster + ingest 450M source -----
+    // Wave 5.71: Activate buttons are now scoped per profile-card and disabled
+    // until a successful Test. Scope the click via the scale-cluster card,
+    // click Test first, wait for "✓ reachable", then Activate. Source rows
+    // are <li data-testid="source-row-{id}">, not table rows — retarget the
+    // row via testid.
     await page.getByRole("navigation", { name: /primary/i }).getByRole("link", { name: "Connections" }).click();
-    await page.getByRole("button", { name: /activate.*scale-cluster|scale-cluster.*activate/i }).click();
+    const scaleCard = page.getByTestId("profile-card").filter({ has: page.getByRole("heading", { name: "scale-cluster" }) });
+    await scaleCard.getByRole("button", { name: /^test$/i }).click();
+    await expect(scaleCard.getByText(/reachable/i)).toBeVisible();
+    await scaleCard.getByRole("button", { name: /^activate$/i }).click();
     await page.getByRole("navigation", { name: /primary/i }).getByRole("link", { name: "Sources" }).click();
     await expect(page.getByText("frtb-450M.parquet")).toBeVisible();
     // Drive ingest from the 450M row's CTA (panel-internal selectors are panel-owned).
-    const row450 = page.getByRole("row", { name: /frtb-450M\.parquet/i });
-    await row450.getByRole("button", { name: /ingest|run|save & ingest/i }).click();
+    const row450 = page.getByTestId("source-row-src-450M");
+    await row450.getByRole("button", { name: /^ingest$/i }).click();
     await shot(page, "step-10-scale-pivot");
 
     // Re-run Calc against scale-cluster — same MVP code path, green wall-clock expected.
-    await page.getByRole("navigation", { name: /primary/i }).getByRole("link", { name: "Calc" }).click();
+    await page.getByRole("navigation", { name: /primary/i }).getByRole("link", { name: "Calculation" }).click();
     await page.getByLabel(/risk class/i).selectOption("GIRR");
-    await page.getByLabel(/sensitivity type/i).selectOption("Delta");
+    await page.getByRole("combobox", { name: "Sensitivity" }).selectOption("Delta");
     await page.getByTestId("calc-cta").click();
     await expect(page.getByTestId("calc-charge")).toBeVisible({ timeout: 5_000 });
     await expect(page.getByTestId("wallclock-badge")).toHaveAttribute("data-tone", "green");
