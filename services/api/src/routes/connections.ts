@@ -8,6 +8,7 @@
 
 import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import type { ConnectionsStore, ConnectionProfile, RedactedProfile, TestResult, CreateInput } from "../store.ts";
+import { DuplicateEndpointError } from "../store.ts";
 import { setActiveTarget } from "../active-target.ts";
 import * as inflight from "../inflight-registry.ts";
 
@@ -65,9 +66,25 @@ export function registerConnectionsRoutes(
   tester?: ConnectionTester,
 ): void {
   app.post<{ Body: CreateInput }>("/connections", async (req, reply) => {
-    const p = await store.create(req.body);
-    reply.code(201);
-    return publicProfile(p);
+    try {
+      const p = await store.create(req.body);
+      reply.code(201);
+      return publicProfile(p);
+    } catch (err) {
+      if (err instanceof DuplicateEndpointError) {
+        reply.code(409);
+        return {
+          error: "duplicate-endpoint",
+          message: err.message,
+          existing_id: err.existing_id,
+          existing_name: err.existing_name,
+          host: err.host,
+          port: err.port,
+          db: err.db,
+        };
+      }
+      throw err;
+    }
   });
 
   app.get("/connections", async () => (await store.list()).map(publicProfile));
@@ -112,7 +129,24 @@ export function registerConnectionsRoutes(
         };
       }
     }
-    const p = await store.update(req.params.id, req.body);
+    let p: RedactedProfile | null;
+    try {
+      p = await store.update(req.params.id, req.body);
+    } catch (err) {
+      if (err instanceof DuplicateEndpointError) {
+        reply.code(409);
+        return {
+          error: "duplicate-endpoint",
+          message: err.message,
+          existing_id: err.existing_id,
+          existing_name: err.existing_name,
+          host: err.host,
+          port: err.port,
+          db: err.db,
+        };
+      }
+      throw err;
+    }
     if (!p) { reply.code(404); return { error: "not found" }; }
     if (isActive) {
       const raw = store.getActiveRaw();

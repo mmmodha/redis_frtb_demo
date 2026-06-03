@@ -61,6 +61,27 @@ async function getJson<T>(path: string): Promise<T> {
   return (await res.json()) as T;
 }
 
+// Wave 5.60 — typed error raised when the api refuses a create/update because
+// another profile already owns the same `(host, port, db)` triple. The panel
+// surfaces this inline in the Add/Edit dialog with a "Switch to Edit"
+// affordance pointing at `existing_id`.
+export class DuplicateEndpointError extends Error {
+  existing_id: string;
+  existing_name: string;
+  host: string;
+  port: number;
+  db: number;
+  constructor(d: { existing_id: string; existing_name: string; host: string; port: number; db: number }) {
+    super(`duplicate endpoint ${d.host}:${d.port}/${d.db} (${d.existing_name})`);
+    this.name = "DuplicateEndpointError";
+    this.existing_id = d.existing_id;
+    this.existing_name = d.existing_name;
+    this.host = d.host;
+    this.port = d.port;
+    this.db = d.db;
+  }
+}
+
 async function sendJson<T>(path: string, method: "POST" | "PUT" | "DELETE", body?: unknown): Promise<T | undefined> {
   const init: RequestInit = {
     method,
@@ -68,6 +89,20 @@ async function sendJson<T>(path: string, method: "POST" | "PUT" | "DELETE", body
     body: body !== undefined ? JSON.stringify(body) : undefined,
   };
   const res = await fetch(`${apiBase()}${path}`, init);
+  if (res.status === 409) {
+    let body: { error?: unknown; existing_id?: unknown; existing_name?: unknown; host?: unknown; port?: unknown; db?: unknown } = {};
+    try { body = (await res.json()) as typeof body; } catch { /* ignore */ }
+    if (body.error === "duplicate-endpoint") {
+      throw new DuplicateEndpointError({
+        existing_id: String(body.existing_id ?? ""),
+        existing_name: String(body.existing_name ?? ""),
+        host: String(body.host ?? ""),
+        port: Number(body.port ?? 0),
+        db: Number(body.db ?? 0),
+      });
+    }
+    throw new Error(`api ${path} ${res.status}`);
+  }
   if (!res.ok) throw new Error(`api ${path} ${res.status}`);
   if (res.status === 204) return undefined;
   return (await res.json()) as T;

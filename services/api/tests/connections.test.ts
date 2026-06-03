@@ -252,4 +252,140 @@ describe("/connections HTTP routes", () => {
     expect(body.label).toBe("default");
     expect(body.password).toBeUndefined();
   });
+
+  describe("Wave 5.60 — duplicate-endpoint guard", () => {
+    it("POST duplicate (host, port, db) → 409 with duplicate-endpoint payload", async () => {
+      const first = await app.inject({
+        method: "POST", url: "/connections",
+        payload: { name: "first", host: "rs.demo", port: 12000, db: 0 },
+      });
+      expect(first.statusCode).toBe(201);
+      const firstId = first.json().id;
+
+      const dup = await app.inject({
+        method: "POST", url: "/connections",
+        payload: { name: "dup", host: "rs.demo", port: 12000, db: 0 },
+      });
+      expect(dup.statusCode).toBe(409);
+      expect(dup.json()).toMatchObject({
+        error: "duplicate-endpoint",
+        existing_id: firstId,
+        existing_name: "first",
+        host: "rs.demo",
+        port: 12000,
+        db: 0,
+      });
+    });
+
+    it("first POST of a unique endpoint still works", async () => {
+      const res = await app.inject({
+        method: "POST", url: "/connections",
+        payload: { name: "unique", host: "rs.unique", port: 12000 },
+      });
+      expect(res.statusCode).toBe(201);
+    });
+
+    it("PUT changing host to an existing endpoint → 409", async () => {
+      const a = await app.inject({
+        method: "POST", url: "/connections",
+        payload: { name: "a", host: "rs.a", port: 12000 },
+      });
+      const b = await app.inject({
+        method: "POST", url: "/connections",
+        payload: { name: "b", host: "rs.b", port: 12000 },
+      });
+      const aId = a.json().id;
+      const bId = b.json().id;
+
+      const put = await app.inject({
+        method: "PUT", url: `/connections/${bId}`,
+        payload: { host: "rs.a" },
+      });
+      expect(put.statusCode).toBe(409);
+      expect(put.json()).toMatchObject({
+        error: "duplicate-endpoint",
+        existing_id: aId,
+        existing_name: "a",
+      });
+    });
+
+    it("PUT to the same endpoint (no host/port/db change) on the SAME profile → 200", async () => {
+      const created = await app.inject({
+        method: "POST", url: "/connections",
+        payload: { name: "demo", host: "rs.demo", port: 12000 },
+      });
+      const id = created.json().id;
+      const put = await app.inject({
+        method: "PUT", url: `/connections/${id}`,
+        payload: { name: "demo-renamed" },
+      });
+      expect(put.statusCode).toBe(200);
+      expect(put.json().name).toBe("demo-renamed");
+    });
+
+    it("case-insensitive host match (REDIS-1.LAB vs redis-1.lab) → 409", async () => {
+      await app.inject({
+        method: "POST", url: "/connections",
+        payload: { name: "lower", host: "redis-1.lab", port: 12000 },
+      });
+      const dup = await app.inject({
+        method: "POST", url: "/connections",
+        payload: { name: "upper", host: "REDIS-1.LAB", port: 12000 },
+      });
+      expect(dup.statusCode).toBe(409);
+      expect(dup.json().error).toBe("duplicate-endpoint");
+    });
+
+    it("whitespace-trim in host comparison → 409", async () => {
+      await app.inject({
+        method: "POST", url: "/connections",
+        payload: { name: "clean", host: "rs.demo", port: 12000 },
+      });
+      const dup = await app.inject({
+        method: "POST", url: "/connections",
+        payload: { name: "padded", host: "  rs.demo  ", port: 12000 },
+      });
+      expect(dup.statusCode).toBe(409);
+      expect(dup.json().error).toBe("duplicate-endpoint");
+    });
+
+    it("missing-db vs db:0 treated as equal → 409", async () => {
+      await app.inject({
+        method: "POST", url: "/connections",
+        payload: { name: "no-db", host: "rs.demo", port: 12000 }, // db missing
+      });
+      const dup = await app.inject({
+        method: "POST", url: "/connections",
+        payload: { name: "db-zero", host: "rs.demo", port: 12000, db: 0 },
+      });
+      expect(dup.statusCode).toBe(409);
+      expect(dup.json().error).toBe("duplicate-endpoint");
+    });
+
+    it("inflight 409 payload remains distinguishable from duplicate-endpoint", async () => {
+      const { register, resetInflightRegistryForTests } = await import("../src/inflight-registry.ts");
+      resetInflightRegistryForTests();
+      const created = await app.inject({
+        method: "POST", url: "/connections",
+        payload: { name: "demo", host: "rs.demo", port: 12000 },
+      });
+      const id = created.json().id;
+      await app.inject({ method: "POST", url: `/connections/${id}/activate` });
+      const handle = register("loadgen", "loadgen-1");
+      try {
+        const blocked = await app.inject({
+          method: "PUT", url: `/connections/${id}`,
+          payload: { host: "rs.new-host" },
+        });
+        expect(blocked.statusCode).toBe(409);
+        // The inflight payload uses `inflight` array, not `error: "duplicate-endpoint"`.
+        const body = blocked.json();
+        expect(body.error).not.toBe("duplicate-endpoint");
+        expect(Array.isArray(body.inflight)).toBe(true);
+      } finally {
+        handle.release();
+        resetInflightRegistryForTests();
+      }
+    });
+  });
 });

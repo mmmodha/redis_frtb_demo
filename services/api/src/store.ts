@@ -76,6 +76,41 @@ export interface CreateStoreOpts {
   masterKey: string;
 }
 
+// Wave 5.60 — thrown by create/update when a profile already exists for the
+// same `(host, port, db)` triple. Host comparison is case-insensitive and
+// whitespace-trimmed; missing/null `db` is normalised to 0. Routes catch this
+// and translate it into a 409 with `error: "duplicate-endpoint"`.
+export interface DuplicateEndpointDetails {
+  existing_id: string;
+  existing_name: string;
+  host: string;
+  port: number;
+  db: number;
+}
+export class DuplicateEndpointError extends Error {
+  existing_id: string;
+  existing_name: string;
+  host: string;
+  port: number;
+  db: number;
+  constructor(d: DuplicateEndpointDetails) {
+    super(`profile for ${d.host}:${d.port}/${d.db} already exists (${d.existing_name})`);
+    this.name = "DuplicateEndpointError";
+    this.existing_id = d.existing_id;
+    this.existing_name = d.existing_name;
+    this.host = d.host;
+    this.port = d.port;
+    this.db = d.db;
+  }
+}
+
+function normaliseHost(h: string): string {
+  return (h ?? "").trim().toLowerCase();
+}
+function normaliseDb(db: number | null | undefined): number {
+  return db == null ? 0 : db;
+}
+
 export async function createStore(opts: CreateStoreOpts): Promise<ConnectionsStore> {
   const cipher = createCipher(opts.masterKey);
   const state: PersistedState = loadOrInit(opts.filePath, cipher);
@@ -94,8 +129,29 @@ export async function createStore(opts: CreateStoreOpts): Promise<ConnectionsSto
     return redactSecrets({ ...p });
   }
 
+  // Wave 5.60 — return the first profile matching the (host, port, db) tuple,
+  // or null. Host is matched case-insensitively / whitespace-trimmed; db is
+  // normalised to 0 when missing on either side.
+  function findByEndpoint(host: string, port: number, db: number | null | undefined): ConnectionProfile | null {
+    const h = normaliseHost(host);
+    const d = normaliseDb(db);
+    return state.profiles.find(
+      (x) => normaliseHost(x.host) === h && x.port === port && normaliseDb(x.db) === d,
+    ) ?? null;
+  }
+
   return {
     async create(input) {
+      const dup = findByEndpoint(input.host, input.port, input.db);
+      if (dup) {
+        throw new DuplicateEndpointError({
+          existing_id: dup.id,
+          existing_name: dup.name,
+          host: dup.host,
+          port: dup.port,
+          db: normaliseDb(dup.db),
+        });
+      }
       const now = new Date().toISOString();
       const p: ConnectionProfile = { ...input, id: ulid(), created_at: now, updated_at: now };
       state.profiles.push(p);
@@ -114,6 +170,28 @@ export async function createStore(opts: CreateStoreOpts): Promise<ConnectionsSto
     async update(id, patch) {
       const p = state.profiles.find((x) => x.id === id);
       if (!p) return null;
+      // Wave 5.60 — only check duplicates when the patch actually changes
+      // host/port/db (the endpoint tuple). A no-op or name-only patch on the
+      // same profile must NOT trigger a false positive.
+      const nextHost = patch.host !== undefined ? patch.host : p.host;
+      const nextPort = patch.port !== undefined ? patch.port : p.port;
+      const nextDb = patch.db !== undefined ? patch.db : p.db;
+      const endpointChanges =
+        normaliseHost(nextHost) !== normaliseHost(p.host) ||
+        nextPort !== p.port ||
+        normaliseDb(nextDb) !== normaliseDb(p.db);
+      if (endpointChanges) {
+        const dup = findByEndpoint(nextHost, nextPort, nextDb);
+        if (dup && dup.id !== id) {
+          throw new DuplicateEndpointError({
+            existing_id: dup.id,
+            existing_name: dup.name,
+            host: dup.host,
+            port: dup.port,
+            db: normaliseDb(dup.db),
+          });
+        }
+      }
       Object.assign(p, patch, { updated_at: new Date().toISOString() });
       persist();
       return redact(p);

@@ -572,4 +572,209 @@ describe("<ConnectionsPanel/>", () => {
     expect(errEl).toHaveTextContent(/loadgen-1/);
     expect(errEl).toHaveTextContent(/ingest-3/);
   });
+
+  describe("Wave 5.60 — duplicate-endpoint guard + explicit-mode submit", () => {
+    function dupResponse(existingId: string, existingName: string, host: string, port: number) {
+      return new Response(
+        JSON.stringify({
+          error: "duplicate-endpoint",
+          message: `duplicate ${host}:${port}`,
+          existing_id: existingId,
+          existing_name: existingName,
+          host, port, db: 0,
+        }),
+        { status: 409, headers: { "content-type": "application/json" } },
+      );
+    }
+
+    it("duplicate POST keeps the dialog open, shows the banner, and offers Switch to Edit", async () => {
+      fetchMock.mockImplementation(async (input: RequestInfo, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        if (url.match(/\/redis\/active-target$/)) {
+          return new Response(JSON.stringify({ host: "h", port: 1, tls: false, db: 0, label: "x" }), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        if (url.match(/\/connections$/) && method === "GET") {
+          return new Response(JSON.stringify([profile({ id: "existing-1", name: "demo-cluster", host: "redis-1.lab", port: 12000 })]), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        if (url.match(/\/connections\/[^/]+\/test$/) && method === "POST") {
+          return new Response(JSON.stringify({ ok: true, latency_ms: 1, modules: [], errors: [] }), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        if (url.match(/\/connections$/) && method === "POST") {
+          return dupResponse("existing-1", "demo-cluster", "redis-1.lab", 12000);
+        }
+        return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+      });
+      renderPanel();
+      fireEvent.click(await screen.findByRole("button", { name: /add cluster/i }));
+      const dialog = await screen.findByRole("dialog", { name: /add cluster/i });
+      fireEvent.change(within(dialog).getByLabelText(/^name$/i), { target: { value: "new-cluster" } });
+      fireEvent.change(within(dialog).getByLabelText(/^host$/i), { target: { value: "redis-1.lab" } });
+      fireEvent.change(within(dialog).getByLabelText(/^port$/i), { target: { value: "12000" } });
+      fireEvent.click(within(dialog).getByRole("button", { name: /save/i }));
+
+      const banner = await within(dialog).findByTestId("dialog-banner-error");
+      expect(banner).toHaveTextContent(/already exists/i);
+      expect(banner).toHaveTextContent(/demo-cluster/);
+      // The dialog must remain open with the Switch-to-Edit affordance.
+      expect(within(dialog).getByTestId("dialog-switch-to-edit")).toBeInTheDocument();
+      expect(screen.getByRole("dialog", { name: /add cluster/i })).toBeInTheDocument();
+    });
+
+    it("clicking Switch to Edit reopens the dialog as Edit on the existing profile, pre-filled", async () => {
+      fetchMock.mockImplementation(async (input: RequestInfo, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        if (url.match(/\/redis\/active-target$/)) {
+          return new Response(JSON.stringify({ host: "h", port: 1, tls: false, db: 0, label: "x" }), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        if (url.match(/\/connections$/) && method === "GET") {
+          return new Response(JSON.stringify([profile({ id: "existing-1", name: "demo-cluster", host: "redis-1.lab", port: 12000 })]), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        if (url.match(/\/connections\/[^/]+\/test$/) && method === "POST") {
+          return new Response(JSON.stringify({ ok: true, latency_ms: 1, modules: [], errors: [] }), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        if (url.match(/\/connections$/) && method === "POST") {
+          return dupResponse("existing-1", "demo-cluster", "redis-1.lab", 12000);
+        }
+        return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+      });
+      renderPanel();
+      await waitFor(() => expect(screen.getByText("demo-cluster")).toBeInTheDocument());
+      fireEvent.click(screen.getByRole("button", { name: /add cluster/i }));
+      const addDialog = await screen.findByRole("dialog", { name: /add cluster/i });
+      fireEvent.change(within(addDialog).getByLabelText(/^name$/i), { target: { value: "dup-cluster" } });
+      fireEvent.change(within(addDialog).getByLabelText(/^host$/i), { target: { value: "redis-1.lab" } });
+      fireEvent.change(within(addDialog).getByLabelText(/^port$/i), { target: { value: "12000" } });
+      fireEvent.click(within(addDialog).getByRole("button", { name: /save/i }));
+
+      const switchBtn = await within(addDialog).findByTestId("dialog-switch-to-edit");
+      fireEvent.click(switchBtn);
+
+      const editDialog = await screen.findByRole("dialog", { name: /edit cluster/i });
+      expect((within(editDialog).getByLabelText(/^name$/i) as HTMLInputElement).value).toBe("demo-cluster");
+      expect((within(editDialog).getByLabelText(/^host$/i) as HTMLInputElement).value).toBe("redis-1.lab");
+      expect((within(editDialog).getByLabelText(/^port$/i) as HTMLInputElement).value).toBe("12000");
+      // Banner is gone after switching.
+      expect(within(editDialog).queryByTestId("dialog-banner-error")).toBeNull();
+    });
+
+    it("duplicate PUT (changing host to existing) shows the banner inside the Edit dialog", async () => {
+      fetchMock.mockImplementation(async (input: RequestInfo, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        if (url.match(/\/redis\/active-target$/)) {
+          return new Response(JSON.stringify({ host: "h", port: 1, tls: false, db: 0, label: "x" }), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        if (url.match(/\/connections$/) && method === "GET") {
+          return new Response(JSON.stringify([
+            profile({ id: "01A", name: "a-cluster", host: "rs.a", port: 12000 }),
+            profile({ id: "01B", name: "b-cluster", host: "rs.b", port: 12000 }),
+          ]), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        if (url.match(/\/connections\/[^/]+\/test$/) && method === "POST") {
+          return new Response(JSON.stringify({ ok: true, latency_ms: 1, modules: [], errors: [] }), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        if (url.match(/\/connections\/01B$/) && method === "PUT") {
+          return dupResponse("01A", "a-cluster", "rs.a", 12000);
+        }
+        return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+      });
+      renderPanel();
+      await waitFor(() => expect(screen.getByText("b-cluster")).toBeInTheDocument());
+      // Edit the b-cluster card.
+      const cards = screen.getAllByTestId("profile-card");
+      const bCard = cards.find((c) => within(c).queryByText("b-cluster")) as HTMLElement;
+      fireEvent.click(within(bCard).getByRole("button", { name: /^Edit$/ }));
+      const dialog = await screen.findByRole("dialog", { name: /edit cluster/i });
+      fireEvent.change(within(dialog).getByLabelText(/^host$/i), { target: { value: "rs.a" } });
+      fireEvent.click(within(dialog).getByRole("button", { name: /save/i }));
+
+      const banner = await within(dialog).findByTestId("dialog-banner-error");
+      expect(banner).toHaveTextContent(/already exists/i);
+      expect(banner).toHaveTextContent(/a-cluster/);
+      // The Edit dialog stays open.
+      expect(screen.getByRole("dialog", { name: /edit cluster/i })).toBeInTheDocument();
+    });
+
+    it("normal PUT (no host/port/db change) on the active profile does NOT trigger a false-positive banner", async () => {
+      let putCalled = false;
+      fetchMock.mockImplementation(async (input: RequestInfo, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        if (url.match(/\/redis\/active-target$/)) {
+          return new Response(JSON.stringify({ host: "redis-1.lab", port: 12000, tls: true, db: 0, label: "demo-cluster" }), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        if (url.match(/\/connections$/) && method === "GET") {
+          return new Response(JSON.stringify([profile()]), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        if (url.match(/\/connections\/01J\/test$/) && method === "POST") {
+          return new Response(JSON.stringify({ ok: true, latency_ms: 1, modules: [], errors: [] }), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        if (url.match(/\/connections\/01J$/) && method === "PUT") {
+          putCalled = true;
+          return new Response(JSON.stringify(profile({ name: "demo-renamed" })), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+      });
+      renderPanel();
+      await waitFor(() => expect(screen.getByText("demo-cluster")).toBeInTheDocument());
+      fireEvent.click((await screen.findAllByRole("button", { name: /^Edit$/ }))[0]!);
+      const dialog = await screen.findByRole("dialog", { name: /edit cluster/i });
+      fireEvent.change(within(dialog).getByLabelText(/^name$/i), { target: { value: "demo-renamed" } });
+      fireEvent.click(within(dialog).getByRole("button", { name: /save/i }));
+
+      await waitFor(() => expect(putCalled).toBe(true));
+      // Dialog closes, no banner.
+      await waitFor(() => expect(screen.queryByRole("dialog", { name: /edit cluster/i })).toBeNull());
+      expect(screen.queryByTestId("dialog-banner-error")).toBeNull();
+    });
+
+    it("Cancel-then-Edit: opening Add, cancelling, then editing a card fires exactly one PUT (no POST)", async () => {
+      const requests: Array<{ url: string; method: string }> = [];
+      fetchMock.mockImplementation(async (input: RequestInfo, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        requests.push({ url, method });
+        if (url.match(/\/redis\/active-target$/)) {
+          return new Response(JSON.stringify({ host: "h", port: 1, tls: false, db: 0, label: "x" }), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        if (url.match(/\/connections$/) && method === "GET") {
+          return new Response(JSON.stringify([profile()]), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        if (url.match(/\/connections\/01J\/test$/) && method === "POST") {
+          return new Response(JSON.stringify({ ok: true, latency_ms: 1, modules: [], errors: [] }), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        if (url.match(/\/connections\/01J$/) && method === "PUT") {
+          return new Response(JSON.stringify(profile({ name: "renamed" })), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+      });
+      renderPanel();
+      await waitFor(() => expect(screen.getByText("demo-cluster")).toBeInTheDocument());
+      // 1. Open Add dialog.
+      fireEvent.click(screen.getByRole("button", { name: /add cluster/i }));
+      await screen.findByRole("dialog", { name: /add cluster/i });
+      // 2. Cancel.
+      fireEvent.click(screen.getByRole("button", { name: /^Cancel$/ }));
+      await waitFor(() => expect(screen.queryByRole("dialog", { name: /add cluster/i })).toBeNull());
+      // 3. Click Edit on the card.
+      fireEvent.click((await screen.findAllByRole("button", { name: /^Edit$/ }))[0]!);
+      const dialog = await screen.findByRole("dialog", { name: /edit cluster/i });
+      fireEvent.change(within(dialog).getByLabelText(/^name$/i), { target: { value: "renamed" } });
+      fireEvent.click(within(dialog).getByRole("button", { name: /save/i }));
+
+      // The submit MUST be PUT, not POST — the Add dialog was cancelled, so
+      // the closure-captured `dialog.kind` race is moot now.
+      await waitFor(() => expect(requests.some((r) => r.method === "PUT" && /\/connections\/01J$/.test(r.url))).toBe(true));
+      const writes = requests.filter((r) =>
+        (r.method === "POST" && /\/connections$/.test(r.url)) ||
+        (r.method === "PUT" && /\/connections\/[^/]+$/.test(r.url))
+      );
+      const puts = writes.filter((w) => w.method === "PUT");
+      const posts = writes.filter((w) => w.method === "POST");
+      expect(puts.length).toBe(1);
+      expect(posts.length).toBe(0);
+    });
+  });
 });

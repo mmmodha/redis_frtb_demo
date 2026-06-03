@@ -13,6 +13,7 @@ import {
   activateConnection,
   createConnection,
   deleteConnection,
+  DuplicateEndpointError,
   getActiveTarget,
   InflightConflictError,
   listConnections,
@@ -66,6 +67,10 @@ export function ConnectionsPanel() {
   const [testResults, setTestResults] = useState<Record<string, ConnectionTestResult | "pending">>({});
   const [actionBusy, setActionBusy] = useState<Record<string, boolean>>({});
   const [rowError, setRowError] = useState<Record<string, string | null>>({});
+  // Wave 5.60 — inline duplicate-endpoint banner inside the dialog. Carries
+  // the existing profile's id so the "Switch to Edit" button can reopen the
+  // dialog on it. Cleared on every dialog open / mode switch.
+  const [dialogBanner, setDialogBanner] = useState<{ message: string; existingId: string | null } | null>(null);
   const inflight = useInflight();
   const lockedOut = inflight.count > 0;
 
@@ -125,11 +130,19 @@ export function ConnectionsPanel() {
     });
   }, [profiles, testResults]);
 
-  async function onSubmitDialog(input: ConnectionInput) {
+  // Wave 5.60 — derive POST vs PUT from an explicit `mode` parameter instead
+  // of reading `dialog.kind` from the closure. The parent's `dialog` state is
+  // consulted only to pick up the edit target's id and to drive the post-save
+  // active-target dispatch when the edit hits the active profile.
+  async function onSubmitDialog(mode: "add" | "edit", input: ConnectionInput) {
     try {
-      if (dialog.kind === "add") {
+      if (mode === "add") {
         await createConnection(input);
-      } else if (dialog.kind === "edit") {
+      } else {
+        // mode === "edit" — dialog.kind MUST be "edit" here by construction
+        // (the dialog only renders when dialog.kind !== "closed" and the mode
+        // it receives is derived from dialog.kind).
+        if (dialog.kind !== "edit") return;
         // Wave 5.59 — if the edited profile is the active one, notify the
         // shell so the ActiveTargetPill re-fetches. The api already pushes
         // the new values into the active-target singleton on PUT.
@@ -140,10 +153,31 @@ export function ConnectionsPanel() {
         }
       }
       setDialog({ kind: "closed" });
+      setDialogBanner(null);
       await refresh();
     } catch (e) {
+      if (e instanceof DuplicateEndpointError) {
+        // Keep the dialog open — render an inline banner with a Switch-to-Edit
+        // affordance pointing at the existing profile.
+        setDialogBanner({
+          message: `A profile for ${e.host}:${e.port} already exists: ${e.existing_name}. Did you mean to edit it instead?`,
+          existingId: e.existing_id,
+        });
+        return;
+      }
       setErrorMsg(`Save failed: ${(e as Error).message}`);
     }
+  }
+
+  function onSwitchToEdit(existingId: string) {
+    const existing = profiles.find((p) => p.id === existingId);
+    setDialogBanner(null);
+    if (!existing) {
+      // Profile vanished (deleted concurrently) — just close the dialog.
+      setDialog({ kind: "closed" });
+      return;
+    }
+    setDialog({ kind: "edit", profile: existing });
   }
 
   async function onTest(id: string) {
@@ -218,7 +252,7 @@ export function ConnectionsPanel() {
           <button
             type="button"
             className="btn btn--primary"
-            onClick={() => setDialog({ kind: "add" })}
+            onClick={() => { setDialogBanner(null); setDialog({ kind: "add" }); }}
             data-testid="add-cluster-btn"
           >
             Add cluster
@@ -244,7 +278,7 @@ export function ConnectionsPanel() {
             <p>
               <strong>No clusters configured yet</strong> — Add your first Redis Enterprise cluster to begin.
             </p>
-            <button type="button" className="btn btn--primary" onClick={() => setDialog({ kind: "add" })}>
+            <button type="button" className="btn btn--primary" onClick={() => { setDialogBanner(null); setDialog({ kind: "add" }); }}>
               Add your first cluster
             </button>
           </div>
@@ -308,7 +342,7 @@ export function ConnectionsPanel() {
                     <button type="button" onClick={() => void onTest(p.id)} disabled={tr === "pending"}>
                       {tr === "pending" ? "Testing…" : "Test"}
                     </button>
-                    <button type="button" onClick={() => setDialog({ kind: "edit", profile: p })}>
+                    <button type="button" onClick={() => { setDialogBanner(null); setDialog({ kind: "edit", profile: p }); }}>
                       Edit
                     </button>
                     {!active && isConfirmedUnreachable(tr) ? null : (() => {
@@ -363,10 +397,20 @@ export function ConnectionsPanel() {
 
       {dialog.kind !== "closed" ? (
         <ConnectionDialog
+          // Wave 5.60 — `key` forces a remount when the dialog target changes
+          // (e.g. Switch-to-Edit hops Add → Edit on a specific profile). The
+          // form's internal useState would otherwise persist the prior values.
+          key={dialog.kind === "edit" ? `edit-${dialog.profile.id}` : "add"}
           mode={dialog.kind}
           initial={dialog.kind === "edit" ? inputFromProfile(dialog.profile) : emptyInput()}
-          onCancel={() => setDialog({ kind: "closed" })}
+          onCancel={() => { setDialog({ kind: "closed" }); setDialogBanner(null); }}
           onSubmit={onSubmitDialog}
+          bannerError={dialogBanner?.message ?? null}
+          onSwitchToEdit={
+            dialogBanner?.existingId
+              ? () => onSwitchToEdit(dialogBanner.existingId!)
+              : null
+          }
         />
       ) : null}
     </div>
@@ -392,9 +436,14 @@ function ConnectionDialog(props: {
   mode: "add" | "edit";
   initial: ConnectionInput;
   onCancel: () => void;
-  onSubmit: (input: ConnectionInput) => void | Promise<void>;
+  // Wave 5.60 — submit receives the dialog's own mode as an explicit argument
+  // so the parent's branch on POST vs PUT no longer depends on the captured
+  // `dialog.kind` closure.
+  onSubmit: (mode: "add" | "edit", input: ConnectionInput) => void | Promise<void>;
+  bannerError?: string | null;
+  onSwitchToEdit?: (() => void) | null;
 }) {
-  const { mode, initial, onCancel, onSubmit } = props;
+  const { mode, initial, onCancel, onSubmit, bannerError, onSwitchToEdit } = props;
   const [name, setName] = useState(initial.name);
   const [host, setHost] = useState(initial.host);
   const [port, setPort] = useState(String(initial.port ?? ""));
@@ -405,7 +454,7 @@ function ConnectionDialog(props: {
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    void onSubmit({
+    void onSubmit(mode, {
       name, host, port: Number(port),
       username: username || undefined,
       password: password || undefined,
@@ -460,6 +509,25 @@ function ConnectionDialog(props: {
             <span>CA certificate (PEM)</span>
             <textarea value={ca} onChange={(e) => setCa(e.target.value)} rows={3} placeholder="-----BEGIN CERTIFICATE-----" />
           </label>
+        ) : null}
+        {bannerError ? (
+          <div
+            className="dialog__banner-error"
+            role="alert"
+            data-testid="dialog-banner-error"
+          >
+            <span>{bannerError}</span>
+            {onSwitchToEdit ? (
+              <button
+                type="button"
+                className="btn"
+                onClick={onSwitchToEdit}
+                data-testid="dialog-switch-to-edit"
+              >
+                Switch to Edit
+              </button>
+            ) : null}
+          </div>
         ) : null}
         <div className="dialog__actions">
           <button type="button" onClick={onCancel}>Cancel</button>
