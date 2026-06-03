@@ -114,6 +114,8 @@ The Wave 5.8.5 commit `114eaa9` changed:
 ```
 …without addressing the `/data` ownership inherited from the `node:20-alpine` base image's behaviour with anonymous-mode named volumes.
 
+> **Wave 5.64 note:** `SEED_CONNECTIONS_FILE` removed from `docker-compose.yml`; `services/api/fixtures/seed-connections.json` deleted. The boot-time seeding path described above is no longer exercised on a default `docker compose up`.
+
 ## Steps 4–11
 
 **Not executed.** Step 3 is the hard gate; no api means no bootstrap means no /observability/shards means no /connections means no generator path means no calc, loadgen or e2e.

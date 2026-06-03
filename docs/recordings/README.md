@@ -35,7 +35,9 @@ Override the live base URL with `UI_BASE_URL=http://… npm run test:e2e:live` i
 
 ### Seed connection prerequisite
 
-The live e2e asserts `getByText('demo-cluster')` (and `scale-cluster`) on the Connections panel at Step 2a. These profiles are auto-created on api boot by `seedConnections()`, which reads `SEED_CONNECTIONS_FILE` — wired in `docker-compose.yml` to bind-mount `services/api/fixtures/seed-connections.json` at `/app/fixtures/seed-connections.json` on the api container. No manual UI step is needed; `docker compose up -d --wait` is sufficient.
+**Wave 5.64:** the hard-coded `demo-cluster` / `scale-cluster` seed has been removed. `SEED_CONNECTIONS_FILE` is no longer wired in `docker-compose.yml` and `services/api/fixtures/seed-connections.json` has been deleted. On a fresh `docker compose up -d --wait` the Connections panel starts empty — the operator adds profiles through the UI (or via the env-driven `RS_DEMO_*` / `RS_LARGE_*` / `REDIS_URL` paths still honoured by `services/api/src/seed.ts`).
+
+The mocked-mode e2e (`installCommonRoutes()` in `e2e/full-demo.spec.ts`) still returns `demo-cluster` + `scale-cluster` from the `**/connections` route stub, so the CI screenshot at step 2a is unchanged. The live (`INTEGRATION=1`) run now only asserts the Connections heading at step 2a; populating connection profiles for the rest of the live flow is the operator's responsibility.
 
 ### Before-run reset (Wave 5.8.3)
 

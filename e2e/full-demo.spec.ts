@@ -13,6 +13,14 @@ import fs from "node:fs";
 //   - Step 8 + 10 expect a ShardMetricsStrip with per-shard ops/sec (Wave 4.6).
 // Verifier should re-run this spec after 4.1, 4.2, 4.6 land — it should turn
 // GREEN with no spec changes.
+//
+// Wave 5.64: the boot-time seed of `demo-cluster` / `scale-cluster` profiles
+// has been removed (SEED_CONNECTIONS_FILE wiring + seed-connections.json are
+// gone). Step 2a's `demo-cluster` / `scale-cluster` visibility assertions are
+// now gated to mocked mode only — `installCommonRoutes()` still returns both
+// profiles via the `**/connections` route stub, so mocked-CI screenshot
+// fidelity is preserved. In INTEGRATION=1 mode the panel starts empty and the
+// spec only asserts the Connections heading is present.
 
 const SCREENSHOT_DIR = path.resolve(__dirname, "../docs/recordings/screenshots");
 
@@ -199,8 +207,13 @@ test.describe("Full demo — 11-step flow (storyboard + protection)", () => {
     // ----- Step 2a — Connections + Sources -----
     await page.getByRole("navigation", { name: /primary/i }).getByRole("link", { name: "Connections" }).click();
     await expect(page.getByRole("heading", { name: /^Connections$/, level: 1 })).toBeVisible();
-    await expect(page.getByText("demo-cluster")).toBeVisible();
-    await expect(page.getByText("scale-cluster")).toBeVisible();
+    // Wave 5.64: gate the demo-cluster / scale-cluster name assertions to
+    // mocked mode. In INTEGRATION=1 the panel is operator-driven and starts
+    // empty; in mocked mode `installCommonRoutes()` returns both profiles.
+    if (!INTEGRATION) {
+      await expect(page.getByText("demo-cluster")).toBeVisible();
+      await expect(page.getByText("scale-cluster")).toBeVisible();
+    }
     await shot(page, "step-02a-connections");
 
     await page.getByRole("navigation", { name: /primary/i }).getByRole("link", { name: "Sources" }).click();
