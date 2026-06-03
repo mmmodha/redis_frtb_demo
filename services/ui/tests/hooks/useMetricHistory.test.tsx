@@ -170,4 +170,57 @@ describe("useMetricHistory", () => {
     await waitFor(() => expect(result.current.reason).toBe("fetch-error"));
     expect(result.current.points).toEqual([]);
   });
+
+  // Wave 5.61 — windowMs is in the effect deps, so changing it triggers a
+  // fresh fetch through /observability/history?windowMs=<new>.
+  it("re-fetches when windowMs changes", async () => {
+    const fetchMock = mockFetch((url) => {
+      const u = new URL(url, "http://localhost");
+      const w = u.searchParams.get("windowMs") ?? "18000000";
+      return jsonResponse({
+        source: "redis-timeseries",
+        metric: "total_keys",
+        windowMs: Number(w),
+        points: [{ t: 1, v: Number(w) }],
+        reason: null,
+        target_label: "tA",
+      });
+    });
+    const { result, rerender } = renderHook(({ w }: { w: number }) =>
+      useMetricHistory({ metric: "total_keys", currentValue: 0, pulseKey: 0, windowMs: w }), {
+      initialProps: { w: 18_000_000 },
+    });
+    await waitFor(() => expect(result.current.points.length).toBe(1));
+    const initialCalls = fetchMock.mock.calls.length;
+    rerender({ w: 1_800_000 });
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.length).toBeGreaterThan(initialCalls);
+    });
+    const urls = fetchMock.mock.calls.map((c) => String(c[0]));
+    expect(urls.some((u) => u.includes("windowMs=1800000"))).toBe(true);
+  });
+
+  // Wave 5.61 — ring-buffer source clamps the returned view to windowMs.
+  it("clamps ring-buffer points to the selected window", async () => {
+    const NOW = 2_000_000_000_000;
+    const FIVE_H = 18_000_000;
+    const stored = [
+      { t: NOW - 4 * 3_600_000, v: 10 }, // 4h ago
+      { t: NOW - 90 * 60_000, v: 20 },   // 90m ago
+      { t: NOW - 10 * 60_000, v: 30 },   // 10m ago
+      { t: NOW - 1 * 60_000, v: 40 },    // 1m ago
+    ];
+    window.localStorage.setItem("obs.ring.tA.total_keys", JSON.stringify(stored));
+    mockFetch(() => jsonResponse({
+      source: "unavailable", metric: "total_keys", windowMs: FIVE_H,
+      points: [], reason: "module-not-loaded", target_label: "tA",
+    }));
+    const fixedNow = (): number => NOW;
+    const { result } = renderHook(() =>
+      useMetricHistory({ metric: "total_keys", currentValue: null, pulseKey: 0,
+        windowMs: 1_800_000, nowFn: fixedNow }));
+    await waitFor(() => expect(result.current.source).toBe("ring-buffer"));
+    // Only the two points within the last 30m should remain visible.
+    expect(result.current.points.map((p) => p.v)).toEqual([30, 40]);
+  });
 });

@@ -140,10 +140,15 @@ export function useMetricHistory(args: UseMetricHistoryArgs): MetricHistoryState
             windowMs,
           });
         } else {
+          // Wave 5.61 — clamp persisted ring buffer to the requested view
+          // window. The storage itself is sized at RETENTION_MS so a
+          // shrunken modal selection doesn't destroy older samples.
           const ring = readRing(res.target_label, metric);
+          const viewCutoff = now() - windowMs;
+          const view = windowMs >= RETENTION_MS ? ring : ring.filter((p) => p.t >= viewCutoff);
           setState({
             source: "ring-buffer",
-            points: ring,
+            points: view,
             reason: res.reason ?? "module-not-loaded",
             target_label: res.target_label,
             windowMs,
@@ -184,12 +189,27 @@ export function useMetricHistory(args: UseMetricHistoryArgs): MetricHistoryState
     lastPulseRef.current = pulseKey;
     setState((prev) => {
       if (prev.source !== "ring-buffer" || prev.target_label === null) return prev;
-      const cutoff = now() - windowMs;
-      const next = [...prev.points, { t: now(), v: currentValue }]
-        .filter((p) => p.t >= cutoff)
+      if (windowMs >= RETENTION_MS) {
+        // Default path — unchanged from Wave 5.57.
+        const cutoff = now() - windowMs;
+        const next = [...prev.points, { t: now(), v: currentValue }]
+          .filter((p) => p.t >= cutoff)
+          .slice(-RING_CAP);
+        writeRing(prev.target_label, metric, next);
+        return { ...prev, points: next, reason: next.length > 0 ? null : "no-data-yet" };
+      }
+      // Wave 5.61 — modal-zoom path. The visible `points` are clamped to
+      // the smaller window, but the persisted ring is sized at
+      // RETENTION_MS so closing/reopening the modal doesn't lose history.
+      const storeCutoff = now() - RETENTION_MS;
+      const viewCutoff = now() - windowMs;
+      const stored = readRing(prev.target_label, metric);
+      const full = [...stored, { t: now(), v: currentValue }]
+        .filter((p) => p.t >= storeCutoff)
         .slice(-RING_CAP);
-      writeRing(prev.target_label, metric, next);
-      return { ...prev, points: next, reason: next.length > 0 ? null : "no-data-yet" };
+      writeRing(prev.target_label, metric, full);
+      const view = full.filter((p) => p.t >= viewCutoff);
+      return { ...prev, points: view, reason: view.length > 0 ? null : "no-data-yet" };
     });
   }, [pulseKey, currentValue, enabled, state.source, state.target_label, metric, windowMs, now]);
 

@@ -17,7 +17,7 @@ import {
   OBS_REFRESH_OPTIONS,
   useObservabilityRefresh,
 } from "../hooks/useObservabilityRefresh";
-import { useMetricHistory, type MetricName } from "../hooks/useMetricHistory";
+import { useMetricHistory, RETENTION_MS, type MetricName } from "../hooks/useMetricHistory";
 
 interface ObservabilityData {
   keys: ObservabilityKeysResponse;
@@ -252,12 +252,28 @@ function ObservabilityReady({ data, pulseKey }: { data: ObservabilityData; pulse
 
 function SnapshotTile({ spec, pulseKey }: { spec: SnapshotMetricSpec; pulseKey: number }) {
   const [open, setOpen] = useState(false);
-  const history = useMetricHistory({
+  // Wave 5.61 — Option B: the inline sparkline keeps its own 5h history,
+  // while the popout modal owns a separate windowMs that the user can zoom
+  // independently. The modal-side hook is enabled only while open.
+  const [modalWindowMs, setModalWindowMs] = useState<number>(RETENTION_MS);
+  const currentValue = Number.isFinite(spec.value) ? spec.value : null;
+  const sparkline = useMetricHistory({
     metric: spec.key,
-    currentValue: Number.isFinite(spec.value) ? spec.value : null,
+    currentValue,
     pulseKey,
   });
-  const sparkPoints = history.points.map((p) => p.v);
+  const modalHistory = useMetricHistory({
+    metric: spec.key,
+    currentValue,
+    pulseKey,
+    enabled: open,
+    windowMs: modalWindowMs,
+  });
+  const sparkPoints = sparkline.points.map((p) => p.v);
+  const handleClose = (): void => {
+    setOpen(false);
+    setModalWindowMs(RETENTION_MS);
+  };
   return (
     <>
       <MetricTile
@@ -270,15 +286,16 @@ function SnapshotTile({ spec, pulseKey }: { spec: SnapshotMetricSpec; pulseKey: 
       />
       <MetricHistoryModal
         open={open}
-        onClose={() => setOpen(false)}
+        onClose={handleClose}
         title={spec.label}
         unit={spec.unit}
         formatValue={spec.format}
-        points={history.points}
-        source={history.source}
-        reason={history.reason}
-        windowMs={history.windowMs}
-        targetLabel={history.target_label}
+        points={modalHistory.points}
+        source={modalHistory.source}
+        reason={modalHistory.reason}
+        windowMs={modalWindowMs}
+        onWindowChange={setModalWindowMs}
+        targetLabel={modalHistory.target_label}
       />
     </>
   );
