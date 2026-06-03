@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as wait } from "node:timers/promises";
@@ -15,11 +15,17 @@ import {
 } from "../src/index.mjs";
 
 // Integration tests run against a real Redis with the RediSearch + RedisJSON
-// modules loaded. We try `redis-stack-server` first (the documented Wave 2
-// runtime), then fall back to `redis-server` (which has search bundled in
-// Redis 8). If FT.CREATE fails on the booted instance, the integration suite
-// auto-skips via `it.skipIf` per Wave 1 follow-up #1 — never silently passes.
+// modules loaded. The Ubuntu 22.04 apt `redis-stack-server` wrapper does not
+// reliably load modules when spawned standalone with custom args, so we
+// prefer driving `redis-server` directly with explicit --loadmodule flags
+// pointing at the apt-installed .so files under /opt/redis-stack/lib/. We
+// fall back to redis-stack-server, then plain redis-server. If FT.CREATE
+// still fails on the booted instance, the integration suite auto-skips via
+// `it.skipIf` per Wave 1 follow-up #1 — never silently passes.
 const PORT = 16401;
+const STACK_LIB_DIR = "/opt/redis-stack/lib";
+const STACK_MODULES = [`${STACK_LIB_DIR}/redisearch.so`, `${STACK_LIB_DIR}/rejson.so`];
+const STACK_MODULES_PRESENT = STACK_MODULES.every((p) => existsSync(p));
 let proc;
 let tmp;
 let redis;
@@ -33,19 +39,17 @@ function binaryOnPath(binary) {
   return r.status === 0;
 }
 
-function spawnRedis(binary, port, dir) {
-  const p = spawn(
-    binary,
-    ["--port", String(port), "--dir", dir, "--save", "", "--appendonly", "no", "--protected-mode", "no"],
-    { stdio: "ignore" }
-  );
+function spawnRedis(binary, port, dir, inlineModules) {
+  const baseArgs = ["--port", String(port), "--dir", dir, "--save", "", "--appendonly", "no", "--protected-mode", "no"];
+  const moduleArgs = inlineModules ? STACK_MODULES.flatMap((m) => ["--loadmodule", m]) : [];
+  const p = spawn(binary, [...baseArgs, ...moduleArgs], { stdio: "ignore" });
   p.on("error", () => { /* swallow — tryBoot returns undefined on connection timeout */ });
   return p;
 }
 
-async function tryBoot(binary, port, dir) {
+async function tryBoot(binary, port, dir, inlineModules) {
   if (!binaryOnPath(binary)) return undefined;
-  const p = spawnRedis(binary, port, dir);
+  const p = spawnRedis(binary, port, dir, inlineModules);
   // 60 × 100ms = 6s — redis-stack-server takes longer than vanilla
   // redis-server because it has to load 4-5 modules before accepting
   // connections (Wave 5.73e: tightened the gate so the testcontainers job
@@ -81,8 +85,15 @@ async function hasSearchModule(port) {
 
 beforeAll(async () => {
   tmp = mkdtempSync(join(tmpdir(), "frtb-rqe-"));
-  for (const bin of ["redis-stack-server", "redis-server"]) {
-    proc = await tryBoot(bin, PORT, tmp);
+  // Strategy order: redis-server + explicit --loadmodule (most reliable on
+  // apt-installed redis-stack), then redis-stack-server wrapper, then vanilla.
+  const strategies = [
+    ...(STACK_MODULES_PRESENT ? [{ bin: "redis-server", inline: true }] : []),
+    { bin: "redis-stack-server", inline: false },
+    { bin: "redis-server", inline: false },
+  ];
+  for (const { bin, inline } of strategies) {
+    proc = await tryBoot(bin, PORT, tmp, inline);
     if (!proc) continue;
     if (await hasSearchModule(PORT)) {
       searchAvailable = true;

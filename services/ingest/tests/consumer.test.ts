@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as wait } from "node:timers/promises";
@@ -14,24 +14,30 @@ import {
   createConsumer,
 } from "../src/consumer.ts";
 
-// Wave 5.73e — prefer redis-stack-server so the RedisJSON branch (jsonAvailable)
-// actually exercises in CI. Falls back to redis-server (Redis 7+ supports the
-// rest of the consumer surface). Ubuntu 22.04 apt redis-server is 6.0 and
-// lacks JSON.* commands, so jsonAvailable would always be false without this.
+// Wave 5.73e — prefer driving redis-server with explicit --loadmodule pointing
+// at the apt-installed redis-stack .so files (the apt redis-stack-server
+// wrapper does not reliably load modules when spawned standalone with custom
+// args). Falls back to redis-stack-server, then vanilla redis-server. Ubuntu
+// 22.04 apt redis-server is 6.0 and lacks JSON.* commands, so jsonAvailable
+// would always be false without picking up the stack modules.
 function binaryOnPath(binary: string): boolean {
   const r = spawnSync("which", [binary], { stdio: ["ignore", "pipe", "ignore"] });
   return r.status === 0;
 }
+const STACK_LIB_DIR = "/opt/redis-stack/lib";
+const STACK_MODULES = [`${STACK_LIB_DIR}/redisearch.so`, `${STACK_LIB_DIR}/rejson.so`];
+const STACK_MODULES_PRESENT = STACK_MODULES.every((p) => existsSync(p));
 const REDIS_BIN = process.env.REDIS_STACK_BIN && binaryOnPath(process.env.REDIS_STACK_BIN)
   ? process.env.REDIS_STACK_BIN
-  : (binaryOnPath("redis-stack-server") ? "redis-stack-server" : "redis-server");
+  : (binaryOnPath("redis-server") && STACK_MODULES_PRESENT
+    ? "redis-server"
+    : (binaryOnPath("redis-stack-server") ? "redis-stack-server" : "redis-server"));
+const USE_INLINE_MODULES = REDIS_BIN === "redis-server" && STACK_MODULES_PRESENT;
 
 function spawnRedis(port: number, dir: string): ChildProcess {
-  const p = spawn(
-    REDIS_BIN,
-    ["--port", String(port), "--dir", dir, "--save", "", "--appendonly", "no", "--protected-mode", "no"],
-    { stdio: "ignore" }
-  );
+  const baseArgs = ["--port", String(port), "--dir", dir, "--save", "", "--appendonly", "no", "--protected-mode", "no"];
+  const moduleArgs = USE_INLINE_MODULES ? STACK_MODULES.flatMap((m) => ["--loadmodule", m]) : [];
+  const p = spawn(REDIS_BIN, [...baseArgs, ...moduleArgs], { stdio: "ignore" });
   p.on("error", () => undefined);
   return p;
 }
