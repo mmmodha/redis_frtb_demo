@@ -15,7 +15,9 @@ function binaryOnPath(binary: string): boolean {
   return r.status === 0;
 }
 
-const STACK_LIB_DIR = "/opt/redis-stack/lib";
+const STACK_DIR = "/opt/redis-stack";
+const STACK_BUNDLED_REDIS = `${STACK_DIR}/bin/redis-server`;
+const STACK_LIB_DIR = `${STACK_DIR}/lib`;
 const STACK_MODULES = [
   `${STACK_LIB_DIR}/redisearch.so`,
   `${STACK_LIB_DIR}/rejson.so`,
@@ -28,11 +30,13 @@ function hasStackModulesOnDisk(): boolean {
 function resolveStrategy(): { kind: "stack-inline" | "stack-bin" | "vanilla" | "none"; bin?: string } {
   const envBin = process.env.REDIS_STACK_BIN;
   if (envBin && binaryOnPath(envBin)) return { kind: "stack-bin", bin: envBin };
-  // Prefer driving redis-server with explicit --loadmodule flags pointing at
-  // the apt-installed .so files; this is the only configuration we have seen
-  // reliably expose FT.* / JSON.* on the Ubuntu apt redis-stack-server pkg.
-  if (binaryOnPath("redis-server") && hasStackModulesOnDisk()) {
-    return { kind: "stack-inline", bin: "redis-server" };
+  // Best path: the Redis 7.4 binary bundled with the apt redis-stack-server
+  // package at /opt/redis-stack/bin/redis-server, driven with explicit
+  // --loadmodule flags. The /usr/bin/redis-server from the `redis-server`
+  // apt package on Ubuntu 22.04 is Redis 6.0 and crashes when trying to
+  // load Redis-7 modules, so we cannot reuse it for module loading.
+  if (existsSync(STACK_BUNDLED_REDIS) && hasStackModulesOnDisk()) {
+    return { kind: "stack-inline", bin: STACK_BUNDLED_REDIS };
   }
   if (binaryOnPath("redis-stack-server")) return { kind: "stack-bin", bin: "redis-stack-server" };
   if (binaryOnPath("redis-server")) return { kind: "vanilla", bin: "redis-server" };

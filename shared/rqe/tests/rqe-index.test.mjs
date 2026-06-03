@@ -23,9 +23,12 @@ import {
 // still fails on the booted instance, the integration suite auto-skips via
 // `it.skipIf` per Wave 1 follow-up #1 — never silently passes.
 const PORT = 16401;
-const STACK_LIB_DIR = "/opt/redis-stack/lib";
+const STACK_DIR = "/opt/redis-stack";
+const STACK_BUNDLED_REDIS = `${STACK_DIR}/bin/redis-server`;
+const STACK_LIB_DIR = `${STACK_DIR}/lib`;
 const STACK_MODULES = [`${STACK_LIB_DIR}/redisearch.so`, `${STACK_LIB_DIR}/rejson.so`];
 const STACK_MODULES_PRESENT = STACK_MODULES.every((p) => existsSync(p));
+const STACK_BUNDLED_PRESENT = existsSync(STACK_BUNDLED_REDIS) && STACK_MODULES_PRESENT;
 let proc;
 let tmp;
 let redis;
@@ -47,8 +50,14 @@ function spawnRedis(binary, port, dir, inlineModules) {
   return p;
 }
 
+function binaryAvailable(binary) {
+  // Absolute path: check existsSync; PATH-relative: defer to `which`.
+  if (binary.startsWith("/")) return existsSync(binary);
+  return binaryOnPath(binary);
+}
+
 async function tryBoot(binary, port, dir, inlineModules) {
-  if (!binaryOnPath(binary)) return undefined;
+  if (!binaryAvailable(binary)) return undefined;
   const p = spawnRedis(binary, port, dir, inlineModules);
   // 60 × 100ms = 6s — redis-stack-server takes longer than vanilla
   // redis-server because it has to load 4-5 modules before accepting
@@ -85,10 +94,14 @@ async function hasSearchModule(port) {
 
 beforeAll(async () => {
   tmp = mkdtempSync(join(tmpdir(), "frtb-rqe-"));
-  // Strategy order: redis-server + explicit --loadmodule (most reliable on
-  // apt-installed redis-stack), then redis-stack-server wrapper, then vanilla.
+  // Strategy order: the Redis 7.4 binary bundled with the apt redis-stack
+  // package (/opt/redis-stack/bin/redis-server) driven with explicit
+  // --loadmodule (most reliable on Ubuntu apt), then redis-stack-server
+  // wrapper, then vanilla redis-server. The /usr/bin/redis-server from the
+  // `redis-server` apt package is Redis 6.0 and crashes when loading
+  // Redis-7 modules, so we never use it for inline-module loading.
   const strategies = [
-    ...(STACK_MODULES_PRESENT ? [{ bin: "redis-server", inline: true }] : []),
+    ...(STACK_BUNDLED_PRESENT ? [{ bin: STACK_BUNDLED_REDIS, inline: true }] : []),
     { bin: "redis-stack-server", inline: false },
     { bin: "redis-server", inline: false },
   ];

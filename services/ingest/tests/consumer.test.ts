@@ -24,15 +24,21 @@ function binaryOnPath(binary: string): boolean {
   const r = spawnSync("which", [binary], { stdio: ["ignore", "pipe", "ignore"] });
   return r.status === 0;
 }
-const STACK_LIB_DIR = "/opt/redis-stack/lib";
+const STACK_DIR = "/opt/redis-stack";
+const STACK_BUNDLED_REDIS = `${STACK_DIR}/bin/redis-server`;
+const STACK_LIB_DIR = `${STACK_DIR}/lib`;
 const STACK_MODULES = [`${STACK_LIB_DIR}/redisearch.so`, `${STACK_LIB_DIR}/rejson.so`];
 const STACK_MODULES_PRESENT = STACK_MODULES.every((p) => existsSync(p));
+const STACK_BUNDLED_PRESENT = existsSync(STACK_BUNDLED_REDIS) && STACK_MODULES_PRESENT;
+// Prefer the Redis 7.4 binary bundled with the apt redis-stack-server pkg —
+// /usr/bin/redis-server is Redis 6.0 on Ubuntu 22.04 and crashes when trying
+// to load Redis-7 modules.
 const REDIS_BIN = process.env.REDIS_STACK_BIN && binaryOnPath(process.env.REDIS_STACK_BIN)
   ? process.env.REDIS_STACK_BIN
-  : (binaryOnPath("redis-server") && STACK_MODULES_PRESENT
-    ? "redis-server"
+  : (STACK_BUNDLED_PRESENT
+    ? STACK_BUNDLED_REDIS
     : (binaryOnPath("redis-stack-server") ? "redis-stack-server" : "redis-server"));
-const USE_INLINE_MODULES = REDIS_BIN === "redis-server" && STACK_MODULES_PRESENT;
+const USE_INLINE_MODULES = REDIS_BIN === STACK_BUNDLED_REDIS;
 
 function spawnRedis(port: number, dir: string): ChildProcess {
   const baseArgs = ["--port", String(port), "--dir", dir, "--save", "", "--appendonly", "no", "--protected-mode", "no"];
