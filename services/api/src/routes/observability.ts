@@ -4,6 +4,12 @@ import { getActiveTarget } from "../active-target.ts";
 import { getBootstrapStatus } from "../bootstrap-status.ts";
 import { translateRedisError } from "../redis-errors.ts";
 import { corsHeadersForRequest } from "../cors-headers.ts";
+import {
+  RETENTION_MS,
+  isValidMetric,
+  readHistory,
+  writeMetric,
+} from "../lib/timeseries.ts";
 
 const NUMERIC_INFO_FIELDS = new Set([
   "used_memory",
@@ -209,6 +215,10 @@ export function registerObservabilityRoutes(
       const [, keys] = await redis.scan("0", "MATCH", `${prefix}*`, "COUNT", "1000");
       const dbsize = await redis.dbsize();
       const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+      // Wave 5.57 — fire-and-forget TimeSeries write. writeMetric() swallows
+      // every error internally so an unavailable module or a failed TS.ADD
+      // cannot break the snapshot response.
+      void writeMetric(redis, "total_keys", dbsize, target_label);
       return {
         prefix,
         dbsize,
@@ -243,6 +253,8 @@ export function registerObservabilityRoutes(
       const maxmemory_bytes = Number(parsed.maxmemory ?? 0);
       const total_system_memory_bytes = Number(parsed.total_system_memory ?? 0);
       const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+      const used_memory_bytes = Number(parsed.used_memory ?? 0);
+      void writeMetric(redis, "memory_used_bytes", used_memory_bytes, target_label);
       return {
         ...parsed,
         maxmemory_bytes,
@@ -264,7 +276,11 @@ export function registerObservabilityRoutes(
     const redis = getRedis();
     const target_label = getActiveTarget().label;
     try {
-      return await readShards(redis, req.log);
+      const shards = await readShards(redis, req.log);
+      const totalOps = shards.reduce((acc, s) => acc + (s.opsPerSec ?? 0), 0);
+      void writeMetric(redis, "shard_count", shards.length, target_label);
+      void writeMetric(redis, "ops_per_sec", totalOps, target_label);
+      return shards;
     } catch (err) {
       const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
       if (translated) {
@@ -274,6 +290,34 @@ export function registerObservabilityRoutes(
       throw err;
     }
   });
+
+  // Wave 5.57 — historical points for the Cluster snapshot sparklines /
+  // popout modal. TimeSeries-first; UI falls back to a client-side ring
+  // buffer when source === "unavailable".
+  app.get<{ Querystring: { metric?: string; windowMs?: string } }>(
+    "/observability/history",
+    async (req, reply) => {
+      const metricRaw = String(req.query.metric ?? "");
+      const target_label = getActiveTarget().label;
+      const windowMs = (() => {
+        const n = Number(req.query.windowMs ?? RETENTION_MS);
+        return Number.isFinite(n) && n > 0 ? Math.min(n, RETENTION_MS) : RETENTION_MS;
+      })();
+      if (!isValidMetric(metricRaw)) {
+        reply.code(400);
+        return { error: "invalid metric", target_label };
+      }
+      const result = await readHistory(getRedis(), metricRaw, windowMs, target_label);
+      return {
+        source: result.source,
+        metric: metricRaw,
+        windowMs,
+        points: result.points,
+        reason: result.reason,
+        target_label,
+      };
+    },
+  );
 
   // SSE: write one frame immediately, then every `sseIntervalMs` until the
   // client disconnects. We hijack the reply so Fastify doesn't try to send a

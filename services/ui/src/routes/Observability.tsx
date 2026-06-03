@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { PanelCard } from "../components/PanelCard";
 import { MetricTile } from "../components/MetricTile";
+import { MetricHistoryModal } from "../components/MetricHistoryModal";
 import { TimingStrip } from "../components/TimingStrip";
 import { EnterpriseCallout } from "../components/EnterpriseCallout";
 import { ShardMetricsStrip } from "../components/ShardMetricsStrip";
@@ -16,6 +17,7 @@ import {
   OBS_REFRESH_OPTIONS,
   useObservabilityRefresh,
 } from "../hooks/useObservabilityRefresh";
+import { useMetricHistory, type MetricName } from "../hooks/useMetricHistory";
 
 interface ObservabilityData {
   keys: ObservabilityKeysResponse;
@@ -183,14 +185,24 @@ export function Observability() {
         </div>
       )}
 
-      {status.kind === "ready" && <ObservabilityReady data={status.data} />}
+      {status.kind === "ready" && <ObservabilityReady data={status.data} pulseKey={pulseKey} />}
     </>
   );
 }
 
-function ObservabilityReady({ data }: { data: ObservabilityData }) {
+interface SnapshotMetricSpec {
+  key: MetricName;
+  label: string;
+  unit?: string;
+  value: number;
+  display: string;
+  format: (v: number) => string;
+}
+
+function ObservabilityReady({ data, pulseKey }: { data: ObservabilityData; pulseKey: number }) {
   const totalKeys = data.keys.dbsize;
   const memHuman = data.memory.used_memory_human ?? "—";
+  const memBytes = Number(data.memory.used_memory ?? 0);
   const shards = data.shards;
 
   if (totalKeys === 0 && shards.length === 0) {
@@ -205,15 +217,20 @@ function ObservabilityReady({ data }: { data: ObservabilityData }) {
   }
 
   const totalOps = shards.reduce((acc, s) => acc + (s.opsPerSec ?? 0), 0);
+  const specs: SnapshotMetricSpec[] = [
+    { key: "total_keys", label: "Total keys", unit: "keys", value: totalKeys, display: formatNumber(totalKeys), format: formatNumber },
+    { key: "memory_used_bytes", label: "Memory used", value: memBytes, display: memHuman, format: (v) => `${(v / (1024 * 1024)).toFixed(2)} MB` },
+    { key: "shard_count", label: "Shards", unit: "primaries", value: shards.length, display: String(shards.length), format: (v) => String(Math.round(v)) },
+    { key: "ops_per_sec", label: "Ops / sec", unit: "ops/s", value: totalOps, display: formatNumber(totalOps), format: formatNumber },
+  ];
 
   return (
     <>
       <PanelCard title="Cluster snapshot">
         <div className="metric-grid">
-          <MetricTile label="Total keys" value={formatNumber(totalKeys)} unit="keys" status="live" />
-          <MetricTile label="Memory used" value={memHuman} status="live" />
-          <MetricTile label="Shards" value={shards.length} unit="primaries" status="live" />
-          <MetricTile label="Ops / sec" value={formatNumber(totalOps)} unit="ops/s" status="live" />
+          {specs.map((s) => (
+            <SnapshotTile key={s.key} spec={s} pulseKey={pulseKey} />
+          ))}
         </div>
       </PanelCard>
       <PanelCard title="Per-shard ops/sec">
@@ -229,6 +246,40 @@ function ObservabilityReady({ data }: { data: ObservabilityData }) {
       <PanelCard title="Live shard metrics">
         <ShardMetricsStrip shards={shards} />
       </PanelCard>
+    </>
+  );
+}
+
+function SnapshotTile({ spec, pulseKey }: { spec: SnapshotMetricSpec; pulseKey: number }) {
+  const [open, setOpen] = useState(false);
+  const history = useMetricHistory({
+    metric: spec.key,
+    currentValue: Number.isFinite(spec.value) ? spec.value : null,
+    pulseKey,
+  });
+  const sparkPoints = history.points.map((p) => p.v);
+  return (
+    <>
+      <MetricTile
+        label={spec.label}
+        value={spec.display}
+        unit={spec.unit}
+        status="live"
+        history={{ points: sparkPoints, ariaLabel: `${spec.label} history sparkline` }}
+        onClick={() => setOpen(true)}
+      />
+      <MetricHistoryModal
+        open={open}
+        onClose={() => setOpen(false)}
+        title={spec.label}
+        unit={spec.unit}
+        formatValue={spec.format}
+        points={history.points}
+        source={history.source}
+        reason={history.reason}
+        windowMs={history.windowMs}
+        targetLabel={history.target_label}
+      />
     </>
   );
 }

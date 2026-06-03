@@ -9,3 +9,5 @@ export { ShardMetricsStrip } from "./ShardMetricsStrip";
 export type { Shard as ShardMetric, ShardMetricsStripProps } from "./ShardMetricsStrip";
 export { Sparkline } from "./Sparkline";
 export type { SparklineProps } from "./Sparkline";
+export { MetricHistoryModal } from "./MetricHistoryModal";
+export type { MetricHistoryModalProps } from "./MetricHistoryModal";

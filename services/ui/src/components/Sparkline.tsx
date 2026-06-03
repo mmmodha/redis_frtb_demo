@@ -11,6 +11,11 @@ export interface SparklineProps {
   width?: number;
   height?: number;
   ariaLabel?: string;
+  // Wave 5.57 — tile variant. `filled` paints the area under the line; `dots`
+  // controls per-point markers (default "all" for the original K_b drill-down
+  // usage; "last" or "none" for the inline metric-tile sparkline).
+  filled?: boolean;
+  dots?: "all" | "last" | "none";
 }
 
 const DEFAULT_WIDTH = 120;
@@ -47,6 +52,8 @@ export function Sparkline({
   width = DEFAULT_WIDTH,
   height = DEFAULT_HEIGHT,
   ariaLabel,
+  filled = false,
+  dots = "all",
 }: SparklineProps) {
   const all = series === 2 && pointsB ? [...points, ...pointsB] : points;
   if (all.length === 0) {
@@ -60,20 +67,38 @@ export function Sparkline({
 
   const pathA = buildPath(points, min, max, width, height);
   const pathB = series === 2 && pointsB ? buildPath(pointsB, min, max, width, height) : null;
+  // Wave 5.57 — closed path for the area-fill variant; reuses the same x/y
+  // mapping as `pathA` so the fill exactly tracks the stroke.
+  const areaPath =
+    filled && points.length > 0
+      ? `${pathA} L${(PAD_X + (points.length - 1) * (points.length > 1 ? usableW / (points.length - 1) : 0)).toFixed(2)},${(PAD_Y + usableH).toFixed(2)} L${PAD_X.toFixed(2)},${(PAD_Y + usableH).toFixed(2)} Z`
+      : null;
 
   const stepX = points.length > 1 ? usableW / (points.length - 1) : 0;
+  const markerIndices: number[] =
+    dots === "all" ? points.map((_, i) => i) : dots === "last" && points.length > 0 ? [points.length - 1] : [];
 
   return (
     <svg
       className="sparkline"
       data-testid="sparkline"
       data-series={series}
+      data-filled={filled ? "1" : "0"}
+      data-dots={dots}
       width={width}
       height={height}
       viewBox={`0 0 ${width} ${height}`}
       role="img"
       aria-label={ariaLabel ?? `sparkline with ${points.length} points`}
     >
+      {areaPath ? (
+        <path
+          d={areaPath}
+          fill="var(--sparkline-area, rgba(91, 211, 123, 0.18))"
+          stroke="none"
+          data-series-id="a-area"
+        />
+      ) : null}
       <path
         d={pathA}
         fill="none"
@@ -90,17 +115,27 @@ export function Sparkline({
           data-series-id="b"
         />
       ) : null}
-      {points.map((p, i) => {
+      {markerIndices.map((i) => {
+        const p = points[i] as number;
         const x = PAD_X + i * stepX;
         const y = PAD_Y + usableH - ((p - min) / range) * usableH;
         const label = labels?.[i];
+        const isLast = i === points.length - 1;
         return (
-          <circle key={`a-${i}`} cx={x} cy={y} r={1.5} fill="var(--sparkline-up, #5BD37B)" data-point-index={i}>
+          <circle
+            key={`a-${i}`}
+            cx={x}
+            cy={y}
+            r={dots === "last" && isLast ? 2 : 1.5}
+            fill="var(--sparkline-up, #5BD37B)"
+            data-point-index={i}
+            data-point-last={isLast ? "1" : "0"}
+          >
             <title>{label ? `${label} → ${p}` : String(p)}</title>
           </circle>
         );
       })}
-      {pathB && pointsB
+      {pathB && pointsB && dots === "all"
         ? pointsB.map((p, i) => {
             const x = PAD_X + i * stepX;
             const y = PAD_Y + usableH - ((p - min) / range) * usableH;

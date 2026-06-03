@@ -27,4 +27,21 @@ describe("<Sparkline />", () => {
     expect(svg.querySelector('path[data-series-id="a"]')).not.toBeNull();
     expect(svg.querySelector('path[data-series-id="b"]')).not.toBeNull();
   });
+
+  // Wave 5.57 — area-filled tile variant with last-point marker only.
+  it("renders an area path and a single last-point marker when filled+dots=last", () => {
+    render(<Sparkline points={[1, 2, 3, 4]} filled dots="last" />);
+    const svg = screen.getByTestId("sparkline");
+    expect(svg.getAttribute("data-filled")).toBe("1");
+    expect(svg.getAttribute("data-dots")).toBe("last");
+    expect(svg.querySelector('path[data-series-id="a-area"]')).not.toBeNull();
+    const markers = svg.querySelectorAll("circle[data-point-index]");
+    expect(markers.length).toBe(1);
+    expect(markers[0]!.getAttribute("data-point-last")).toBe("1");
+  });
+
+  it("renders the empty placeholder when points is []", () => {
+    render(<Sparkline points={[]} filled dots="last" ariaLabel="empty hist" />);
+    expect(screen.getByLabelText("empty hist")).toBeInTheDocument();
+  });
 });

@@ -135,6 +135,99 @@
 }
 .metric-tile__status[data-status="live"] { color: var(--redis-hyper); border-color: var(--redis-hyper); }
 
+/* Wave 5.57 — interactive tile (history click target) + inline sparkline. */
+.metric-tile--interactive {
+  background: var(--redis-bg-tertiary);
+  border: 1px solid var(--redis-border-secondary);
+  border-radius: var(--radius);
+  padding: calc(var(--grid) * 2);
+  display: grid;
+  gap: var(--grid);
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+.metric-tile--interactive:hover,
+.metric-tile--interactive:focus-visible {
+  border-color: var(--redis-text-link);
+  background: var(--redis-bg-secondary);
+  outline: none;
+}
+.metric-tile__sparkline { line-height: 0; }
+
+.metric-history-modal__backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+}
+.metric-history-modal {
+  background: var(--redis-bg-secondary);
+  border: 1px solid var(--redis-border-secondary);
+  border-radius: calc(var(--radius) * 2);
+  padding: calc(var(--grid) * 3);
+  width: min(840px, calc(100vw - 32px));
+  max-height: calc(100vh - 32px);
+  display: grid;
+  gap: calc(var(--grid) * 2);
+  color: var(--redis-text-primary);
+}
+.metric-history-modal__header {
+  display: flex;
+  align-items: center;
+  gap: var(--grid);
+}
+.metric-history-modal__header h2 {
+  margin: 0;
+  font-size: 1.125rem;
+  flex: 1;
+}
+.metric-history-modal__target {
+  font-size: 0.75rem;
+  color: var(--redis-text-secondary);
+  padding: 2px 8px;
+  border: 1px solid var(--redis-border-secondary);
+  border-radius: var(--radius);
+}
+.metric-history-modal__close {
+  background: transparent;
+  border: 1px solid var(--redis-border-secondary);
+  border-radius: var(--radius);
+  color: var(--redis-text-primary);
+  width: 28px;
+  height: 28px;
+  cursor: pointer;
+  font-size: 1.125rem;
+  line-height: 1;
+}
+.metric-history-modal__badges {
+  display: flex;
+  gap: calc(var(--grid) * 2);
+  font-size: 0.8125rem;
+  color: var(--redis-text-secondary);
+}
+.metric-history-modal__badges strong {
+  color: var(--redis-text-primary);
+  font-family: var(--font-mono);
+}
+.metric-history-modal__chart { width: 100%; height: auto; }
+.metric-history-modal__empty {
+  text-align: center;
+  color: var(--redis-text-secondary);
+  font-size: 0.875rem;
+}
+.metric-history-modal__footer {
+  font-size: 0.75rem;
+  color: var(--redis-text-secondary);
+  border-top: 1px solid var(--redis-border-secondary);
+  padding-top: var(--grid);
+}
+
 .timing-strip { display: grid; gap: var(--grid); }
 .timing-strip__row {
   display: grid;

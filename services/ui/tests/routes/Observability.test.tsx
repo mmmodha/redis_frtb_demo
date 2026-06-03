@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { Observability } from "../../src/routes/Observability";
 
@@ -95,6 +95,69 @@ describe("<Observability />", () => {
     await waitFor(() => {
       expect(screen.getByText(/failed to load observability/i)).toBeInTheDocument();
     });
+  });
+
+  // Wave 5.57 — wiring of /observability/history + popout modal.
+  it("renders sparklines and shows the TimeSeries source label in the popout modal", async () => {
+    mockFetch((url) => {
+      if (url.endsWith("/observability/keys?prefix=sens:")) {
+        return jsonResponse({ prefix: "sens:", dbsize: 1234, sample: [], sample_size: 0, ms: 0 });
+      }
+      if (url.endsWith("/observability/memory")) {
+        return jsonResponse({ used_memory: 1, used_memory_human: "1B", ms: 0 });
+      }
+      if (url.endsWith("/observability/shards")) {
+        return jsonResponse([
+          { shardId: "shard-1", role: "master", opsPerSec: 100, slotCount: 1, usedMemoryBytes: 1, netInBytes: 0, netOutBytes: 0 },
+        ]);
+      }
+      if (url.includes("/observability/history")) {
+        return jsonResponse({
+          source: "redis-timeseries",
+          metric: "total_keys",
+          windowMs: 18_000_000,
+          points: [{ t: Date.now() - 60_000, v: 100 }, { t: Date.now(), v: 200 }],
+          reason: null,
+          target_label: "tA",
+        });
+      }
+      return jsonResponse({}, 404);
+    });
+    renderRoute();
+    await waitFor(() => expect(screen.getByText("1,234")).toBeInTheDocument());
+    // 4 tile buttons (the four Cluster snapshot metrics).
+    await waitFor(() => expect(screen.getAllByTestId("metric-tile-button").length).toBe(4));
+    const [first] = screen.getAllByTestId("metric-tile-button");
+    fireEvent.click(first!);
+    await waitFor(() => expect(screen.getByTestId("metric-history-modal")).toBeInTheDocument());
+    expect(screen.getByTestId("metric-history-modal-source").textContent).toMatch(/Redis TimeSeries/);
+  });
+
+  it("falls back to ring-buffer source label when /observability/history reports unavailable", async () => {
+    mockFetch((url) => {
+      if (url.endsWith("/observability/keys?prefix=sens:")) {
+        return jsonResponse({ prefix: "sens:", dbsize: 5, sample: [], sample_size: 0, ms: 0 });
+      }
+      if (url.endsWith("/observability/memory")) {
+        return jsonResponse({ used_memory: 1, used_memory_human: "1B", ms: 0 });
+      }
+      if (url.endsWith("/observability/shards")) {
+        return jsonResponse([
+          { shardId: "shard-1", role: "master", opsPerSec: 50, slotCount: 1, usedMemoryBytes: 1, netInBytes: 0, netOutBytes: 0 },
+        ]);
+      }
+      if (url.includes("/observability/history")) {
+        return jsonResponse({
+          source: "unavailable", metric: "total_keys", windowMs: 18_000_000,
+          points: [], reason: "module-not-loaded", target_label: "tA",
+        });
+      }
+      return jsonResponse({}, 404);
+    });
+    renderRoute();
+    await waitFor(() => expect(screen.getAllByTestId("metric-tile-button").length).toBe(4));
+    fireEvent.click(screen.getAllByTestId("metric-tile-button")[0]!);
+    await waitFor(() => expect(screen.getByTestId("metric-history-modal-source").textContent).toMatch(/this browser/));
   });
 
   it("renders the ObservabilityModule enterprise callout banner", async () => {

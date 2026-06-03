@@ -61,3 +61,26 @@ export function getObservabilityMemory(): Promise<ObservabilityMemoryResponse> {
 export function getObservabilityShards(): Promise<ObservabilityShardsResponse> {
   return getJson<ObservabilityShardsResponse>(`/observability/shards`);
 }
+
+// Wave 5.57 — historical samples for the Cluster snapshot sparkline / popout
+// modal. `source` is "redis-timeseries" when the active target has the TS
+// module loaded; "unavailable" triggers the UI's client-side ring-buffer
+// fallback.
+export interface ObservabilityHistoryPoint { t: number; v: number }
+export interface ObservabilityHistoryResponse {
+  source: "redis-timeseries" | "unavailable";
+  metric: string;
+  windowMs: number;
+  points: ObservabilityHistoryPoint[];
+  reason: null | "module-not-loaded" | "no-data-yet";
+  target_label: string;
+}
+
+export function getObservabilityHistory(
+  metric: string,
+  windowMs: number,
+): Promise<ObservabilityHistoryResponse> {
+  return getJson<ObservabilityHistoryResponse>(
+    `/observability/history?metric=${encodeURIComponent(metric)}&windowMs=${windowMs}`,
+  );
+}

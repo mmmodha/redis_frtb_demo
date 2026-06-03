@@ -1,0 +1,198 @@
+// Wave 5.57 — centred popout chart for a single Cluster snapshot metric.
+// Minimal SVG renderer (no chart library): X labels at 0/-1h/-2h/-3h/-4h/-5h,
+// Y min/max, hoverable tooltip, min/max/avg badges, footer source label.
+// Closes on Esc, the X button, or click on the backdrop.
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { ObservabilityHistoryPoint } from "../lib/api";
+import type { HistorySource, HistoryReason } from "../hooks/useMetricHistory";
+
+export interface MetricHistoryModalProps {
+  open: boolean;
+  onClose: () => void;
+  title: string;
+  unit?: string;
+  formatValue?: (v: number) => string;
+  points: ObservabilityHistoryPoint[];
+  source: HistorySource;
+  reason: HistoryReason;
+  windowMs: number;
+  targetLabel: string | null;
+}
+
+const CHART_W = 760;
+const CHART_H = 280;
+const PAD_L = 56;
+const PAD_R = 16;
+const PAD_T = 16;
+const PAD_B = 32;
+
+interface Hover { x: number; y: number; p: ObservabilityHistoryPoint }
+
+function fmtClock(ts: number): string {
+  const d = new Date(ts);
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  return `${hh}:${mm}`;
+}
+
+function sourceFooter(
+  source: HistorySource,
+  reason: HistoryReason,
+  windowMs: number,
+  points: ObservabilityHistoryPoint[],
+): string {
+  if (source === "redis-timeseries") {
+    const hours = Math.round(windowMs / 3_600_000);
+    return `Source: Redis TimeSeries · last ${hours}h`;
+  }
+  if (source === "ring-buffer") {
+    const first = points[0];
+    const last = points[points.length - 1];
+    const spanMin = first && last ? Math.max(1, Math.round((last.t - first.t) / 60_000)) : 0;
+    const suffix = reason === "module-not-loaded"
+      ? " · RedisTimeSeries module not loaded on this target."
+      : "";
+    return `Source: this browser · last ${spanMin}m${suffix}`;
+  }
+  return "Source: —";
+}
+
+export function MetricHistoryModal({
+  open, onClose, title, unit, formatValue, points, source, reason, windowMs, targetLabel,
+}: MetricHistoryModalProps) {
+  const [hover, setHover] = useState<Hover | null>(null);
+  const svgRef = useRef<SVGSVGElement | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === "Escape") { e.stopPropagation(); onClose(); }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+
+  const stats = useMemo(() => {
+    if (points.length === 0) return null;
+    let min = Infinity, max = -Infinity, sum = 0;
+    for (const p of points) {
+      if (p.v < min) min = p.v;
+      if (p.v > max) max = p.v;
+      sum += p.v;
+    }
+    return { min, max, avg: sum / points.length };
+  }, [points]);
+
+  if (!open) return null;
+  const fmt = formatValue ?? ((v: number) => v.toLocaleString("en-US"));
+
+  const innerW = CHART_W - PAD_L - PAD_R;
+  const innerH = CHART_H - PAD_T - PAD_B;
+  const now = Date.now();
+  const fromMs = now - windowMs;
+  const yMin = stats ? Math.min(stats.min, stats.max) : 0;
+  const yMax = stats ? Math.max(stats.min, stats.max) : 1;
+  const yRange = (yMax - yMin) || 1;
+  const xScale = (t: number): number =>
+    PAD_L + ((Math.max(fromMs, Math.min(now, t)) - fromMs) / windowMs) * innerW;
+  const yScale = (v: number): number =>
+    PAD_T + innerH - ((v - yMin) / yRange) * innerH;
+
+  const path = points
+    .map((p, i) => `${i === 0 ? "M" : "L"}${xScale(p.t).toFixed(2)},${yScale(p.v).toFixed(2)}`)
+    .join(" ");
+  const areaPath = points.length > 0
+    ? `${path} L${xScale(points[points.length - 1]!.t).toFixed(2)},${(PAD_T + innerH).toFixed(2)} L${xScale(points[0]!.t).toFixed(2)},${(PAD_T + innerH).toFixed(2)} Z`
+    : "";
+
+  const onMove = (e: React.MouseEvent<SVGSVGElement>): void => {
+    if (points.length === 0) return;
+    const svg = svgRef.current; if (!svg) return;
+    const rect = svg.getBoundingClientRect();
+    const x = ((e.clientX - rect.left) / rect.width) * CHART_W;
+    let best = points[0]!, bestDx = Infinity;
+    for (const p of points) {
+      const dx = Math.abs(xScale(p.t) - x);
+      if (dx < bestDx) { best = p; bestDx = dx; }
+    }
+    setHover({ x: xScale(best.t), y: yScale(best.v), p: best });
+  };
+  const onLeave = (): void => setHover(null);
+
+  const xTicks = [0, 1, 2, 3, 4, 5].map((h) => ({ ms: now - h * 3_600_000, label: h === 0 ? "now" : `-${h}h` }));
+
+  const emptyMsg = points.length === 0
+    ? source === "redis-timeseries" && reason === "no-data-yet"
+      ? "Recording… first sample in a few seconds."
+      : source === "ring-buffer"
+        ? "Collecting samples… first sample in a few seconds."
+        : "No data yet."
+    : null;
+
+  return (
+    <div
+      className="metric-history-modal__backdrop"
+      data-testid="metric-history-modal"
+      role="presentation"
+      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+    >
+      <div className="metric-history-modal" role="dialog" aria-modal="true" aria-label={`${title} history`}>
+        <header className="metric-history-modal__header">
+          <h2>{title}{unit ? ` · ${unit}` : ""}</h2>
+          {targetLabel ? <span className="metric-history-modal__target">{targetLabel}</span> : null}
+          <button
+            type="button"
+            className="metric-history-modal__close"
+            aria-label="Close"
+            data-testid="metric-history-modal-close"
+            onClick={onClose}
+          >×</button>
+        </header>
+        <div className="metric-history-modal__badges">
+          <span data-testid="mhm-badge-min">min&nbsp;<strong>{stats ? fmt(stats.min) : "—"}</strong></span>
+          <span data-testid="mhm-badge-max">max&nbsp;<strong>{stats ? fmt(stats.max) : "—"}</strong></span>
+          <span data-testid="mhm-badge-avg">avg&nbsp;<strong>{stats ? fmt(stats.avg) : "—"}</strong></span>
+        </div>
+        <svg
+          ref={svgRef}
+          className="metric-history-modal__chart"
+          data-testid="metric-history-modal-chart"
+          width="100%"
+          viewBox={`0 0 ${CHART_W} ${CHART_H}`}
+          role="img"
+          aria-label={`${title} chart over the last ${Math.round(windowMs / 60000)} minutes`}
+          onMouseMove={onMove}
+          onMouseLeave={onLeave}
+        >
+          <rect x={PAD_L} y={PAD_T} width={innerW} height={innerH} fill="var(--redis-bg-tertiary)" />
+          {/* Y gridlines + min/max labels */}
+          <line x1={PAD_L} y1={PAD_T} x2={PAD_L + innerW} y2={PAD_T} stroke="var(--redis-border-secondary)" strokeWidth={1} />
+          <line x1={PAD_L} y1={PAD_T + innerH} x2={PAD_L + innerW} y2={PAD_T + innerH} stroke="var(--redis-border-secondary)" strokeWidth={1} />
+          <text x={PAD_L - 6} y={PAD_T + 4} textAnchor="end" fontSize={11} fill="var(--redis-text-secondary)">{stats ? fmt(yMax) : ""}</text>
+          <text x={PAD_L - 6} y={PAD_T + innerH} textAnchor="end" fontSize={11} fill="var(--redis-text-secondary)">{stats ? fmt(yMin) : ""}</text>
+          {/* X ticks */}
+          {xTicks.map((t, i) => (
+            <g key={i}>
+              <line x1={xScale(t.ms)} y1={PAD_T + innerH} x2={xScale(t.ms)} y2={PAD_T + innerH + 4} stroke="var(--redis-border-secondary)" />
+              <text x={xScale(t.ms)} y={PAD_T + innerH + 18} textAnchor="middle" fontSize={11} fill="var(--redis-text-secondary)" data-testid="mhm-x-tick">{t.label}</text>
+            </g>
+          ))}
+          {areaPath ? <path d={areaPath} fill="var(--sparkline-area, rgba(91, 211, 123, 0.18))" stroke="none" /> : null}
+          {path ? <path d={path} fill="none" stroke="var(--sparkline-line, var(--redis-text-link))" strokeWidth={1.5} /> : null}
+          {hover ? (
+            <g data-testid="mhm-hover">
+              <line x1={hover.x} y1={PAD_T} x2={hover.x} y2={PAD_T + innerH} stroke="var(--redis-text-secondary)" strokeDasharray="2 2" />
+              <circle cx={hover.x} cy={hover.y} r={3} fill="var(--sparkline-up, #5BD37B)" />
+              <text x={hover.x + 8} y={hover.y - 8} fontSize={11} fill="var(--redis-text-primary)">{fmt(hover.p.v)} · {fmtClock(hover.p.t)}</text>
+            </g>
+          ) : null}
+        </svg>
+        {emptyMsg ? <div className="metric-history-modal__empty" role="status">{emptyMsg}</div> : null}
+        <footer className="metric-history-modal__footer" data-testid="metric-history-modal-source">
+          {sourceFooter(source, reason, windowMs, points)}
+        </footer>
+      </div>
+    </div>
+  );
+}
