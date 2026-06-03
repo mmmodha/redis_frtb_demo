@@ -10,7 +10,8 @@ import {
   readErrorBody,
 } from "../lib/empty-target";
 import type { PivotResp } from "../lib/pivot";
-import { BUCKETS_BY_RISK_CLASS, RISK_CLASSES, SENSITIVITY_TYPES } from "../lib/buckets";
+import { useFacets } from "../hooks/useFacets";
+import { bucketOptions, riskClassOptions, sensitivityTypeOptions } from "../lib/facet-options";
 import { usePivotBurst } from "../context/PivotBurstContext";
 import { usePivotHistory } from "../context/PivotHistoryContext";
 
@@ -34,8 +35,14 @@ export function PivotPanel(): JSX.Element {
   // Wave 5.21g — burst lives in the global PivotBurstContext so the loop
   // survives route changes (and AppShell can render a nav pill).
   const { burst, startBurst } = usePivotBurst();
+  // Wave 5.56 — drive dropdown options from /facets so risk classes /
+  // buckets / sensitivity types that have zero rows in the active index
+  // are hidden, with counts surfaced next to live values.
+  const { facets } = useFacets();
 
-  const buckets = useMemo<string[]>(() => BUCKETS_BY_RISK_CLASS[riskClass] ?? [], [riskClass]);
+  const riskClasses = useMemo(() => riskClassOptions(facets), [facets]);
+  const buckets = useMemo(() => bucketOptions(facets, riskClass), [facets, riskClass]);
+  const sensTypes = useMemo(() => sensitivityTypeOptions(facets), [facets]);
 
   function onRiskClassChange(next: string): void {
     setRiskClass(next);
@@ -161,8 +168,8 @@ export function PivotPanel(): JSX.Element {
             onChange={(e) => onRiskClassChange(e.target.value)}
           >
             <option value="">All risk classes</option>
-            {RISK_CLASSES.map((r) => (
-              <option key={r} value={r}>{r}</option>
+            {riskClasses.map((r) => (
+              <option key={r.value} value={r.value}>{r.label}</option>
             ))}
           </select>
           <label htmlFor="pivot-bucket">Bucket</label>
@@ -175,7 +182,7 @@ export function PivotPanel(): JSX.Element {
           >
             <option value="">{buckets.length === 0 ? "Pick a class first" : "All buckets"}</option>
             {buckets.map((b) => (
-              <option key={b} value={b}>{b}</option>
+              <option key={b.value} value={b.value}>{b.label}</option>
             ))}
           </select>
           <label htmlFor="pivot-sensitivity-type">Sensitivity type</label>
@@ -185,8 +192,9 @@ export function PivotPanel(): JSX.Element {
             value={sensType}
             onChange={(e) => setSensType(e.target.value)}
           >
-            {SENSITIVITY_TYPES.map((s) => (
-              <option key={s || "_all"} value={s}>{s || "All sensitivity types"}</option>
+            <option value="">All sensitivity types</option>
+            {sensTypes.map((s) => (
+              <option key={s.value} value={s.value}>{s.label}</option>
             ))}
           </select>
           <label htmlFor="pivot-book">Book</label>

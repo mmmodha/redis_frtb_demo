@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useRef, useState, type CSSProperties, type KeyboardEvent } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent } from "react";
 import { EnterpriseCallout, PanelCard, Sparkline, TimingStrip } from "../components";
 import { SuggestCombobox } from "../components/SuggestCombobox";
 import type { ShardTiming } from "../components/TimingStrip";
@@ -13,6 +13,7 @@ import {
 import { EmptyTargetError } from "../lib/empty-target";
 import { formatCharge } from "../lib/format";
 import { fetchPivot, type PivotDoc, type PivotRow } from "../lib/pivot";
+import { useFacets } from "../hooks/useFacets";
 
 type RiskClass = "GIRR" | "Equity" | "FX";
 type SortKey = "bucket" | "K_b" | "S_b" | "count" | "ms";
@@ -258,6 +259,10 @@ function readInitialShowRedisCommands(): boolean {
 export function CalcPanel() {
   const [riskClass, setRiskClass] = useState<RiskClass>("GIRR");
   const [sensitivityType, setSensitivityType] = useState<SensitivityType>("Delta");
+  // Wave 5.56 — facet counts narrow the risk_class / sensitivity_type
+  // dropdowns to what's actually in the active index, with row counts
+  // shown next to each label.
+  const { facets } = useFacets();
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<CalcSbmResponse | null>(null);
   // Wave 5.18: capture the (risk_class, sensitivity_type) at compute time so
@@ -320,6 +325,24 @@ export function CalcPanel() {
   const advancedAutoOpen =
     excludeTotal > 0 || bucketSubset !== null || !fuzzy || showRedisCommands;
   const advancedOpen = advancedManuallyOpened || advancedAutoOpen;
+
+  // Wave 5.56 — narrow the static risk_class / sensitivity_type lists to
+  // values that have rows in the live index, and surface the count next to
+  // each label. When facets are null (api error) or empty-index, fall back
+  // to the full static lists so the form remains usable.
+  const liveFacets = facets !== null && facets.ok === true && facets.total_rows > 0 ? facets : null;
+  const calcRiskClassOptions = useMemo(() => {
+    if (!liveFacets) return RISK_CLASS_OPTIONS.map((o) => ({ ...o, count: null as number | null }));
+    return RISK_CLASS_OPTIONS
+      .filter((o) => (liveFacets.risk_class[o.value] ?? 0) > 0)
+      .map((o) => ({ ...o, count: liveFacets.risk_class[o.value]! }));
+  }, [liveFacets]);
+  const calcSensitivityOptions = useMemo(() => {
+    if (!liveFacets) return SENSITIVITY_OPTIONS.map((s) => ({ value: s, count: null as number | null }));
+    return SENSITIVITY_OPTIONS
+      .filter((s) => (liveFacets.sensitivity_type[s] ?? 0) > 0)
+      .map((s) => ({ value: s, count: liveFacets.sensitivity_type[s]! }));
+  }, [liveFacets]);
 
   async function onCalculate() {
     setLoading(true);
@@ -432,9 +455,9 @@ export function CalcPanel() {
               value={riskClass}
               onChange={(e) => setRiskClass(e.target.value as RiskClass)}
             >
-              {RISK_CLASS_OPTIONS.map((o) => (
+              {calcRiskClassOptions.map((o) => (
                 <option key={o.value} value={o.value}>
-                  {o.label}
+                  {o.count !== null ? `${o.label} (${o.count})` : o.label}
                 </option>
               ))}
             </select>
@@ -445,9 +468,9 @@ export function CalcPanel() {
               value={sensitivityType}
               onChange={(e) => setSensitivityType(e.target.value as SensitivityType)}
             >
-              {SENSITIVITY_OPTIONS.map((s) => (
-                <option key={s} value={s}>
-                  {s}
+              {calcSensitivityOptions.map((s) => (
+                <option key={s.value} value={s.value}>
+                  {s.count !== null ? `${s.value} (${s.count})` : s.value}
                 </option>
               ))}
             </select>

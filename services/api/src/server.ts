@@ -17,6 +17,7 @@ import {
 import { registerPivotRoute } from "./routes/pivot.ts";
 import { registerCalcRoute } from "./routes/calc.ts";
 import { registerSuggestRoutes } from "./routes/suggest.ts";
+import { registerFacetsRoute } from "./routes/facets.ts";
 import { registerObservabilityRoutes } from "./routes/observability.ts";
 import { registerSourcesProxyRoutes } from "./routes/sources-proxy.ts";
 import { registerLoadgenProxyRoutes } from "./routes/loadgen-proxy.ts";
@@ -190,6 +191,7 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
   registerPivotRoute(app, getRedis);
   registerCalcRoute(app, getRedis, { correlations: opts.correlations ?? {} });
   registerSuggestRoutes(app, getRedis, { corsAllowed });
+  registerFacetsRoute(app, getRedis);
   registerObservabilityRoutes(app, getRedis, { sseIntervalMs: opts.sseIntervalMs, corsAllowed });
   registerGeneratorRoutes(app, getRedis, opts.schema, {
     sseProgressIntervalMs: opts.generatorSseProgressIntervalMs,

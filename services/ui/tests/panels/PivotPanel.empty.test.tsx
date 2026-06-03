@@ -4,6 +4,7 @@ import { MemoryRouter } from "react-router-dom";
 import { PivotPanel } from "../../src/panels/PivotPanel";
 import { PivotBurstProvider } from "../../src/context/PivotBurstContext";
 import { PivotHistoryProvider } from "../../src/context/PivotHistoryContext";
+import { installFetchRouter } from "../helpers/fetch-mock";
 
 vi.mock("../../src/components/PanelCard", () => ({
   PanelCard: ({ title, children, actions }: any) => (
@@ -44,25 +45,25 @@ function renderPanel() {
 }
 
 describe("<PivotPanel /> friendly empty-target banner (Wave 5.16z3)", () => {
-  let fetchMock: ReturnType<typeof vi.fn>;
-  beforeEach(() => {
-    fetchMock = vi.fn();
-    vi.stubGlobal("fetch", fetchMock);
-  });
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
 
   it("412 bootstrap response renders the amber banner (target_label + bootstrap_phase), not the red error", async () => {
-    fetchMock.mockResolvedValueOnce({
-      ok: false,
-      status: 412,
-      json: async () => ({
-        error: "Function not found",
-        target_label: "test2",
-        bootstrap_phase: "library-loading",
-      }),
+    installFetchRouter({
+      routes: [{
+        match: "/pivot",
+        response: {
+          ok: false,
+          status: 412,
+          json: async () => ({
+            error: "Function not found",
+            target_label: "test2",
+            bootstrap_phase: "library-loading",
+          }),
+        },
+      }],
     });
     renderPanel();
     fireEvent.click(screen.getByRole("button", { name: /run query/i }));
@@ -78,10 +79,15 @@ describe("<PivotPanel /> friendly empty-target banner (Wave 5.16z3)", () => {
   });
 
   it("503 no-data-or-index renders the amber 'head to Sources' banner", async () => {
-    fetchMock.mockResolvedValueOnce({
-      ok: false,
-      status: 503,
-      json: async () => ({ error: "no-data-or-index", hint: "Upload via Sources first." }),
+    installFetchRouter({
+      routes: [{
+        match: "/pivot",
+        response: {
+          ok: false,
+          status: 503,
+          json: async () => ({ error: "no-data-or-index", hint: "Upload via Sources first." }),
+        },
+      }],
     });
     renderPanel();
     fireEvent.click(screen.getByRole("button", { name: /run query/i }));
@@ -95,10 +101,15 @@ describe("<PivotPanel /> friendly empty-target banner (Wave 5.16z3)", () => {
   });
 
   it("ordinary 500 still renders the existing red alert (not swallowed)", async () => {
-    fetchMock.mockResolvedValueOnce({
-      ok: false,
-      status: 500,
-      json: async () => ({ error: "boom" }),
+    installFetchRouter({
+      routes: [{
+        match: "/pivot",
+        response: {
+          ok: false,
+          status: 500,
+          json: async () => ({ error: "boom" }),
+        },
+      }],
     });
     renderPanel();
     fireEvent.click(screen.getByRole("button", { name: /run query/i }));

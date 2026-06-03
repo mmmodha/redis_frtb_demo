@@ -4,6 +4,7 @@ import { MemoryRouter } from "react-router-dom";
 import { PivotPanel } from "../src/panels/PivotPanel";
 import { PivotBurstProvider } from "../src/context/PivotBurstContext";
 import { PivotHistoryProvider } from "../src/context/PivotHistoryContext";
+import { installFetchIntercept, installFetchRouter } from "./helpers/fetch-mock";
 
 // Shell components (owned by task 1) are mocked so this unit test runs in
 // isolation. Production composition is asserted by the Playwright e2e suite.
@@ -79,8 +80,11 @@ describe("PivotPanel", () => {
   let fetchMock: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
-    fetchMock = vi.fn();
-    vi.stubGlobal("fetch", fetchMock);
+    // Intercept wires fetch globally; the returned inner mock only sees
+    // URLs other than /facets and /suggest, so existing once-queue patterns
+    // target the test's intended endpoint without competing with the
+    // background hook fetches added in Wave 5.56.
+    fetchMock = installFetchIntercept();
   });
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -439,6 +443,40 @@ describe("PivotPanel", () => {
     const headline = await screen.findByTestId("latency-strip-headline");
     expect(headline).toHaveTextContent(/n = 1/);
     expect(headline).toHaveTextContent(/17\.2/);
+  });
+
+  it("Wave 5.56 — dropdown options filter to facet hits when /facets has data", async () => {
+    // /facets returns GIRR + Equity rows only (FX/CSR absent), with USD-IRS
+    // the only GIRR bucket present. The risk_class and sensitivity_type
+    // dropdowns should hide the unrepresented values and surface counts in
+    // each visible label.
+    installFetchRouter({
+      facets: {
+        ok: true, status: 200, json: async () => ({
+          ok: true, ms: 1, target_label: "primary", total_rows: 12,
+          risk_class: { GIRR: 8, Equity: 4 },
+          sensitivity_type: { Delta: 9, Vega: 3 },
+          bucket_by_risk_class: { GIRR: { "USD-IRS": 8 }, Equity: { B1: 4 } },
+        }),
+      },
+    });
+    renderPanel();
+    const rc = await screen.findByLabelText(/risk class/i) as HTMLSelectElement;
+    await waitFor(() => {
+      expect(Array.from(rc.options).map((o) => o.value)).toEqual(["", "GIRR", "Equity"]);
+    });
+    // Counts appear next to each option label.
+    expect(Array.from(rc.options).map((o) => o.textContent)).toEqual(
+      expect.arrayContaining(["GIRR (8)", "Equity (4)"]),
+    );
+    const sens = screen.getByLabelText(/sensitivity type/i) as HTMLSelectElement;
+    const sensValues = Array.from(sens.options).map((o) => o.value);
+    expect(sensValues).toEqual(["", "Delta", "Vega"]);
+    expect(sensValues).not.toContain("Curvature");
+    // Bucket dropdown depends on the selected risk class.
+    fireEvent.change(rc, { target: { value: "GIRR" } });
+    const bucket = screen.getByLabelText(/^bucket$/i) as HTMLSelectElement;
+    expect(Array.from(bucket.options).map((o) => o.value)).toEqual(["", "USD-IRS"]);
   });
 
   it("Wave 5.22 — Reset clears the latency history", async () => {

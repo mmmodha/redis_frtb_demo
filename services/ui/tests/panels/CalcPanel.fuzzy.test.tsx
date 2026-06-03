@@ -9,13 +9,31 @@ import { CalcPanel } from "../../src/panels/CalcPanel";
 
 const originalFetch = globalThis.fetch;
 
+// Wave 5.56 — CalcPanel now calls /facets on mount via useFacets. Stub it
+// out with a benign empty-index reply so the existing suggest/no-suggest
+// assertions can keep looking at the /suggest call exclusively.
 function suggestFetchMock() {
-  return vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => {
+  return vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
+    const url = typeof input === "string" ? input : input.toString();
+    if (url.includes("/facets")) {
+      return new Response(
+        JSON.stringify({
+          ok: false, reason: "empty-index", ms: 0, target_label: "test",
+          total_rows: 0, risk_class: {}, sensitivity_type: {}, bucket_by_risk_class: {},
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
     return new Response(
       JSON.stringify({ suggestions: [{ value: "RATES-LDN", score: 1 }], ms: 0.5 }),
       { headers: { "content-type": "application/json" } },
     );
   }) as typeof fetch;
+}
+
+function suggestCalls(): unknown[][] {
+  const m = globalThis.fetch as ReturnType<typeof vi.fn>;
+  return m.mock.calls.filter((c) => String(c[0]).includes("/suggest"));
 }
 
 beforeEach(() => {
@@ -56,7 +74,7 @@ describe("CalcPanel fuzzy-suggestions toggle (in Advanced)", () => {
     await new Promise((r) => setTimeout(r, 200));
     expect(screen.queryByRole("listbox")).toBeNull();
     expect(bookInput).toHaveAttribute("aria-expanded", "false");
-    expect(globalThis.fetch).not.toHaveBeenCalled();
+    expect(suggestCalls()).toHaveLength(0);
   });
 
   it("flipping the toggle back on ⇒ listbox opens on next keystroke", async () => {
@@ -73,8 +91,8 @@ describe("CalcPanel fuzzy-suggestions toggle (in Advanced)", () => {
     expect(toggle).toHaveAttribute("aria-pressed", "true");
     fireEvent.change(bookInput, { target: { value: "RAT" } });
     await screen.findByRole("listbox");
-    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled());
-    const url = String((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0]![0]);
+    await waitFor(() => expect(suggestCalls().length).toBeGreaterThan(0));
+    const url = String(suggestCalls()[0]![0]);
     expect(url).toContain("/suggest?");
     expect(url).toContain("fuzzy=1");
   });

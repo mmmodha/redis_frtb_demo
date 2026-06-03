@@ -6,8 +6,9 @@ import {
   checkEmptyTargetError,
   readErrorBody,
 } from "../lib/empty-target";
-import { BUCKETS_BY_RISK_CLASS, RISK_CLASSES, SENSITIVITY_TYPES } from "../lib/buckets";
 import type { PivotResp, PivotRow } from "../lib/pivot";
+import { useFacets } from "../hooks/useFacets";
+import { bucketOptions, riskClassOptions, sensitivityTypeOptions } from "../lib/facet-options";
 
 const PAGE_SIZES = [10, 25, 100] as const;
 
@@ -26,7 +27,12 @@ export function JsonExplorerPanel(): JSX.Element {
   const [emptyError, setEmptyError] = useState<EmptyTargetError | null>(null);
   const [result, setResult] = useState<PivotResp | null>(null);
 
-  const buckets = useMemo<string[]>(() => BUCKETS_BY_RISK_CLASS[riskClass] ?? [], [riskClass]);
+  // Wave 5.56 — facet-driven dropdowns; fall back to static lists when the
+  // /facets call errors or the index is empty.
+  const { facets } = useFacets();
+  const riskClasses = useMemo(() => riskClassOptions(facets), [facets]);
+  const buckets = useMemo(() => bucketOptions(facets, riskClass), [facets, riskClass]);
+  const sensTypes = useMemo(() => sensitivityTypeOptions(facets), [facets]);
 
   function onRiskClassChange(next: string): void {
     setRiskClass(next);
@@ -110,8 +116,8 @@ export function JsonExplorerPanel(): JSX.Element {
             onChange={(e) => onRiskClassChange(e.target.value)}
           >
             <option value="">All risk classes</option>
-            {RISK_CLASSES.map((r) => (
-              <option key={r} value={r}>{r}</option>
+            {riskClasses.map((r) => (
+              <option key={r.value} value={r.value}>{r.label}</option>
             ))}
           </select>
           <label htmlFor="je-bucket">Bucket</label>
@@ -124,7 +130,7 @@ export function JsonExplorerPanel(): JSX.Element {
           >
             <option value="">{buckets.length === 0 ? "Pick a class first" : "All buckets"}</option>
             {buckets.map((b) => (
-              <option key={b} value={b}>{b}</option>
+              <option key={b.value} value={b.value}>{b.label}</option>
             ))}
           </select>
           <label htmlFor="je-sensitivity-type">Sensitivity type</label>
@@ -134,8 +140,9 @@ export function JsonExplorerPanel(): JSX.Element {
             value={sensType}
             onChange={(e) => setSensType(e.target.value)}
           >
-            {SENSITIVITY_TYPES.map((s) => (
-              <option key={s || "_all"} value={s}>{s || "All sensitivity types"}</option>
+            <option value="">All sensitivity types</option>
+            {sensTypes.map((s) => (
+              <option key={s.value} value={s.value}>{s.label}</option>
             ))}
           </select>
           <label htmlFor="je-book">Book</label>

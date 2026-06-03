@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { JsonExplorerPanel } from "../../src/panels/JsonExplorerPanel";
+import { installFetchIntercept, installFetchRouter } from "../helpers/fetch-mock";
 
 vi.mock("../../src/components/PanelCard", () => ({
   PanelCard: ({ title, children, actions }: any) => (
@@ -69,8 +70,9 @@ describe("JsonExplorerPanel", () => {
   let fetchMock: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
-    fetchMock = vi.fn();
-    vi.stubGlobal("fetch", fetchMock);
+    // Wave 5.56 — intercept /facets + /suggest so the test's once-queue
+    // sees only /pivot.
+    fetchMock = installFetchIntercept();
   });
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -174,6 +176,34 @@ describe("JsonExplorerPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: /run query/i }));
     const err = await screen.findByRole("alert");
     expect(err).toHaveTextContent(/network down|failed/i);
+  });
+
+  it("Wave 5.56 — risk_class / bucket / sensitivity_type dropdowns reflect facet hits with counts", async () => {
+    installFetchRouter({
+      facets: {
+        ok: true, status: 200, json: async () => ({
+          ok: true, ms: 2, target_label: "primary", total_rows: 9,
+          risk_class: { GIRR: 6, FX: 3 },
+          sensitivity_type: { Delta: 7, Curvature: 2 },
+          bucket_by_risk_class: { GIRR: { "EUR-IRS": 6 }, FX: { EURUSD: 3 } },
+        }),
+      },
+    });
+    renderPanel();
+    const rc = await screen.findByLabelText(/risk class/i) as HTMLSelectElement;
+    await waitFor(() => {
+      expect(Array.from(rc.options).map((o) => o.value)).toEqual(["", "GIRR", "FX"]);
+    });
+    expect(Array.from(rc.options).map((o) => o.textContent)).toEqual(
+      expect.arrayContaining(["GIRR (6)", "FX (3)"]),
+    );
+    const sens = screen.getByLabelText(/sensitivity type/i) as HTMLSelectElement;
+    const sensValues = Array.from(sens.options).map((o) => o.value);
+    expect(sensValues).toEqual(["", "Delta", "Curvature"]);
+    expect(sensValues).not.toContain("Vega");
+    fireEvent.change(rc, { target: { value: "GIRR" } });
+    const bucket = screen.getByLabelText(/^bucket$/i) as HTMLSelectElement;
+    expect(Array.from(bucket.options).map((o) => o.value)).toEqual(["", "EUR-IRS"]);
   });
 
   it("renders the empty-target amber banner for 412 responses", async () => {
