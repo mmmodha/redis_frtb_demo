@@ -96,6 +96,16 @@ jobs:
     # /var/run/docker.sock, so the four it.skipIf(!HAS_DOCKER) tests
     # always RUN here (no silent skips). Verified via the "no-skip" assertion
     # step below.
+    services:
+      redis-stack:
+        image: redis/redis-stack-server:7.4.0-v0
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     env:
       DOCKER_HOST: unix:///var/run/docker.sock
     steps:
