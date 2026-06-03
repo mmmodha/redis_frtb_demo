@@ -45,8 +45,11 @@ function binaryOnPath(binary) {
 function spawnRedis(binary, port, dir, inlineModules) {
   const baseArgs = ["--port", String(port), "--dir", dir, "--save", "", "--appendonly", "no", "--protected-mode", "no"];
   const moduleArgs = inlineModules ? STACK_MODULES.flatMap((m) => ["--loadmodule", m]) : [];
-  const p = spawn(binary, [...baseArgs, ...moduleArgs], { stdio: "ignore" });
-  p.on("error", () => { /* swallow — tryBoot returns undefined on connection timeout */ });
+  const p = spawn(binary, [...baseArgs, ...moduleArgs], { stdio: ["ignore", "pipe", "pipe"] });
+  p.on("error", (e) => { console.error(`[rqe-spawn] spawn error for ${binary}:`, e.message); });
+  p.stderr?.on("data", (b) => { process.stderr.write(`[rqe-spawn:${binary}:stderr] ${b}`); });
+  p.stdout?.on("data", (b) => { process.stderr.write(`[rqe-spawn:${binary}:stdout] ${b}`); });
+  p.on("exit", (code, sig) => { if (code !== 0 && code !== null) console.error(`[rqe-spawn] ${binary} exited code=${code} sig=${sig}`); });
   return p;
 }
 
@@ -94,21 +97,20 @@ async function hasSearchModule(port) {
 
 beforeAll(async () => {
   tmp = mkdtempSync(join(tmpdir(), "frtb-rqe-"));
-  // Strategy order: the Redis 7.4 binary bundled with the apt redis-stack
-  // package (/opt/redis-stack/bin/redis-server) driven with explicit
-  // --loadmodule (most reliable on Ubuntu apt), then redis-stack-server
-  // wrapper, then vanilla redis-server. The /usr/bin/redis-server from the
-  // `redis-server` apt package is Redis 6.0 and crashes when loading
-  // Redis-7 modules, so we never use it for inline-module loading.
   const strategies = [
     ...(STACK_BUNDLED_PRESENT ? [{ bin: STACK_BUNDLED_REDIS, inline: true }] : []),
     { bin: "redis-stack-server", inline: false },
     { bin: "redis-server", inline: false },
   ];
+  console.error(`[rqe-boot] STACK_BUNDLED_PRESENT=${STACK_BUNDLED_PRESENT} STACK_MODULES_PRESENT=${STACK_MODULES_PRESENT}`);
+  console.error(`[rqe-boot] strategies=${JSON.stringify(strategies)}`);
   for (const { bin, inline } of strategies) {
+    console.error(`[rqe-boot] trying bin=${bin} inline=${inline}`);
     proc = await tryBoot(bin, PORT, tmp, inline);
-    if (!proc) continue;
-    if (await hasSearchModule(PORT)) {
+    if (!proc) { console.error(`[rqe-boot] tryBoot returned undefined for ${bin}`); continue; }
+    const hasSearch = await hasSearchModule(PORT);
+    console.error(`[rqe-boot] booted ${bin}, hasSearchModule=${hasSearch}`);
+    if (hasSearch) {
       searchAvailable = true;
       redis = new Redis({ port: PORT });
       break;
@@ -117,6 +119,7 @@ beforeAll(async () => {
     proc = undefined;
     await wait(100);
   }
+  console.error(`[rqe-boot] final searchAvailable=${searchAvailable}`);
 });
 
 afterAll(async () => {
