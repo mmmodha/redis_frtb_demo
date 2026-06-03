@@ -130,7 +130,14 @@ export function ConnectionsPanel() {
       if (dialog.kind === "add") {
         await createConnection(input);
       } else if (dialog.kind === "edit") {
+        // Wave 5.59 — if the edited profile is the active one, notify the
+        // shell so the ActiveTargetPill re-fetches. The api already pushes
+        // the new values into the active-target singleton on PUT.
+        const wasActive = isActiveProfile(dialog.profile, target);
         await updateConnection(dialog.profile.id, input);
+        if (wasActive) {
+          window.dispatchEvent(new CustomEvent("connections:active-changed"));
+        }
       }
       setDialog({ kind: "closed" });
       await refresh();

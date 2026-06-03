@@ -6,7 +6,7 @@
 // pushed into the active-target singleton along with the raw credentials so
 // any local Redis client factory can authenticate.
 
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import type { ConnectionsStore, ConnectionProfile, RedactedProfile, TestResult, CreateInput } from "../store.ts";
 import { setActiveTarget } from "../active-target.ts";
 import * as inflight from "../inflight-registry.ts";
@@ -24,6 +24,20 @@ function publicProfile(p: RedactedProfile): RedactedProfile {
     out[k] = v;
   }
   return out as unknown as RedactedProfile;
+}
+
+// Wave 5.59 — true when the patch flips host/port/tls/db/clusterMode (the
+// identity tuple in active-target.targetKey). Renames and credential rotations
+// are NOT included here: name is not part of targetKey, and creds rotation
+// already bumps credsGeneration via setActiveTarget. Used to gate edit-while-
+// active behind the same inflight lockout as POST /activate.
+function identityWouldChange(prev: ConnectionProfile, patch: Partial<CreateInput>): boolean {
+  if (patch.host !== undefined && patch.host !== prev.host) return true;
+  if (patch.port !== undefined && patch.port !== prev.port) return true;
+  if (patch.db !== undefined && (patch.db ?? 0) !== (prev.db ?? 0)) return true;
+  if (patch.clusterMode !== undefined && !!patch.clusterMode !== !!prev.clusterMode) return true;
+  if (patch.tls !== undefined && !!patch.tls?.enabled !== !!prev.tls?.enabled) return true;
+  return false;
 }
 
 function activateProfileTarget(p: ConnectionProfile): void {
@@ -70,23 +84,45 @@ export function registerConnectionsRoutes(
     return publicProfile(p);
   });
 
-  app.put<{ Params: { id: string }; Body: Partial<CreateInput> }>(
-    "/connections/:id",
-    async (req, reply) => {
-      const p = await store.update(req.params.id, req.body);
-      if (!p) { reply.code(404); return { error: "not found" }; }
-      return publicProfile(p);
-    },
-  );
+  // Wave 5.59 — edit-while-active: when the edited id matches the active
+  // profile, push the updated values into the active-target singleton so the
+  // ActiveTargetPill and sidecar watchers pick them up without requiring a
+  // manual re-activate. Identity-changing edits (host/port/tls/db/clusterMode)
+  // would rebuild the cached ioredis client, so we block them when inflight
+  // ops exist — same 409 payload shape as POST /connections/:id/activate.
+  type UpdateRoute = { Params: { id: string }; Body: Partial<CreateInput> };
+  const updateHandler = async (
+    req: FastifyRequest<UpdateRoute>,
+    reply: FastifyReply,
+  ) => {
+    const prevActiveRaw = store.getActiveRaw();
+    const isActive = !!prevActiveRaw && prevActiveRaw.id === req.params.id;
+    if (isActive && identityWouldChange(prevActiveRaw!, req.body)) {
+      const items = inflight.list();
+      const stale = inflight.listStale();
+      if (stale.length > 0) {
+        req.log.warn({ stale }, "inflight registry: stale entries excluded from lockout");
+      }
+      if (items.length > 0) {
+        reply.code(409);
+        return {
+          error: "Cannot switch active target — operations in flight. Wait for them to complete or stop them first.",
+          inflight: items,
+          stale,
+        };
+      }
+    }
+    const p = await store.update(req.params.id, req.body);
+    if (!p) { reply.code(404); return { error: "not found" }; }
+    if (isActive) {
+      const raw = store.getActiveRaw();
+      if (raw) activateProfileTarget(raw);
+    }
+    return publicProfile(p);
+  };
 
-  app.patch<{ Params: { id: string }; Body: Partial<CreateInput> }>(
-    "/connections/:id",
-    async (req, reply) => {
-      const p = await store.update(req.params.id, req.body);
-      if (!p) { reply.code(404); return { error: "not found" }; }
-      return publicProfile(p);
-    },
-  );
+  app.put<UpdateRoute>("/connections/:id", updateHandler);
+  app.patch<UpdateRoute>("/connections/:id", updateHandler);
 
   app.delete<{ Params: { id: string } }>("/connections/:id", async (req, reply) => {
     const ok = await store.delete(req.params.id);

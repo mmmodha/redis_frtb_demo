@@ -145,6 +145,106 @@ describe("/connections HTTP routes", () => {
     expect(res.statusCode).toBe(404);
   });
 
+  it("Wave 5.59: editing the active profile updates the active-target singleton label", async () => {
+    const created = await app.inject({
+      method: "POST", url: "/connections",
+      payload: { name: "demo", host: "rs.demo", port: 12000, password: "PW" },
+    });
+    const id = created.json().id;
+    await app.inject({ method: "POST", url: `/connections/${id}/activate` });
+    const before = await app.inject({ method: "GET", url: "/redis/active-target" });
+    expect(before.json().label).toBe("demo");
+
+    const put = await app.inject({
+      method: "PUT", url: `/connections/${id}`,
+      payload: { name: "demo-renamed" },
+    });
+    expect(put.statusCode).toBe(200);
+
+    const after = await app.inject({ method: "GET", url: "/redis/active-target" });
+    expect(after.json()).toMatchObject({ host: "rs.demo", port: 12000, label: "demo-renamed" });
+  });
+
+  it("Wave 5.59: editing the active profile's host propagates to the singleton", async () => {
+    const created = await app.inject({
+      method: "POST", url: "/connections",
+      payload: { name: "demo", host: "old-host", port: 12000, password: "PW" },
+    });
+    const id = created.json().id;
+    await app.inject({ method: "POST", url: `/connections/${id}/activate` });
+
+    const patch = await app.inject({
+      method: "PATCH", url: `/connections/${id}`,
+      payload: { host: "new-host", port: 13000 },
+    });
+    expect(patch.statusCode).toBe(200);
+
+    const after = await app.inject({ method: "GET", url: "/redis/active-target" });
+    expect(after.json()).toMatchObject({ host: "new-host", port: 13000, label: "demo" });
+  });
+
+  it("Wave 5.59: editing a NON-active profile does NOT mutate the singleton", async () => {
+    const a = await app.inject({
+      method: "POST", url: "/connections",
+      payload: { name: "active-one", host: "rs.active", port: 12000, password: "PW" },
+    });
+    const b = await app.inject({
+      method: "POST", url: "/connections",
+      payload: { name: "other-one", host: "rs.other", port: 12001, password: "PW" },
+    });
+    const activeId = a.json().id;
+    const otherId = b.json().id;
+    await app.inject({ method: "POST", url: `/connections/${activeId}/activate` });
+    const before = await app.inject({ method: "GET", url: "/redis/active-target" });
+    expect(before.json()).toMatchObject({ host: "rs.active", port: 12000, label: "active-one" });
+
+    const put = await app.inject({
+      method: "PUT", url: `/connections/${otherId}`,
+      payload: { name: "other-renamed", host: "rs.other-new" },
+    });
+    expect(put.statusCode).toBe(200);
+
+    const after = await app.inject({ method: "GET", url: "/redis/active-target" });
+    // Singleton is untouched — still the active profile's identity.
+    expect(after.json()).toMatchObject({ host: "rs.active", port: 12000, label: "active-one" });
+  });
+
+  it("Wave 5.59: identity-changing edit on the active profile is blocked while inflight ops exist (409)", async () => {
+    const { register, resetInflightRegistryForTests } = await import("../src/inflight-registry.ts");
+    resetInflightRegistryForTests();
+    const created = await app.inject({
+      method: "POST", url: "/connections",
+      payload: { name: "demo", host: "rs.demo", port: 12000, password: "PW" },
+    });
+    const id = created.json().id;
+    await app.inject({ method: "POST", url: `/connections/${id}/activate` });
+    const handle = register("loadgen", "loadgen-1");
+
+    try {
+      // Identity-changing edit (host) is blocked.
+      const blocked = await app.inject({
+        method: "PUT", url: `/connections/${id}`,
+        payload: { host: "rs.new-host" },
+      });
+      expect(blocked.statusCode).toBe(409);
+      expect(blocked.json()).toMatchObject({
+        error: expect.stringMatching(/in flight/i),
+        inflight: expect.arrayContaining([expect.objectContaining({ label: "loadgen-1" })]),
+      });
+      // Name-only edit is allowed through unchanged.
+      const allowed = await app.inject({
+        method: "PUT", url: `/connections/${id}`,
+        payload: { name: "demo-renamed" },
+      });
+      expect(allowed.statusCode).toBe(200);
+      const after = await app.inject({ method: "GET", url: "/redis/active-target" });
+      expect(after.json().label).toBe("demo-renamed");
+    } finally {
+      handle.release();
+      resetInflightRegistryForTests();
+    }
+  });
+
   it("GET /redis/active-target falls back to default when nothing is active (per existing contract)", async () => {
     const res = await app.inject({ method: "GET", url: "/redis/active-target" });
     expect(res.statusCode).toBe(200);

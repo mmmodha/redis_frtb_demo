@@ -453,6 +453,90 @@ describe("<ConnectionsPanel/>", () => {
     expect(btn.title).toMatch(/in flight|target switching/i);
   });
 
+  it("Wave 5.59: editing the active profile dispatches connections:active-changed after PUT", async () => {
+    let putCalled = false;
+    fetchMock.mockImplementation(async (input: RequestInfo, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      if (url.match(/\/redis\/active-target$/)) {
+        return new Response(JSON.stringify({ host: "redis-1.lab", port: 12000, tls: true, db: 0, label: "demo-cluster" }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (url.match(/\/connections$/) && method === "GET") {
+        return new Response(JSON.stringify([profile()]), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (url.match(/\/connections\/01J\/test$/) && method === "POST") {
+        return new Response(JSON.stringify({ ok: true, latency_ms: 4, modules: [], errors: [] }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (url.match(/\/connections\/01J$/) && method === "PUT") {
+        putCalled = true;
+        return new Response(JSON.stringify(profile({ name: "demo-renamed" })), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    });
+
+    const events: Event[] = [];
+    const listener = (e: Event) => events.push(e);
+    window.addEventListener("connections:active-changed", listener);
+
+    try {
+      renderPanel();
+      await waitFor(() => expect(screen.getByText("demo-cluster")).toBeInTheDocument());
+      // Open Edit on the active card and submit a new name.
+      const editBtn = (await screen.findAllByRole("button", { name: /^Edit$/ }))[0]!;
+      fireEvent.click(editBtn);
+      const dialog = await screen.findByRole("dialog", { name: /edit cluster/i });
+      const nameInput = within(dialog).getByLabelText(/^name$/i) as HTMLInputElement;
+      fireEvent.change(nameInput, { target: { value: "demo-renamed" } });
+      fireEvent.click(within(dialog).getByRole("button", { name: /save/i }));
+
+      await waitFor(() => expect(putCalled).toBe(true));
+      await waitFor(() => expect(events.length).toBeGreaterThan(0));
+      expect(events[0]!.type).toBe("connections:active-changed");
+    } finally {
+      window.removeEventListener("connections:active-changed", listener);
+    }
+  });
+
+  it("Wave 5.59: editing a NON-active profile does NOT dispatch connections:active-changed", async () => {
+    fetchMock.mockImplementation(async (input: RequestInfo, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      if (url.match(/\/redis\/active-target$/)) {
+        // Active target is something else entirely.
+        return new Response(JSON.stringify({ host: "other.lab", port: 9999, tls: false, db: 0, label: "other-cluster" }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (url.match(/\/connections$/) && method === "GET") {
+        return new Response(JSON.stringify([profile()]), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (url.match(/\/connections\/01J\/test$/) && method === "POST") {
+        return new Response(JSON.stringify({ ok: true, latency_ms: 4, modules: [], errors: [] }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (url.match(/\/connections\/01J$/) && method === "PUT") {
+        return new Response(JSON.stringify(profile({ name: "demo-renamed" })), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    });
+
+    const events: Event[] = [];
+    const listener = (e: Event) => events.push(e);
+    window.addEventListener("connections:active-changed", listener);
+
+    try {
+      renderPanel();
+      await waitFor(() => expect(screen.getByText("demo-cluster")).toBeInTheDocument());
+      const editBtn = (await screen.findAllByRole("button", { name: /^Edit$/ }))[0]!;
+      fireEvent.click(editBtn);
+      const dialog = await screen.findByRole("dialog", { name: /edit cluster/i });
+      fireEvent.change(within(dialog).getByLabelText(/^name$/i), { target: { value: "demo-renamed" } });
+      fireEvent.click(within(dialog).getByRole("button", { name: /save/i }));
+      // Wait for refresh to settle; non-active edit must NOT dispatch.
+      await waitFor(() => expect(screen.getByText("demo-cluster")).toBeInTheDocument());
+      expect(events.length).toBe(0);
+    } finally {
+      window.removeEventListener("connections:active-changed", listener);
+    }
+  });
+
   it("Wave 5.16z2: a 409 from activate surfaces a per-row error listing inflight items", async () => {
     fetchMock.mockImplementation(async (input: RequestInfo, init?: RequestInit) => {
       const url = String(input);
