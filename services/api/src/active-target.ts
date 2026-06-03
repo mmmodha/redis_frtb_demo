@@ -46,6 +46,19 @@ function targetKey(t: ActiveTarget): string {
   return `${t.host}|${t.port}|${t.tls ? 1 : 0}|${t.db}|${t.clusterMode ? 1 : 0}|${credsGeneration}`;
 }
 
+// Three kinds of mutation are supported on this singleton:
+//   1. Full identity switch — `setActiveTarget(...)`: replaces host/port/tls/db
+//      (and creds), bumps `credsGeneration` so the cached ioredis client is
+//      rebuilt, and fires listeners (the bootstrap scheduler hangs off this).
+//   2. Label-only refresh — `setActiveTargetLabel(...)`: a rename of the
+//      currently-active profile. The Redis we're pointed at is unchanged, so we
+//      MUST NOT bump `credsGeneration` (would invalidate the cached client for
+//      no reason) and MUST NOT fire listeners (would re-trigger bootstrap).
+//      Consumers learn the new label via the next `GET /redis/active-target`.
+//   3. Creds-only rotation — currently handled by funnelling through
+//      `setActiveTarget`. It bumps creds and re-runs bootstrap; acceptable
+//      because creds rotations are rare. Documented here so a future split
+//      (setActiveTargetCreds) can be added without surprising existing callers.
 export function setActiveTarget(t: ActiveTarget, creds?: ActiveTargetCreds): void {
   // Strip any stray fields (notably `password`) — the public type is intentionally
   // password-free; secrets live only in the encrypted Connections store and in
@@ -66,6 +79,19 @@ export function setActiveTarget(t: ActiveTarget, creds?: ActiveTargetCreds): voi
   for (const fn of listeners) {
     try { fn(override); } catch { /* listener errors must not break the setter */ }
   }
+}
+
+// Wave 5.62 — label-only refresh for the active-target singleton. The label is
+// a presentation field surfaced by `GET /redis/active-target` (consumed by the
+// UI pill). Renaming the active profile must update the pill but MUST NOT bump
+// `credsGeneration` (no client rebuild needed — same Redis) and MUST NOT fire
+// listeners (the bootstrap scheduler subscribes here and would otherwise flip
+// the status banner to "Bootstrapping…" on a pure rename). No-op when there's
+// no override (e.g. fallback to REDIS_URL): there is no caller-installed label
+// to mutate, and the env-derived label is computed on read.
+export function setActiveTargetLabel(label: string): void {
+  if (!override) return;
+  override = { ...override, label };
 }
 
 export function resetActiveTarget(): void {

@@ -389,3 +389,108 @@ describe("/connections HTTP routes", () => {
     });
   });
 });
+
+
+// Wave 5.62 — renaming the active connection profile must NOT re-trigger the
+// "Bootstrapping…" banner. The bootstrap scheduler subscribes to active-target
+// listeners, so the route must use the silent setActiveTargetLabel helper for
+// pure renames and only call activateProfileTarget (which fires listeners)
+// when identity (host/port/tls/db/clusterMode) actually changes.
+describe("Wave 5.62 — rename does not re-trigger bootstrap banner", () => {
+  let app: Awaited<ReturnType<typeof createServer>>;
+  let store: ConnectionsStore;
+
+  beforeEach(async () => {
+    const { resetBootstrapStatusForTests, setBootstrapRunnerForTests, setDebounceMsForTests } =
+      await import("../src/bootstrap-status.ts");
+    resetActiveTarget();
+    resetBootstrapStatusForTests();
+    setDebounceMsForTests(5);
+    // Stub the bootstrap runner so we don't touch a real Redis. Resolves
+    // immediately so the status reaches "ready" after the debounce window.
+    setBootstrapRunnerForTests(() => Promise.resolve());
+    store = await freshStore();
+    const fakeSchema = { risk_classes: [] } as unknown as Parameters<typeof createServer>[0]["schema"];
+    app = await createServer({
+      store,
+      schema: fakeSchema,
+      // Any non-null redis client satisfies scheduleBootstrap's guard;
+      // routes that need a real client aren't exercised in these tests.
+      redis: {} as unknown as Parameters<typeof createServer>[0]["redis"],
+    });
+  });
+
+  afterEach(async () => {
+    const { resetBootstrapStatusForTests, setBootstrapRunnerForTests } =
+      await import("../src/bootstrap-status.ts");
+    await app.close();
+    resetActiveTarget();
+    resetBootstrapStatusForTests();
+    setBootstrapRunnerForTests(null);
+  });
+
+  it("PUT { name } on the active profile does not flip bootstrap-status.phase to 'running'", async () => {
+    const { getBootstrapStatus } = await import("../src/bootstrap-status.ts");
+    const created = await app.inject({
+      method: "POST", url: "/connections",
+      payload: { name: "demo", host: "rs.demo", port: 12000, password: "PW" },
+    });
+    const id = created.json().id;
+    await app.inject({ method: "POST", url: `/connections/${id}/activate` });
+    // Wait past debounce so the initial activation's bootstrap resolves to ready.
+    await new Promise((r) => setTimeout(r, 30));
+    expect(getBootstrapStatus().phase).toBe("ready");
+
+    const phaseBefore = getBootstrapStatus().phase;
+    const put = await app.inject({
+      method: "PUT", url: `/connections/${id}`,
+      payload: { name: "demo-renamed" },
+    });
+    expect(put.statusCode).toBe(200);
+    // Synchronously after the rename, phase must NOT have flipped to "running".
+    expect(getBootstrapStatus().phase).toBe(phaseBefore);
+    // And after the debounce window would have fired, still no flip.
+    await new Promise((r) => setTimeout(r, 30));
+    expect(getBootstrapStatus().phase).toBe("ready");
+  });
+
+  it("PUT { host } on the active profile DOES schedule bootstrap (regression for identity edits)", async () => {
+    const { getBootstrapStatus, markBootstrapStatusReady } = await import("../src/bootstrap-status.ts");
+    const created = await app.inject({
+      method: "POST", url: "/connections",
+      payload: { name: "demo", host: "rs.demo", port: 12000, password: "PW" },
+    });
+    const id = created.json().id;
+    await app.inject({ method: "POST", url: `/connections/${id}/activate` });
+    await new Promise((r) => setTimeout(r, 30));
+    // Force a known "ready" baseline tied to a different label so the next
+    // schedule call doesn't short-circuit on the same-label ready guard.
+    markBootstrapStatusReady("baseline");
+
+    const put = await app.inject({
+      method: "PUT", url: `/connections/${id}`,
+      payload: { host: "rs.new-host" },
+    });
+    expect(put.statusCode).toBe(200);
+    // Identity change → listener fires → scheduleBootstrap flips synchronously
+    // to "running" before the debounce timer dispatches the runner.
+    const after = getBootstrapStatus();
+    expect(after.phase).toBe("running");
+    expect(after.target_label).toBe("demo");
+  });
+
+  it("GET /redis/active-target reflects the new label after a rename", async () => {
+    const created = await app.inject({
+      method: "POST", url: "/connections",
+      payload: { name: "demo", host: "rs.demo", port: 12000, password: "PW" },
+    });
+    const id = created.json().id;
+    await app.inject({ method: "POST", url: `/connections/${id}/activate` });
+    await app.inject({
+      method: "PUT", url: `/connections/${id}`,
+      payload: { name: "demo-renamed" },
+    });
+    const target = await app.inject({ method: "GET", url: "/redis/active-target" });
+    expect(target.json()).toMatchObject({ host: "rs.demo", port: 12000, label: "demo-renamed" });
+  });
+});

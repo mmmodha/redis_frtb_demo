@@ -9,7 +9,7 @@
 import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import type { ConnectionsStore, ConnectionProfile, RedactedProfile, TestResult, CreateInput } from "../store.ts";
 import { DuplicateEndpointError } from "../store.ts";
-import { setActiveTarget } from "../active-target.ts";
+import { setActiveTarget, setActiveTargetLabel } from "../active-target.ts";
 import * as inflight from "../inflight-registry.ts";
 
 export type ConnectionTester = (profile: ConnectionProfile) => Promise<TestResult>;
@@ -150,7 +150,27 @@ export function registerConnectionsRoutes(
     if (!p) { reply.code(404); return { error: "not found" }; }
     if (isActive) {
       const raw = store.getActiveRaw();
-      if (raw) activateProfileTarget(raw);
+      if (raw) {
+        // Wave 5.62 — branch on what actually changed to avoid spuriously
+        // re-running bootstrap. Identity edits (host/port/tls/db/clusterMode)
+        // legitimately point at a different Redis, so we run the full
+        // activateProfileTarget flow (bumps credsGeneration, fires listeners,
+        // bootstrap re-runs against the new target). A pure rename is just a
+        // presentation tweak — refresh the label silently so the pill picks
+        // it up on its next poll without the "Bootstrapping…" banner.
+        // Creds rotations (username/password) also funnel through
+        // activateProfileTarget: the simpler path. Creds rotation is rare,
+        // and a bootstrap re-run on a creds change is acceptable; this
+        // avoids adding a separate credsGeneration-only helper just for an
+        // edge case.
+        const credsChanged =
+          req.body.username !== undefined || req.body.password !== undefined;
+        if (identityWouldChange(prevActiveRaw!, req.body) || credsChanged) {
+          activateProfileTarget(raw);
+        } else {
+          setActiveTargetLabel(raw.name);
+        }
+      }
     }
     return publicProfile(p);
   };

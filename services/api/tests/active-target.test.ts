@@ -2,8 +2,10 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   getActiveTarget,
   setActiveTarget,
+  setActiveTargetLabel,
   resetActiveTarget,
   getActiveRedisClient,
+  onActiveTargetChange,
   type ActiveTarget,
 } from "../src/active-target.ts";
 
@@ -122,5 +124,56 @@ describe("Wave 5.16y — getActiveRedisClient passes credentials to ioredis", ()
     const t = getActiveTarget();
     expect((t as Record<string, unknown>).password).toBeUndefined();
     expect((t as Record<string, unknown>).username).toBeUndefined();
+  });
+});
+
+
+// Wave 5.62 — setActiveTargetLabel is a presentation-only mutation used when
+// the operator renames the active connection profile. It must update the label
+// surfaced via GET /redis/active-target without bumping credsGeneration (no
+// client rebuild needed) and without firing listeners (the bootstrap scheduler
+// hangs off them — firing would re-trigger the "Bootstrapping…" banner).
+describe("Wave 5.62 — setActiveTargetLabel", () => {
+  beforeEach(() => {
+    resetActiveTarget();
+    delete process.env.REDIS_URL;
+  });
+  afterEach(() => {
+    resetActiveTarget();
+  });
+
+  it("updates the label exposed by getActiveTarget()", () => {
+    setActiveTarget({ host: "h", port: 6379, tls: false, db: 0, label: "old-name" });
+    setActiveTargetLabel("new-name");
+    expect(getActiveTarget().label).toBe("new-name");
+  });
+
+  it("does not rebuild the cached ioredis client (credsGeneration is unchanged)", () => {
+    setActiveTarget(
+      { host: "h", port: 6379, tls: false, db: 0, label: "old-name" },
+      { password: "P" },
+    );
+    const c1 = getActiveRedisClient();
+    setActiveTargetLabel("new-name");
+    const c2 = getActiveRedisClient();
+    // Same instance — the cache key embeds credsGeneration, so an unchanged
+    // generation must yield a cache hit.
+    expect(c2).toBe(c1);
+    c1?.disconnect();
+  });
+
+  it("does not fire registered listeners", () => {
+    setActiveTarget({ host: "h", port: 6379, tls: false, db: 0, label: "old-name" });
+    let calls = 0;
+    const unsub = onActiveTargetChange(() => { calls += 1; });
+    setActiveTargetLabel("new-name");
+    expect(calls).toBe(0);
+    unsub();
+  });
+
+  it("is a no-op when no override is set (env fallback in use)", () => {
+    process.env.REDIS_URL = "redis://envhost:6379";
+    setActiveTargetLabel("attempted-rename");
+    expect(getActiveTarget().label).toBe("env:REDIS_URL");
   });
 });
