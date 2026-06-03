@@ -2,8 +2,10 @@ import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { CalcPanel } from "../../src/panels/CalcPanel";
 
-// Wave 5.48 — Calc-side fuzzy toggle. Mirrors PivotPanel's toggle behaviour
-// onto the three exclude comboboxes (book / trade_id / risk_factor).
+// Calc-side fuzzy toggle. Mirrors PivotPanel's toggle behaviour onto the
+// three exclude comboboxes (book / trade_id / risk_factor). The toggle
+// lives inside the "Show advanced…" disclosure so it travels with the
+// combos it affects.
 
 const originalFetch = globalThis.fetch;
 
@@ -18,6 +20,11 @@ function suggestFetchMock() {
 
 beforeEach(() => {
   globalThis.fetch = suggestFetchMock();
+  try {
+    window.localStorage.clear();
+  } catch {
+    // best-effort
+  }
 });
 
 afterEach(() => {
@@ -25,24 +32,24 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe("Wave 5.48 — CalcPanel fuzzy toggle", () => {
+describe("CalcPanel fuzzy-suggestions toggle (in Advanced)", () => {
   it("renders a fuzzy toggle with default state 'on'", () => {
     render(<CalcPanel />);
     const toggle = screen.getByTestId("calc-fuzzy-toggle");
     expect(toggle).toBeInTheDocument();
     expect(toggle).toHaveAttribute("aria-pressed", "true");
-    expect(screen.getByTestId("calc-fuzzy-hint")).toHaveTextContent(/fuzzy:\s*on/i);
+    expect(screen.getByTestId("calc-fuzzy-hint")).toHaveTextContent(/fuzzy suggestions:\s*on/i);
   });
 
-  it("flipping the toggle off ⇒ typing in Exclude books does NOT open the listbox", async () => {
+  it("flipping the toggle off ⇒ typing in Books to exclude does NOT open the listbox", async () => {
     render(<CalcPanel />);
     const toggle = screen.getByTestId("calc-fuzzy-toggle");
     fireEvent.click(toggle);
     expect(toggle).toHaveAttribute("aria-pressed", "false");
-    // Flipping off also opens the disclosure so the toggle stays discoverable.
+    // Flipping off also forces the disclosure open so the toggle stays discoverable.
     const details = screen.getByTestId("advanced-filters") as HTMLDetailsElement;
     expect(details.open).toBe(true);
-    const bookInput = screen.getByLabelText(/^Book —/i) as HTMLInputElement;
+    const bookInput = screen.getByLabelText(/^Books to exclude$/i) as HTMLInputElement;
     fireEvent.focus(bookInput);
     fireEvent.change(bookInput, { target: { value: "RA" } });
     // Wait past any debounce window — no listbox, no fetch.
@@ -57,7 +64,7 @@ describe("Wave 5.48 — CalcPanel fuzzy toggle", () => {
     const toggle = screen.getByTestId("calc-fuzzy-toggle");
     // Off first
     fireEvent.click(toggle);
-    const bookInput = screen.getByLabelText(/^Book —/i) as HTMLInputElement;
+    const bookInput = screen.getByLabelText(/^Books to exclude$/i) as HTMLInputElement;
     fireEvent.change(bookInput, { target: { value: "RA" } });
     await new Promise((r) => setTimeout(r, 50));
     expect(screen.queryByRole("listbox")).toBeNull();

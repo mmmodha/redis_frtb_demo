@@ -27,14 +27,44 @@ const RISK_CLASS_OPTIONS: Array<{ value: RiskClass; label: string; live: boolean
 
 const SENSITIVITY_OPTIONS: SensitivityType[] = ["Delta", "Vega", "Curvature"];
 
-// Wave 5.31b: Basel MAR21.6 three-regime cross-bucket γ scaler. Med is the
-// default and a no-op vs. pre-5.31b math. The factor + label pair is what the
-// segmented control + hint render — kept in one place so the values can't
-// drift between API and UI.
+// Basel MAR21.6 three-regime cross-bucket γ scaler. The api echoes back which
+// regime was applied; the result-card RegimeBadge reads label + hint from
+// here so values can't drift between API and UI.
 const REGIME_OPTIONS: Array<{ value: CorrelationRegime; label: string; factor: number; hint: string }> = [
   { value: "low", label: "Low", factor: 0.75, hint: "γ × 0.75" },
   { value: "medium", label: "Med", factor: 1.0, hint: "γ × 1.0" },
   { value: "high", label: "High", factor: 1.25, hint: "γ × 1.25 (cap 1)" },
+];
+
+// Scenario picker — replaces the visible "Low/Med/High" segmented control with
+// plain-English regulatory framing. The default "standard" scenario omits the
+// `correlation_regime` field entirely so the default-path /calc/sbm body stays
+// byte-identical to the pre-scenario happy path.
+type ScenarioKey = "standard" | "stress-low" | "stress-high";
+const SCENARIO_OPTIONS: Array<{
+  value: ScenarioKey;
+  label: string;
+  regime: CorrelationRegime | null;
+  tooltip: string;
+}> = [
+  {
+    value: "standard",
+    label: "Standard charge",
+    regime: null,
+    tooltip: "Basel medium correlation — the day-to-day regulatory charge.",
+  },
+  {
+    value: "stress-low",
+    label: "Stress: low correlation",
+    regime: "low",
+    tooltip: "Decorrelated stress — buckets diverge, typical of crisis dispersion.",
+  },
+  {
+    value: "stress-high",
+    label: "Stress: high correlation",
+    regime: "high",
+    tooltip: "Co-movement stress — buckets move together, typical of flight-to-quality.",
+  },
 ];
 
 // Wave 5.18: standard tenor ordering for GIRR Delta/Vega risk_value arrays —
@@ -194,6 +224,37 @@ function BucketChargeChart({
   );
 }
 
+// localStorage key for the "Show Redis commands" toggle. Persisted across
+// sessions so the demo-viewer setting survives reloads.
+const SHOW_REDIS_COMMANDS_KEY = "calc.show-redis-commands";
+
+// Reads the initial state of `showRedisCommands` from the environment. If the
+// URL carries `?demo=1`, the toggle is force-enabled (and the preference is
+// written back to localStorage) so demo wrappers can flip verbose mode on
+// without manual clicking. Otherwise we honour the prior localStorage value.
+function readInitialShowRedisCommands(): boolean {
+  if (typeof window === "undefined") return false;
+  let isDemo = false;
+  try {
+    isDemo = new URLSearchParams(window.location.search).get("demo") === "1";
+  } catch {
+    isDemo = false;
+  }
+  if (isDemo) {
+    try {
+      window.localStorage.setItem(SHOW_REDIS_COMMANDS_KEY, "true");
+    } catch {
+      // best-effort — localStorage may be unavailable
+    }
+    return true;
+  }
+  try {
+    return window.localStorage.getItem(SHOW_REDIS_COMMANDS_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
 export function CalcPanel() {
   const [riskClass, setRiskClass] = useState<RiskClass>("GIRR");
   const [sensitivityType, setSensitivityType] = useState<SensitivityType>("Delta");
@@ -206,32 +267,59 @@ export function CalcPanel() {
   const [error, setError] = useState<string | null>(null);
   const [emptyError, setEmptyError] = useState<EmptyTargetError | null>(null);
   const [sortKey, setSortKey] = useState<SortKey | null>(null);
-  // Wave 5.18: separate expansion sets for chart vs table so clicking a row
-  // in one view doesn't echo an accordion in the other — drill-down sits
-  // directly below the clicked row, nothing else.
+  // Separate expansion sets for chart vs table so clicking a row in one view
+  // doesn't echo an accordion in the other — drill-down sits directly below
+  // the clicked row, nothing else.
   const [chartExpanded, setChartExpanded] = useState<Set<string>>(new Set());
   const [tableExpanded, setTableExpanded] = useState<Set<string>>(new Set());
-  // Wave 5.31a: optional discovery-layer subset. `null` = no subset (default,
-  // sends every bucket); `Set<string>` = user has interacted with the pills.
-  // Carried across runs so a refine→Calculate cycle preserves the selection.
+  // Optional discovery-layer subset. `null` = no subset (default, sends every
+  // bucket); `Set<string>` = user has interacted with the pills. Carried
+  // across runs so a refine→Calculate cycle preserves the selection.
   const [bucketSubset, setBucketSubset] = useState<Set<string> | null>(null);
-  // Wave 5.31b: §21.6 cross-bucket γ regime. Med is the default and a no-op
-  // on the wire (we don't send the field), preserving the pre-5.31b body
-  // shape for default runs and keeping the commands panel clean.
-  const [regime, setRegime] = useState<CorrelationRegime>("medium");
-  // Wave 5.31c: kernel-side row-exclusion predicate sets. Stored as Set<string>
-  // so add/remove via chips stays O(1). Empty sets are not serialised onto the
-  // wire — mirrors 5.31a/5.31b's "don't send the default" convention so the
-  // default-path body shape stays byte-identical to pre-5.31c.
+  // Scenario picker — "standard" is the default and a no-op on the wire (we
+  // omit the `correlation_regime` field), preserving the byte-identical
+  // default-path body shape and keeping the Redis commands panel clean.
+  const [scenario, setScenario] = useState<ScenarioKey>("standard");
+  // Kernel-side row-exclusion predicate sets. Stored as Set<string> so
+  // add/remove via chips stays O(1). Empty sets are not serialised onto the
+  // wire — mirrors the "don't send the default" convention so the
+  // default-path body shape stays byte-identical.
   const [excludeBooks, setExcludeBooks] = useState<Set<string>>(new Set());
   const [excludeTrades, setExcludeTrades] = useState<Set<string>>(new Set());
   const [excludeFactors, setExcludeFactors] = useState<Set<string>>(new Set());
-  // Wave 5.48 — mirrors PivotPanel's fuzzy toggle. `false` ⇒ the exclude
-  // comboboxes stop fetching /suggest and the dropdown stays closed; they
-  // remain plain text inputs so the user can still commit free-text chips.
+  // Mirrors PivotPanel's fuzzy toggle. `false` ⇒ the exclude comboboxes stop
+  // fetching /suggest and the dropdown stays closed; they remain plain text
+  // inputs so the user can still commit free-text chips.
   const [fuzzy, setFuzzy] = useState<boolean>(true);
+  // Visibility toggle for the "Redis commands executed" panel. Hidden by
+  // default for end users; persisted via localStorage so the choice survives
+  // reloads, and force-enabled by the `?demo=1` URL param on first load.
+  const [showRedisCommands, setShowRedisCommands] = useState<boolean>(
+    readInitialShowRedisCommands,
+  );
+  // Tracks whether the user has explicitly opened the Advanced disclosure
+  // this session. Combined with the auto-open conditions below to derive the
+  // `open` prop on <details> — once any auto-open condition is true, the
+  // details stay open regardless.
+  const [advancedManuallyOpened, setAdvancedManuallyOpened] = useState<boolean>(false);
 
-  const isWave4 = riskClass !== "GIRR";
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        SHOW_REDIS_COMMANDS_KEY,
+        showRedisCommands ? "true" : "false",
+      );
+    } catch {
+      // best-effort — localStorage may be unavailable
+    }
+  }, [showRedisCommands]);
+
+  const excludeTotal = excludeBooks.size + excludeTrades.size + excludeFactors.size;
+  // Auto-open Advanced whenever a non-default setting is in play, so the
+  // controls that produced the deviation stay discoverable.
+  const advancedAutoOpen =
+    excludeTotal > 0 || bucketSubset !== null || !fuzzy || showRedisCommands;
+  const advancedOpen = advancedManuallyOpened || advancedAutoOpen;
 
   async function onCalculate() {
     setLoading(true);
@@ -241,20 +329,21 @@ export function CalcPanel() {
     setChartExpanded(new Set());
     setTableExpanded(new Set());
     try {
-      // Wave 5.31a: only send `bucket_subset` when the user has actively
-      // narrowed below the available bucket set — sending a full-list subset
-      // wastes bytes and clutters the "Redis commands executed" panel.
+      // Only send `bucket_subset` when the user has actively narrowed below
+      // the available bucket set — sending a full-list subset wastes bytes
+      // and clutters the "Redis commands executed" panel.
       const sendSubset =
         result !== null &&
         bucketSubset !== null &&
         bucketSubset.size < result.per_bucket.length;
       const subsetArr = sendSubset ? Array.from(bucketSubset!) : undefined;
-      // Wave 5.31b: only send `correlation_regime` when non-default — mirrors
-      // 5.31a's "don't send the default" convention so the default-path wire
-      // shape stays byte-identical to pre-5.31b.
-      const sendRegime = regime !== "medium";
-      // Wave 5.31c: build the optional `exclude` only when at least one list
-      // is non-empty — same "don't send the default" convention.
+      // Only send `correlation_regime` when the Scenario maps to a non-null
+      // regime (i.e. anything other than "Standard charge") — preserves the
+      // byte-identical default-path body shape.
+      const scenarioOpt = SCENARIO_OPTIONS.find((s) => s.value === scenario);
+      const scenarioRegime = scenarioOpt?.regime ?? null;
+      // Build the optional `exclude` only when at least one list is non-empty
+      // — same "don't send the default" convention.
       const excludeBody: Record<string, string[]> = {};
       if (excludeBooks.size > 0) excludeBody.book = Array.from(excludeBooks);
       if (excludeTrades.size > 0) excludeBody.trade_id = Array.from(excludeTrades);
@@ -264,7 +353,7 @@ export function CalcPanel() {
         risk_class: riskClass,
         sensitivity_type: sensitivityType,
         ...(subsetArr ? { bucket_subset: subsetArr } : {}),
-        ...(sendRegime ? { correlation_regime: regime } : {}),
+        ...(scenarioRegime ? { correlation_regime: scenarioRegime } : {}),
         ...(sendExclude ? { exclude: excludeBody } : {}),
       });
       setResult(r);
@@ -335,31 +424,7 @@ export function CalcPanel() {
         </EnterpriseCallout>
       </div>
 
-      <PanelCard
-        title="Calculate"
-        actions={
-          <>
-            <button
-              type="button"
-              className={`pivot-fuzzy-toggle ${fuzzy ? "is-on" : "is-off"}`}
-              data-testid="calc-fuzzy-toggle"
-              aria-pressed={fuzzy}
-              onClick={() => setFuzzy((v) => !v)}
-            >
-              <span data-testid="calc-fuzzy-hint">Fuzzy: {fuzzy ? "on" : "off"}</span>
-            </button>
-            <button
-              type="button"
-              className="calc-panel__cta"
-              onClick={onCalculate}
-              disabled={loading || (bucketSubset !== null && bucketSubset.size === 0)}
-              data-testid="calc-cta"
-            >
-              {loading ? "Calculating…" : "Calculate SBM risk charge"}
-            </button>
-          </>
-        }
-      >
+      <PanelCard title="Calculate">
         <div className="calc-panel__form">
           <label className="calc-panel__field">
             <span>Risk class</span>
@@ -373,10 +438,9 @@ export function CalcPanel() {
                 </option>
               ))}
             </select>
-            {isWave4 ? <span className="calc-panel__badge calc-panel__badge--wave4">Wave 4</span> : null}
           </label>
           <label className="calc-panel__field">
-            <span>Sensitivity type</span>
+            <span>Sensitivity</span>
             <select
               value={sensitivityType}
               onChange={(e) => setSensitivityType(e.target.value as SensitivityType)}
@@ -388,18 +452,32 @@ export function CalcPanel() {
               ))}
             </select>
           </label>
+          <ScenarioSelect scenario={scenario} onChange={setScenario} />
         </div>
-        <CorrelationRegimeControl regime={regime} onChange={setRegime} />
-        {result ? (
-          <RefineBucketsRow
-            buckets={result.per_bucket}
-            riskClass={resultContext?.riskClass ?? riskClass}
-            subset={bucketSubset}
-            onToggle={toggleSubsetBucket}
-            onReset={resetSubset}
-          />
-        ) : null}
+        <div className="calc-panel__cta-row">
+          <button
+            type="button"
+            className="calc-panel__cta"
+            onClick={onCalculate}
+            disabled={loading || (bucketSubset !== null && bucketSubset.size === 0)}
+            data-testid="calc-cta"
+          >
+            {loading ? "Calculating…" : "Calculate SBM risk charge"}
+          </button>
+        </div>
         <AdvancedFilters
+          open={advancedOpen}
+          onToggle={(next) => {
+            // Only persist user clicks when no auto-open condition is forcing
+            // the disclosure open — otherwise the user can never close it.
+            if (!advancedAutoOpen) setAdvancedManuallyOpened(next);
+          }}
+          excludeTotal={excludeTotal}
+          buckets={result?.per_bucket ?? []}
+          riskClass={resultContext?.riskClass ?? riskClass}
+          subset={bucketSubset}
+          onToggleSubsetBucket={toggleSubsetBucket}
+          onResetSubset={resetSubset}
           books={excludeBooks}
           trades={excludeTrades}
           factors={excludeFactors}
@@ -407,6 +485,9 @@ export function CalcPanel() {
           onTradesChange={setExcludeTrades}
           onFactorsChange={setExcludeFactors}
           fuzzy={fuzzy}
+          onFuzzyChange={setFuzzy}
+          showRedisCommands={showRedisCommands}
+          onShowRedisCommandsChange={setShowRedisCommands}
         />
       </PanelCard>
 
@@ -420,7 +501,7 @@ export function CalcPanel() {
 
       {!result && !error && !emptyError && !loading ? (
         <PanelCard title="Result">
-          <p className="calc-panel__empty">Press Calculate to fan out a slot-local FCALL per bucket.</p>
+          <p className="calc-panel__empty">Press Calculate to compute the risk charge.</p>
         </PanelCard>
       ) : null}
 
@@ -435,93 +516,63 @@ export function CalcPanel() {
           tableExpanded={tableExpanded}
           onToggleChart={toggleChart}
           onToggleTable={toggleTable}
+          showRedisCommands={showRedisCommands}
         />
       ) : null}
     </div>
   );
 }
 
-// Wave 5.31b: ARIA-compliant three-way segmented control for the Basel
-// MAR21.6 cross-bucket γ regime. ArrowLeft/ArrowRight cycle, Space/Enter
-// activate, Tab moves out per WAI-ARIA radiogroup pattern. The hint line
-// below shows the scaling factor so the user sees what's being applied
-// without opening the commands panel.
-function CorrelationRegimeControl({
-  regime,
+// Plain-English Scenario picker — the visible regulatory framing for the
+// MAR21.6 cross-bucket γ regime. "Standard charge" is a no-op on the wire
+// (we omit `correlation_regime` entirely); the two stress scenarios map to
+// the "low" and "high" wire values. Each <option> carries a `title` so the
+// hover tooltip surfaces the plain-English explanation without forcing the
+// user into the advanced disclosure.
+function ScenarioSelect({
+  scenario,
   onChange,
 }: {
-  regime: CorrelationRegime;
-  onChange: (next: CorrelationRegime) => void;
+  scenario: ScenarioKey;
+  onChange: (next: ScenarioKey) => void;
 }) {
-  const refs = useRef<Array<HTMLButtonElement | null>>([]);
-  const activeIdx = REGIME_OPTIONS.findIndex((o) => o.value === regime);
-  const activeHint = REGIME_OPTIONS[activeIdx]?.hint ?? "";
-
-  function onKeyDown(idx: number) {
-    return (e: KeyboardEvent<HTMLButtonElement>) => {
-      if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
-        e.preventDefault();
-        const delta = e.key === "ArrowRight" ? 1 : -1;
-        const nextIdx = (idx + delta + REGIME_OPTIONS.length) % REGIME_OPTIONS.length;
-        const nextOpt = REGIME_OPTIONS[nextIdx]!;
-        onChange(nextOpt.value);
-        refs.current[nextIdx]?.focus();
-      } else if (e.key === " " || e.key === "Enter") {
-        e.preventDefault();
-        onChange(REGIME_OPTIONS[idx]!.value);
-      }
-    };
-  }
-
+  const active = SCENARIO_OPTIONS.find((o) => o.value === scenario) ?? SCENARIO_OPTIONS[0]!;
   return (
-    <div className="calc-panel__regime" data-testid="correlation-regime">
-      <div className="calc-panel__regime-label" id="correlation-regime-label">
-        Correlation regime
-      </div>
-      <div
-        role="radiogroup"
-        aria-labelledby="correlation-regime-label"
-        className="calc-panel__regime-group"
+    <label className="calc-panel__field" data-testid="scenario-select">
+      <span>Scenario</span>
+      <select
+        value={scenario}
+        onChange={(e) => onChange(e.target.value as ScenarioKey)}
+        title={active.tooltip}
+        data-testid="scenario-select-input"
       >
-        {REGIME_OPTIONS.map((o, i) => {
-          const checked = o.value === regime;
-          return (
-            <button
-              key={o.value}
-              ref={(el) => {
-                refs.current[i] = el;
-              }}
-              type="button"
-              role="radio"
-              aria-checked={checked}
-              tabIndex={checked ? 0 : -1}
-              className="calc-panel__regime-option"
-              data-selected={checked ? "true" : "false"}
-              data-regime={o.value}
-              data-testid={`regime-option-${o.value}`}
-              onClick={() => onChange(o.value)}
-              onKeyDown={onKeyDown(i)}
-            >
-              {o.label}
-            </button>
-          );
-        })}
-      </div>
-      <div className="calc-panel__regime-hint" data-testid="regime-hint">
-        {activeHint}
-      </div>
-    </div>
+        {SCENARIO_OPTIONS.map((o) => (
+          <option key={o.value} value={o.value} title={o.tooltip}>
+            {o.label}
+          </option>
+        ))}
+      </select>
+    </label>
   );
 }
 
-// Wave 5.31c: "Advanced filters" disclosure that hosts the three kernel-side
-// row-exclusion combos (book / trade_id / risk_factor). Collapsed by default
-// so the Calc panel stays uncluttered for the demo's happy path. Each combo
-// is a SuggestCombobox (from 5.30b) wired into a chip list — typing + Enter
-// or clicking a suggestion adds the value as a chip and clears the input;
-// clicking the × on a chip removes it. Empty chip lists are not sent on the
-// wire so the default-path /calc/sbm body stays byte-identical to pre-5.31c.
+// "Show advanced…" disclosure. Collapsed by default so the Calc panel stays
+// uncluttered for first-time users and demo viewers. Hosts everything that
+// isn't part of the day-to-day happy path: the bucket-subset refine row
+// (only after a result lands), the three kernel-side row-exclusion chip
+// combos, the fuzzy-suggestions toggle (which only affects those combos),
+// and the "Show Redis commands" toggle that surfaces the verbose
+// observability panel for demos. The `open` prop is controlled by the
+// parent so it can auto-open when any non-default setting is active.
 function AdvancedFilters({
+  open,
+  onToggle,
+  excludeTotal,
+  buckets,
+  riskClass,
+  subset,
+  onToggleSubsetBucket,
+  onResetSubset,
   books,
   trades,
   factors,
@@ -529,7 +580,18 @@ function AdvancedFilters({
   onTradesChange,
   onFactorsChange,
   fuzzy,
+  onFuzzyChange,
+  showRedisCommands,
+  onShowRedisCommandsChange,
 }: {
+  open: boolean;
+  onToggle: (next: boolean) => void;
+  excludeTotal: number;
+  buckets: BucketResult[];
+  riskClass: RiskClass;
+  subset: Set<string> | null;
+  onToggleSubsetBucket: (bucket: string) => void;
+  onResetSubset: () => void;
   books: Set<string>;
   trades: Set<string>;
   factors: Set<string>;
@@ -537,42 +599,91 @@ function AdvancedFilters({
   onTradesChange: (next: Set<string>) => void;
   onFactorsChange: (next: Set<string>) => void;
   fuzzy: boolean;
+  onFuzzyChange: (next: boolean) => void;
+  showRedisCommands: boolean;
+  onShowRedisCommandsChange: (next: boolean) => void;
 }) {
-  const total = books.size + trades.size + factors.size;
-  // Wave 5.48 — open by default when the user has either added chips or
-  // flipped fuzzy off, so the toggle and filters are discoverable. The
-  // pristine empty state (no chips, fuzzy=on) stays collapsed.
-  const openByDefault = total > 0 || !fuzzy;
   return (
-    <details className="calc-panel__advanced" data-testid="advanced-filters" open={openByDefault}>
+    <details
+      className="calc-panel__advanced"
+      data-testid="advanced-filters"
+      open={open}
+      onToggle={(e) => onToggle((e.currentTarget as HTMLDetailsElement).open)}
+    >
       <summary className="calc-panel__advanced-summary" data-testid="advanced-filters-summary">
-        Filters · exclude rows from this calculation{total > 0 ? ` · ${total} excluded` : ""}
+        Show advanced…
       </summary>
       <div className="calc-panel__advanced-body">
-        <ExcludeChipsCombobox
-          field="book"
-          label="Book — excluded from totals"
-          placeholder="e.g. RATES-LDN"
-          values={books}
-          onChange={onBooksChange}
-          fuzzy={fuzzy}
-        />
-        <ExcludeChipsCombobox
-          field="trade_id"
-          label="Trade ID — excluded from totals"
-          placeholder="e.g. T0042"
-          values={trades}
-          onChange={onTradesChange}
-          fuzzy={fuzzy}
-        />
-        <ExcludeChipsCombobox
-          field="risk_factor"
-          label="Risk factor — excluded from totals"
-          placeholder="e.g. RF_GIRR_05"
-          values={factors}
-          onChange={onFactorsChange}
-          fuzzy={fuzzy}
-        />
+        {buckets.length > 0 ? (
+          <section className="calc-panel__advanced-section">
+            <h3 className="calc-panel__advanced-heading">Refine to specific buckets</h3>
+            <RefineBucketsRow
+              buckets={buckets}
+              riskClass={riskClass}
+              subset={subset}
+              onToggle={onToggleSubsetBucket}
+              onReset={onResetSubset}
+            />
+          </section>
+        ) : null}
+        <section className="calc-panel__advanced-section">
+          <h3
+            className="calc-panel__advanced-heading"
+            data-testid="exclude-rows-heading"
+          >
+            Exclude rows{excludeTotal > 0 ? ` · ${excludeTotal} excluded` : ""}
+          </h3>
+          <ExcludeChipsCombobox
+            field="book"
+            label="Books to exclude"
+            placeholder="e.g. RATES-LDN"
+            values={books}
+            onChange={onBooksChange}
+            fuzzy={fuzzy}
+          />
+          <ExcludeChipsCombobox
+            field="trade_id"
+            label="Trades to exclude"
+            placeholder="e.g. T0042"
+            values={trades}
+            onChange={onTradesChange}
+            fuzzy={fuzzy}
+          />
+          <ExcludeChipsCombobox
+            field="risk_factor"
+            label="Risk factors to exclude"
+            placeholder="e.g. RF_GIRR_05"
+            values={factors}
+            onChange={onFactorsChange}
+            fuzzy={fuzzy}
+          />
+        </section>
+        <section className="calc-panel__advanced-section calc-panel__advanced-toggles">
+          <button
+            type="button"
+            className={`pivot-fuzzy-toggle calc-fuzzy-toggle ${fuzzy ? "is-on" : "is-off"}`}
+            data-testid="calc-fuzzy-toggle"
+            aria-pressed={fuzzy}
+            onClick={() => onFuzzyChange(!fuzzy)}
+          >
+            <span data-testid="calc-fuzzy-hint">
+              Fuzzy suggestions: {fuzzy ? "on" : "off"}
+            </span>
+          </button>
+          <button
+            type="button"
+            className={`pivot-fuzzy-toggle calc-redis-commands-toggle ${
+              showRedisCommands ? "is-on" : "is-off"
+            }`}
+            data-testid="calc-show-redis-commands-toggle"
+            aria-pressed={showRedisCommands}
+            onClick={() => onShowRedisCommandsChange(!showRedisCommands)}
+          >
+            <span data-testid="calc-show-redis-commands-hint">
+              Show Redis commands: {showRedisCommands ? "on" : "off"}
+            </span>
+          </button>
+        </section>
       </div>
     </details>
   );
@@ -876,6 +987,7 @@ function CalcResult({
   tableExpanded,
   onToggleChart,
   onToggleTable,
+  showRedisCommands,
 }: {
   result: CalcSbmResponse;
   context: { riskClass: RiskClass; sensitivityType: SensitivityType };
@@ -886,6 +998,7 @@ function CalcResult({
   tableExpanded: Set<string>;
   onToggleChart: (bucket: string) => void;
   onToggleTable: (bucket: string) => void;
+  showRedisCommands: boolean;
 }) {
   const tone = toneFor(result.total_ms);
   const bClass = bucketClassFor(context.riskClass);
@@ -912,7 +1025,7 @@ function CalcResult({
             data-testid="wallclock-badge"
             data-tone={tone}
           >
-            Total wall-clock: {result.total_ms} ms · fanout {result.fanout_ms} ms
+            Computed in {result.total_ms} ms ({result.fanout_ms} ms of Redis fan-out)
           </span>
         }
       >
@@ -936,17 +1049,27 @@ function CalcResult({
         </PanelCard>
       ) : null}
 
-      {result.commands ? <CommandsPanel commands={result.commands} /> : null}
+      {showRedisCommands && result.commands ? <CommandsPanel commands={result.commands} /> : null}
 
-      <PanelCard title="Per-bucket K_b (capital concentration)">
-        <BucketChargeChart
-          buckets={result.per_bucket}
-          riskClass={context.riskClass}
-          expanded={chartExpanded}
-          onToggle={onToggleChart}
-          renderDrilldown={(b) => renderDrilldown(b, "chart")}
-        />
-      </PanelCard>
+      {/* Inlined panel-card so the heading can carry a `title` attribute
+          tooltip — the shared PanelCard component renders the title as plain
+          text and has no tooltip slot. */}
+      <section className="panel-card">
+        <div className="panel-card__header">
+          <h2 title="Per-bucket K_b — capital charge concentration">
+            Charge by bucket
+          </h2>
+        </div>
+        <div className="panel-card__body">
+          <BucketChargeChart
+            buckets={result.per_bucket}
+            riskClass={context.riskClass}
+            expanded={chartExpanded}
+            onToggle={onToggleChart}
+            renderDrilldown={(b) => renderDrilldown(b, "chart")}
+          />
+        </div>
+      </section>
 
       <PanelCard title="Per-bucket breakdown">
         <table aria-label="per-bucket K_b breakdown" className="calc-panel__table">

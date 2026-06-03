@@ -30,17 +30,20 @@ const baseResponse: CalcSbmResponse = {
 afterEach(() => {
   globalThis.fetch = originalFetch;
   vi.restoreAllMocks();
+  try {
+    window.localStorage.clear();
+  } catch {
+    // best-effort — jsdom localStorage should always be available
+  }
 });
 
-describe("Wave 5.31c — Advanced filters (book / trade_id / risk_factor exclusion)", () => {
-  it("renders an Advanced filters disclosure that is collapsed by default", () => {
+describe("Advanced disclosure — row-exclusion combos (book / trade_id / risk_factor)", () => {
+  it("renders the Advanced disclosure collapsed by default with a plain 'Show advanced…' summary", () => {
     render(<CalcPanel />);
     const details = screen.getByTestId("advanced-filters") as HTMLDetailsElement;
     expect(details).toBeInTheDocument();
     expect(details.open).toBe(false);
-    expect(screen.getByTestId("advanced-filters-summary").textContent).toBe(
-      "Filters · exclude rows from this calculation",
-    );
+    expect(screen.getByTestId("advanced-filters-summary").textContent).toBe("Show advanced…");
   });
 
   it("shows three exclude combos (book / trade_id / risk_factor) when expanded", () => {
@@ -52,7 +55,7 @@ describe("Wave 5.31c — Advanced filters (book / trade_id / risk_factor exclusi
     expect(screen.getByTestId("exclude-risk_factor")).toBeInTheDocument();
   });
 
-  it("Calculate with no exclude touched sends NO `exclude` field (byte-identical to pre-5.31c)", async () => {
+  it("Calculate with no exclude touched sends NO `exclude` field (byte-identical default-path body)", async () => {
     const sent = mockCalcWithCapture(baseResponse);
     render(<CalcPanel />);
     fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
@@ -65,7 +68,7 @@ describe("Wave 5.31c — Advanced filters (book / trade_id / risk_factor exclusi
     const sent = mockCalcWithCapture(baseResponse);
     render(<CalcPanel />);
     (screen.getByTestId("advanced-filters") as HTMLDetailsElement).open = true;
-    const bookInput = screen.getByLabelText(/^Book —/i);
+    const bookInput = screen.getByLabelText(/^Books to exclude$/i);
     fireEvent.change(bookInput, { target: { value: "BookA" } });
     fireEvent.keyDown(bookInput, { key: "Enter" });
     await waitFor(() => {
@@ -81,7 +84,7 @@ describe("Wave 5.31c — Advanced filters (book / trade_id / risk_factor exclusi
     mockCalcWithCapture(baseResponse);
     render(<CalcPanel />);
     (screen.getByTestId("advanced-filters") as HTMLDetailsElement).open = true;
-    const tradeInput = screen.getByLabelText(/^Trade ID —/i);
+    const tradeInput = screen.getByLabelText(/^Trades to exclude$/i);
     fireEvent.change(tradeInput, { target: { value: "T1,T2,T3," } });
     await waitFor(() => {
       const chips = within(screen.getByTestId("exclude-trade_id-chips")).getAllByTestId("exclude-chip");
@@ -93,7 +96,7 @@ describe("Wave 5.31c — Advanced filters (book / trade_id / risk_factor exclusi
     mockCalcWithCapture(baseResponse);
     render(<CalcPanel />);
     (screen.getByTestId("advanced-filters") as HTMLDetailsElement).open = true;
-    const factorInput = screen.getByLabelText(/^Risk factor —/i);
+    const factorInput = screen.getByLabelText(/^Risk factors to exclude$/i);
     fireEvent.change(factorInput, { target: { value: "RF1,RF2," } });
     await waitFor(() => {
       const chips = within(screen.getByTestId("exclude-risk_factor-chips")).getAllByTestId("exclude-chip");
@@ -108,16 +111,18 @@ describe("Wave 5.31c — Advanced filters (book / trade_id / risk_factor exclusi
     });
   });
 
-  it("disclosure summary shows the running excluded count when chips are present", async () => {
+  it("Exclude-rows section heading shows the running excluded count when chips are present", async () => {
     mockCalcWithCapture(baseResponse);
     render(<CalcPanel />);
     (screen.getByTestId("advanced-filters") as HTMLDetailsElement).open = true;
-    fireEvent.change(screen.getByLabelText(/^Book —/i), { target: { value: "A,B," } });
-    fireEvent.change(screen.getByLabelText(/^Trade ID —/i), { target: { value: "T1," } });
+    fireEvent.change(screen.getByLabelText(/^Books to exclude$/i), { target: { value: "A,B," } });
+    fireEvent.change(screen.getByLabelText(/^Trades to exclude$/i), { target: { value: "T1," } });
     await waitFor(() => {
-      expect(screen.getByTestId("advanced-filters-summary").textContent).toBe(
-        "Filters · exclude rows from this calculation · 3 excluded",
+      expect(screen.getByTestId("exclude-rows-heading").textContent).toBe(
+        "Exclude rows · 3 excluded",
       );
     });
+    // Summary itself stays "Show advanced…" — the count surfaces in the section header.
+    expect(screen.getByTestId("advanced-filters-summary").textContent).toBe("Show advanced…");
   });
 });

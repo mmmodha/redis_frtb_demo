@@ -60,6 +60,11 @@ const baseResponse: CalcSbmResponse = {
 afterEach(() => {
   globalThis.fetch = originalFetch;
   vi.restoreAllMocks();
+  try {
+    window.localStorage.clear();
+  } catch {
+    // best-effort — jsdom localStorage should always be available
+  }
 });
 
 describe("<CalcPanel />", () => {
@@ -69,10 +74,10 @@ describe("<CalcPanel />", () => {
     expect(screen.getByRole("button", { name: /calculate sbm risk charge/i })).toBeInTheDocument();
   });
 
-  it("renders risk_class and sensitivity_type selectors with GIRR/Delta defaults", () => {
+  it("renders risk_class and sensitivity selectors with GIRR/Delta defaults", () => {
     render(<CalcPanel />);
     const rc = screen.getByLabelText(/risk class/i) as HTMLSelectElement;
-    const st = screen.getByLabelText(/sensitivity type/i) as HTMLSelectElement;
+    const st = screen.getByLabelText(/^sensitivity$/i) as HTMLSelectElement;
     expect(rc.value).toBe("GIRR");
     expect(st.value).toBe("Delta");
     expect(within(rc).getByRole("option", { name: /GIRR/ })).toBeInTheDocument();
@@ -80,18 +85,6 @@ describe("<CalcPanel />", () => {
     expect(within(rc).getByRole("option", { name: /FX/ })).toBeInTheDocument();
     expect(within(st).getByRole("option", { name: "Delta" })).toBeInTheDocument();
     expect(within(st).getByRole("option", { name: "Vega" })).toBeInTheDocument();
-  });
-
-  it("shows a Wave 4 badge when Equity or FX is selected", () => {
-    render(<CalcPanel />);
-    const rc = screen.getByLabelText(/risk class/i) as HTMLSelectElement;
-    expect(screen.queryByText(/wave 4/i)).toBeNull();
-    fireEvent.change(rc, { target: { value: "Equity" } });
-    expect(screen.getByText(/wave 4/i)).toBeInTheDocument();
-    fireEvent.change(rc, { target: { value: "FX" } });
-    expect(screen.getByText(/wave 4/i)).toBeInTheDocument();
-    fireEvent.change(rc, { target: { value: "GIRR" } });
-    expect(screen.queryByText(/wave 4/i)).toBeNull();
   });
 
   it("renders three EnterpriseCallout banners for in-database compute / map-reduce / hash-tag locality", () => {
@@ -157,8 +150,10 @@ describe("<CalcPanel />", () => {
     expect(byCount[0]).toBe("USD-IRS");
   });
 
-  // Wave 5.16m: surfaces the Redis commands the api dispatched.
-  it("Wave 5.16m: renders the Redis commands panel with FT.AGGREGATE query and FCALL function verbatim when commands are present", async () => {
+  // Surfaces the Redis commands the api dispatched. Gated behind the
+  // "Show Redis commands" toggle (in the Advanced disclosure) so the panel
+  // only appears when the user (or `?demo=1`) has opted into verbose mode.
+  it("renders the Redis commands panel with FT.AGGREGATE query and FCALL function verbatim when commands are present and the toggle is on", async () => {
     const responseWithCommands: CalcSbmResponse = {
       ...baseResponse,
       commands: {
@@ -184,6 +179,7 @@ describe("<CalcPanel />", () => {
     };
     mockCalcResponse(responseWithCommands);
     render(<CalcPanel />);
+    fireEvent.click(screen.getByTestId("calc-show-redis-commands-toggle"));
     fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
     await waitFor(() =>
       expect(screen.getByRole("heading", { name: /redis commands executed/i })).toBeInTheDocument(),
@@ -201,9 +197,10 @@ describe("<CalcPanel />", () => {
     expect(details.textContent).toContain("sens:{GIRR:EUR-IRS}:_route");
   });
 
-  it("Wave 5.16m: does NOT render the Redis commands panel when commands are absent (back-compat)", async () => {
+  it("does NOT render the Redis commands panel when commands are absent (back-compat)", async () => {
     mockCalcResponse(baseResponse);
     render(<CalcPanel />);
+    fireEvent.click(screen.getByTestId("calc-show-redis-commands-toggle"));
     fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
     await waitFor(() => expect(screen.getByTestId("calc-charge")).toBeInTheDocument());
     expect(screen.queryByRole("heading", { name: /redis commands executed/i })).toBeNull();
