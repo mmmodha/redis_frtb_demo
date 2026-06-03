@@ -108,11 +108,26 @@ async function installCommonRoutes(page: Page, opts: { activeName?: string } = {
   await page.route("**/connections", (route: Route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify([demoProfile, scaleProfile]) }),
   );
+  // Wave 5.69: /connections/{id}/test returns ConnectionTestResult with
+  // `modules: Array<{ name; present }>` (see services/ui/src/lib/connections.ts).
+  // The previous stub returned modules as a plain object, which made
+  // `(tr.modules ?? []).map(...)` blow up the ConnectionsPanel on render and
+  // unmount the page heading the spec asserts on.
+  const testOk = JSON.stringify({
+    ok: true,
+    latency_ms: 4,
+    modules: [
+      { name: "ReJSON", present: true },
+      { name: "search", present: true },
+      { name: "timeseries", present: true },
+      { name: "bf", present: true },
+    ],
+  });
   await page.route("**/connections/01J-demo/test", (route: Route) =>
-    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ok: true, modules: { ReJSON: true, search: true, redisgears: true }, tls: true, acl: true }) }),
+    route.fulfill({ status: 200, contentType: "application/json", body: testOk }),
   );
   await page.route("**/connections/01K-scale/test", (route: Route) =>
-    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ok: true, modules: { ReJSON: true, search: true, redisgears: true }, tls: true, acl: true }) }),
+    route.fulfill({ status: 200, contentType: "application/json", body: testOk }),
   );
   await page.route("**/connections/01K-scale/activate", (route: Route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ...scaleProfile, is_active: true }) }),
@@ -134,6 +149,13 @@ async function installCommonRoutes(page: Page, opts: { activeName?: string } = {
   );
 
   // Observability — keys/memory used by Ingest panel.
+  // Wave 5.69: register the catch-all FIRST so the specific keys/memory/shards
+  // stubs registered below take precedence (Playwright applies last-registered
+  // matching route, so order matters here). The catch-all answers
+  // /observability/history and any future endpoints with a benign empty body.
+  await page.route("**/observability/**", (route: Route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({}) }),
+  );
   await page.route("**/observability/keys**", (route: Route) =>
     route.fulfill({
       status: 200, contentType: "application/json",
@@ -146,18 +168,22 @@ async function installCommonRoutes(page: Page, opts: { activeName?: string } = {
       body: JSON.stringify({ used_memory: 2_147_483_648, used_memory_human: "2.00G", ms: 1 }),
     }),
   );
+  // Wave 5.69: GET /observability/shards returns a bare ObservabilityShard[]
+  // (see services/ui/src/lib/api.ts and services/api/src/routes/observability.ts).
+  // The previous stub wrapped the array in `{ shards: [...] }` with snake_case
+  // fields, which made `data.shards.reduce is not a function` blow up the
+  // Observability route and unmount the AppShell — causing every subsequent
+  // nav-link click in the spec (starting with Step 2a "Connections") to time
+  // out on a blank page.
   await page.route("**/observability/shards", (route: Route) =>
     route.fulfill({
       status: 200, contentType: "application/json",
-      body: JSON.stringify({ shards: [
-        { id: "shard-1", role: "primary", ops_per_sec: 51_200, memory_used: 8_589_934_592, slot_range: "0-5460" },
-        { id: "shard-2", role: "primary", ops_per_sec: 49_800, memory_used: 8_321_499_136, slot_range: "5461-10922" },
-        { id: "shard-3", role: "primary", ops_per_sec: 50_100, memory_used: 8_456_716_864, slot_range: "10923-16383" },
-      ] }),
+      body: JSON.stringify([
+        { shardId: "shard-1", role: "primary", opsPerSec: 51_200, slotCount: 5461, usedMemoryBytes: 8_589_934_592, netInBytes: 0, netOutBytes: 0 },
+        { shardId: "shard-2", role: "primary", opsPerSec: 49_800, slotCount: 5462, usedMemoryBytes: 8_321_499_136, netInBytes: 0, netOutBytes: 0 },
+        { shardId: "shard-3", role: "primary", opsPerSec: 50_100, slotCount: 5461, usedMemoryBytes: 8_456_716_864, netInBytes: 0, netOutBytes: 0 },
+      ]),
     }),
-  );
-  await page.route("**/observability/**", (route: Route) =>
-    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ shards: [], dbsize: 0, used_memory: 0, used_memory_human: "0B", ms: 0 }) }),
   );
 
   await page.route("**/pivot?**", (route: Route) =>
@@ -211,8 +237,11 @@ test.describe("Full demo — 11-step flow (storyboard + protection)", () => {
     // mocked mode. In INTEGRATION=1 the panel is operator-driven and starts
     // empty; in mocked mode `installCommonRoutes()` returns both profiles.
     if (!INTEGRATION) {
-      await expect(page.getByText("demo-cluster")).toBeVisible();
-      await expect(page.getByText("scale-cluster")).toBeVisible();
+      // Wave 5.69: scope to the profile-card headings so the assertion does
+      // not strict-mode-collide with the active-target pill in the top bar
+      // (which also renders the active cluster's label on every page).
+      await expect(page.getByRole("heading", { name: "demo-cluster" })).toBeVisible();
+      await expect(page.getByRole("heading", { name: "scale-cluster" })).toBeVisible();
     }
     await shot(page, "step-02a-connections");
 
