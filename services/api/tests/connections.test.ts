@@ -27,8 +27,10 @@ describe("/connections HTTP routes", () => {
         ok: true,
         latency_ms: 1,
         modules: [
-          { name: "ReJSON", present: true },
-          { name: "search", present: true },
+          { name: "JSON", present: true },
+          { name: "Search", present: true },
+          { name: "Time Series", present: true },
+          { name: "Probabilistic", present: true },
         ],
         errors: [],
       }),
@@ -105,7 +107,10 @@ describe("/connections HTTP routes", () => {
     expect(res.statusCode).toBe(200);
     const body = res.json();
     expect(body.ok).toBe(true);
-    expect(body.modules.find((m: { name: string }) => m.name === "ReJSON").present).toBe(true);
+    expect(body.modules.find((m: { name: string }) => m.name === "JSON").present).toBe(true);
+    expect(body.modules.map((m: { name: string }) => m.name)).toEqual([
+      "JSON", "Search", "Time Series", "Probabilistic",
+    ]);
     expect(JSON.stringify(body)).not.toContain("PW");
   });
 

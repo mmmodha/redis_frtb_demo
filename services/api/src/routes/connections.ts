@@ -162,8 +162,18 @@ async function defaultTester(profile: ConnectionProfile): Promise<TestResult> {
   }
 }
 
+// Wave 5.58 — display label vs MODULE LIST internal name. RedisBloom reports
+// itself as "bf" (covers Bloom/Cuckoo/Count-Min/Top-K/T-Digest), TimeSeries as
+// "timeseries". Response shape stays `{ name, present }` — `name` is the
+// human label so the UI doesn't need a contract change.
+const REQUIRED_MODULES = [
+  { displayName: "JSON",          moduleListName: "ReJSON" },
+  { displayName: "Search",        moduleListName: "search" },
+  { displayName: "Time Series",   moduleListName: "timeseries" },
+  { displayName: "Probabilistic", moduleListName: "bf" },
+] as const;
+
 function parseModuleList(raw: unknown[]): Array<{ name: string; present: boolean }> {
-  const required = ["ReJSON", "search", "redisgears"];
   const found = new Set<string>();
   for (const entry of raw) {
     if (Array.isArray(entry)) {
@@ -171,5 +181,5 @@ function parseModuleList(raw: unknown[]): Array<{ name: string; present: boolean
       if (idx >= 0 && typeof entry[idx + 1] === "string") found.add(entry[idx + 1] as string);
     }
   }
-  return required.map((name) => ({ name, present: found.has(name) }));
+  return REQUIRED_MODULES.map((m) => ({ name: m.displayName, present: found.has(m.moduleListName) }));
 }

@@ -88,7 +88,7 @@ describe("<ConnectionsPanel/>", () => {
     renderPanel();
     expect(screen.getByRole("heading", { name: /^Connections$/i, level: 1 })).toBeInTheDocument();
     const signals = screen.getAllByTestId("enterprise-callout").map((e) => e.getAttribute("data-signal"));
-    expect(signals).toEqual(expect.arrayContaining(["ClusterScaleOut", "Functions", "ObservabilityModule"]));
+    expect(signals).toEqual(expect.arrayContaining(["ClusterScaleOut", "ModuleBundle", "ObservabilityModule"]));
   });
 
   it("shows a loading state while initial fetch is in flight", () => {
@@ -182,9 +182,10 @@ describe("<ConnectionsPanel/>", () => {
       routeJson(/\/connections\/01J\/test$/, "POST", {
         ok: true, latency_ms: 9,
         modules: [
-          { name: "ReJSON", present: true },
-          { name: "search", present: true },
-          { name: "redisgears", present: false },
+          { name: "JSON", present: true },
+          { name: "Search", present: true },
+          { name: "Time Series", present: true },
+          { name: "Probabilistic", present: false },
         ],
         errors: [],
       }),
@@ -194,9 +195,10 @@ describe("<ConnectionsPanel/>", () => {
     fireEvent.click(testBtn);
     await waitFor(() => expect(screen.getByTestId("test-result-01J")).toBeInTheDocument());
     const result = screen.getByTestId("test-result-01J");
-    expect(within(result).getByText(/ReJSON/)).toBeInTheDocument();
-    expect(within(result).getByText(/search/)).toBeInTheDocument();
-    expect(within(result).getByText(/redisgears/)).toBeInTheDocument();
+    expect(within(result).getByText(/JSON/)).toBeInTheDocument();
+    expect(within(result).getByText(/Search/)).toBeInTheDocument();
+    expect(within(result).getByText(/Time Series/)).toBeInTheDocument();
+    expect(within(result).getByText(/Probabilistic/)).toBeInTheDocument();
     expect(within(result).getByText(/9\s*ms/)).toBeInTheDocument();
   });
 

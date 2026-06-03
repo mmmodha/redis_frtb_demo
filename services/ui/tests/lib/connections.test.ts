@@ -98,9 +98,10 @@ describe("lib/connections api client", () => {
     const body = {
       ok: true, latency_ms: 12,
       modules: [
-        { name: "ReJSON", present: true },
-        { name: "search", present: true },
-        { name: "redisgears", present: false },
+        { name: "JSON", present: true },
+        { name: "Search", present: true },
+        { name: "Time Series", present: true },
+        { name: "Probabilistic", present: false },
       ],
       errors: [],
     };
@@ -108,7 +109,8 @@ describe("lib/connections api client", () => {
     const r = await testConnection("01N");
     expect(r.ok).toBe(true);
     expect(r.latency_ms).toBe(12);
-    expect(r.modules?.find((m) => m.name === "ReJSON")?.present).toBe(true);
+    expect(r.modules?.find((m) => m.name === "JSON")?.present).toBe(true);
+    expect(r.modules?.find((m) => m.name === "Probabilistic")?.present).toBe(false);
     expect(calls[0]!.url).toMatch(/\/connections\/01N\/test$/);
     expect(calls[0]!.init?.method).toBe("POST");
   });

@@ -197,8 +197,8 @@ export function ConnectionsPanel() {
         <EnterpriseCallout signal="ClusterScaleOut">
           <strong>Deploy in your perimeter</strong> — bare-metal, VMware, GCP, AWS, OpenShift; the bank&rsquo;s VPC, the bank&rsquo;s NVMe, no SaaS dependency.
         </EnterpriseCallout>
-        <EnterpriseCallout signal="Functions">
-          <strong>Module bundle</strong> — ReJSON, RediSearch, and Functions ship inside Redis Enterprise; one Test click verifies all three.
+        <EnterpriseCallout signal="ModuleBundle">
+          <strong>Module bundle</strong> — JSON, Search, Time Series and Probabilistic ship inside Redis Enterprise / Stack; one Test click verifies them all.
         </EnterpriseCallout>
         <EnterpriseCallout signal="ObservabilityModule">
           <strong>TLS + ACL + data sovereignty</strong> — mutual-TLS, per-user ACLs and CA pinning are first-class on every profile.
