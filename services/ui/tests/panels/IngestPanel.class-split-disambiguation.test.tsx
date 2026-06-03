@@ -76,6 +76,17 @@ function generatorCard() {
   return screen.getAllByTestId("panel-card").find((el) => el.getAttribute("data-title") === "Synthetic generator")!;
 }
 
+// Wave 5.52 — advanced fields live under "Show advanced…". Helper opens it
+// and clears the auto-derived class_split values so each test starts from a
+// blank slate (the same starting state the pre-5.52 form had).
+function openAdvancedAndClearSplit(card: HTMLElement) {
+  fireEvent.click(within(card).getByTestId("generator-advanced-toggle"));
+  const splitGroup = within(card).getByTestId("generator-class-split");
+  for (const c of ["GIRR", "Equity", "FX"]) {
+    fireEvent.change(within(splitGroup).getByLabelText(c), { target: { value: "" } });
+  }
+}
+
 function postedGeneratorBody(fetchMock: ReturnType<typeof vi.fn>): Record<string, unknown> {
   const posted = fetchMock.mock.calls.find(
     (c) => /\/generator\/start\/stream$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",
@@ -98,6 +109,7 @@ describe("<IngestPanel /> — per-class row targets disambiguation (Wave 5.50)",
     baselineFetch(fetchMock);
     renderPanel();
     const card = await waitFor(() => generatorCard());
+    openAdvancedAndClearSplit(card);
     const rowsInput = within(card).getByLabelText(/^rows$/i) as HTMLInputElement;
     expect(rowsInput.disabled).toBe(false);
     const sumLine = within(card).getByTestId("class-split-sum");
@@ -108,6 +120,7 @@ describe("<IngestPanel /> — per-class row targets disambiguation (Wave 5.50)",
     baselineFetch(fetchMock);
     renderPanel();
     const card = await waitFor(() => generatorCard());
+    openAdvancedAndClearSplit(card);
     const splitGroup = within(card).getByTestId("generator-class-split");
     fireEvent.change(within(splitGroup).getByLabelText("GIRR"), { target: { value: "100" } });
     const rowsInput = within(card).getByLabelText(/^rows$/i) as HTMLInputElement;
@@ -121,6 +134,7 @@ describe("<IngestPanel /> — per-class row targets disambiguation (Wave 5.50)",
     baselineFetch(fetchMock);
     renderPanel();
     const card = await waitFor(() => generatorCard());
+    openAdvancedAndClearSplit(card);
     const splitGroup = within(card).getByTestId("generator-class-split");
     fireEvent.change(within(splitGroup).getByLabelText("GIRR"), { target: { value: "100" } });
     expect(within(card).getByTestId("class-split-sum").textContent).toBe("Sum: 100 rows");
@@ -134,6 +148,7 @@ describe("<IngestPanel /> — per-class row targets disambiguation (Wave 5.50)",
     baselineFetch(fetchMock);
     renderPanel();
     const card = await waitFor(() => generatorCard());
+    openAdvancedAndClearSplit(card);
     const splitGroup = within(card).getByTestId("generator-class-split");
     fireEvent.change(within(splitGroup).getByLabelText("GIRR"), { target: { value: "100" } });
     expect((within(card).getByLabelText(/^rows$/i) as HTMLInputElement).disabled).toBe(true);
@@ -148,10 +163,11 @@ describe("<IngestPanel /> — per-class row targets disambiguation (Wave 5.50)",
     baselineFetch(fetchMock);
     renderPanel();
     const card = await waitFor(() => generatorCard());
+    openAdvancedAndClearSplit(card);
     const splitGroup = within(card).getByTestId("generator-class-split");
     fireEvent.change(within(splitGroup).getByLabelText("GIRR"), { target: { value: "100" } });
     fireEvent.change(within(splitGroup).getByLabelText("FX"), { target: { value: "50" } });
-    fireEvent.click(within(card).getByRole("button", { name: /^generate$/i }));
+    fireEvent.click(within(card).getByTestId("generator-generate-btn"));
     await waitFor(() => {
       const posted = fetchMock.mock.calls.find(
         (c) => /\/generator\/start\/stream$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",
@@ -167,7 +183,8 @@ describe("<IngestPanel /> — per-class row targets disambiguation (Wave 5.50)",
     baselineFetch(fetchMock);
     renderPanel();
     const card = await waitFor(() => generatorCard());
-    fireEvent.click(within(card).getByRole("button", { name: /^generate$/i }));
+    openAdvancedAndClearSplit(card);
+    fireEvent.click(within(card).getByTestId("generator-generate-btn"));
     await waitFor(() => {
       const posted = fetchMock.mock.calls.find(
         (c) => /\/generator\/start\/stream$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",

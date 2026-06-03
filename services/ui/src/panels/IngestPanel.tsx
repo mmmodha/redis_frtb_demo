@@ -53,6 +53,52 @@ const PRESETS: Record<Exclude<GeneratorPreset, "custom">, { label: string; trade
 const DEFAULT_PRESET: GeneratorPreset = "small";
 const DEFAULT_GEN_TRADE_POOL = PRESETS[DEFAULT_PRESET].tradePool;
 
+// Wave 5.52 — Generator UX overhaul. The simple-mode form shows only two
+// inputs (Total rows + Class mix). Auto-derivation maps these to the full
+// request body; advanced mode reveals the historical fine-grained controls.
+const QUICK_PICK_ROWS = [
+  { label: "200", value: 200 },
+  { label: "2k", value: 2_000 },
+  { label: "20k", value: 20_000 },
+  { label: "200k", value: 200_000 },
+  { label: "2M", value: 2_000_000 },
+] as const;
+const DEFAULT_MIX_PCT: Record<(typeof GENERATOR_CLASSES)[number], number> = { GIRR: 60, Equity: 30, FX: 10 };
+const CANONICAL_DEMO_SEED = 0xCAFEBABE;
+const CANONICAL_DEMO_MIX: Record<(typeof GENERATOR_CLASSES)[number], number> = { GIRR: 100, Equity: 0, FX: 0 };
+const CANONICAL_DEMO_ROWS = 200;
+const CANONICAL_DEMO_SENS_TYPES = ["Delta", "Vega"] as const;
+
+function deriveTradePool(n: number): number {
+  return Math.max(50, Math.min(10_000, Math.floor(n / 20)));
+}
+function deriveFactorPool(n: number): number {
+  return Math.max(8, Math.min(256, Math.floor(n / 200)));
+}
+function deriveClassSplit(
+  n: number,
+  mix: Record<(typeof GENERATOR_CLASSES)[number], number>,
+): Record<string, number> {
+  const ordered = GENERATOR_CLASSES.filter((c) => (mix[c] ?? 0) > 0);
+  const out: Record<string, number> = {};
+  if (ordered.length === 0) return out;
+  let allocated = 0;
+  for (let i = 0; i < ordered.length - 1; i++) {
+    const c = ordered[i]!;
+    const cnt = Math.floor((n * (mix[c] ?? 0)) / 100);
+    out[c] = cnt;
+    allocated += cnt;
+  }
+  out[ordered[ordered.length - 1]!] = n - allocated;
+  return out;
+}
+function formatSeedHex(seed: number): string {
+  return `0x${(seed >>> 0).toString(16).toUpperCase().padStart(8, "0")}`;
+}
+function randomSeed(): number {
+  return (Math.floor(Math.random() * 0xFFFFFFFF)) >>> 0;
+}
+
 const POLL_MS = 1000;
 const MAX_SAMPLES = 60;
 
@@ -620,38 +666,76 @@ function fmtMB(n: number): string {
 // survives route changes; the panel only owns form-validation errors.
 function SyntheticGeneratorCard(props: { preflightGate?: () => Promise<PreflightResponse | null> }) {
   const { preflightGate } = props;
+  // Wave 5.52 — the two simple-mode controls: Total rows and Class mix.
   const [rows, setRows] = useState<number>(DEFAULT_GEN_ROWS);
+  const [mixPct, setMixPct] = useState<Record<(typeof GENERATOR_CLASSES)[number], number>>(
+    () => ({ ...DEFAULT_MIX_PCT }),
+  );
+  // Wave 5.52 — pendingSeed is non-null when the user has explicitly chosen
+  // a seed for the next run (Reset to canonical → 0xCAFEBABE). Otherwise
+  // simple-mode submits draw a fresh random seed per run so the displayed
+  // "Last seed" pill is meaningful and the run is replayable.
+  const [pendingSeed, setPendingSeed] = useState<number | null>(null);
+  // Wave 5.52 — surfaced as "Last seed: 0x…" below the action buttons after
+  // the first run has been kicked off this session. Click-to-copy.
+  const [lastSeed, setLastSeed] = useState<number | null>(null);
+  const [seedCopied, setSeedCopied] = useState<boolean>(false);
+
+  // Wave 5.49 / pre-5.52 — advanced-mode state. Only consulted when
+  // advancedOpen=true; otherwise auto-derivation builds the body.
   const [classes, setClasses] = useState<Set<string>>(() => new Set(GENERATOR_CLASSES));
   const [sensTypes, setSensTypes] = useState<Set<string>>(() => new Set(["Delta", "Vega"]));
   const [seed, setSeed] = useState<string>("0");
-  // Wave 5.49 — default to the "small" preset's resolved trade/factor sizes
-  // so submit ships trade_pool_size=200, factor_pool_size=16 without needing
-  // the user to expand the (now-hidden) custom inputs.
   const [preset, setPreset] = useState<GeneratorPreset>(DEFAULT_PRESET);
   const [tradePool, setTradePool] = useState<string>(String(DEFAULT_GEN_TRADE_POOL));
   const [factorPool, setFactorPool] = useState<number>(DEFAULT_GEN_FACTOR_POOL);
-  const [formError, setFormError] = useState<string | null>(null);
-  const [advancedOpen, setAdvancedOpen] = useState(false);
-  const [pending, setPending] = useState<PendingSubmit | null>(null);
-  // Wave 5.47d — explicit per-class row targets. Keyed by class label (not
-  // canonical UPPER form); server resolves. All-zero / empty ⇒ omitted from
-  // the request so the server falls back to round-robin via classes + rows.
   const [classSplit, setClassSplit] = useState<Record<string, string>>({});
-  // Wave 5.47c — optional stop conditions (rows / memory % / elapsed s).
-  // Empty strings ⇒ omitted from the request so the historical
-  // "stop at row count" behaviour is preserved.
   const [stopRows, setStopRows] = useState<string>("");
   const [stopMemPct, setStopMemPct] = useState<string>("");
   const [stopElapsedSec, setStopElapsedSec] = useState<string>("");
+
+  const [formError, setFormError] = useState<string | null>(null);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [pending, setPending] = useState<PendingSubmit | null>(null);
+
   const { run, error: streamError, startRun, cancelRun, clearRun } = useGeneratorRun();
   const busy = run?.status === "running" || run?.status === "cancelling";
   const displayError = formError ?? streamError;
 
-  // Wave 5.50 — live sum of the per-class targets table. class_split is
-  // "active" when ≥1 selected-class input is a positive integer; invalid /
-  // blank / zero values don't count. When active the Rows input is disabled
-  // (the server ignores `rows` once `class_split` is set) and the live sum
-  // surfaces both as a hint next to Rows and below the per-class table.
+  // Wave 5.52 — class-mix validation. Generate is disabled until the three
+  // class percentages sum to exactly 100; the pill surfaces the live total.
+  const mixSum = useMemo(
+    () => GENERATOR_CLASSES.reduce((s, c) => s + (Number.isFinite(mixPct[c]) ? mixPct[c] : 0), 0),
+    [mixPct],
+  );
+  const mixValid = mixSum === 100;
+
+  // Wave 5.52 — non-destructive reveal: opening Advanced pre-populates the
+  // legacy fields with whatever the simple-mode auto-derivation would have
+  // sent. Re-runs on every open so the values track the current rows + mix.
+  useEffect(() => {
+    if (!advancedOpen) return;
+    const derivedTrade = deriveTradePool(rows);
+    const derivedFactor = deriveFactorPool(rows);
+    const derivedSplit = deriveClassSplit(rows, mixPct);
+    setSensTypes(new Set(CANONICAL_DEMO_SENS_TYPES));
+    setClasses(new Set(GENERATOR_CLASSES));
+    setSeed(String(pendingSeed ?? lastSeed ?? randomSeed()));
+    setPreset("custom");
+    setTradePool(String(derivedTrade));
+    setFactorPool(derivedFactor);
+    setClassSplit(
+      Object.fromEntries(
+        GENERATOR_CLASSES.map((c) => [c, derivedSplit[c] !== undefined ? String(derivedSplit[c]) : ""]),
+      ),
+    );
+    setStopRows(String(rows));
+    setStopMemPct("75");
+    setStopElapsedSec("600");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [advancedOpen]);
+
+  // Wave 5.50 — live sum of the per-class targets table (advanced only).
   const classSplitSum = useMemo(() => {
     let sum = 0;
     for (const c of classes) {
@@ -731,7 +815,34 @@ function SyntheticGeneratorCard(props: { preflightGate?: () => Promise<Preflight
     return cfg;
   }
 
-  async function runWithSanityCheck(cfg: GeneratorConfig | null, rowsForCheck: number) {
+  // Wave 5.52 — simple-mode config builder. Maps Total rows + Class mix to
+  // the full request body via the documented auto-derivation table, includes
+  // a fresh per-run seed (or the canonical 0xCAFEBABE when staged), and
+  // returns an error string if validation fails.
+  function buildSimpleConfig(): { cfg: GeneratorConfig; seedUsed: number } | string {
+    if (!Number.isFinite(rows) || !Number.isInteger(rows) || rows < 1) {
+      return "Total rows must be a positive integer.";
+    }
+    if (!mixValid) return `Class mix must sum to 100 (currently ${mixSum})`;
+    const split = deriveClassSplit(rows, mixPct);
+    if (Object.keys(split).length === 0) return "At least one class must have a non-zero percentage.";
+    const seedUsed = pendingSeed ?? randomSeed();
+    const cfg: GeneratorConfig = {
+      class_split: split,
+      sensitivity_types: [...CANONICAL_DEMO_SENS_TYPES],
+      seed: seedUsed,
+      trade_pool_size: deriveTradePool(rows),
+      factor_pool_size: deriveFactorPool(rows),
+      stop_when: { rows, memory_pct: 75, elapsed_seconds: 600 },
+    };
+    return { cfg, seedUsed };
+  }
+
+  async function runWithSanityCheck(
+    cfg: GeneratorConfig | null,
+    rowsForCheck: number,
+    seedUsed: number | null,
+  ) {
     setFormError(null);
     clearRun();
     // Wave 5.47b — gate the run on pre-flight. ensureFresh re-probes when the
@@ -748,7 +859,14 @@ function SyntheticGeneratorCard(props: { preflightGate?: () => Promise<Preflight
     let mem: ObservabilityMemoryResponse | null = null;
     try { mem = await getObservabilityMemory(); } catch { mem = null; }
     const est = mem ? computeSanity(rowsForCheck, mem) : null;
-    if (!est) { startRun(cfg); return; }
+    if (!est) {
+      startRun(cfg);
+      if (seedUsed !== null) {
+        setLastSeed(seedUsed);
+        setPendingSeed(null);
+      }
+      return;
+    }
     setPending({ cfg, rows: rowsForCheck, est });
   }
 
@@ -756,23 +874,70 @@ function SyntheticGeneratorCard(props: { preflightGate?: () => Promise<Preflight
     e.preventDefault();
     setFormError(null);
     clearRun();
-    const built = buildAdvancedConfig();
+    if (advancedOpen) {
+      // Wave 5.52 — advanced-mode submit: ship user-entered values verbatim.
+      const built = buildAdvancedConfig();
+      if (typeof built === "string") { setFormError(built); return; }
+      const effectiveRows = built.class_split
+        ? Object.values(built.class_split).reduce((a, b) => a + b, 0)
+        : built.rows ?? DEFAULT_GEN_ROWS;
+      // Capture the seed actually sent so the "Last seed" pill updates.
+      const seedNum = typeof built.seed === "number"
+        ? built.seed
+        : typeof built.seed === "string" && /^-?\d+$/.test(built.seed)
+          ? Number(built.seed)
+          : null;
+      await runWithSanityCheck(built, effectiveRows, seedNum);
+      return;
+    }
+    // Simple mode: auto-derive trade/factor pool, class_split, stop_when.
+    const built = buildSimpleConfig();
     if (typeof built === "string") { setFormError(built); return; }
-    // Wave 5.47d — when class_split is set, the effective row count is the
-    // sum; otherwise it's the explicit `rows` field. Pass that to the sanity
-    // check so headroom math reflects what the server will actually queue.
-    const effectiveRows = built.class_split
-      ? Object.values(built.class_split).reduce((a, b) => a + b, 0)
-      : built.rows ?? DEFAULT_GEN_ROWS;
-    await runWithSanityCheck(built, effectiveRows);
-  }
-
-  async function onGenerateDefaults() {
-    await runWithSanityCheck(null, DEFAULT_GEN_ROWS);
+    await runWithSanityCheck(built.cfg, rows, built.seedUsed);
   }
 
   function onRandomSeed() {
     setSeed(String(Math.floor(Math.random() * 1_000_000_000)));
+  }
+
+  // Wave 5.52 — quick-pick row buttons. Pure UX: set the Total rows input
+  // and clear any staged canonical seed (a non-canonical row count is a
+  // signal the user is moving away from the canonical demo).
+  function onQuickPickRows(n: number): void {
+    setRows(n);
+    setPendingSeed(null);
+  }
+
+  // Wave 5.52 — class-mix percent input. Integer 0..100 per channel; the
+  // mix-sum pill enforces the equality-to-100 invariant before submit.
+  function onMixChange(c: (typeof GENERATOR_CLASSES)[number], raw: string): void {
+    const n = raw === "" ? 0 : Number(raw);
+    if (!Number.isFinite(n)) return;
+    const clamped = Math.max(0, Math.min(100, Math.floor(n)));
+    setMixPct((prev) => ({ ...prev, [c]: clamped }));
+    setPendingSeed(null);
+  }
+
+  // Wave 5.52 — Reset to canonical demo. Stages the fixed-seed run that
+  // reproduces the 0.6846 GIRR.Delta result. User still has to click
+  // Generate to fire it (matches the spec mockup's two-button layout).
+  function onResetToCanonical(): void {
+    setRows(CANONICAL_DEMO_ROWS);
+    setMixPct({ ...CANONICAL_DEMO_MIX });
+    setPendingSeed(CANONICAL_DEMO_SEED);
+    setFormError(null);
+  }
+
+  async function onCopyLastSeed(): Promise<void> {
+    if (lastSeed === null) return;
+    const text = formatSeedHex(lastSeed);
+    try {
+      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+      }
+    } catch { /* clipboard unavailable — still show the tooltip for feedback */ }
+    setSeedCopied(true);
+    window.setTimeout(() => setSeedCopied(false), 1500);
   }
 
   // Wave 5.49 — preset change drops the resolved trade / factor sizes into
@@ -821,18 +986,105 @@ function SyntheticGeneratorCard(props: { preflightGate?: () => Promise<Preflight
   return (
     <PanelCard title="Synthetic generator">
       <form className="generator-form" onSubmit={onSubmit} aria-label="Synthetic generator">
+        {/* Wave 5.52 — simple-mode controls: Total rows + Class mix. The
+            advanced disclosure below reveals the full historical form. */}
+        <div className="generator-form__row" data-testid="generator-total-rows">
+          <label htmlFor="gen-total-rows">Total rows</label>
+          <input
+            id="gen-total-rows"
+            type="number"
+            min={1}
+            max={100_000_000}
+            value={rows}
+            disabled={busy}
+            onChange={(e) => onQuickPickRows(Number(e.target.value) || 0)}
+          />
+          <span className="generator-form__quick-picks" data-testid="generator-quick-picks">
+            {QUICK_PICK_ROWS.map((q) => (
+              <button
+                key={q.value}
+                type="button"
+                className="btn btn--secondary"
+                disabled={busy}
+                onClick={() => onQuickPickRows(q.value)}
+                data-testid={`generator-quick-pick-${q.label}`}
+              >
+                {q.label}
+              </button>
+            ))}
+          </span>
+        </div>
+
+        <fieldset
+          className="generator-form__group"
+          disabled={busy}
+          data-testid="generator-class-mix"
+        >
+          <legend>Class mix (sum = 100%)</legend>
+          {GENERATOR_CLASSES.map((c) => (
+            <div key={c} className="generator-form__row">
+              <label htmlFor={`gen-mix-${c}`}>{c}</label>
+              <input
+                id={`gen-mix-${c}`}
+                type="number"
+                min={0}
+                max={100}
+                step={1}
+                value={mixPct[c] ?? 0}
+                disabled={busy}
+                onChange={(e) => onMixChange(c, e.target.value)}
+              />
+              <span className="generator-form__hint">%</span>
+            </div>
+          ))}
+          {!mixValid ? (
+            <span
+              className="generator-form__pill generator-form__pill--warn"
+              data-testid="generator-mix-pill"
+              role="status"
+            >
+              Class mix must sum to 100 (currently {mixSum})
+            </span>
+          ) : null}
+        </fieldset>
+
         <div className="generator-form__actions">
           <button
-            type="button"
+            type="submit"
             className="btn btn--primary"
-            disabled={busy}
-            onClick={onGenerateDefaults}
-            data-testid="generator-defaults-btn"
+            disabled={busy || !mixValid}
+            data-testid="generator-generate-btn"
           >
-            {busy ? "Generating…" : "Generate 200 rows"}
+            {busy ? "Generating…" : "Generate"}
           </button>
-          <span className="generator-form__hint">uses api defaults (200 rows · all classes · Delta+Vega)</span>
+          <button
+            type="button"
+            className="btn btn--secondary"
+            disabled={busy}
+            onClick={onResetToCanonical}
+            data-testid="generator-reset-canonical-btn"
+          >
+            Reset to canonical demo
+          </button>
         </div>
+
+        {lastSeed !== null ? (
+          <div className="generator-form__last-seed" data-testid="generator-last-seed">
+            <span>Last seed: </span>
+            <button
+              type="button"
+              className="generator-form__seed-copy"
+              onClick={() => { void onCopyLastSeed(); }}
+              data-testid="generator-last-seed-copy"
+              aria-label={`Copy last seed ${formatSeedHex(lastSeed)}`}
+            >
+              <code>{formatSeedHex(lastSeed)}</code>
+            </button>
+            {seedCopied ? (
+              <span className="generator-form__hint" data-testid="generator-last-seed-copied">Copied</span>
+            ) : null}
+          </div>
+        ) : null}
 
         <button
           type="button"
@@ -840,9 +1092,11 @@ function SyntheticGeneratorCard(props: { preflightGate?: () => Promise<Preflight
           aria-expanded={advancedOpen}
           aria-controls="generator-form-advanced"
           onClick={() => setAdvancedOpen((v) => !v)}
+          data-testid="generator-advanced-toggle"
         >
-          {advancedOpen ? "▾" : "▸"} Advanced options
+          {advancedOpen ? "▾ Hide advanced…" : "▸ Show advanced…"}
         </button>
+        {advancedOpen ? (
         <div id="generator-form-advanced" className="generator-form__advanced-body">
           {/* Wave 5.49 — named presets sit at the top of the advanced
               fieldset; they update tradePool / factorPool state and hide the
@@ -975,40 +1229,36 @@ function SyntheticGeneratorCard(props: { preflightGate?: () => Promise<Preflight
             ))}
           </fieldset>
 
-          {/* Wave 5.49 — raw trade / factor pool inputs only surface when
-              the user picks "Custom…". Non-custom presets seed the same
-              underlying state slots, so the submit body is identical. */}
-          {preset === "custom" ? (
-            <>
-              <div className="generator-form__row">
-                <label htmlFor="gen-trade-pool">Trade pool size</label>
-                <input
-                  id="gen-trade-pool"
-                  type="number"
-                  min={1}
-                  max={10000}
-                  placeholder="auto"
-                  value={tradePool}
-                  disabled={busy}
-                  onChange={(e) => setTradePool(e.target.value)}
-                />
-                <span className="generator-form__hint">empty = auto (ceil(rows/10))</span>
-              </div>
+          {/* Wave 5.52 — Advanced disclosure always surfaces the raw trade /
+              factor pool inputs (preset just stages new values into them); in
+              the new UX the simple-mode card is the abstraction layer. */}
+          <div className="generator-form__row">
+            <label htmlFor="gen-trade-pool">Trade pool size</label>
+            <input
+              id="gen-trade-pool"
+              type="number"
+              min={1}
+              max={10000}
+              placeholder="auto"
+              value={tradePool}
+              disabled={busy}
+              onChange={(e) => setTradePool(e.target.value)}
+            />
+            <span className="generator-form__hint">empty = auto (ceil(rows/10))</span>
+          </div>
 
-              <div className="generator-form__row">
-                <label htmlFor="gen-factor-pool">Risk factor pool size</label>
-                <input
-                  id="gen-factor-pool"
-                  type="number"
-                  min={1}
-                  max={256}
-                  value={factorPool}
-                  disabled={busy}
-                  onChange={(e) => setFactorPool(Number(e.target.value) || 0)}
-                />
-              </div>
-            </>
-          ) : null}
+          <div className="generator-form__row">
+            <label htmlFor="gen-factor-pool">Risk factor pool size</label>
+            <input
+              id="gen-factor-pool"
+              type="number"
+              min={1}
+              max={256}
+              value={factorPool}
+              disabled={busy}
+              onChange={(e) => setFactorPool(Number(e.target.value) || 0)}
+            />
+          </div>
 
           {/* Wave 5.47c — optional stop conditions. Whichever trips first
               halts the run; leaving all three empty preserves the historical
@@ -1058,13 +1308,8 @@ function SyntheticGeneratorCard(props: { preflightGate?: () => Promise<Preflight
               />
             </div>
           </fieldset>
-
-          <div className="generator-form__actions">
-            <button type="submit" className="btn btn--secondary" disabled={busy}>
-              {busy ? "Generating…" : "Generate"}
-            </button>
-          </div>
         </div>
+        ) : null}
 
         {run && (run.status === "running" || run.status === "cancelling") ? (
           <GeneratorProgress run={run} onCancel={onCancelRun} />

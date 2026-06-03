@@ -81,7 +81,12 @@ function generatorCard() {
   return screen.getAllByTestId("panel-card").find((el) => el.getAttribute("data-title") === "Synthetic generator")!;
 }
 
-describe("<IngestPanel /> — synthetic generator card (Wave 5.17b)", () => {
+// Wave 5.52 — most legacy controls live under the "Show advanced…" disclosure.
+function openAdvanced(card: HTMLElement) {
+  fireEvent.click(within(card).getByTestId("generator-advanced-toggle"));
+}
+
+describe("<IngestPanel /> — synthetic generator card (Wave 5.17b / 5.52)", () => {
   let fetchMock: ReturnType<typeof vi.fn>;
   beforeEach(() => {
     fetchMock = vi.fn();
@@ -92,15 +97,21 @@ describe("<IngestPanel /> — synthetic generator card (Wave 5.17b)", () => {
     vi.restoreAllMocks();
   });
 
-  it("renders the form with correct defaults: rows=200, all classes checked, Delta+Vega checked, seed=0, 'small' preset selected and raw trade/factor pool inputs hidden (Wave 5.49)", async () => {
+  it("renders simple-mode defaults (200 rows + 60/30/10 mix) and advanced legacy fields after opening Advanced", async () => {
     baselineFetch(fetchMock);
     renderPanel();
     const card = await waitFor(() => generatorCard());
     expect(within(card).getByRole("heading", { name: /synthetic generator/i })).toBeInTheDocument();
 
-    const rows = within(card).getByLabelText(/^rows$/i) as HTMLInputElement;
-    expect(rows.value).toBe("200");
+    // Wave 5.52 — simple-mode: Total rows + Class mix percent inputs.
+    const totalRows = within(card).getByLabelText(/^total rows$/i) as HTMLInputElement;
+    expect(totalRows.value).toBe("200");
+    expect((within(card).getByLabelText("GIRR") as HTMLInputElement).value).toBe("60");
+    expect((within(card).getByLabelText("Equity") as HTMLInputElement).value).toBe("30");
+    expect((within(card).getByLabelText("FX") as HTMLInputElement).value).toBe("10");
 
+    // Opening Advanced reveals the legacy controls pre-populated with derived values.
+    openAdvanced(card);
     for (const c of ["GIRR", "Equity", "FX"]) {
       const cb = within(card).getByRole("checkbox", { name: c }) as HTMLInputElement;
       expect(cb.checked).toBe(true);
@@ -109,20 +120,17 @@ describe("<IngestPanel /> — synthetic generator card (Wave 5.17b)", () => {
     expect((within(card).getByRole("checkbox", { name: "Vega" }) as HTMLInputElement).checked).toBe(true);
     expect((within(card).getByRole("checkbox", { name: "Curvature" }) as HTMLInputElement).checked).toBe(false);
 
-    expect((within(card).getByLabelText(/^seed$/i) as HTMLInputElement).value).toBe("0");
-    // Wave 5.49 — default preset is "small"; raw trade/factor inputs are
-    // hidden until the user picks "Custom…".
-    expect((within(card).getByTestId("generator-preset") as HTMLSelectElement).value).toBe("small");
-    expect(within(card).queryByLabelText(/trade pool size/i)).toBeNull();
-    expect(within(card).queryByLabelText(/risk factor pool size/i)).toBeNull();
-    expect(within(card).getByRole("button", { name: /^generate$/i })).toBeInTheDocument();
+    expect((within(card).getByTestId("generator-preset") as HTMLSelectElement).value).toBe("custom");
+    expect((within(card).getByLabelText(/trade pool size/i) as HTMLInputElement).value).toBe("50");
+    expect((within(card).getByLabelText(/risk factor pool size/i) as HTMLInputElement).value).toBe("8");
+    expect(within(card).getByTestId("generator-generate-btn")).toBeInTheDocument();
   });
 
-  it("submitting with defaults POSTs the correct body shape to /generator/start/stream (Wave 5.49: small preset ⇒ trade_pool_size=200, factor_pool_size=16)", async () => {
+  it("submitting in simple mode POSTs the auto-derived body shape (Wave 5.52)", async () => {
     baselineFetch(fetchMock);
     renderPanel();
     const card = await waitFor(() => generatorCard());
-    fireEvent.click(within(card).getByRole("button", { name: /^generate$/i }));
+    fireEvent.click(within(card).getByTestId("generator-generate-btn"));
     await waitFor(() => {
       const posted = fetchMock.mock.calls.find(
         (c) => /\/generator\/start\/stream$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",
@@ -133,24 +141,25 @@ describe("<IngestPanel /> — synthetic generator card (Wave 5.17b)", () => {
       (c) => /\/generator\/start\/stream$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",
     )!;
     const body = JSON.parse((posted[1] as RequestInit).body as string);
-    expect(body).toEqual({
-      rows: 200,
-      classes: ["GIRR", "Equity", "FX"],
-      sensitivity_types: ["Delta", "Vega"],
-      seed: 0,
-      factor_pool_size: 16,
-      trade_pool_size: 200,
-    });
+    expect(body.class_split).toEqual({ GIRR: 120, Equity: 60, FX: 20 });
+    expect(body.sensitivity_types).toEqual(["Delta", "Vega"]);
+    expect(body.trade_pool_size).toBe(50);
+    expect(body.factor_pool_size).toBe(8);
+    expect(body.stop_when).toEqual({ rows: 200, memory_pct: 75, elapsed_seconds: 600 });
+    expect(typeof body.seed).toBe("number");
+    // Simple-mode never sends `rows` (class_split fully determines the count).
+    expect(body).not.toHaveProperty("rows");
   });
 
-  it("blocks submit and shows a role=alert when no risk class is checked", async () => {
+  it("advanced submit blocks and shows a role=alert when no risk class is checked", async () => {
     baselineFetch(fetchMock);
     renderPanel();
     const card = await waitFor(() => generatorCard());
+    openAdvanced(card);
     for (const c of ["GIRR", "Equity", "FX"]) {
       fireEvent.click(within(card).getByRole("checkbox", { name: c }));
     }
-    fireEvent.click(within(card).getByRole("button", { name: /^generate$/i }));
+    fireEvent.click(within(card).getByTestId("generator-generate-btn"));
     const alert = await within(card).findByRole("alert");
     expect(alert.textContent).toMatch(/risk class/i);
     const posted = fetchMock.mock.calls.find(

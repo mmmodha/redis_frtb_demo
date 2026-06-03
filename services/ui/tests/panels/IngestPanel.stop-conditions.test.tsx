@@ -77,6 +77,17 @@ function generatorCard() {
   return screen.getAllByTestId("panel-card").find((el) => el.getAttribute("data-title") === "Synthetic generator")!;
 }
 
+// Wave 5.52 — Stop conditions moved under the "Show advanced…" disclosure.
+// Helper opens advanced and clears the auto-derived stop_when defaults so
+// each test starts from the blank-input baseline the pre-5.52 form had.
+function openAdvancedAndClearStop(card: HTMLElement) {
+  fireEvent.click(within(card).getByTestId("generator-advanced-toggle"));
+  const group = within(card).getByTestId("generator-stop-when");
+  for (const re of [/Stop after rows/i, /Stop at memory %/i, /Stop after seconds/i]) {
+    fireEvent.change(within(group).getByLabelText(re), { target: { value: "" } });
+  }
+}
+
 describe("<IngestPanel /> — Stop conditions (Wave 5.47c)", () => {
   let fetchMock: ReturnType<typeof vi.fn>;
   beforeEach(() => {
@@ -88,10 +99,11 @@ describe("<IngestPanel /> — Stop conditions (Wave 5.47c)", () => {
     vi.restoreAllMocks();
   });
 
-  it("renders the Stop conditions fieldset with three blank inputs", async () => {
+  it("renders the Stop conditions fieldset; after clearing the auto-derived defaults all three inputs are blank", async () => {
     baselineFetch(fetchMock);
     renderPanel();
     const card = await waitFor(() => generatorCard());
+    openAdvancedAndClearStop(card);
     const group = within(card).getByTestId("generator-stop-when");
     const rowsInput = within(group).getByLabelText(/Stop after rows/i) as HTMLInputElement;
     const memInput = within(group).getByLabelText(/Stop at memory %/i) as HTMLInputElement;
@@ -105,9 +117,10 @@ describe("<IngestPanel /> — Stop conditions (Wave 5.47c)", () => {
     baselineFetch(fetchMock);
     renderPanel();
     const card = await waitFor(() => generatorCard());
+    openAdvancedAndClearStop(card);
     const group = within(card).getByTestId("generator-stop-when");
     fireEvent.change(within(group).getByLabelText(/Stop at memory %/i), { target: { value: "70" } });
-    fireEvent.click(within(card).getByRole("button", { name: /^generate$/i }));
+    fireEvent.click(within(card).getByTestId("generator-generate-btn"));
     await waitFor(() => {
       const posted = fetchMock.mock.calls.find(
         (c) => /\/generator\/start\/stream$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",
@@ -125,7 +138,8 @@ describe("<IngestPanel /> — Stop conditions (Wave 5.47c)", () => {
     baselineFetch(fetchMock);
     renderPanel();
     const card = await waitFor(() => generatorCard());
-    fireEvent.click(within(card).getByRole("button", { name: /^generate$/i }));
+    openAdvancedAndClearStop(card);
+    fireEvent.click(within(card).getByTestId("generator-generate-btn"));
     await waitFor(() => {
       const posted = fetchMock.mock.calls.find(
         (c) => /\/generator\/start\/stream$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",
@@ -143,6 +157,7 @@ describe("<IngestPanel /> — Stop conditions (Wave 5.47c)", () => {
     baselineFetch(fetchMock);
     renderPanel();
     const card = await waitFor(() => generatorCard());
+    openAdvancedAndClearStop(card);
     const group = within(card).getByTestId("generator-stop-when");
     fireEvent.change(within(group).getByLabelText(/Stop after rows/i), { target: { value: "500" } });
     fireEvent.change(within(group).getByLabelText(/Stop at memory %/i), { target: { value: "80" } });
@@ -150,7 +165,7 @@ describe("<IngestPanel /> — Stop conditions (Wave 5.47c)", () => {
     // Match rows so the rows-vs-stop_when.rows guard doesn't kick in on the
     // client validation side.
     fireEvent.change(within(card).getByLabelText(/^Rows$/i), { target: { value: "500" } });
-    fireEvent.click(within(card).getByRole("button", { name: /^generate$/i }));
+    fireEvent.click(within(card).getByTestId("generator-generate-btn"));
     await waitFor(() => {
       const posted = fetchMock.mock.calls.find(
         (c) => /\/generator\/start\/stream$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",
@@ -175,7 +190,7 @@ describe("<IngestPanel /> — Stop conditions (Wave 5.47c)", () => {
     });
     renderPanel();
     const card = await waitFor(() => generatorCard());
-    fireEvent.click(within(card).getByRole("button", { name: /^generate$/i }));
+    fireEvent.click(within(card).getByTestId("generator-generate-btn"));
     await waitFor(() => {
       expect(screen.getByTestId("generator-stop-reason").textContent).toMatch(/time limit reached/);
     });

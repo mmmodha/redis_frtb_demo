@@ -77,6 +77,11 @@ function generatorCard() {
   return screen.getAllByTestId("panel-card").find((el) => el.getAttribute("data-title") === "Synthetic generator")!;
 }
 
+// Wave 5.52 — advanced fields live under the "Show advanced…" disclosure.
+function openAdvanced(card: HTMLElement) {
+  fireEvent.click(within(card).getByTestId("generator-advanced-toggle"));
+}
+
 function postedBody(fetchMock: ReturnType<typeof vi.fn>): any {
   const posted = fetchMock.mock.calls.find(
     (c) => /\/generator\/start\/stream$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",
@@ -95,31 +100,38 @@ describe("<IngestPanel /> — Realistic profile presets (Wave 5.49)", () => {
     vi.restoreAllMocks();
   });
 
-  it("renders the preset dropdown with 'Small desk' selected by default and the four named tiers + Custom", async () => {
+  // Wave 5.52 — preset dropdown moved under the "Show advanced…" disclosure.
+  // Opening advanced is now the entry point for any preset-related assertion.
+  it("renders the preset dropdown with the four named tiers + Custom after opening Advanced", async () => {
     baselineFetch(fetchMock);
     renderPanel();
     const card = await waitFor(() => generatorCard());
+    openAdvanced(card);
     const select = within(card).getByTestId("generator-preset") as HTMLSelectElement;
-    expect(select.value).toBe("small");
     const options = Array.from(select.options).map((o) => o.value);
     expect(options).toEqual(["small", "single-desk", "trading-book", "full-bank", "custom"]);
     expect(select.options[0]!.text).toMatch(/Small desk/);
   });
 
-  it("non-custom presets hide the raw trade_pool / factor_pool inputs", async () => {
+  it("Advanced disclosure surfaces the raw trade_pool / factor_pool inputs pre-populated with the derived values", async () => {
     baselineFetch(fetchMock);
     renderPanel();
     const card = await waitFor(() => generatorCard());
-    expect(within(card).queryByLabelText(/trade pool size/i)).toBeNull();
-    expect(within(card).queryByLabelText(/risk factor pool size/i)).toBeNull();
+    openAdvanced(card);
+    // rows=200, mix=60/30/10 ⇒ trade_pool=max(50,floor(200/20))=50, factor_pool=max(8,floor(200/200))=8.
+    const trade = within(card).getByLabelText(/trade pool size/i) as HTMLInputElement;
+    const factor = within(card).getByLabelText(/risk factor pool size/i) as HTMLInputElement;
+    expect(trade.value).toBe("50");
+    expect(factor.value).toBe("8");
   });
 
   it("switching to 'Single desk realistic' submits trade_pool_size=2000 and factor_pool_size=32", async () => {
     baselineFetch(fetchMock);
     renderPanel();
     const card = await waitFor(() => generatorCard());
+    openAdvanced(card);
     fireEvent.change(within(card).getByTestId("generator-preset"), { target: { value: "single-desk" } });
-    fireEvent.click(within(card).getByRole("button", { name: /^generate$/i }));
+    fireEvent.click(within(card).getByTestId("generator-generate-btn"));
     await waitFor(() => {
       const posted = fetchMock.mock.calls.find(
         (c) => /\/generator\/start\/stream$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",
@@ -131,13 +143,12 @@ describe("<IngestPanel /> — Realistic profile presets (Wave 5.49)", () => {
     expect(body.factor_pool_size).toBe(32);
   });
 
-  it("switching to 'Custom…' reveals the raw trade/factor inputs pre-populated with the last preset's values", async () => {
+  it("switching to 'Trading book' updates the raw trade/factor inputs to the preset's values", async () => {
     baselineFetch(fetchMock);
     renderPanel();
     const card = await waitFor(() => generatorCard());
-    // Bump to trading-book so the carried-over numbers are obviously preset-derived.
+    openAdvanced(card);
     fireEvent.change(within(card).getByTestId("generator-preset"), { target: { value: "trading-book" } });
-    fireEvent.change(within(card).getByTestId("generator-preset"), { target: { value: "custom" } });
     const trade = within(card).getByLabelText(/trade pool size/i) as HTMLInputElement;
     const factor = within(card).getByLabelText(/risk factor pool size/i) as HTMLInputElement;
     expect(trade.value).toBe("20000");

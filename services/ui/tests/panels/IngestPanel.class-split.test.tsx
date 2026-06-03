@@ -74,6 +74,17 @@ function generatorCard() {
   return screen.getAllByTestId("panel-card").find((el) => el.getAttribute("data-title") === "Synthetic generator")!;
 }
 
+// Wave 5.52 — per-class targets table moved under "Show advanced…".
+function openAdvanced(card: HTMLElement) {
+  fireEvent.click(within(card).getByTestId("generator-advanced-toggle"));
+}
+
+function clearSplit(splitGroup: HTMLElement) {
+  for (const c of ["GIRR", "Equity", "FX"]) {
+    fireEvent.change(within(splitGroup).getByLabelText(c), { target: { value: "" } });
+  }
+}
+
 describe("<IngestPanel /> — per-class targets (Wave 5.47d)", () => {
   let fetchMock: ReturnType<typeof vi.fn>;
   beforeEach(() => {
@@ -85,17 +96,20 @@ describe("<IngestPanel /> — per-class targets (Wave 5.47d)", () => {
     vi.restoreAllMocks();
   });
 
-  it("renders one input per selected class in the Per-class targets table", async () => {
+  it("renders one input per selected class in the Per-class targets table (advanced pre-populates with auto-derived split)", async () => {
     baselineFetch(fetchMock);
     renderPanel();
     const card = await waitFor(() => generatorCard());
+    openAdvanced(card);
     const splitGroup = within(card).getByTestId("generator-class-split");
-    // All three default classes show up as inputs labeled by class name.
-    for (const c of ["GIRR", "Equity", "FX"]) {
+    // Wave 5.52 — defaults (200 rows · 60/30/10 mix) drop {120, 60, 20} into
+    // the per-class inputs so the reveal mirrors the simple-mode submit body.
+    const expected = { GIRR: "120", Equity: "60", FX: "20" } as const;
+    for (const c of ["GIRR", "Equity", "FX"] as const) {
       const input = within(splitGroup).getByLabelText(c) as HTMLInputElement;
       expect(input).toBeInTheDocument();
       expect(input.type).toBe("number");
-      expect(input.value).toBe("");
+      expect(input.value).toBe(expected[c]);
     }
   });
 
@@ -103,6 +117,7 @@ describe("<IngestPanel /> — per-class targets (Wave 5.47d)", () => {
     baselineFetch(fetchMock);
     renderPanel();
     const card = await waitFor(() => generatorCard());
+    openAdvanced(card);
     const splitGroup = within(card).getByTestId("generator-class-split");
     fireEvent.click(within(splitGroup).getByTestId("generator-even-split-btn"));
     // Default rows=200, 3 classes ⇒ 67 + 66 + 67 = 200 (remainder lands on first).
@@ -121,11 +136,13 @@ describe("<IngestPanel /> — per-class targets (Wave 5.47d)", () => {
     baselineFetch(fetchMock);
     renderPanel();
     const card = await waitFor(() => generatorCard());
+    openAdvanced(card);
     const splitGroup = within(card).getByTestId("generator-class-split");
+    clearSplit(splitGroup);
     fireEvent.change(within(splitGroup).getByLabelText("GIRR"), { target: { value: "100" } });
     fireEvent.change(within(splitGroup).getByLabelText("FX"), { target: { value: "50" } });
     // Equity stays blank ⇒ excluded from class_split.
-    fireEvent.click(within(card).getByRole("button", { name: /^generate$/i }));
+    fireEvent.click(within(card).getByTestId("generator-generate-btn"));
     await waitFor(() => {
       const posted = fetchMock.mock.calls.find(
         (c) => /\/generator\/start\/stream$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",

@@ -221,20 +221,42 @@ export function createRowGenerator(
               row[op.name] = { cvr_up: up, cvr_down: down };
             } else {
               // Wave 5.17a — Delta/Vega array values wrapped as a tenor-keyed
-              // object so the bank can FT.SEARCH per-tenor without unpacking. The
-              // rng() draw order and the resulting numeric values are
-              // bit-identical to the prior array shape — only the container
-              // changes. When tenor metadata is missing (defensive), fall
-              // back to the legacy array so the row is still well-formed.
-              const arr = new Array(op.len);
-              for (let j = 0; j < op.len; j++) arr[j] = Math.round((rng() * 2 - 1) * 1e6) / 1e6;
+              // object so the bank can FT.SEARCH per-tenor without unpacking.
+              // Wave 5.52 — emit K ∈ [5..10] tenors per row (uniform draw),
+              // sampled without replacement via a Fisher-Yates partial shuffle
+              // on the tenor index list. Emitted keys retain the declared
+              // tenor order so the Lua kernels see stable iteration. Same
+              // rng() drives K-draw, shuffle, and value draws so a given
+              // seed is still reproducible. Fallback (missing tenor metadata)
+              // preserves the legacy full-length array shape.
               const nodes = plan.tenorNodes;
-              if (nodes && nodes.length === op.len) {
+              if (nodes && nodes.length === op.len && op.len >= 5) {
+                const K = 5 + Math.floor(rng() * 6);
+                const k = Math.min(K, op.len);
+                const idx = new Array<number>(op.len);
+                for (let j = 0; j < op.len; j++) idx[j] = j;
+                for (let j = 0; j < k; j++) {
+                  const swap = j + Math.floor(rng() * (op.len - j));
+                  const tmp = idx[j]!; idx[j] = idx[swap]!; idx[swap] = tmp;
+                }
+                const picked = new Uint8Array(op.len);
+                for (let j = 0; j < k; j++) picked[idx[j]!] = 1;
                 const obj: Record<string, number> = {};
-                for (let j = 0; j < op.len; j++) obj[nodes[j]!] = arr[j]!;
+                for (let j = 0; j < op.len; j++) {
+                  if (!picked[j]) continue;
+                  obj[nodes[j]!] = Math.round((rng() * 2 - 1) * 1e6) / 1e6;
+                }
                 row[op.name] = obj;
               } else {
-                row[op.name] = arr;
+                const arr = new Array(op.len);
+                for (let j = 0; j < op.len; j++) arr[j] = Math.round((rng() * 2 - 1) * 1e6) / 1e6;
+                if (nodes && nodes.length === op.len) {
+                  const obj: Record<string, number> = {};
+                  for (let j = 0; j < op.len; j++) obj[nodes[j]!] = arr[j]!;
+                  row[op.name] = obj;
+                } else {
+                  row[op.name] = arr;
+                }
               }
             }
             break;

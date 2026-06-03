@@ -18,21 +18,31 @@ beforeAll(() => {
 });
 
 describe("createRowGenerator (schema-driven, per-risk-class)", () => {
-  it("emits GIRR rows with risk_value as a per-tenor JSON object (Wave 5.17a tenant reshape)", () => {
+  it("emits GIRR rows with risk_value as a sparse per-tenor JSON object (Wave 5.52 — K∈[5..10] tenors per row)", () => {
     const gen = createRowGenerator(schema, { seed: 1 });
-    const row = gen.generate("GIRR");
     const tenorNodes = schema.risk_classes.GIRR!.tenor!.nodes;
-    const rv = row.risk_value as Record<string, number>;
-    expect(rv).toBeTypeOf("object");
-    expect(Array.isArray(rv)).toBe(false);
-    for (const t of tenorNodes) {
-      expect(typeof rv[t]).toBe("number");
-      expect(Number.isFinite(rv[t])).toBe(true);
+    const tenorSet = new Set(tenorNodes);
+    const seenLengths = new Set<number>();
+    for (let i = 0; i < 200; i++) {
+      const row = gen.generate("GIRR");
+      const rv = row.risk_value as Record<string, number>;
+      expect(rv).toBeTypeOf("object");
+      expect(Array.isArray(rv)).toBe(false);
+      const keys = Object.keys(rv);
+      expect(keys.length).toBeGreaterThanOrEqual(5);
+      expect(keys.length).toBeLessThanOrEqual(10);
+      seenLengths.add(keys.length);
+      for (const k of keys) {
+        expect(tenorSet.has(k)).toBe(true);
+        expect(typeof rv[k]).toBe("number");
+        expect(Number.isFinite(rv[k])).toBe(true);
+      }
+      // Declared tenor order is preserved in the emitted keys.
+      const expectedOrder = tenorNodes.filter((t) => t in rv);
+      expect(keys).toEqual(expectedOrder);
     }
-    // Object keys cover the full tenor list (order doesn't matter for object
-    // membership; iteration order is preserved by both Lua and TS oracles
-    // via the explicit `tenors` substitution).
-    expect(Object.keys(rv).sort()).toEqual([...tenorNodes].sort());
+    // Across 200 rows the K-draw should cover the full [5..10] range.
+    expect(seenLengths.size).toBeGreaterThan(1);
   });
 
   it("emits GIRR rows whose tenor matches the schema's tenor.nodes (when ARRAY shape)", () => {
