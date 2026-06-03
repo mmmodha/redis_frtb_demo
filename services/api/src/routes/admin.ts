@@ -97,6 +97,11 @@ export function registerAdminRoutes(
   // surface a "rebuild indexes" banner before a generator run silently
   // produces unindexed rows. No body required; GET keeps it cacheable-free
   // and aligns with the read-only intent.
+  //
+  // Wave 5.54 — the stream check is informational only: the stream is the
+  // OUTPUT of the generator, not a precondition for it. Gating the generator
+  // on its existence created a chicken-and-egg deadlock on fresh Redis
+  // targets. Only idx_sens + frtb_library participate in the ok gate now.
   app.get("/admin/preflight", async () => {
     const redis = getRedis();
     const masters = resolveMasterNodes(redis as unknown as BootstrapRedis);
@@ -145,7 +150,7 @@ export function registerAdminRoutes(
     let pingOk = true;
     try { await redis.call("PING"); } catch { pingOk = false; }
 
-    const ok = idx_sens_ok && loaded && streamExists;
+    const ok = idx_sens_ok && loaded;
     return {
       ok,
       checks: {
@@ -160,7 +165,14 @@ export function registerAdminRoutes(
   // Wave 5.47b — one-click rebuild. Re-runs bootstrapFrtb against the active
   // redis client (same helper Wave 5.46 wires into the flush path). Idempotent
   // because ensureSensIndex / loadFrtbLibrary tolerate already-loaded state.
-  app.post("/admin/rebuild-indexes", async () => {
+  //
+  // Wave 5.54 — also creates the sensitivities:in stream + ingest consumer
+  // group via XGROUP CREATE ... MKSTREAM. Defaults mirror
+  // services/ingest/src/cli.ts (STREAM_KEY / CONSUMER_GROUP) so a fresh Redis
+  // is fully wired after a single rebuild click. BUSYGROUP (group already
+  // exists, MKSTREAM is a no-op) is tolerated; other XGROUP errors are
+  // logged but do not fail the rebuild because bootstrap itself succeeded.
+  app.post("/admin/rebuild-indexes", async (req) => {
     if (!opts.schema) {
       return { ok: false, ms: 0, bootstrap: { ok: false, error: "schema-missing" } };
     }
@@ -176,6 +188,20 @@ export function registerAdminRoutes(
         error: String(err instanceof Error ? err.message : err),
       };
     }
+
+    if (bootstrap.ok) {
+      const stream = process.env.STREAM_KEY ?? "sensitivities:in";
+      const group = process.env.CONSUMER_GROUP ?? "ingest";
+      try {
+        await redis.call("XGROUP", "CREATE", stream, group, "$", "MKSTREAM");
+      } catch (err) {
+        const msg = String(err instanceof Error ? err.message : err);
+        if (!msg.includes("BUSYGROUP")) {
+          req.log.warn({ err: msg, stream, group }, "rebuild: XGROUP CREATE MKSTREAM failed");
+        }
+      }
+    }
+
     const ms = Math.round(Number(process.hrtime.bigint() - t0) / 1e6);
     return { ok: bootstrap.ok, ms, bootstrap };
   });

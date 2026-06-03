@@ -86,22 +86,26 @@ describe("GET /admin/preflight (Wave 5.47b)", () => {
     expect(body.can_rebuild).toBe(true);
   });
 
-  it("reports stream.exists=false when EXISTS returns 0", async () => {
+  // Wave 5.54 — stream is informational only. With idx_sens + library healthy
+  // but the stream missing, ok=true (the generator creates the stream itself
+  // on first XADD, and ingest's XGROUP CREATE MKSTREAM handles the consumer
+  // side). The stream field stays in the response for observability.
+  it("returns ok=true when idx_sens + frtb_library are ok even if the stream is missing", async () => {
     const fr = fakeRedis();
     primeHealthy(fr);
     fr.setResponse("EXISTS", 0);
     app = makeApp(fr);
     const res = await app.inject({ method: "GET", url: "/admin/preflight" });
     const body = res.json();
-    expect(body.ok).toBe(false);
+    expect(body.ok).toBe(true);
     expect(body.checks.stream).toEqual({ ok: false, exists: false });
-    expect(body.can_rebuild).toBe(true);
+    expect(body.can_rebuild).toBe(false);
   });
 
   it("sets can_rebuild=false when PING fails even if other checks failed", async () => {
     const fr = fakeRedis();
     primeHealthy(fr);
-    fr.setResponse("EXISTS", 0);
+    fr.setResponse("FT.INFO", () => { throw new Error("Unknown Index name"); });
     fr.setResponse("PING", () => { throw new Error("connection refused"); });
     app = makeApp(fr);
     const res = await app.inject({ method: "GET", url: "/admin/preflight" });
@@ -121,6 +125,7 @@ describe("POST /admin/rebuild-indexes (Wave 5.47b)", () => {
 
   it("calls bootstrap and returns ok=true with timing", async () => {
     const fr = fakeRedis();
+    fr.setResponse("XGROUP", "OK");
     const runBootstrap = vi.fn(async () => ({ index: { nodes: 1 } }));
     app = makeApp(fr, { schema: stubSchema, bootstrap: runBootstrap });
     const res = await app.inject({
@@ -137,8 +142,63 @@ describe("POST /admin/rebuild-indexes (Wave 5.47b)", () => {
     expect(runBootstrap.mock.calls[0]![1]).toBe(stubSchema);
   });
 
+  // Wave 5.54 — rebuild also creates the sensitivities:in stream + ingest
+  // consumer group via XGROUP CREATE ... MKSTREAM so a fresh Redis is fully
+  // wired after a single rebuild click.
+  it("calls XGROUP CREATE ... MKSTREAM after bootstrap succeeds (Wave 5.54)", async () => {
+    const fr = fakeRedis();
+    fr.setResponse("XGROUP", "OK");
+    const runBootstrap = vi.fn(async () => ({ index: { nodes: 1 } }));
+    app = makeApp(fr, { schema: stubSchema, bootstrap: runBootstrap });
+    const res = await app.inject({
+      method: "POST", url: "/admin/rebuild-indexes",
+      headers: { "content-type": "application/json" }, payload: "{}",
+    });
+    expect(res.json().ok).toBe(true);
+    const xgroupCall = fr.calls.find((c) => c.command === "XGROUP");
+    expect(xgroupCall).toBeDefined();
+    expect(xgroupCall!.args).toEqual(["CREATE", "sensitivities:in", "ingest", "$", "MKSTREAM"]);
+  });
+
+  it("tolerates BUSYGROUP from XGROUP CREATE and still returns ok=true (Wave 5.54)", async () => {
+    const fr = fakeRedis();
+    fr.setResponse("XGROUP", () => {
+      throw new Error("BUSYGROUP Consumer Group name already exists");
+    });
+    const runBootstrap = vi.fn(async () => ({ index: { nodes: 1 } }));
+    app = makeApp(fr, { schema: stubSchema, bootstrap: runBootstrap });
+    const res = await app.inject({
+      method: "POST", url: "/admin/rebuild-indexes",
+      headers: { "content-type": "application/json" }, payload: "{}",
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().ok).toBe(true);
+  });
+
+  it("logs but does not fail rebuild when XGROUP CREATE throws a non-BUSYGROUP error (Wave 5.54)", async () => {
+    const fr = fakeRedis();
+    fr.setResponse("XGROUP", () => { throw new Error("connection lost"); });
+    const runBootstrap = vi.fn(async () => ({ index: { nodes: 1 } }));
+    app = makeApp(fr, { schema: stubSchema, bootstrap: runBootstrap });
+    const res = await app.inject({
+      method: "POST", url: "/admin/rebuild-indexes",
+      headers: { "content-type": "application/json" }, payload: "{}",
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().ok).toBe(true);
+  });
+
+  it("skips XGROUP CREATE when bootstrap fails (Wave 5.54)", async () => {
+    const fr = fakeRedis();
+    const runBootstrap = vi.fn(async () => { throw new Error("FT.CREATE failed"); });
+    app = makeApp(fr, { schema: stubSchema, bootstrap: runBootstrap });
+    await app.inject({ method: "POST", url: "/admin/rebuild-indexes", headers: { "content-type": "application/json" }, payload: "{}" });
+    expect(fr.calls.find((c) => c.command === "XGROUP")).toBeUndefined();
+  });
+
   it("is idempotent — a second invocation re-runs bootstrap and still returns ok=true", async () => {
     const fr = fakeRedis();
+    fr.setResponse("XGROUP", "OK");
     const runBootstrap = vi.fn(async () => ({ index: { nodes: 1 } }));
     app = makeApp(fr, { schema: stubSchema, bootstrap: runBootstrap });
     await app.inject({ method: "POST", url: "/admin/rebuild-indexes", headers: { "content-type": "application/json" }, payload: "{}" });
