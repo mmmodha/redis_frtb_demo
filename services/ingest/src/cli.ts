@@ -4,7 +4,8 @@ import os from "node:os";
 import { Redis, Cluster } from "ioredis";
 import { createRedisClient } from "@frtb/redis-client";
 import pino from "pino";
-import { createConsumer, ensureGroup, type RedisLike } from "./consumer.js";
+import { createConsumer, ensureGroup, type ConsumerRunner, type RedisLike } from "./consumer.js";
+import { createActiveTargetWatcher, type ActiveTargetWatcher } from "./active-target-watcher.ts";
 
 const log = pino({ level: process.env.LOG_LEVEL ?? "info" });
 
@@ -14,40 +15,16 @@ const CONSUMER_NAME = process.env.CONSUMER_NAME ?? `ingest-${os.hostname()}-${pr
 const BATCH_SIZE = Number(process.env.BATCH_SIZE ?? "500");
 const BLOCK_MS = Number(process.env.BLOCK_MS ?? "1000");
 const HEALTH_PORT = Number(process.env.HEALTH_PORT ?? "8083");
+const ACTIVE_TARGET_POLL_MS = Number(process.env.ACTIVE_TARGET_POLL_MS ?? "2500");
 
-interface ActiveTarget {
-  host: string;
-  port: number;
-  password?: string;
-  tls?: boolean;
-  db?: number;
-  url?: string;
-}
-
-async function fetchActiveTarget(apiUrl: string): Promise<ActiveTarget> {
-  const res = await fetch(`${apiUrl.replace(/\/$/, "")}/redis/active-target`);
-  if (!res.ok) throw new Error(`active-target ${res.status}: ${await res.text()}`);
-  return (await res.json()) as ActiveTarget;
-}
-
-function createClient(target: ActiveTarget | string): RedisLike {
-  if (typeof target === "string") {
-    // Wave 5.2: REDIS_URL path → cluster-aware shared helper (honours
-    // REDIS_CLUSTER / REDIS_TLS env). Legacy `redis-cluster://` prefix is
-    // still supported as an explicit override.
-    if (target.startsWith("redis-cluster://")) {
-      return new Cluster([target.replace("redis-cluster://", "redis://")]);
-    }
-    return createRedisClient({ url: target }) as unknown as RedisLike;
+function createClientFromUrl(target: string): RedisLike {
+  // Wave 5.2: REDIS_URL path → cluster-aware shared helper (honours
+  // REDIS_CLUSTER / REDIS_TLS env). Legacy `redis-cluster://` prefix is
+  // still supported as an explicit override.
+  if (target.startsWith("redis-cluster://")) {
+    return new Cluster([target.replace("redis-cluster://", "redis://")]);
   }
-  if (target.url) return createRedisClient({ url: target.url }) as unknown as RedisLike;
-  return new Redis({
-    host: target.host,
-    port: target.port,
-    password: target.password,
-    db: target.db ?? 0,
-    tls: target.tls ? {} : undefined,
-  });
+  return createRedisClient({ url: target }) as unknown as RedisLike;
 }
 
 function startHealth(port: number, state: { ready: boolean; consumed: () => number; errors: () => number }): http.Server {
@@ -68,46 +45,87 @@ function startHealth(port: number, state: { ready: boolean; consumed: () => numb
 async function main(): Promise<void> {
   const redisUrl = process.env.REDIS_URL;
   const apiUrl = process.env.API_URL;
+  const internalToken = process.env.INTERNAL_API_TOKEN;
 
-  let client: RedisLike;
-  if (redisUrl) {
+  // Wave 5.55 precedence: API_URL wins so the sidecar tracks the api's
+  // active Redis target. REDIS_URL becomes the boot-time fallback. The
+  // legacy REDIS_URL-only path (no API_URL) is preserved for CI/unit-tests
+  // exactly as before.
+  const useWatcher = !!(apiUrl && internalToken);
+
+  // Mutable runner reference — rebuilt on every target swap so the
+  // throughput log and shutdown hook always observe the live consumer.
+  let runner: ConsumerRunner | null = null;
+  let activeClient: RedisLike | null = null;
+  const state = {
+    ready: false,
+    consumed: () => runner?.stats.consumed ?? 0,
+    errors: () => runner?.stats.errors ?? 0,
+  };
+  const health = startHealth(HEALTH_PORT, state);
+
+  let watcher: ActiveTargetWatcher | null = null;
+
+  if (useWatcher) {
+    log.info({ apiUrl, pollMs: ACTIVE_TARGET_POLL_MS }, "ingest starting with active-target watcher");
+    watcher = createActiveTargetWatcher({
+      apiBase: apiUrl!,
+      token: internalToken!,
+      pollMs: ACTIVE_TARGET_POLL_MS,
+      fallbackUrl: redisUrl,
+      onTargetChange: async (next, prev) => {
+        // Drain the previous consumer so its in-flight XREADGROUP batch
+        // finishes (capped by BLOCK_MS) before we tear the old client down.
+        if (runner && prev) {
+          try { await runner.stop(); } catch (err) {
+            log.warn({ err: String(err) }, "drain previous consumer failed");
+          }
+        }
+        await ensureGroup(next.client, STREAM, GROUP);
+        runner = createConsumer(next.client, {
+          stream: STREAM, group: GROUP, consumerName: CONSUMER_NAME,
+          batchSize: BATCH_SIZE, blockMs: BLOCK_MS,
+        });
+        activeClient = next.client;
+        runner.start();
+        state.ready = true;
+      },
+    });
+    await watcher.start();
+  } else if (redisUrl) {
     log.info({ stream: STREAM, group: GROUP, consumerName: CONSUMER_NAME, source: "REDIS_URL" }, "ingest starting");
-    client = createClient(redisUrl);
-  } else if (apiUrl) {
-    log.info({ apiUrl }, "fetching active redis target from api");
-    const target = await fetchActiveTarget(apiUrl);
-    log.info({ host: target.host, port: target.port, tls: !!target.tls }, "ingest starting against active target");
-    client = createClient(target);
+    const client = createClientFromUrl(redisUrl);
+    activeClient = client;
+    await ensureGroup(client, STREAM, GROUP);
+    runner = createConsumer(client, {
+      stream: STREAM, group: GROUP, consumerName: CONSUMER_NAME,
+      batchSize: BATCH_SIZE, blockMs: BLOCK_MS,
+    });
+    runner.start();
+    state.ready = true;
   } else {
-    throw new Error("ingest requires REDIS_URL (tests) or API_URL (compose) to locate Redis");
+    throw new Error("ingest requires REDIS_URL (tests) or API_URL+INTERNAL_API_TOKEN (compose) to locate Redis");
   }
 
-  await ensureGroup(client, STREAM, GROUP);
-  const runner = createConsumer(client, {
-    stream: STREAM, group: GROUP, consumerName: CONSUMER_NAME,
-    batchSize: BATCH_SIZE, blockMs: BLOCK_MS,
-  });
-  const state = { ready: false, consumed: () => runner.stats.consumed, errors: () => runner.stats.errors };
-  const health = startHealth(HEALTH_PORT, state);
-  runner.start();
-  state.ready = true;
-
   // Throughput log every 5s
-  let last = runner.stats.consumed;
+  let last = runner?.stats.consumed ?? 0;
   const tick = setInterval(() => {
-    const now = runner.stats.consumed;
+    const now = runner?.stats.consumed ?? 0;
     const rps = Math.round((now - last) / 5);
     last = now;
-    log.info({ consumed: now, errors: runner.stats.errors, rps }, "ingest progress");
+    log.info({ consumed: now, errors: runner?.stats.errors ?? 0, rps }, "ingest progress");
   }, 5000).unref();
 
   const shutdown = async (sig: string) => {
     log.info({ sig }, "shutting down");
     clearInterval(tick);
     state.ready = false;
-    await runner.stop();
+    if (runner) await runner.stop();
+    if (watcher) await watcher.stop();
     await new Promise<void>((r) => health.close(() => r()));
-    await (client as Redis).quit().catch(() => undefined);
+    if (activeClient && !watcher) {
+      await (activeClient as Redis).quit().catch(() => undefined);
+    }
     process.exit(0);
   };
   for (const sig of ["SIGINT", "SIGTERM"] as const) {
