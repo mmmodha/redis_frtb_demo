@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createStore, type ConnectionsStore } from "../src/store.ts";
+import { createStore, DuplicateEndpointError, type ConnectionsStore } from "../src/store.ts";
 import { seedConnections } from "../src/seed.ts";
 
 const KEY = "test-master-key";
@@ -162,5 +162,81 @@ describe("seedConnections", () => {
     await seedConnections(store);
     const profiles = await store.list();
     expect(profiles.filter((p) => p.name === "live-standalone")).toHaveLength(1);
+  });
+
+  it("Wave 5.68 — DuplicateEndpointError resolves successfully and emits an info log, not a warn", async () => {
+    process.env.REDIS_URL = "redis://:pw@host:6379";
+
+    const dupErr = new DuplicateEndpointError({
+      existing_id: "id-1",
+      existing_name: "hsbc test cluster",
+      host: "host",
+      port: 6379,
+      db: 0,
+    });
+    const fakeStore: ConnectionsStore = {
+      create: vi.fn().mockRejectedValue(dupErr),
+      get: vi.fn().mockResolvedValue(null),
+      getRaw: vi.fn().mockResolvedValue(null),
+      list: vi.fn().mockResolvedValue([]),
+      update: vi.fn().mockResolvedValue(null),
+      delete: vi.fn().mockResolvedValue(false),
+      setActive: vi.fn().mockResolvedValue(null),
+      getActive: vi.fn().mockReturnValue(null),
+      getActiveRaw: vi.fn().mockReturnValue(null),
+      on: vi.fn(),
+      off: vi.fn(),
+    };
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+    try {
+      await expect(seedConnections(fakeStore)).resolves.toBeUndefined();
+      expect(fakeStore.create).toHaveBeenCalledTimes(1);
+      expect(warnSpy).not.toHaveBeenCalled();
+      expect(infoSpy).toHaveBeenCalledTimes(1);
+      const payload = JSON.parse(infoSpy.mock.calls[0][0] as string);
+      expect(payload.service).toBe("api");
+      expect(payload.info).toBe("seed-connections-skipped");
+      expect(payload.name).toBe("live-standalone");
+      expect(payload.reason).toBe("duplicate-endpoint");
+      expect(payload.existing).toBe("hsbc test cluster");
+    } finally {
+      warnSpy.mockRestore();
+      infoSpy.mockRestore();
+    }
+  });
+
+  it("Wave 5.68 — non-duplicate store errors still emit a warn log", async () => {
+    process.env.REDIS_URL = "redis://:pw@host:6379";
+
+    const fakeStore: ConnectionsStore = {
+      create: vi.fn().mockRejectedValue(new Error("boom: write failed")),
+      get: vi.fn().mockResolvedValue(null),
+      getRaw: vi.fn().mockResolvedValue(null),
+      list: vi.fn().mockResolvedValue([]),
+      update: vi.fn().mockResolvedValue(null),
+      delete: vi.fn().mockResolvedValue(false),
+      setActive: vi.fn().mockResolvedValue(null),
+      getActive: vi.fn().mockReturnValue(null),
+      getActiveRaw: vi.fn().mockReturnValue(null),
+      on: vi.fn(),
+      off: vi.fn(),
+    };
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+    try {
+      await expect(seedConnections(fakeStore)).resolves.toBeUndefined();
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(infoSpy).not.toHaveBeenCalled();
+      const payload = JSON.parse(warnSpy.mock.calls[0][0] as string);
+      expect(payload.warn).toBe("seed-connections-failed");
+      expect(payload.name).toBe("live-standalone");
+      expect(payload.err).toContain("boom: write failed");
+    } finally {
+      warnSpy.mockRestore();
+      infoSpy.mockRestore();
+    }
   });
 });

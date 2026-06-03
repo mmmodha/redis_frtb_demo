@@ -13,7 +13,7 @@
 // Idempotent: skips any profile whose `name` already exists in the store.
 
 import { readFileSync } from "node:fs";
-import type { ConnectionsStore, CreateInput, TlsConfig } from "./store.ts";
+import { DuplicateEndpointError, type ConnectionsStore, type CreateInput, type TlsConfig } from "./store.ts";
 
 function parseBool(raw: string | undefined): boolean {
   if (!raw) return false;
@@ -108,6 +108,21 @@ export async function seedConnections(store: ConnectionsStore): Promise<void> {
       await store.create(input);
       existing.add(input.name);
     } catch (err) {
+      // Wave 5.68 — a DuplicateEndpointError is the expected, benign outcome
+      // when a user profile already covers the same (host, port, db) tuple
+      // that REDIS_URL (or another env-seed) would create. Log at info so
+      // operators can still see why the env-seed didn't take effect, but
+      // don't imply something is broken.
+      if (err instanceof DuplicateEndpointError) {
+        console.info(JSON.stringify({
+          service: "api",
+          info: "seed-connections-skipped",
+          name: input.name,
+          reason: "duplicate-endpoint",
+          existing: err.existing_name,
+        }));
+        continue;
+      }
       // Non-fatal: an EACCES (or any other persistence error) on the
       // connections store should not crash bootstrap. The operator can add
       // connections later via the UI; surface as a structured warn so the
