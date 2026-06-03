@@ -22,8 +22,9 @@ let redis: Redis | undefined;
 let stackAvailable = false;
 
 function spawnRedisStack(port: number, dir: string): ChildProcess {
+  const bin = process.env.REDIS_STACK_BIN || "redis-stack-server";
   return spawn(
-    "redis-stack-server",
+    bin,
     [
       "--port",
       String(port),
@@ -48,7 +49,9 @@ beforeAll(async () => {
     return;
   }
   proc?.on("error", () => undefined);
-  for (let i = 0; i < 40; i++) {
+  // 80 × 150ms = 12s — redis-stack-server with all modules takes longer
+  // than vanilla redis-server (Wave 5.73e: tightened the gate).
+  for (let i = 0; i < 80; i++) {
     try {
       const r = new Redis({ port: PORT, lazyConnect: true, maxRetriesPerRequest: 1 });
       await r.connect();

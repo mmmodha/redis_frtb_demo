@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
-import { spawn, execSync, type ChildProcess } from "node:child_process";
+import { type ChildProcess } from "node:child_process";
+import { spawnRedis, redisAvailable } from "./helpers/redis-spawn.ts";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,24 +12,10 @@ import { buildEquityDeltaSnippet } from "../src/equityDeltaSnippet.ts";
 import { loadFrtbLibrary } from "../src/loadFrtbLibrary.ts";
 import { computeKbEquityDelta } from "../src/equityDeltaReference.ts";
 
-function spawnRedis(port: number, dir: string): ChildProcess {
-  return spawn(
-    "redis-server",
-    ["--port", String(port), "--dir", dir, "--save", "", "--appendonly", "no", "--protected-mode", "no"],
-    { stdio: "ignore" }
-  );
-}
-
 const PORT = 16412;
 let proc: ChildProcess | undefined;
 let tmp: string;
 let redis: Redis;
-
-function hasOnPath(cmd: string): boolean {
-  try { execSync(`command -v ${cmd}`, { stdio: "ignore" }); return true; }
-  catch { return false; }
-}
-const redisAvailable = hasOnPath("redis-server");
 
 // Equity bucket → weight from config/schema/frtb-default.yaml (equity_weights.by_bucket).
 const EQUITY_W = {

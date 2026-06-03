@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
-import { spawn, execSync, type ChildProcess } from "node:child_process";
+import { type ChildProcess } from "node:child_process";
+import { spawnRedis, redisAvailable } from "./helpers/redis-spawn.ts";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,28 +12,10 @@ import { buildGirrDeltaSnippet } from "../src/girrDeltaSnippet.ts";
 import { loadFrtbLibrary } from "../src/loadFrtbLibrary.ts";
 import { computeKbDelta } from "../src/girrDeltaReference.ts";
 
-// Spawn a local ephemeral redis-server (Redis 7+ has FUNCTION LOAD natively).
-function spawnRedis(port: number, dir: string): ChildProcess {
-  return spawn(
-    "redis-server",
-    ["--port", String(port), "--dir", dir, "--save", "", "--appendonly", "no", "--protected-mode", "no"],
-    { stdio: "ignore" }
-  );
-}
-
 const PORT = 16411;
 let proc: ChildProcess | undefined;
 let tmp: string;
 let redis: Redis;
-
-// Synchronous PATH check at module load — `it.skipIf` evaluates its condition
-// at test-registration time, not at runtime, so the previous beforeAll-mutated
-// flag pattern would always skip even when redis-server was available.
-function hasOnPath(cmd: string): boolean {
-  try { execSync(`command -v ${cmd}`, { stdio: "ignore" }); return true; }
-  catch { return false; }
-}
-const redisAvailable = hasOnPath("redis-server");
 
 // Canonical GIRR Delta weights per tenor (MAR21.42 — see config/schema/frtb-default.yaml).
 const GIRR_W = [0.017, 0.017, 0.016, 0.013, 0.012, 0.011, 0.011, 0.011, 0.011, 0.011];

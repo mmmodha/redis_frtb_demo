@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
-import { spawn, execSync, type ChildProcess } from "node:child_process";
+import { type ChildProcess } from "node:child_process";
+import { spawnRedis, redisAvailable } from "./helpers/redis-spawn.ts";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,24 +12,10 @@ import { buildEquityVegaSnippet } from "../src/equityVegaSnippet.ts";
 import { loadFrtbLibrary } from "../src/loadFrtbLibrary.ts";
 import { computeKbEquityVega } from "../src/equityVegaReference.ts";
 
-function spawnRedis(port: number, dir: string): ChildProcess {
-  return spawn(
-    "redis-server",
-    ["--port", String(port), "--dir", dir, "--save", "", "--appendonly", "no", "--protected-mode", "no"],
-    { stdio: "ignore" }
-  );
-}
-
 const PORT = 16413;
 let proc: ChildProcess | undefined;
 let tmp: string;
 let redis: Redis;
-
-function hasOnPath(cmd: string): boolean {
-  try { execSync(`command -v ${cmd}`, { stdio: "ignore" }); return true; }
-  catch { return false; }
-}
-const redisAvailable = hasOnPath("redis-server");
 
 const EQUITY_VEGA_W = 1.0; // PoV representative constant
 const EQUITY_RHO = 0.50;

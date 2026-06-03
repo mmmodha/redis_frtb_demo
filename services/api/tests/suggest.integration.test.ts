@@ -38,7 +38,9 @@ function spawnRedis(binary: string, port: number, dir: string): ChildProcess {
 async function tryBoot(binary: string, port: number, dir: string): Promise<ChildProcess | undefined> {
   if (!binaryOnPath(binary)) return undefined;
   const p = spawnRedis(binary, port, dir);
-  for (let i = 0; i < 30; i++) {
+  // 60 × 100ms = 6s — redis-stack-server boots slower than vanilla
+  // redis-server due to module loading (Wave 5.73e).
+  for (let i = 0; i < 60; i++) {
     const r = new Redis({ port, lazyConnect: true, maxRetriesPerRequest: 1 });
     r.on("error", () => undefined);
     try {

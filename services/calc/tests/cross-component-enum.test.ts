@@ -7,7 +7,8 @@
 // sides in-process and asserts count>0 — that is the gate.
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
-import { spawn, execSync, type ChildProcess } from "node:child_process";
+import { type ChildProcess } from "node:child_process";
+import { spawnRedis, redisAvailable } from "./helpers/redis-spawn.ts";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve, join } from "node:path";
@@ -22,25 +23,11 @@ import { buildGirrDeltaSnippet } from "../src/girrDeltaSnippet.ts";
 import { buildGirrVegaSnippet } from "../src/girrVegaSnippet.ts";
 import { loadFrtbLibrary } from "../src/loadFrtbLibrary.ts";
 
-function spawnRedis(port: number, dir: string): ChildProcess {
-  return spawn(
-    "redis-server",
-    ["--port", String(port), "--dir", dir, "--save", "", "--appendonly", "no", "--protected-mode", "no"],
-    { stdio: "ignore" }
-  );
-}
-
 // Port bumped from 16412 in Wave 5.16c to avoid collision with equity-delta-bucket.test.ts.
 const PORT = 16419;
 let proc: ChildProcess | undefined;
 let tmp: string;
 let redis: Redis;
-
-function hasOnPath(cmd: string): boolean {
-  try { execSync(`command -v ${cmd}`, { stdio: "ignore" }); return true; }
-  catch { return false; }
-}
-const redisAvailable = hasOnPath("redis-server");
 
 const HERE = resolve(fileURLToPath(import.meta.url), "..");
 const FIXTURE = resolve(HERE, "..", "..", "generator", "tests", "fixtures", "multi-class.yaml");

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,12 +14,26 @@ import {
   createConsumer,
 } from "../src/consumer.ts";
 
+// Wave 5.73e — prefer redis-stack-server so the RedisJSON branch (jsonAvailable)
+// actually exercises in CI. Falls back to redis-server (Redis 7+ supports the
+// rest of the consumer surface). Ubuntu 22.04 apt redis-server is 6.0 and
+// lacks JSON.* commands, so jsonAvailable would always be false without this.
+function binaryOnPath(binary: string): boolean {
+  const r = spawnSync("which", [binary], { stdio: ["ignore", "pipe", "ignore"] });
+  return r.status === 0;
+}
+const REDIS_BIN = process.env.REDIS_STACK_BIN && binaryOnPath(process.env.REDIS_STACK_BIN)
+  ? process.env.REDIS_STACK_BIN
+  : (binaryOnPath("redis-stack-server") ? "redis-stack-server" : "redis-server");
+
 function spawnRedis(port: number, dir: string): ChildProcess {
-  return spawn(
-    "redis-server",
+  const p = spawn(
+    REDIS_BIN,
     ["--port", String(port), "--dir", dir, "--save", "", "--appendonly", "no", "--protected-mode", "no"],
     { stdio: "ignore" }
   );
+  p.on("error", () => undefined);
+  return p;
 }
 
 const PORT = 16410;
@@ -32,7 +46,9 @@ let jsonAvailable = false;
 beforeAll(async () => {
   tmp = mkdtempSync(join(tmpdir(), "frtb-ingest-redis-"));
   proc = spawnRedis(PORT, tmp);
-  for (let i = 0; i < 30; i++) {
+  // 60 × 100ms = 6s — redis-stack-server with modules loads slower than vanilla
+  // redis-server (Wave 5.73e).
+  for (let i = 0; i < 60; i++) {
     try {
       const r = new Redis({ port: PORT, lazyConnect: true, maxRetriesPerRequest: 1 });
       await r.connect();

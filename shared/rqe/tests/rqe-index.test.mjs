@@ -46,7 +46,11 @@ function spawnRedis(binary, port, dir) {
 async function tryBoot(binary, port, dir) {
   if (!binaryOnPath(binary)) return undefined;
   const p = spawnRedis(binary, port, dir);
-  for (let i = 0; i < 30; i++) {
+  // 60 × 100ms = 6s — redis-stack-server takes longer than vanilla
+  // redis-server because it has to load 4-5 modules before accepting
+  // connections (Wave 5.73e: tightened the gate so the testcontainers job
+  // doesn't silently skip).
+  for (let i = 0; i < 60; i++) {
     const r = new Redis({ port, lazyConnect: true, maxRetriesPerRequest: 1 });
     r.on("error", () => { /* expected during boot probe — handled by retry */ });
     try {
