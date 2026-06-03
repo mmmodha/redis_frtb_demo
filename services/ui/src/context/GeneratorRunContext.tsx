@@ -48,6 +48,20 @@ const STORAGE_KEY = "generator-active-run";
 const POLL_INTERVAL_MS = 500;
 const TERMINAL_GRACE_MS = 30_000;
 
+// Wave 5.56 — broadcast that /facets is stale so PivotPanel / CalcPanel /
+// JsonExplorerPanel re-fetch their dropdown counts as soon as the generator
+// (any path: SSE terminal frame, SSE error, post-refresh polling) reaches
+// a terminal state. The event is best-effort — no-op when window is
+// undefined (SSR / Node test harness without a DOM).
+function dispatchFacetsStale(): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.dispatchEvent(new CustomEvent("frtb:facets-stale"));
+  } catch {
+    // best-effort; ignore environments without CustomEvent support
+  }
+}
+
 // Wave 5.45 — auto-dismiss windows for the nav pill / terminal summary so
 // the bar disappears on its own after a run completes. Exported for tests.
 export const AUTO_DISMISS_DONE_MS = 6_000;
@@ -204,6 +218,8 @@ export function GeneratorRunProvider({ children }: { children: ReactNode }): JSX
           scheduleDismiss(
             status.status === "error" || status.error ? AUTO_DISMISS_ERROR_MS : AUTO_DISMISS_DONE_MS,
           );
+          // Wave 5.56 — new rows may have landed; invalidate cached /facets.
+          dispatchFacetsStale();
         } else {
           setRun((prev) => {
             const next = statusToRunState(status);
@@ -292,6 +308,8 @@ export function GeneratorRunProvider({ children }: { children: ReactNode }): JSX
         // Wave 5.45 — auto-dismiss the pill once the terminal summary has
         // been on screen for the configured window.
         scheduleDismiss(f.error ? AUTO_DISMISS_ERROR_MS : AUTO_DISMISS_DONE_MS);
+        // Wave 5.56 — terminal SSE frame ⇒ /facets may be stale.
+        dispatchFacetsStale();
       },
       onError: (e: Error) => {
         setError(e.message);
@@ -299,6 +317,9 @@ export function GeneratorRunProvider({ children }: { children: ReactNode }): JSX
         streamRef.current = null;
         // Wave 5.45 — auto-dismiss the error summary.
         scheduleDismiss(AUTO_DISMISS_ERROR_MS);
+        // Wave 5.56 — partial rows may still have been written before the
+        // stream failed; invalidate /facets just in case.
+        dispatchFacetsStale();
       },
     });
     streamRef.current = handle;
