@@ -49,7 +49,8 @@ jobs:
           echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/redis.list
           sudo apt-get update
           sudo apt-get install -y redis-stack-server
-          redis-stack-server --version
+          dpkg -l redis-stack-server | tail -1
+          which redis-stack-server
       - name: Install dependencies
         run: npm ci --ignore-scripts
       - name: Typecheck
@@ -132,7 +133,8 @@ jobs:
           echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/redis.list
           sudo apt-get update
           sudo apt-get install -y redis-stack-server
-          redis-stack-server --version
+          dpkg -l redis-stack-server | tail -1
+          which redis-stack-server
       - name: Verify Docker is available (required for testcontainers tests)
         run: |
           docker info
