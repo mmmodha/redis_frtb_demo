@@ -150,7 +150,11 @@ describe("@frtb/rqe — module constants (locked Wave 2 contract)", () => {
   });
 });
 
-describe.skipIf(!searchAvailable)("@frtb/rqe — ensureSensIndex (integration)", () => {
+// Wave 5.73f: gate on the synchronous on-disk module check directly so
+// vitest sees the right value at collection time (describe.skipIf is
+// evaluated eagerly, before beforeAll). STACK_BUNDLED_PRESENT is the
+// boot-success precondition in CI.
+describe.skipIf(!STACK_BUNDLED_PRESENT)("@frtb/rqe — ensureSensIndex (integration)", () => {
   async function seedFixtureRows() {
     // Three docs spanning the 5 indexed TAGs so FT.SEARCH-by-tag assertions
     // have something to find. Keys obey the Wave 2 contract literal shape:

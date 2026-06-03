@@ -119,8 +119,12 @@ afterAll(async () => {
   if (tmp) rmSync(tmp, { recursive: true, force: true });
 });
 
+// Wave 5.73f: gate on the synchronous on-disk module check directly —
+// it.skipIf is evaluated eagerly at collection time, before beforeAll has
+// set stackAvailable. STACK_BUNDLED_PRESENT is the boot-success precondition
+// in CI.
 describe("POST /calc/sbm — integration against redis-stack-server", () => {
-  it.skipIf(!stackAvailable)(
+  it.skipIf(!STACK_BUNDLED_PRESENT)(
     "discovers buckets, FCALLs the stub frtb library, reduces — under 2s wall-clock",
     async () => {
       const app = await createServer({

@@ -247,8 +247,13 @@ describe("consumer SUGADD live-populate hook [Wave 5.30a]", () => {
 // Per Wave 1 follow-up #1, use it.skipIf() not the legacy if-guard pattern so
 // coverage stays visible. In CI / on demo workstations redis-stack-server is
 // expected to be on PATH and JSON ships with the locked Redis Enterprise 8.x runtime.
+//
+// Wave 5.73f: gate on the synchronous on-disk module check directly —
+// it.skipIf is evaluated eagerly at collection time, before beforeAll has
+// set redisAvailable/jsonAvailable. STACK_BUNDLED_PRESENT is the
+// boot-success precondition in CI.
 const integration = (label: string, fn: () => Promise<void> | void) =>
-  it.skipIf(!redisAvailable || !jsonAvailable)(label, fn);
+  it.skipIf(!STACK_BUNDLED_PRESENT)(label, fn);
 
 describe("XREADGROUP consumer → JSON.SET", () => {
   integration("ensureGroup creates the consumer group with MKSTREAM (idempotent on BUSYGROUP)", async () => {
