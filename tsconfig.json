@@ -1,0 +1,16 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./services/api" },
+    { "path": "./services/calc" },
+    { "path": "./services/generator" },
+    { "path": "./services/ingest" },
+    { "path": "./services/loadgen" },
+    { "path": "./services/source" },
+    { "path": "./services/ui" },
+    { "path": "./shared/redis-client" },
+    { "path": "./shared/rqe" },
+    { "path": "./shared/schema" },
+    { "path": "./tools/schema-cli" }
+  ]
+}

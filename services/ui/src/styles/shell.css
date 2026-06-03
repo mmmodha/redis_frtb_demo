@@ -222,11 +222,36 @@
   line-height: 1;
   display: inline-block;
 }
+.metric-history-modal__window-selector-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: calc(var(--grid) * 2);
+  align-items: center;
+}
 .metric-history-modal__window-selector {
   display: flex;
   flex-wrap: wrap;
   gap: var(--grid);
   align-items: center;
+}
+.metric-history-modal__reset-zoom {
+  background: transparent;
+  border: 1px solid var(--redis-border-secondary);
+  border-radius: var(--radius);
+  color: var(--redis-text-secondary);
+  padding: 4px 8px;
+  font-size: 0.75rem;
+  line-height: 1.4;
+  cursor: pointer;
+}
+.metric-history-modal__reset-zoom:hover {
+  color: var(--redis-text-primary);
+  border-color: var(--redis-text-link);
+  background: var(--redis-bg-tertiary);
+}
+.metric-history-modal__reset-zoom:focus-visible {
+  outline: 2px solid var(--redis-text-link);
+  outline-offset: 2px;
 }
 .metric-history-modal__window-pill {
   background: transparent;
@@ -261,7 +286,16 @@
   color: var(--redis-text-primary);
   font-family: var(--font-mono);
 }
-.metric-history-modal__chart { width: 100%; height: auto; }
+.metric-history-modal__chart {
+  width: 100%;
+  height: auto;
+  cursor: crosshair;
+  touch-action: none;
+  user-select: none;
+}
+.metric-history-modal__chart--dragging { cursor: col-resize; }
+.metric-history-modal__brush { pointer-events: none; }
+.metric-history-modal__zoom-label { pointer-events: none; }
 .metric-history-modal__empty {
   text-align: center;
   color: var(--redis-text-secondary);
