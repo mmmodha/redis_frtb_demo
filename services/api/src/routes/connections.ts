@@ -163,8 +163,22 @@ export function registerConnectionsRoutes(
         // and a bootstrap re-run on a creds change is acceptable; this
         // avoids adding a separate credsGeneration-only helper just for an
         // edge case.
-        const credsChanged =
-          req.body.username !== undefined || req.body.password !== undefined;
+        // Wave 5.65 — compare credentials by VALUE, not by presence. The UI's
+        // updateConnection() submits the full form body on every save (it
+        // only conditionally omits `password`), so `username` is always
+        // present and the old `!== undefined` check fired on every edit-of-
+        // active, re-running bootstrap on pure renames. An empty password
+        // string is treated as "keep existing" (defence in depth — the UI
+        // already strips it before sending). Behaviour change: callers that
+        // echo unchanged username/password no longer trigger bootstrap.
+        const usernameChanged =
+          req.body.username !== undefined &&
+          (req.body.username ?? "") !== (prevActiveRaw!.username ?? "");
+        const passwordChanged =
+          req.body.password !== undefined &&
+          req.body.password.length > 0 &&
+          req.body.password !== prevActiveRaw!.password;
+        const credsChanged = usernameChanged || passwordChanged;
         if (identityWouldChange(prevActiveRaw!, req.body) || credsChanged) {
           activateProfileTarget(raw);
         } else {

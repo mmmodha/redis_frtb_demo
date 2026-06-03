@@ -493,4 +493,72 @@ describe("Wave 5.62 — rename does not re-trigger bootstrap banner", () => {
     const target = await app.inject({ method: "GET", url: "/redis/active-target" });
     expect(target.json()).toMatchObject({ host: "rs.demo", port: 12000, label: "demo-renamed" });
   });
+
+  // Wave 5.65 — the UI's updateConnection() submits the full form body on
+  // every save (name, host, port, username, …), only conditionally omitting
+  // password. The 5.62 check used `!== undefined`, so echoed-but-unchanged
+  // username re-triggered bootstrap on every rename. These cases pin the
+  // value-based comparison: presence alone is not enough, the value must
+  // actually differ from the stored profile.
+  it("echoed username with name-only change does NOT re-trigger bootstrap", async () => {
+    const { getBootstrapStatus } = await import("../src/bootstrap-status.ts");
+    const created = await app.inject({
+      method: "POST", url: "/connections",
+      payload: { name: "demo", host: "rs.demo", port: 12000, username: "default", password: "PW" },
+    });
+    const id = created.json().id;
+    await app.inject({ method: "POST", url: `/connections/${id}/activate` });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(getBootstrapStatus().phase).toBe("ready");
+
+    const put = await app.inject({
+      method: "PUT", url: `/connections/${id}`,
+      payload: { name: "demo-renamed", username: "default", port: 12000, host: "rs.demo" },
+    });
+    expect(put.statusCode).toBe(200);
+    expect(getBootstrapStatus().phase).not.toBe("running");
+    await new Promise((r) => setTimeout(r, 30));
+    expect(getBootstrapStatus().phase).not.toBe("running");
+    const target = await app.inject({ method: "GET", url: "/redis/active-target" });
+    expect(target.json().label).toBe("demo-renamed");
+  });
+
+  it("genuine username change DOES trigger bootstrap", async () => {
+    const { getBootstrapStatus, markBootstrapStatusReady } =
+      await import("../src/bootstrap-status.ts");
+    const created = await app.inject({
+      method: "POST", url: "/connections",
+      payload: { name: "demo", host: "rs.demo", port: 12000, username: "default", password: "PW" },
+    });
+    const id = created.json().id;
+    await app.inject({ method: "POST", url: `/connections/${id}/activate` });
+    await new Promise((r) => setTimeout(r, 30));
+    markBootstrapStatusReady("baseline");
+
+    const put = await app.inject({
+      method: "PUT", url: `/connections/${id}`,
+      payload: { username: "new-user" },
+    });
+    expect(put.statusCode).toBe(200);
+    expect(getBootstrapStatus().phase).toBe("running");
+  });
+
+  it("empty password string is treated as no-change (does not trigger bootstrap)", async () => {
+    const { getBootstrapStatus } = await import("../src/bootstrap-status.ts");
+    const created = await app.inject({
+      method: "POST", url: "/connections",
+      payload: { name: "demo", host: "rs.demo", port: 12000, username: "default", password: "PW" },
+    });
+    const id = created.json().id;
+    await app.inject({ method: "POST", url: `/connections/${id}/activate` });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(getBootstrapStatus().phase).toBe("ready");
+
+    const put = await app.inject({
+      method: "PUT", url: `/connections/${id}`,
+      payload: { name: "x", password: "" },
+    });
+    expect(put.statusCode).toBe(200);
+    expect(getBootstrapStatus().phase).not.toBe("running");
+  });
 });
