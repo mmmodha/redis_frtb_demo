@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as wait } from "node:timers/promises";
@@ -16,29 +16,28 @@ import { createServer } from "../src/server.ts";
 // FRTB function bodies are owned by the calc agents).
 
 const PORT = 16401;
+const STACK_DIR = "/opt/redis-stack";
+const STACK_BUNDLED_REDIS = `${STACK_DIR}/bin/redis-server`;
+const STACK_LIB_DIR = `${STACK_DIR}/lib`;
+const STACK_MODULES = [`${STACK_LIB_DIR}/redisearch.so`, `${STACK_LIB_DIR}/rejson.so`];
+const STACK_BUNDLED_PRESENT = existsSync(STACK_BUNDLED_REDIS) && STACK_MODULES.every((p) => existsSync(p));
 let proc: ChildProcess | undefined;
 let tmp: string;
 let redis: Redis | undefined;
-let stackAvailable = false;
+// vitest evaluates it.skipIf at file collection time — seed from sync on-disk
+// check so the test is included, then beforeAll downgrades on boot failure.
+let stackAvailable = STACK_BUNDLED_PRESENT;
 
 function spawnRedisStack(port: number, dir: string): ChildProcess {
-  const bin = process.env.REDIS_STACK_BIN || "redis-stack-server";
-  return spawn(
-    bin,
-    [
-      "--port",
-      String(port),
-      "--dir",
-      dir,
-      "--save",
-      "",
-      "--appendonly",
-      "no",
-      "--protected-mode",
-      "no",
-    ],
-    { stdio: "ignore" }
-  );
+  // Prefer the Redis 7.4 binary bundled with the apt redis-stack-server pkg
+  // at /opt/redis-stack/bin/redis-server, with explicit --loadmodule flags.
+  // The /usr/bin/redis-stack-server wrapper does not reliably load modules
+  // when spawned standalone with custom args (Wave 5.73e).
+  const envBin = process.env.REDIS_STACK_BIN;
+  const bin = envBin || (STACK_BUNDLED_PRESENT ? STACK_BUNDLED_REDIS : "redis-stack-server");
+  const baseArgs = ["--port", String(port), "--dir", dir, "--save", "", "--appendonly", "no", "--protected-mode", "no"];
+  const moduleArgs = bin === STACK_BUNDLED_REDIS ? STACK_MODULES.flatMap((m) => ["--loadmodule", m]) : [];
+  return spawn(bin, [...baseArgs, ...moduleArgs], { stdio: "ignore" });
 }
 
 beforeAll(async () => {
@@ -51,6 +50,7 @@ beforeAll(async () => {
   proc?.on("error", () => undefined);
   // 80 × 150ms = 12s — redis-stack-server with all modules takes longer
   // than vanilla redis-server (Wave 5.73e: tightened the gate).
+  let booted = false;
   for (let i = 0; i < 80; i++) {
     try {
       const r = new Redis({ port: PORT, lazyConnect: true, maxRetriesPerRequest: 1 });
@@ -58,7 +58,7 @@ beforeAll(async () => {
       const modules = (await r.call("MODULE", "LIST")) as unknown[][];
       const names = modules.map((m) => String(m[1]));
       if (names.includes("search") && names.includes("ReJSON")) {
-        stackAvailable = true;
+        booted = true;
       }
       await r.quit();
       break;
@@ -66,6 +66,8 @@ beforeAll(async () => {
       await wait(150);
     }
   }
+  // Downgrade the collection-time optimistic flag on actual boot failure.
+  stackAvailable = booted;
   if (!stackAvailable) return;
   redis = new Redis({ port: PORT });
 

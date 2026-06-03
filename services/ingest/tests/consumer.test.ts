@@ -52,14 +52,21 @@ const PORT = 16410;
 let proc: ChildProcess | undefined;
 let tmp: string;
 let redis: Redis;
-let redisAvailable = false;
-let jsonAvailable = false;
+// IMPORTANT: vitest evaluates `it.skipIf(!redisAvailable || !jsonAvailable)`
+// at file collection time, BEFORE `beforeAll` runs. Seed these flags from
+// the synchronous on-disk module check so the integration tests are
+// included; beforeAll then performs the actual boot and downgrades them to
+// false if the boot fails (Wave 5.73e).
+let redisAvailable = STACK_BUNDLED_PRESENT;
+let jsonAvailable = STACK_BUNDLED_PRESENT;
 
 beforeAll(async () => {
   tmp = mkdtempSync(join(tmpdir(), "frtb-ingest-redis-"));
   proc = spawnRedis(PORT, tmp);
   // 60 × 100ms = 6s — redis-stack-server with modules loads slower than vanilla
   // redis-server (Wave 5.73e).
+  let booted = false;
+  let json = false;
   for (let i = 0; i < 60; i++) {
     try {
       const r = new Redis({ port: PORT, lazyConnect: true, maxRetriesPerRequest: 1 });
@@ -68,15 +75,18 @@ beforeAll(async () => {
       try {
         await r.call("JSON.SET", "__probe__", "$", '{"ok":1}');
         await r.del("__probe__");
-        jsonAvailable = true;
-      } catch { jsonAvailable = false; }
+        json = true;
+      } catch { json = false; }
       await r.quit();
-      redisAvailable = true;
+      booted = true;
       break;
     } catch {
       await wait(100);
     }
   }
+  // Downgrade the collection-time optimistic flags if the actual boot failed.
+  redisAvailable = booted;
+  jsonAvailable = json;
   if (redisAvailable) redis = new Redis({ port: PORT });
 });
 

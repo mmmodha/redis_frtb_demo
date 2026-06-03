@@ -32,7 +32,11 @@ const STACK_BUNDLED_PRESENT = existsSync(STACK_BUNDLED_REDIS) && STACK_MODULES_P
 let proc;
 let tmp;
 let redis;
-let searchAvailable = false;
+// IMPORTANT: vitest evaluates `describe.skipIf(!searchAvailable)` at file
+// collection time, BEFORE `beforeAll` runs. So we seed the flag from the
+// synchronous on-disk module check; beforeAll then performs the actual boot
+// and downgrades the flag to false if the boot fails (Wave 5.73e).
+let searchAvailable = STACK_BUNDLED_PRESENT;
 
 function binaryOnPath(binary) {
   // Use `which` rather than spawning the binary blindly — a bad spawn would
@@ -45,11 +49,8 @@ function binaryOnPath(binary) {
 function spawnRedis(binary, port, dir, inlineModules) {
   const baseArgs = ["--port", String(port), "--dir", dir, "--save", "", "--appendonly", "no", "--protected-mode", "no"];
   const moduleArgs = inlineModules ? STACK_MODULES.flatMap((m) => ["--loadmodule", m]) : [];
-  const p = spawn(binary, [...baseArgs, ...moduleArgs], { stdio: ["ignore", "pipe", "pipe"] });
-  p.on("error", (e) => { console.error(`[rqe-spawn] spawn error for ${binary}:`, e.message); });
-  p.stderr?.on("data", (b) => { process.stderr.write(`[rqe-spawn:${binary}:stderr] ${b}`); });
-  p.stdout?.on("data", (b) => { process.stderr.write(`[rqe-spawn:${binary}:stdout] ${b}`); });
-  p.on("exit", (code, sig) => { if (code !== 0 && code !== null) console.error(`[rqe-spawn] ${binary} exited code=${code} sig=${sig}`); });
+  const p = spawn(binary, [...baseArgs, ...moduleArgs], { stdio: "ignore" });
+  p.on("error", () => { /* swallow — tryBoot returns undefined on connection timeout */ });
   return p;
 }
 
@@ -102,24 +103,21 @@ beforeAll(async () => {
     { bin: "redis-stack-server", inline: false },
     { bin: "redis-server", inline: false },
   ];
-  console.error(`[rqe-boot] STACK_BUNDLED_PRESENT=${STACK_BUNDLED_PRESENT} STACK_MODULES_PRESENT=${STACK_MODULES_PRESENT}`);
-  console.error(`[rqe-boot] strategies=${JSON.stringify(strategies)}`);
+  let booted = false;
   for (const { bin, inline } of strategies) {
-    console.error(`[rqe-boot] trying bin=${bin} inline=${inline}`);
     proc = await tryBoot(bin, PORT, tmp, inline);
-    if (!proc) { console.error(`[rqe-boot] tryBoot returned undefined for ${bin}`); continue; }
-    const hasSearch = await hasSearchModule(PORT);
-    console.error(`[rqe-boot] booted ${bin}, hasSearchModule=${hasSearch}`);
-    if (hasSearch) {
-      searchAvailable = true;
+    if (!proc) continue;
+    if (await hasSearchModule(PORT)) {
       redis = new Redis({ port: PORT });
+      booted = true;
       break;
     }
     proc.kill("SIGTERM");
     proc = undefined;
     await wait(100);
   }
-  console.error(`[rqe-boot] final searchAvailable=${searchAvailable}`);
+  // Downgrade the collection-time optimistic flag if the actual boot failed.
+  searchAvailable = booted;
 });
 
 afterAll(async () => {
