@@ -1,4 +1,5 @@
-# Wave 5.1 — multi-stage build for the @frtb/calc service.
+# syntax=docker/dockerfile:1.7
+# Multi-stage build for the @frtb/calc service.
 # Stage 1: install workspace deps. Stage 2: copy a minimal node:20-alpine
 # runtime that runs the service entrypoint.
 #
@@ -16,11 +17,21 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 COPY services/calc/package.json ./services/calc/package.json
 COPY shared/schema ./shared/schema
-RUN npm ci --workspace=@frtb/calc --include-workspace-root \
+RUN --mount=type=cache,target=/root/.npm,sharing=locked \
+    npm ci --workspace=@frtb/calc --include-workspace-root \
     --omit=dev --no-audit --no-fund
 
 FROM node:20-alpine AS runtime
 WORKDIR /app
+
+ARG GIT_SHA=unknown
+ARG BUILD_DATE=unknown
+LABEL org.opencontainers.image.title="@frtb/calc" \
+      org.opencontainers.image.description="FRTB SBM PoV Redis Functions loader and calc orchestrator" \
+      org.opencontainers.image.source="https://github.com/mmmodha/redis_frtb_demo" \
+      org.opencontainers.image.revision="${GIT_SHA}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.licenses="Proprietary"
 
 # curl is used by the compose healthcheck.
 RUN apk add --no-cache curl
