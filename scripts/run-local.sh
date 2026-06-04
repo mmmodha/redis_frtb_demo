@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # scripts/run-local.sh
 #
-# Local-developer launcher for the FRTB SBM stack. Starts all 7 services as
-# background processes owned by the invoking user; all PIDs, logs, and runtime
-# state live under ./.run/. No sudo, no systemd, no /var/lib/frtb.
+# Local-developer launcher for the FRTB SBM stack. Starts 6 long-running
+# services as background processes owned by the invoking user; all PIDs, logs,
+# and runtime state live under ./.run/. No sudo, no systemd, no /var/lib/frtb.
+#
+# The synthetic-data `generator` is a one-shot CLI, NOT a long-running service;
+# `start` (no args) does not launch it. Invoke explicitly with
+# `start generator [-- --rows N]` when you want to populate `sensitivities:in`.
 #
 # Modelled on scripts/deploy-bare-metal.sh's process-mode helpers (entry-point
 # catalogue, pid_alive, health polling, status table) but rootless and rooted
@@ -31,8 +35,12 @@ ENV_EXAMPLE_REL=".env.example"
 
 # Service catalogue (parallel arrays — bash 3.2). Iteration order = start order.
 # api must come first (others depend on it), ui must come last (depends on api healthy).
-SERVICES=( api source ingest calc loadgen generator ui )
-PORTS=(    8080 8082    8083    8084 8085    8081      3000 )
+SERVICES=( api source ingest calc loadgen ui )
+PORTS=(    8080 8082    8083    8084 8085    3000 )
+
+# One-shot tools (CLI utilities, no /healthz, not started by bulk `start`).
+# Invoked explicitly via `scripts/run-local.sh start <tool> [-- ...extra]`.
+ONE_SHOT_TOOLS=( generator )
 
 # Health probe path is uniform across services per docker-compose.
 HEALTH_PATH="/healthz"
@@ -48,6 +56,10 @@ OPT_FORCE_BUILD=0
 LOGS_FOLLOW=0
 LOGS_SERVICE=""
 COMMAND=""
+# Wave 5.80 — optional single-target for `start` and `--`-separated extra args
+# forwarded to one-shot tools (e.g. `start generator -- --rows 50`).
+START_TARGET=""
+EXTRA_ARGS=()
 
 # ---------------------------------------------------------------------------
 # Colour primitives (mirrors deploy-bare-metal.sh init_colours).
@@ -148,6 +160,25 @@ resolve_ports_from_env() {
     fi
     i=$(( i + 1 ))
   done
+}
+
+# Wave 5.80 — name predicates that span both SERVICES and ONE_SHOT_TOOLS.
+# Used by parse_args, cmd_logs, and cmd_start_one so explicit-invocation forms
+# (`start generator`, `logs generator`) accept one-shot tool names too.
+is_one_shot_tool() {
+  local name="$1" i=0
+  while [[ $i -lt ${#ONE_SHOT_TOOLS[@]} ]]; do
+    [[ "${ONE_SHOT_TOOLS[$i]}" == "${name}" ]] && return 0
+    i=$(( i + 1 ))
+  done
+  return 1
+}
+
+is_known_name() {
+  local name="$1"
+  svc_index "${name}" >/dev/null 2>&1 && return 0
+  is_one_shot_tool "${name}" && return 0
+  return 1
 }
 
 pid_file() { echo "${PIDS_DIR}/$1.pid"; }
@@ -357,6 +388,45 @@ spawn_service() {
   return 0
 }
 
+# Wave 5.80 — spawn a one-shot CLI tool (e.g. generator). Like spawn_service
+# but: no HEALTH_PORT (no /healthz), and forwards any extra args after `--`
+# straight to the npm script (`npm run … start -- --rows 50`). Backgrounded so
+# the caller returns immediately; tail `.run/logs/<tool>.log` for progress.
+spawn_one_shot() {
+  local svc="$1"; shift
+  local cmd; cmd="$(service_entry_cmd "${svc}")"
+  local logf; logf="$(log_file "${svc}")"
+  local pidf; pidf="$(pid_file "${svc}")"
+  if [[ -z "${cmd}" ]]; then
+    fail "no entry command for one-shot tool '${svc}'"
+    return 1
+  fi
+  if [[ -f "${pidf}" ]]; then
+    local existing
+    existing="$(tr -d '[:space:]' < "${pidf}" 2>/dev/null || echo '')"
+    if [[ -n "${existing}" ]] && pid_alive "${existing}"; then
+      info "  ${svc}: already running (pid ${existing})"
+      return 0
+    fi
+    rm -f "${pidf}"
+  fi
+  local extra_args=("$@")
+  local full_cmd="${cmd}"
+  if [[ ${#extra_args[@]} -gt 0 ]]; then
+    full_cmd="${cmd} -- ${extra_args[*]}"
+  fi
+  printf '\n[boot] %s tool=%s args=%s ppid=%s\n' \
+    "$(date -u +%FT%TZ 2>/dev/null || date)" "${svc}" "${extra_args[*]:-(none)}" "$$" >> "${logf}"
+  # shellcheck disable=SC2086
+  (
+    cd "${REPO_ROOT}" || exit 1
+    nohup bash -c "exec ${full_cmd}" >> "${logf}" 2>&1 &
+    echo $! > "${pidf}"
+    disown 2>/dev/null || true
+  )
+  return 0
+}
+
 # Single curl health probe. Returns 0 if 2xx, 1 otherwise.
 health_probe() {
   local port="$1"
@@ -494,6 +564,12 @@ print_status_table() {
 # Subcommands
 # ---------------------------------------------------------------------------
 cmd_start() {
+  # Wave 5.80 — single-target invocation (`start <svc>` or `start <tool>`)
+  # dispatches to cmd_start_one and never touches the bulk-start loop.
+  if [[ -n "${START_TARGET}" ]]; then
+    cmd_start_one "${START_TARGET}" "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
+    return $?
+  fi
   preflight
   load_env
   apply_defaults
@@ -561,6 +637,13 @@ cmd_stop() {
     stop_service "${SERVICES[$i]}" || any_fail=1
     i=$(( i - 1 ))
   done
+  # Wave 5.80 — also tear down any explicitly-launched one-shot tools so a
+  # bare `stop` always returns the workspace to a clean state.
+  local j=0
+  while [[ $j -lt ${#ONE_SHOT_TOOLS[@]} ]]; do
+    stop_service "${ONE_SHOT_TOOLS[$j]}" || any_fail=1
+    j=$(( j + 1 ))
+  done
   if [[ "${any_fail}" == "0" ]]; then
     ok "Stack stopped."
     return 0
@@ -583,10 +666,29 @@ cmd_status() {
   hdr "FRTB SBM stack status"
   info "  repo:    ${REPO_ROOT}"
   info "  run dir: ${RUN_DIR}"
-  if print_status_table; then
-    exit 0
+  local rc=0
+  print_status_table || rc=1
+  # Wave 5.80 — list one-shot tools with their running/idle state. These are
+  # informational only and never fail the status command.
+  if (( ${#ONE_SHOT_TOOLS[@]} > 0 )); then
+    printf '\n%sOne-shot tools (manual invocation only):%s\n' "${C_DIM}" "${C_RESET}"
+    local k=0
+    while [[ $k -lt ${#ONE_SHOT_TOOLS[@]} ]]; do
+      local tool="${ONE_SHOT_TOOLS[$k]}"
+      local tpidf; tpidf="$(pid_file "${tool}")"
+      local state="idle"
+      if [[ -f "${tpidf}" ]]; then
+        local tpid
+        tpid="$(tr -d '[:space:]' < "${tpidf}" 2>/dev/null || echo '')"
+        if [[ -n "${tpid}" ]] && pid_alive "${tpid}"; then
+          state="running (pid ${tpid})"
+        fi
+      fi
+      printf '  %-11s %s\n' "${tool}" "${state}"
+      k=$(( k + 1 ))
+    done
   fi
-  exit 1
+  exit "${rc}"
 }
 
 cmd_logs() {
@@ -598,12 +700,21 @@ cmd_logs() {
       printf '  %s (log: %s)\n' "${SERVICES[$i]}" "$(log_file "${SERVICES[$i]}")"
       i=$(( i + 1 ))
     done
+    # Wave 5.80 — also surface one-shot tool log paths.
+    if (( ${#ONE_SHOT_TOOLS[@]} > 0 )); then
+      info "Available one-shot tools:"
+      local j=0
+      while [[ $j -lt ${#ONE_SHOT_TOOLS[@]} ]]; do
+        printf '  %s (log: %s)\n' "${ONE_SHOT_TOOLS[$j]}" "$(log_file "${ONE_SHOT_TOOLS[$j]}")"
+        j=$(( j + 1 ))
+      done
+    fi
     info ""
     info "Usage: ${SCRIPT_NAME} logs <svc> [-f|--follow]"
     return 0
   fi
-  if ! svc_index "${LOGS_SERVICE}" >/dev/null; then
-    fail "Unknown service '${LOGS_SERVICE}'. Known: ${SERVICES[*]}"
+  if ! is_known_name "${LOGS_SERVICE}"; then
+    fail "Unknown service '${LOGS_SERVICE}'. Known: ${SERVICES[*]} ${ONE_SHOT_TOOLS[*]}"
     exit 2
   fi
   local logf; logf="$(log_file "${LOGS_SERVICE}")"
@@ -740,18 +851,29 @@ usage() {
 Usage: ${SCRIPT_NAME} <command> [options]
 
 Commands:
-  start              Start all 7 services in dependency order, poll /healthz,
+  start              Start the 6 long-running services (api, source, ingest,
+                     calc, loadgen, ui) in dependency order, poll /healthz,
                      print a status table. Exits 0 only if every service is healthy.
-  stop               SIGTERM each service (5s grace, then SIGKILL). Idempotent.
+  start <svc>        Start one named service or one-shot tool. For the
+                     one-shot 'generator', append '-- --rows N' to forward
+                     CLI args (e.g. 'start generator -- --rows 50').
+  stop               SIGTERM each service + one-shot tool (5s grace, then
+                     SIGKILL). Idempotent.
   restart            stop, then start.
-  status             Print the live status table. Exits 0 if all healthy.
+  status             Print the live status table for long-running services;
+                     also lists one-shot tools with running/idle state.
   logs <svc> [-f]    Tail .run/logs/<svc>.log. --follow / -f streams new lines.
-                     Argless prints the list of known services.
+                     Argless prints the list of known services + one-shot tools.
   doctor             Run diagnostics (Node version, env file, ports, .run/ writable).
 
 Options for start/restart:
   --force-install    Re-run 'npm install' even if node_modules/ exists.
   --force-build      Re-run the UI build even if services/ui/dist/ exists.
+
+One-shot tools (NOT started by bare 'start'; invoke explicitly):
+  generator          Synthetic FRTB sensitivity producer; pushes rows into
+                     the 'sensitivities:in' Redis stream and exits. Default
+                     run produces 2,000,000 rows — use '-- --rows N' to limit.
 
 Environment:
   NO_COLOR=1         Force monochrome output.
@@ -766,7 +888,36 @@ EOF
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      start|stop|restart|status|doctor)
+      start)
+        if [[ -n "${COMMAND}" ]]; then
+          fail "error: multiple commands ('${COMMAND}' and 'start')"; exit 2
+        fi
+        COMMAND="start"; shift
+        # Wave 5.80 — `start` accepts an optional positional <svc> followed
+        # by `--` and extra args forwarded to one-shot tools.
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --force-install) OPT_FORCE_INSTALL=1; shift ;;
+            --force-build)   OPT_FORCE_BUILD=1;   shift ;;
+            -h|--help)       usage; exit 0 ;;
+            --)
+              shift
+              while [[ $# -gt 0 ]]; do
+                EXTRA_ARGS+=("$1"); shift
+              done
+              ;;
+            -*) fail "error: unknown option for start: $1"; exit 2 ;;
+            *)
+              if [[ -z "${START_TARGET}" ]]; then
+                START_TARGET="$1"; shift
+              else
+                fail "error: unexpected arg for start: $1"; exit 2
+              fi
+              ;;
+          esac
+        done
+        ;;
+      stop|restart|status|doctor)
         if [[ -n "${COMMAND}" ]]; then
           fail "error: multiple commands ('${COMMAND}' and '$1')"; exit 2
         fi

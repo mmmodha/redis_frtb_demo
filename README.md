@@ -100,16 +100,31 @@ npm run -w @frtb/ui start    # boot a single service stub
 ## Local-developer launcher (no Docker)
 
 ```bash
-scripts/run-local.sh start              # boot all 7 services in the background
-scripts/run-local.sh status             # one-line-per-service table
+scripts/run-local.sh start              # boot the 6 long-running services
+scripts/run-local.sh status             # one-line-per-service table + one-shot tool state
 scripts/run-local.sh logs api -f        # tail a service log
 scripts/run-local.sh doctor             # diagnostics
-scripts/run-local.sh stop               # stop all
+scripts/run-local.sh stop               # stop all (services + any running one-shot tools)
 ```
 
 Runtime state (PIDs, logs, env snapshot) lives under `./.run/`. Runs as the
 invoking user; no sudo, no systemd, no `/var/lib` paths. To reset cleanly:
 `scripts/run-local.sh stop && rm -rf .run/`.
+
+### Synthetic data: the `generator` one-shot tool
+
+`generator` is a one-shot CLI that streams synthetic FRTB sensitivities into
+the `sensitivities:in` Redis Stream and exits — it is **not** part of the
+default `start`. Invoke it explicitly only when you want to populate data:
+
+```bash
+scripts/run-local.sh start generator                    # default: 2,000,000 rows
+scripts/run-local.sh start generator -- --rows 1000     # small/dev run
+scripts/run-local.sh logs generator -f                  # follow progress
+```
+
+Anything after `--` is forwarded to `tsx services/generator/src/cli.ts`
+(e.g. `--rows`, `--rate`, `--seed`, `--stream`).
 
 ## Testing & TDD
 
