@@ -37,5 +37,5 @@ services/ui/test-results/
 # TypeScript incremental build cache
 *.tsbuildinfo
 
-# FRTB user-mode deploy state
-.frtb/
+# scripts/run-local.sh runtime state (PIDs, logs, env snapshot)
+.run/

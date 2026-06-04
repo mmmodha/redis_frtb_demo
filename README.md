@@ -97,18 +97,19 @@ npm test            # runs the monorepo + per-package vitest suites
 npm run -w @frtb/ui start    # boot a single service stub
 ```
 
-## Bare-metal deploy (no Docker)
+## Local-developer launcher (no Docker)
 
 ```bash
-scripts/deploy.sh install --redis-url 'rediss://:pw@host:port'
-scripts/deploy.sh start
-scripts/deploy.sh status
-scripts/deploy.sh logs api -f
+scripts/run-local.sh start              # boot all 7 services in the background
+scripts/run-local.sh status             # one-line-per-service table
+scripts/run-local.sh logs api -f        # tail a service log
+scripts/run-local.sh doctor             # diagnostics
+scripts/run-local.sh stop               # stop all
 ```
 
-Runtime state (env, logs, PID files) lives in `<repo>/.frtb/`. Run as the user
-you want to own the services. No sudo, no service account, no systemd. To
-reset cleanly, stop all and `rm -rf .frtb/`.
+Runtime state (PIDs, logs, env snapshot) lives under `./.run/`. Runs as the
+invoking user; no sudo, no systemd, no `/var/lib` paths. To reset cleanly:
+`scripts/run-local.sh stop && rm -rf .run/`.
 
 ## Testing & TDD
 
