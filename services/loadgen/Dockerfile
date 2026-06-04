@@ -10,9 +10,9 @@ RUN apk add --no-cache curl
 
 # Workspace install: copy root + workspace manifests, then install. Building
 # from the monorepo root keeps install consistent with the other services.
-COPY package.json package-lock.json* ./
+COPY package.json package-lock.json ./
 COPY services/loadgen/package.json ./services/loadgen/package.json
-RUN npm install --workspaces --include-workspace-root --omit=dev=false
+RUN npm ci --include-workspace-root
 
 COPY services/loadgen/tsconfig.json ./services/loadgen/tsconfig.json
 COPY services/loadgen/src ./services/loadgen/src

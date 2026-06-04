@@ -13,10 +13,10 @@ WORKDIR /app
 
 # Workspace install — @frtb/calc depends on @frtb/schema (workspace ref),
 # so we copy shared/schema alongside the package manifests.
-COPY package.json package-lock.json* ./
+COPY package.json package-lock.json ./
 COPY services/calc/package.json ./services/calc/package.json
 COPY shared/schema ./shared/schema
-RUN npm install --workspace=@frtb/calc --include-workspace-root \
+RUN npm ci --workspace=@frtb/calc --include-workspace-root \
     --omit=dev --no-audit --no-fund
 
 FROM node:20-alpine AS runtime
@@ -26,7 +26,6 @@ WORKDIR /app
 RUN apk add --no-cache curl
 
 COPY --from=builder /app/node_modules ./node_modules
-COPY --from=builder /app/services/calc/node_modules ./services/calc/node_modules
 COPY --from=builder /app/shared ./shared
 COPY services/calc/package.json ./services/calc/package.json
 COPY services/calc/src ./services/calc/src

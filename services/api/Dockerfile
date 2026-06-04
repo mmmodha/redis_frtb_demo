@@ -13,7 +13,7 @@ RUN apk add --no-cache curl
 # bootstrap that loads the frtb Functions library and creates idx:sens, plus
 # @frtb/generator for the Wave 5.16p in-process POST /generator/start route).
 # Building from the monorepo root lets npm resolve the workspace: protocol.
-COPY package.json package-lock.json* ./
+COPY package.json package-lock.json ./
 COPY services/api/package.json ./services/api/package.json
 COPY shared/schema ./shared/schema
 COPY shared/rqe ./shared/rqe
@@ -23,7 +23,7 @@ COPY services/calc/src ./services/calc/src
 COPY services/calc/lib ./services/calc/lib
 COPY services/generator/package.json ./services/generator/package.json
 COPY services/generator/src ./services/generator/src
-RUN npm install --workspaces --include-workspace-root --omit=dev=false
+RUN npm ci --include-workspace-root
 
 COPY services/api/tsconfig.json ./services/api/tsconfig.json
 COPY services/api/src ./services/api/src

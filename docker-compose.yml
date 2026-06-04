@@ -142,12 +142,6 @@ services:
     depends_on:
       api:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8081/healthz"]
-      interval: 10s
-      timeout: 3s
-      retries: 5
-      start_period: 5s
 
   source:
     <<: *service-defaults

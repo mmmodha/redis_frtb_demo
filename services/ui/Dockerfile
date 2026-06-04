@@ -9,9 +9,9 @@ WORKDIR /app
 # Workspace install — copy the root manifest + ui manifest only so the
 # install layer caches independently of any source changes. UI has no
 # @frtb/* runtime deps so we don't need to copy shared/* here.
-COPY package.json package-lock.json* ./
+COPY package.json package-lock.json ./
 COPY services/ui/package.json ./services/ui/package.json
-RUN npm install --workspace=@frtb/ui --include-workspace-root --no-audit --no-fund
+RUN npm ci --workspace=@frtb/ui --include-workspace-root --no-audit --no-fund
 
 # Source. tsconfig.base.json is referenced by services/ui/tsconfig.json.
 COPY tsconfig.base.json ./
@@ -30,4 +30,3 @@ COPY services/ui/nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=builder /app/services/ui/dist /usr/share/nginx/html
 
 EXPOSE 3000
-HEALTHCHECK NONE

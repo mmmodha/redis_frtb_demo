@@ -12,14 +12,14 @@ WORKDIR /app
 # workspace source for @frtb/schema (a runtime dep resolved via the
 # workspace: protocol). Dev deps are required so tsx is available in the
 # runtime image; the bundle stays small (~250 MB target) thanks to alpine.
-COPY package.json package-lock.json* ./
+COPY package.json package-lock.json ./
 COPY services/generator/package.json ./services/generator/package.json
 COPY shared/schema ./shared/schema
 COPY shared/redis-client ./shared/redis-client
 # Runtime deps only (drops typescript/vitest/@types ~ 150 MB); tsx is needed
 # at runtime to load @frtb/schema and @frtb/redis-client (.ts exports) so we
 # install it globally with the pinned dev-dep version.
-RUN npm install --workspace=@frtb/generator --include-workspace-root \
+RUN npm ci --workspace=@frtb/generator --include-workspace-root \
     --omit=dev --no-audit --no-fund \
  && npm install -g --no-audit --no-fund tsx@4.19.2
 
@@ -37,7 +37,6 @@ RUN apk add --no-cache curl
 # /usr/local/bin/ and fail. We invoke tsx via its real path instead.
 COPY --from=builder /usr/local/lib/node_modules /usr/local/lib/node_modules
 COPY --from=builder /app/node_modules ./node_modules
-COPY --from=builder /app/services/generator/node_modules ./services/generator/node_modules
 COPY --from=builder /app/shared/schema ./shared/schema
 COPY --from=builder /app/shared/redis-client ./shared/redis-client
 COPY services/generator/package.json ./services/generator/package.json
