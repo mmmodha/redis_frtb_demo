@@ -36,3 +36,6 @@ services/ui/test-results/
 
 # TypeScript incremental build cache
 *.tsbuildinfo
+
+# FRTB user-mode deploy state
+.frtb/
