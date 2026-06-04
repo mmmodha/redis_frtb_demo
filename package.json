@@ -23,9 +23,5 @@
   },
   "engines": {
     "node": ">=20"
-  },
-  "dependencies": {
-    "tsc": "^2.0.4",
-    "tsx": "^4.22.4"
   }
 }
