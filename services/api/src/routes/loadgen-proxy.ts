@@ -180,7 +180,7 @@ function parseLabel(buf: Buffer): string {
 }
 
 export function registerLoadgenProxyRoutes(app: FastifyInstance, opts: LoadgenProxyOpts = {}): void {
-  const base = opts.loadgenBase ?? process.env.LOADGEN_BASE ?? "http://loadgen:8085";
+  const base = opts.loadgenBase ?? process.env.LOADGEN_BASE ?? "http://localhost:8085";
   const pollMs = opts.loadgenPollMs ?? (Number(process.env.LOADGEN_POLL_MS) || 5_000);
   const corsAllowed = opts.corsAllowed ?? "http://localhost:3000";
   const handles = new Set<inflight.InflightHandle>();

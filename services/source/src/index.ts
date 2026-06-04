@@ -7,7 +7,8 @@
 // calls always hit the *current* target. Falls back to REDIS_URL only when
 // the api is unreachable for >30s on startup (dev/test ergonomics).
 
-import { resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { existsSync } from "node:fs";
 import { loadSchema } from "@frtb/schema";
 import { createServer } from "./server.ts";
@@ -15,11 +16,16 @@ import { createSourceStore } from "./store.ts";
 import { createActiveTargetWatcher } from "./active-target-watcher.ts";
 
 const PORT = Number(process.env.PORT ?? process.env.HEALTH_PORT ?? 8082);
+// Compute REPO_ROOT relative to this file so defaults work both under tsx
+// (cwd = services/source/) and in the built Docker image (file at
+// /app/services/source/src/index.ts → REPO_ROOT = /app). Env vars set by
+// the Dockerfile or docker-compose still take precedence.
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const SCHEMA_PATH = resolve(
-  process.env.SCHEMA_FILE ?? "/app/config/schema/frtb-default.yaml",
+  process.env.SCHEMA_FILE ?? join(REPO_ROOT, "config/schema/frtb-default.yaml"),
 );
-const UPLOAD_DIR = process.env.UPLOAD_DIR ?? "/data/uploads";
-const API_BASE = process.env.API_BASE ?? "http://api:8080";
+const UPLOAD_DIR = process.env.UPLOAD_DIR ?? join(REPO_ROOT, ".run/data/uploads");
+const API_BASE = process.env.API_BASE ?? "http://localhost:8080";
 const POLL_MS = Number(process.env.ACTIVE_TARGET_POLL_MS ?? 5000);
 
 async function main(): Promise<void> {

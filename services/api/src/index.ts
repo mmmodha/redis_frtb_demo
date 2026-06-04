@@ -4,7 +4,8 @@
 // pending the Connections store agent's profile-switch hook), loads the
 // schema YAML to derive γ_bc per risk class, and listens on $HEALTH_PORT.
 
-import { resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { existsSync } from "node:fs";
 import { Cluster, type Redis } from "ioredis";
 import { createRedisClient } from "@frtb/redis-client";
@@ -24,10 +25,16 @@ import {
 } from "./bootstrap-status.ts";
 
 const PORT = Number(process.env.HEALTH_PORT ?? 8080);
+// Compute REPO_ROOT relative to this file so defaults work both under tsx
+// (cwd = services/api/) and in the built Docker image (file at
+// /app/services/api/src/index.ts → REPO_ROOT = /app). Env vars set by the
+// Dockerfile or docker-compose still take precedence.
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const SCHEMA_PATH = resolve(
-  process.env.SCHEMA_FILE ?? "/app/config/schema/frtb-default.yaml"
+  process.env.SCHEMA_FILE ?? join(REPO_ROOT, "config/schema/frtb-default.yaml")
 );
-const STORE_FILE = process.env.CONN_STORE_FILE ?? "/data/connections.enc.json";
+const STORE_FILE = process.env.CONN_STORE_FILE
+  ?? join(REPO_ROOT, ".run/data/connections.enc.json");
 const MASTER_KEY = process.env.FRTB_MASTER_KEY ?? process.env.CONN_STORE_KEY;
 
 async function main(): Promise<void> {

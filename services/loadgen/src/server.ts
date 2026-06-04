@@ -54,7 +54,7 @@ function frameOf(snap: RunnerSnapshot): string {
 
 export async function createServer(opts: CreateServerOpts = {}): Promise<FastifyInstance> {
   const app = Fastify({ logger: false });
-  const apiBase = opts.apiBase ?? process.env.API_URL ?? "http://api:8080";
+  const apiBase = opts.apiBase ?? process.env.API_URL ?? "http://localhost:8080";
   const tickMs = opts.snapshotIntervalMs ?? 1000;
   const runner = new Runner();
 

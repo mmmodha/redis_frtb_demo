@@ -229,7 +229,7 @@ function trackIngest(
 }
 
 export function registerSourcesProxyRoutes(app: FastifyInstance, opts: SourcesProxyOpts = {}): void {
-  const base = opts.sourceBase ?? process.env.SOURCE_BASE ?? "http://source:3002";
+  const base = opts.sourceBase ?? process.env.SOURCE_BASE ?? "http://localhost:8082";
   const ingestPollMs = opts.ingestPollMs ?? (Number(process.env.INGEST_POLL_MS) || 5_000);
   const ingestTimeoutMs = opts.ingestTimeoutMs ?? (Number(process.env.INFLIGHT_INGEST_TIMEOUT_MS) || 60_000);
   const corsAllowed = opts.corsAllowed ?? "http://localhost:3000";

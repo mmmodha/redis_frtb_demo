@@ -13,7 +13,7 @@ import { createServer } from "./server.ts";
 import { createActiveTargetWatcher } from "./active-target-watcher.ts";
 
 const port = Number(process.env.HEALTH_PORT ?? 8085);
-const apiBase = process.env.API_BASE ?? process.env.API_URL ?? "http://api:8080";
+const apiBase = process.env.API_BASE ?? process.env.API_URL ?? "http://localhost:8080";
 
 async function main(): Promise<void> {
   const app = await createServer({
