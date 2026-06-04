@@ -8,6 +8,7 @@ STATE_DIR="$REPO/.frtb"
 ENV_FILE="$STATE_DIR/env"
 LOG_DIR="$STATE_DIR/logs"
 RUN_DIR="$STATE_DIR/run"
+DATA_DIR="$STATE_DIR/data"
 STATE_FILE="$STATE_DIR/state.json"
 
 SERVICES=(api calc source ingest generator loadgen)
@@ -101,7 +102,7 @@ cmd_install() {
     exit 1
   fi
 
-  mkdir -p "$LOG_DIR" "$RUN_DIR"
+  mkdir -p "$LOG_DIR" "$RUN_DIR" "$DATA_DIR" "$DATA_DIR/uploads"
 
   if [ -f "$ENV_FILE" ]; then
     warn "env exists, keeping; delete $ENV_FILE to regenerate"
@@ -120,6 +121,8 @@ INTERNAL_API_TOKEN=$token
 LOG_LEVEL=debug
 NODE_ENV=development
 FRTB_REPO=$REPO
+CONN_STORE_FILE=$DATA_DIR/connections.enc.json
+UPLOAD_DIR=$DATA_DIR/uploads
 EOF
     chmod 600 "$ENV_FILE"
     umask 022
@@ -156,7 +159,7 @@ start_one() {
     return 0
   fi
   rm -f "$pidfile"
-  mkdir -p "$LOG_DIR" "$RUN_DIR"
+  mkdir -p "$LOG_DIR" "$RUN_DIR" "$DATA_DIR" "$DATA_DIR/uploads"
   cd "$REPO"
   local pid
   if command -v setsid >/dev/null 2>&1; then
