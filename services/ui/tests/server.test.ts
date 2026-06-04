@@ -1,14 +1,25 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { spawn } from "node:child_process";
+import fs from "node:fs";
 import http from "node:http";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const serverEntry = path.resolve(here, "../src/index.mjs");
-const distDir = path.resolve(here, "../dist");
+// Build a self-sufficient fixture dist dir so tests pass without `npm run build`.
 // Set BEFORE the dynamic import so the module picks it up at load time.
+const distDir = fs.mkdtempSync(path.join(os.tmpdir(), "ui-test-"));
+fs.writeFileSync(
+  path.join(distDir, "index.html"),
+  '<!doctype html><html><body><div id="root"></div></body></html>',
+);
+fs.writeFileSync(
+  path.join(distDir, "redis-logo.svg"),
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"></svg>',
+);
 process.env.UI_DIST_DIR = distDir;
 
 // eslint-disable-next-line @typescript-eslint/ban-ts-comment
@@ -27,6 +38,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await new Promise<void>((resolve) => server.close(() => resolve()));
+  fs.rmSync(distDir, { recursive: true, force: true });
 });
 
 describe("UI static server", () => {
