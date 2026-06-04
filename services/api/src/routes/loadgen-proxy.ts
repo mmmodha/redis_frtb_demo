@@ -180,7 +180,10 @@ function parseLabel(buf: Buffer): string {
 }
 
 export function registerLoadgenProxyRoutes(app: FastifyInstance, opts: LoadgenProxyOpts = {}): void {
-  const base = opts.loadgenBase ?? process.env.LOADGEN_BASE ?? "http://localhost:8085";
+  // Wave 5.79: LOADGEN_BASE takes precedence (multi-VM); otherwise compose
+  // from LOADGEN_PORT so a sibling port remap in .env.local just works.
+  const base = opts.loadgenBase ?? process.env.LOADGEN_BASE
+    ?? `http://localhost:${process.env.LOADGEN_PORT ?? 8085}`;
   const pollMs = opts.loadgenPollMs ?? (Number(process.env.LOADGEN_POLL_MS) || 5_000);
   const corsAllowed = opts.corsAllowed ?? "http://localhost:3000";
   const handles = new Set<inflight.InflightHandle>();

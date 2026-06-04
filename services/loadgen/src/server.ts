@@ -54,7 +54,9 @@ function frameOf(snap: RunnerSnapshot): string {
 
 export async function createServer(opts: CreateServerOpts = {}): Promise<FastifyInstance> {
   const app = Fastify({ logger: false });
-  const apiBase = opts.apiBase ?? process.env.API_URL ?? "http://localhost:8080";
+  // Wave 5.79: API_URL takes precedence (legacy); fall back to a computed
+  // localhost URL keyed off API_PORT so remapping the api port just works.
+  const apiBase = opts.apiBase ?? process.env.API_URL ?? `http://localhost:${process.env.API_PORT ?? 8080}`;
   const tickMs = opts.snapshotIntervalMs ?? 1000;
   const runner = new Runner();
 

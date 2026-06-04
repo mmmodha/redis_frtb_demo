@@ -7,7 +7,11 @@
 import http from 'node:http';
 
 const SERVICE = 'calc';
-const PORT = Number(process.env.HEALTH_PORT ?? 3000);
+// Wave 5.79: precedence for self-binding is CALC_HOST/PORT → HOST/PORT
+// → HEALTH_PORT → hardcoded default. The default 8084 matches the
+// run-local.sh + docker-compose port catalogue.
+const HOST = process.env.CALC_HOST ?? process.env.HOST ?? '0.0.0.0';
+const PORT = Number(process.env.CALC_PORT ?? process.env.PORT ?? process.env.HEALTH_PORT ?? 8084);
 
 function start() {
   const server = http.createServer((req, res) => {
@@ -20,7 +24,7 @@ function start() {
     res.end();
   });
 
-  server.listen(PORT, () => {
+  server.listen(PORT, HOST, () => {
     const { port } = server.address();
     console.log(JSON.stringify({ service: SERVICE, status: 'ready', port }));
     if (process.env.SMOKE === '1') {

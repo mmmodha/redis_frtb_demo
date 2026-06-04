@@ -24,7 +24,12 @@ import {
   markBootstrapStatusFailed,
 } from "./bootstrap-status.ts";
 
-const PORT = Number(process.env.HEALTH_PORT ?? 8080);
+// Wave 5.79: precedence for self-binding is API_HOST/PORT → HOST/PORT →
+// HEALTH_PORT → hardcoded default. Lets operators remap or restrict the
+// listen address in .env.local without code changes; Docker's existing
+// ENV HEALTH_PORT=8080 / docker-compose HEALTH_PORT key continue to work.
+const HOST = process.env.API_HOST ?? process.env.HOST ?? "0.0.0.0";
+const PORT = Number(process.env.API_PORT ?? process.env.PORT ?? process.env.HEALTH_PORT ?? 8080);
 // Compute REPO_ROOT relative to this file so defaults work both under tsx
 // (cwd = services/api/) and in the built Docker image (file at
 // /app/services/api/src/index.ts → REPO_ROOT = /app). Env vars set by the
@@ -178,7 +183,7 @@ async function main(): Promise<void> {
     return (active ?? redis) as unknown as RedisLike;
   };
   const app = await createServer({ getRedis, correlations, schema, store, logger: true });
-  await app.listen({ port: PORT, host: "0.0.0.0" });
+  await app.listen({ port: PORT, host: HOST });
   console.log(JSON.stringify({ service: "api", status: "ready", port: PORT, target: target.label }));
 
   if (process.env.SMOKE === "1") {

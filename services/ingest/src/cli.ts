@@ -14,7 +14,11 @@ const GROUP = process.env.CONSUMER_GROUP ?? "ingest";
 const CONSUMER_NAME = process.env.CONSUMER_NAME ?? `ingest-${os.hostname()}-${process.pid}`;
 const BATCH_SIZE = Number(process.env.BATCH_SIZE ?? "500");
 const BLOCK_MS = Number(process.env.BLOCK_MS ?? "1000");
-const HEALTH_PORT = Number(process.env.HEALTH_PORT ?? "8083");
+// Wave 5.79: precedence for self-binding is INGEST_HOST/PORT → HOST/PORT
+// → HEALTH_PORT → hardcoded default. Lets operators remap or restrict the
+// healthz listen address in .env.local without code changes.
+const HEALTH_HOST = process.env.INGEST_HOST ?? process.env.HOST ?? "0.0.0.0";
+const HEALTH_PORT = Number(process.env.INGEST_PORT ?? process.env.PORT ?? process.env.HEALTH_PORT ?? "8083");
 const ACTIVE_TARGET_POLL_MS = Number(process.env.ACTIVE_TARGET_POLL_MS ?? "2500");
 
 function createClientFromUrl(target: string): RedisLike {
@@ -27,7 +31,7 @@ function createClientFromUrl(target: string): RedisLike {
   return createRedisClient({ url: target }) as unknown as RedisLike;
 }
 
-function startHealth(port: number, state: { ready: boolean; consumed: () => number; errors: () => number }): http.Server {
+function startHealth(port: number, host: string, state: { ready: boolean; consumed: () => number; errors: () => number }): http.Server {
   const server = http.createServer((req, res) => {
     if (req.url === "/healthz") {
       res.writeHead(state.ready ? 200 : 503, { "content-type": "application/json" });
@@ -36,8 +40,8 @@ function startHealth(port: number, state: { ready: boolean; consumed: () => numb
     }
     res.writeHead(404); res.end();
   });
-  server.listen(port, () => {
-    log.info({ port }, "ingest healthz listening");
+  server.listen(port, host, () => {
+    log.info({ host, port }, "ingest healthz listening");
   });
   return server;
 }
@@ -62,7 +66,7 @@ async function main(): Promise<void> {
     consumed: () => runner?.stats.consumed ?? 0,
     errors: () => runner?.stats.errors ?? 0,
   };
-  const health = startHealth(HEALTH_PORT, state);
+  const health = startHealth(HEALTH_PORT, HEALTH_HOST, state);
 
   let watcher: ActiveTargetWatcher | null = null;
 

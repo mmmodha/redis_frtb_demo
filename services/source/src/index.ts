@@ -15,7 +15,12 @@ import { createServer } from "./server.ts";
 import { createSourceStore } from "./store.ts";
 import { createActiveTargetWatcher } from "./active-target-watcher.ts";
 
-const PORT = Number(process.env.PORT ?? process.env.HEALTH_PORT ?? 8082);
+// Wave 5.79: precedence for self-binding is SOURCE_HOST/PORT → HOST/PORT
+// → HEALTH_PORT → hardcoded default. Lets operators remap or restrict the
+// listen address in .env.local without code changes; Docker's existing
+// ENV HEALTH_PORT=8082 / docker-compose HEALTH_PORT key continue to work.
+const HOST = process.env.SOURCE_HOST ?? process.env.HOST ?? "0.0.0.0";
+const PORT = Number(process.env.SOURCE_PORT ?? process.env.PORT ?? process.env.HEALTH_PORT ?? 8082);
 // Compute REPO_ROOT relative to this file so defaults work both under tsx
 // (cwd = services/source/) and in the built Docker image (file at
 // /app/services/source/src/index.ts → REPO_ROOT = /app). Env vars set by
@@ -25,7 +30,9 @@ const SCHEMA_PATH = resolve(
   process.env.SCHEMA_FILE ?? join(REPO_ROOT, "config/schema/frtb-default.yaml"),
 );
 const UPLOAD_DIR = process.env.UPLOAD_DIR ?? join(REPO_ROOT, ".run/data/uploads");
-const API_BASE = process.env.API_BASE ?? "http://localhost:8080";
+// Wave 5.79: API_BASE takes precedence (multi-VM); otherwise compose URL from
+// the api's port so a sibling `API_PORT=9080` in .env.local just works.
+const API_BASE = process.env.API_BASE ?? `http://localhost:${process.env.API_PORT ?? 8080}`;
 const POLL_MS = Number(process.env.ACTIVE_TARGET_POLL_MS ?? 5000);
 
 async function main(): Promise<void> {
@@ -61,7 +68,7 @@ async function main(): Promise<void> {
   const redisLike = watcher.asRedisLike();
   const store = createSourceStore({ redis: redisLike });
   const app = await createServer({ redis: redisLike, store, schema, uploadDir: UPLOAD_DIR, logger: true });
-  await app.listen({ port: PORT, host: "0.0.0.0" });
+  await app.listen({ port: PORT, host: HOST });
   console.log(JSON.stringify({ service: "source", status: "ready", port: PORT }));
 
   if (process.env.SMOKE === "1") {

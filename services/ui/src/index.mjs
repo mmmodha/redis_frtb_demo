@@ -7,7 +7,10 @@
 import http from 'node:http';
 
 const SERVICE = 'ui';
-const PORT = Number(process.env.HEALTH_PORT ?? 3000);
+// Wave 5.79: precedence for self-binding is UI_HOST/PORT → HOST/PORT
+// → HEALTH_PORT → hardcoded default.
+const HOST = process.env.UI_HOST ?? process.env.HOST ?? '0.0.0.0';
+const PORT = Number(process.env.UI_PORT ?? process.env.PORT ?? process.env.HEALTH_PORT ?? 3000);
 
 function start() {
   const server = http.createServer((req, res) => {
@@ -20,7 +23,7 @@ function start() {
     res.end();
   });
 
-  server.listen(PORT, () => {
+  server.listen(PORT, HOST, () => {
     const { port } = server.address();
     console.log(JSON.stringify({ service: SERVICE, status: 'ready', port }));
     if (process.env.SMOKE === '1') {

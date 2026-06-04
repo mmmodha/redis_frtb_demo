@@ -12,8 +12,12 @@
 import { createServer } from "./server.ts";
 import { createActiveTargetWatcher } from "./active-target-watcher.ts";
 
-const port = Number(process.env.HEALTH_PORT ?? 8085);
-const apiBase = process.env.API_BASE ?? process.env.API_URL ?? "http://localhost:8080";
+// Wave 5.79: precedence for self-binding is LOADGEN_HOST/PORT → HOST/PORT
+// → HEALTH_PORT → hardcoded default. apiBase falls back to a computed
+// localhost URL keyed off API_PORT so remapping the api port works.
+const host = process.env.LOADGEN_HOST ?? process.env.HOST ?? "0.0.0.0";
+const port = Number(process.env.LOADGEN_PORT ?? process.env.PORT ?? process.env.HEALTH_PORT ?? 8085);
+const apiBase = process.env.API_BASE ?? process.env.API_URL ?? `http://localhost:${process.env.API_PORT ?? 8080}`;
 
 async function main(): Promise<void> {
   const app = await createServer({
@@ -40,7 +44,7 @@ async function main(): Promise<void> {
     }));
   }
 
-  await app.listen({ port, host: "0.0.0.0" });
+  await app.listen({ port, host });
   // eslint-disable-next-line no-console
   console.log(`[loadgen] listening on :${port}`);
 }

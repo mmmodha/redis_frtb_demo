@@ -117,6 +117,39 @@ svc_port_for() {
   echo "${PORTS[$idx]}"
 }
 
+# Wave 5.79 — map a service name to the env var name that overrides its port.
+# Used by resolve_ports_from_env so operators can remap any service's listen
+# port in .env.local without touching the catalogue here.
+svc_port_env_var() {
+  case "$1" in
+    api)       echo API_PORT ;;
+    source)    echo SOURCE_PORT ;;
+    ingest)    echo INGEST_PORT ;;
+    calc)      echo CALC_PORT ;;
+    loadgen)   echo LOADGEN_PORT ;;
+    generator) echo GENERATOR_PORT ;;
+    ui)        echo UI_PORT ;;
+    *)         echo "" ;;
+  esac
+}
+
+# Wave 5.79 — overlay <SVC>_PORT (from .env.local or the caller's env) onto
+# the catalogue PORTS array. Call after load_env_quiet so doctor/status/start
+# poll the operator-chosen port. Idempotent.
+resolve_ports_from_env() {
+  local i=0 var val
+  while [[ $i -lt ${#SERVICES[@]} ]]; do
+    var="$(svc_port_env_var "${SERVICES[$i]}")"
+    if [[ -n "${var}" ]]; then
+      val="${!var:-}"
+      if [[ -n "${val}" ]]; then
+        PORTS[$i]="${val}"
+      fi
+    fi
+    i=$(( i + 1 ))
+  done
+}
+
 pid_file() { echo "${PIDS_DIR}/$1.pid"; }
 log_file() { echo "${LOGS_DIR}/$1.log"; }
 
@@ -197,6 +230,18 @@ ensure_run_dirs() {
 # Secrets whose key matches PASSWORD|KEY|TOKEN|SECRET are replaced with
 # <redacted> in the snapshot file. Original env stays in process memory.
 # ---------------------------------------------------------------------------
+# Wave 5.79 — quiet env loader for commands (doctor/status) that need to read
+# <SVC>_PORT overrides but should not write a snapshot. No-op if .env.local
+# is absent so doctor still runs with sensible defaults on a fresh checkout.
+load_env_quiet() {
+  if [[ -f "${ENV_LOCAL}" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "${ENV_LOCAL}" 2>/dev/null || true
+    set +a
+  fi
+}
+
 load_env() {
   set -a
   # shellcheck disable=SC1090
@@ -452,6 +497,9 @@ cmd_start() {
   preflight
   load_env
   apply_defaults
+  # Wave 5.79 — honour <SVC>_PORT overrides from .env.local for the spawn
+  # loop, the healthz probes, and the final status table.
+  resolve_ports_from_env
   ensure_run_dirs
   ensure_deps || exit 1
   ensure_ui_build || exit 1
@@ -528,6 +576,10 @@ cmd_restart() {
 cmd_status() {
   preflight_no_root
   cd "${REPO_ROOT}" 2>/dev/null || true
+  # Wave 5.79 — pick up <SVC>_PORT overrides so the table + probes match the
+  # operator's actual binding.
+  load_env_quiet
+  resolve_ports_from_env
   hdr "FRTB SBM stack status"
   info "  repo:    ${REPO_ROOT}"
   info "  run dir: ${RUN_DIR}"
@@ -590,6 +642,10 @@ listening_pid_on() {
 }
 
 cmd_doctor() {
+  # Wave 5.79 — pick up <SVC>_PORT overrides so the port-availability checks
+  # below probe the operator's actual binding instead of the catalogue defaults.
+  load_env_quiet
+  resolve_ports_from_env
   hdr "FRTB SBM run-local doctor"
   # Not-root.
   if [[ "$(id -u)" == "0" ]]; then

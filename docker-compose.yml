@@ -77,6 +77,11 @@ services:
     environment:
       <<: *app-env
       HEALTH_PORT: 8080
+      # Wave 5.79: persist the encrypted connections store on the named `data`
+      # volume mounted at /data below. Wave 5.78 dropped the Docker-only path
+      # default in services/api/src/index.ts, so compose must set this
+      # explicitly to keep the legacy behaviour.
+      CONN_STORE_FILE: /data/connections.enc.json
       CONN_STORE_KEY: ${CONN_STORE_KEY:-dev-only-change-in-prod}
       # Wave 5.16g: CORS allow-list for the browser-facing api. The ui
       # container fetches the api cross-origin from the host's nginx port
@@ -93,6 +98,11 @@ services:
       # services/api/src/routes/sources-proxy.ts is http://source:3002 for
       # non-compose runs; under compose we must override or the proxy 502s.
       SOURCE_BASE: http://source:8082
+      # Wave 5.79: point the /loadgen/* proxy at the loadgen container's
+      # service hostname. Wave 5.78 swapped the code default from
+      # http://loadgen:8085 to http://localhost:8085 for laptop use, so
+      # compose must override it to restore inter-container resolution.
+      LOADGEN_BASE: http://loadgen:8085
     ports:
       - "8080:8080"
     volumes:
@@ -148,6 +158,11 @@ services:
     environment:
       <<: *app-env
       HEALTH_PORT: 8082
+      # Wave 5.79: point the active-target watcher at the api container's
+      # service hostname. Wave 5.78 swapped the code default from
+      # http://api:8080 to http://localhost:8080 for laptop use, so
+      # compose must override it to restore inter-container resolution.
+      API_BASE: http://api:8080
     volumes:
       - data:/data
     depends_on:
@@ -209,6 +224,11 @@ services:
     environment:
       <<: *app-env
       HEALTH_PORT: 8085
+      # Wave 5.79: point the runner + active-target watcher at the api
+      # container's service hostname. Wave 5.78 swapped the code default from
+      # http://api:8080 to http://localhost:8080 for laptop use, so compose
+      # must override it to restore inter-container resolution.
+      API_BASE: http://api:8080
     depends_on:
       api:
         condition: service_healthy
