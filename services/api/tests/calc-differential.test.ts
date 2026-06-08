@@ -365,12 +365,13 @@ describe("Wave 5.83D-1 — Lua ⇄ FT.AGGREGATE differential parity (9 variants)
     const wsPerTenor = tenors.map((t) => weights[t]! * perTenorSum[t]!);
     const sumWs = wsPerTenor.reduce((a, b) => a + b, 0);
     const sumWsSq = wsPerTenor.reduce((a, x) => a + x * x, 0);
-    // Fast aggregates: per-tenor SUM of enrichDoc's weighted_value[t].
+    // Fast aggregates: per-tenor SUM of enrichDoc's weighted_value_per_tenor[t].
+    // Wave 5.83F — per-tenor map moved off `$.weighted_value` (now scalar Σ).
     const fastFields: Record<string, number> = { row_count: rows.length };
     for (const t of tenors) {
       let s = 0;
       for (const r of rows) {
-        const wv = (enrichDoc(r, schema).weighted_value as Record<string, number>)[t]!;
+        const wv = (enrichDoc(r, schema).weighted_value_per_tenor as Record<string, number>)[t]!;
         s += wv;
       }
       fastFields[`sum_d_ws_girr_delta_${t}`] = s;
@@ -403,12 +404,13 @@ describe("Wave 5.83D-1 — Lua ⇄ FT.AGGREGATE differential parity (9 variants)
       const rv = r.risk_value as Record<string, number>;
       for (const t of tenors) { const ws = rv[t]!; sumWs += ws; sumWsSq += ws * ws; }
     }
-    // Fast aggregates: per-tenor SUM and SUM(sq) over weighted_value cells.
+    // Fast aggregates: per-tenor SUM and SUM(sq) over weighted_value_per_tenor cells.
+    // Wave 5.83F — per-tenor map moved off `$.weighted_value` (now scalar Σ).
     const fastFields: Record<string, number> = { row_count: rows.length };
     for (const t of tenors) {
       let s = 0, sq = 0;
       for (const r of rows) {
-        const wv = (enrichDoc(r, schema).weighted_value as Record<string, number>)[t]!;
+        const wv = (enrichDoc(r, schema).weighted_value_per_tenor as Record<string, number>)[t]!;
         s += wv; sq += wv * wv;
       }
       fastFields[`sum_v_ws_girr_vega_${t}`] = s;
@@ -443,17 +445,19 @@ describe("Wave 5.83D-1 — Lua ⇄ FT.AGGREGATE differential parity (9 variants)
     const lua = kbDown > kbUp
       ? { K_b: kbDown, S_b: sDown, count: rows.length }
       : { K_b: kbUp, S_b: sUp, count: rows.length };
-    // Fast: per-tenor SUM of weighted_cvr_up/down via enrichDoc. The per-tenor
-    // branch ignores sign-split aggregates, but emit zeroed aliases so the
-    // reducer reads stable strings (parseAggregateRows tolerates them).
+    // Fast: per-tenor SUM of weighted_cvr_{up,down}_per_tenor via enrichDoc.
+    // Wave 5.83F — per-tenor maps moved off `$.weighted_cvr_*` (now scalar Σ).
+    // The per-tenor branch ignores sign-split aggregates, but emit zeroed
+    // aliases so the reducer reads stable strings (parseAggregateRows tolerates
+    // them).
     const fastFields: Record<string, number> = { row_count: rows.length };
     for (let k = 0; k < tenors.length; k++) {
       const t = tenors[k]!;
       let sU = 0, sD = 0;
       for (const r of rows) {
         const e = enrichDoc(r, schema);
-        const up = (e.weighted_cvr_up as Record<string, number>)[t]!;
-        const dn = (e.weighted_cvr_down as Record<string, number>)[t]!;
+        const up = (e.weighted_cvr_up_per_tenor as Record<string, number>)[t]!;
+        const dn = (e.weighted_cvr_down_per_tenor as Record<string, number>)[t]!;
         sU += up; sD += dn;
       }
       fastFields[`sum_u_ws_girr_cvr_up_${t}`] = sU;

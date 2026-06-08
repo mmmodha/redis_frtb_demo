@@ -195,26 +195,39 @@ describe("enrichDoc — Wave 5.83B pre-weighting", () => {
     expect(out.weight).toBe(0.017);
   });
 
-  it("GIRR Delta per-tenor object → weighted_value object keyed by same tenor labels (≤1e-12)", () => {
+  // Wave 5.83F — GIRR per-tenor data now lives at `weighted_value_per_tenor`
+  // and the bare `weighted_value` carries the scalar signed sum so the
+  // NUMERIC index field declared by Equity/FX no longer sees an Object on
+  // GIRR-prefix docs.
+  it("GIRR Delta per-tenor object → weighted_value_per_tenor object keyed by same tenor labels (≤1e-12)", () => {
     const rv = { "3M": 0.1, "6M": -0.2, "10Y": 0.5 };
     const out = enrichDoc({ risk_class: "GIRR", bucket: "USD", sensitivity_type: "Delta", risk_value: rv }, SCHEMA);
-    const wv = out.weighted_value as Record<string, number>;
+    const wv = out.weighted_value_per_tenor as Record<string, number>;
     expect(Object.keys(wv).sort()).toEqual(["10Y", "3M", "6M"]);
     expect(Math.abs(wv["3M"]! - GIRR_W.by_tenor["3M"]! * 0.1)).toBeLessThanOrEqual(TOL);
     expect(Math.abs(wv["6M"]! - GIRR_W.by_tenor["6M"]! * -0.2)).toBeLessThanOrEqual(TOL);
     expect(Math.abs(wv["10Y"]! - GIRR_W.by_tenor["10Y"]! * 0.5)).toBeLessThanOrEqual(TOL);
+    // Scalar `weighted_value` is Σ_k WS_k (matches S_b in girr_delta.lua).
+    const expectedScalar = GIRR_W.by_tenor["3M"]! * 0.1
+      + GIRR_W.by_tenor["6M"]! * -0.2
+      + GIRR_W.by_tenor["10Y"]! * 0.5;
+    expect(typeof out.weighted_value).toBe("number");
+    expect(Math.abs((out.weighted_value as number) - expectedScalar)).toBeLessThanOrEqual(TOL);
   });
 
   // Wave 5.83B-fix — Vega/Curvature use identity (1.0×s), not the delta
   // weight table. Mirrors the Lua kernels: girr_vega/equity_vega/fx_vega
   // multiply by a vega weight that is 1.0 in the locked schema, and
   // *_curvature.lua applies no weight at all.
-  it("GIRR Vega per-tenor object → weighted_value passes the bare sensitivity through (identity)", () => {
+  it("GIRR Vega per-tenor object → weighted_value_per_tenor passes the bare sensitivity through (identity)", () => {
     const out = enrichDoc({ risk_class: "GIRR", bucket: "EUR", sensitivity_type: "Vega", risk_value: { "1Y": 0.3 } }, SCHEMA);
-    const wv = out.weighted_value as Record<string, number>;
+    const wv = out.weighted_value_per_tenor as Record<string, number>;
     expect(Math.abs(wv["1Y"]! - 0.3)).toBeLessThanOrEqual(TOL);
     // Sanity: did NOT apply the delta weight (~0.016) which the pre-fix code did.
     expect(wv["1Y"]!).not.toBeCloseTo(GIRR_W.by_tenor["1Y"]! * 0.3, 6);
+    // Scalar `weighted_value` is the signed Σ — single tenor here so equals 0.3.
+    expect(typeof out.weighted_value).toBe("number");
+    expect(Math.abs((out.weighted_value as number) - 0.3)).toBeLessThanOrEqual(TOL);
   });
 
   it("EQUITY Vega scalar {spot} → weighted_value is identity (1.0×s)", () => {
@@ -233,10 +246,16 @@ describe("enrichDoc — Wave 5.83B pre-weighting", () => {
       risk_class: "GIRR", bucket: "USD", sensitivity_type: "Delta",
       tenor: ["3M", "1Y", "10Y"], risk_value: [0.1, 0.2, 0.3],
     }, SCHEMA);
-    const wv = out.weighted_value as Record<string, number>;
+    // Wave 5.83F — per-tenor map at `weighted_value_per_tenor`; scalar Σ at `weighted_value`.
+    const wv = out.weighted_value_per_tenor as Record<string, number>;
     expect(Math.abs(wv["3M"]! - GIRR_W.by_tenor["3M"]! * 0.1)).toBeLessThanOrEqual(TOL);
     expect(Math.abs(wv["1Y"]! - GIRR_W.by_tenor["1Y"]! * 0.2)).toBeLessThanOrEqual(TOL);
     expect(Math.abs(wv["10Y"]! - GIRR_W.by_tenor["10Y"]! * 0.3)).toBeLessThanOrEqual(TOL);
+    const expectedScalar = GIRR_W.by_tenor["3M"]! * 0.1
+      + GIRR_W.by_tenor["1Y"]! * 0.2
+      + GIRR_W.by_tenor["10Y"]! * 0.3;
+    expect(typeof out.weighted_value).toBe("number");
+    expect(Math.abs((out.weighted_value as number) - expectedScalar)).toBeLessThanOrEqual(TOL);
   });
 
   it("EQUITY scalar {spot} → scalar weighted_value via by_bucket", () => {
@@ -256,7 +275,9 @@ describe("enrichDoc — Wave 5.83B pre-weighting", () => {
 
   // Wave 5.83B-fix — Curvature legs are identity. *_curvature.lua applies
   // no schema weight; ψ-gate + max(K_up, K_down) run in the reduce step.
-  it("GIRR Curvature per-tenor arrays → weighted_cvr_up / weighted_cvr_down passthrough (identity)", () => {
+  // Wave 5.83F — per-tenor map at `weighted_cvr_{up,down}_per_tenor`; scalar
+  // Σ at `weighted_cvr_{up,down}`.
+  it("GIRR Curvature per-tenor arrays → weighted_cvr_*_per_tenor passthrough (identity)", () => {
     const tenors = SCHEMA.risk_classes.GIRR!.tenor!.nodes;
     const up = tenors.map((_, i) => 0.1 * (i + 1));
     const down = tenors.map((_, i) => -0.05 * (i + 1));
@@ -264,16 +285,24 @@ describe("enrichDoc — Wave 5.83B pre-weighting", () => {
       risk_class: "GIRR", bucket: "USD", sensitivity_type: "Curvature",
       risk_value: { cvr_up: up, cvr_down: down },
     }, SCHEMA);
-    const wu = out.weighted_cvr_up as Record<string, number>;
-    const wd = out.weighted_cvr_down as Record<string, number>;
+    const wu = out.weighted_cvr_up_per_tenor as Record<string, number>;
+    const wd = out.weighted_cvr_down_per_tenor as Record<string, number>;
     expect(out.weighted_value).toBeUndefined();
+    let upSum = 0;
+    let downSum = 0;
     for (let i = 0; i < tenors.length; i++) {
       const t = tenors[i]!;
       expect(Math.abs(wu[t]! - up[i]!)).toBeLessThanOrEqual(TOL);
       expect(Math.abs(wd[t]! - down[i]!)).toBeLessThanOrEqual(TOL);
+      upSum += up[i]!;
+      downSum += down[i]!;
     }
     // Sanity: the pre-fix code would have multiplied by GIRR_W.by_tenor here.
     expect(wu[tenors[0]!]!).not.toBeCloseTo(GIRR_W.by_tenor[tenors[0]!]! * up[0]!, 6);
+    expect(typeof out.weighted_cvr_up).toBe("number");
+    expect(typeof out.weighted_cvr_down).toBe("number");
+    expect(Math.abs((out.weighted_cvr_up as number) - upSum)).toBeLessThanOrEqual(TOL);
+    expect(Math.abs((out.weighted_cvr_down as number) - downSum)).toBeLessThanOrEqual(TOL);
   });
 
   it("EQUITY Curvature scalars → scalar weighted_cvr_up / weighted_cvr_down passthrough (identity)", () => {
@@ -525,10 +554,16 @@ describe("XREADGROUP consumer → JSON.SET", () => {
 
     const girrStored = JSON.parse(await redis.call("JSON.GET", `sens:{GIRR:USD}:${girr._id}`) as string);
     expect(girrStored._calibration).toBe("demo");
-    const gwv = girrStored.weighted_value as Record<string, number>;
+    // Wave 5.83F — per-tenor map at `weighted_value_per_tenor`; scalar Σ at `weighted_value`.
+    const gwv = girrStored.weighted_value_per_tenor as Record<string, number>;
     expect(Math.abs(gwv["3M"] - GIRR_W.by_tenor["3M"]! * 0.1)).toBeLessThanOrEqual(TOL);
     expect(Math.abs(gwv["1Y"] - GIRR_W.by_tenor["1Y"]! * 0.2)).toBeLessThanOrEqual(TOL);
     expect(Math.abs(gwv["10Y"] - GIRR_W.by_tenor["10Y"]! * 0.3)).toBeLessThanOrEqual(TOL);
+    const expectedScalar = GIRR_W.by_tenor["3M"]! * 0.1
+      + GIRR_W.by_tenor["1Y"]! * 0.2
+      + GIRR_W.by_tenor["10Y"]! * 0.3;
+    expect(typeof girrStored.weighted_value).toBe("number");
+    expect(Math.abs((girrStored.weighted_value as number) - expectedScalar)).toBeLessThanOrEqual(TOL);
     // Raw fields preserved
     expect(girrStored.risk_value).toEqual([0.1, 0.2, 0.3]);
 
@@ -554,10 +589,14 @@ describe("XREADGROUP consumer → JSON.SET", () => {
     for (const { key, doc } of seeds) {
       await redis.call("JSON.SET", key, "$", JSON.stringify(doc));
     }
-    // Also seed one already-enriched doc so we exercise the skip path.
+    // Also seed one already-enriched doc (new Wave-5.83F shape) so we
+    // exercise the skip path: scalar Σ at `weighted_value`, per-tenor map at
+    // `weighted_value_per_tenor`.
     await redis.call("JSON.SET", "sens:{GIRR:USD}:bf04", "$", JSON.stringify({
       risk_class: "GIRR", bucket: "USD", sensitivity_type: "Delta",
-      risk_value: { "3M": 0.5 }, weighted_value: { "3M": GIRR_W.by_tenor["3M"]! * 0.5 },
+      risk_value: { "3M": 0.5 },
+      weighted_value: GIRR_W.by_tenor["3M"]! * 0.5,
+      weighted_value_per_tenor: { "3M": GIRR_W.by_tenor["3M"]! * 0.5 },
       _calibration: "demo",
     }));
 
@@ -569,7 +608,12 @@ describe("XREADGROUP consumer → JSON.SET", () => {
     // Verify the patches landed and raw fields preserved.
     const girrAfter = JSON.parse(await redis.call("JSON.GET", "sens:{GIRR:USD}:bf01") as string);
     expect(girrAfter._calibration).toBe("demo");
-    expect(Math.abs((girrAfter.weighted_value as Record<string, number>)["3M"]! - GIRR_W.by_tenor["3M"]! * 0.1)).toBeLessThanOrEqual(TOL);
+    const girrAfterMap = girrAfter.weighted_value_per_tenor as Record<string, number>;
+    expect(Math.abs(girrAfterMap["3M"]! - GIRR_W.by_tenor["3M"]! * 0.1)).toBeLessThanOrEqual(TOL);
+    expect(Math.abs(girrAfterMap["6M"]! - GIRR_W.by_tenor["6M"]! * 0.2)).toBeLessThanOrEqual(TOL);
+    const girrAfterSum = GIRR_W.by_tenor["3M"]! * 0.1 + GIRR_W.by_tenor["6M"]! * 0.2;
+    expect(typeof girrAfter.weighted_value).toBe("number");
+    expect(Math.abs((girrAfter.weighted_value as number) - girrAfterSum)).toBeLessThanOrEqual(TOL);
     expect(girrAfter.risk_value).toEqual({ "3M": 0.1, "6M": 0.2 });
     // Wave 5.83B-fix — Curvature legs are identity, not FX_W-weighted.
     const fxAfter = JSON.parse(await redis.call("JSON.GET", "sens:{FX:EURUSD}:bf03") as string);
@@ -585,14 +629,17 @@ describe("XREADGROUP consumer → JSON.SET", () => {
 
   // Wave 5.83B-fix — force mode re-weights every doc so docs ingested under
   // the old (delta-weight-for-all-legs) rule get corrected on next run.
+  // Wave 5.83F — stale doc uses the new shape (scalar `weighted_value` +
+  // `weighted_value_per_tenor` map) but with the WRONG values; default mode
+  // still skips it (shape matches), force mode recomputes both fields.
   integration("backfill --force re-runs enrichDoc on already-tagged docs", async () => {
-    // Seed a Vega doc that's already _calibration='demo' but carries the
-    // WRONG (pre-fix) weighted_value — multiplied by the delta weight.
     const staleKey = "sens:{GIRR:USD}:bfforce01";
+    const wrongWs = GIRR_W.by_tenor["1Y"]! * 0.3;  // pre-fix WRONG identity-violating value
     const stale = {
       risk_class: "GIRR", bucket: "USD", sensitivity_type: "Vega",
       risk_value: { "1Y": 0.3 },
-      weighted_value: { "1Y": GIRR_W.by_tenor["1Y"]! * 0.3 },  // pre-fix WRONG value
+      weighted_value: wrongWs,
+      weighted_value_per_tenor: { "1Y": wrongWs },
       _calibration: "demo",
     };
     await redis.call("JSON.SET", staleKey, "$", JSON.stringify(stale));
@@ -602,14 +649,15 @@ describe("XREADGROUP consumer → JSON.SET", () => {
     expect(noForce.patched).toBe(0);
     expect(noForce.skipped).toBe(1);
     const stillStale = JSON.parse(await redis.call("JSON.GET", staleKey) as string);
-    expect(stillStale.weighted_value["1Y"]).toBeCloseTo(GIRR_W.by_tenor["1Y"]! * 0.3, 12);
+    expect(stillStale.weighted_value_per_tenor["1Y"]).toBeCloseTo(wrongWs, 12);
 
     // Force mode re-weights it to the identity value (1.0×s).
     const forced = await backfill(redis, SCHEMA, { force: true });
     expect(forced.patched).toBe(1);
     expect(forced.skipped).toBe(0);
     const corrected = JSON.parse(await redis.call("JSON.GET", staleKey) as string);
-    expect(corrected.weighted_value["1Y"]).toBeCloseTo(0.3, 12);
+    expect(corrected.weighted_value_per_tenor["1Y"]).toBeCloseTo(0.3, 12);
+    expect(corrected.weighted_value).toBeCloseTo(0.3, 12);
     // Raw risk_value untouched.
     expect(corrected.risk_value).toEqual({ "1Y": 0.3 });
   });

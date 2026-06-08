@@ -43,18 +43,24 @@ export const IDX_SCHEMA_FIELDS = Object.freeze([
 ]);
 
 // Wave 5.83A — risk classes whose pre-weighted sensitivities live under a
-// per-tenor object (e.g. `weighted_value["3M"]`). Other classes (Equity, FX)
-// emit scalar `weighted_value` / `weighted_cvr_*` and get a single ws_* alias
-// per leg with no tenor suffix.
+// per-tenor object (e.g. `weighted_value_per_tenor["3M"]`). Other classes
+// (Equity, FX) emit scalar `weighted_value` / `weighted_cvr_*` and get a
+// single ws_* alias per leg with no tenor suffix.
 const PER_TENOR_CLASSES = Object.freeze(["GIRR"]);
-// Legs and their JSON root path. `delta` and `vega` share `$.weighted_value`
-// (sensitivity_type discriminates at query time); curvature splits into two
-// per-direction paths.
+// Legs, their scalar JSON root path, and the per-tenor JSON root path.
+// `delta` and `vega` share `$.weighted_value` (sensitivity_type discriminates
+// at query time); curvature splits into two per-direction paths.
+//
+// Wave 5.83F — per-tenor classes (GIRR) write their per-tenor maps to a
+// distinct `*_per_tenor` JSONPath so `$.weighted_value` (and the curvature
+// pair) can stay SCALAR across every class. That removes the GIRR-vs-
+// Equity/FX type collision that aborted idx:sens indexing on the GIRR
+// prefix-matched docs.
 const WS_LEGS = Object.freeze([
-  { leg: "delta", root: "weighted_value" },
-  { leg: "vega", root: "weighted_value" },
-  { leg: "cvr_up", root: "weighted_cvr_up" },
-  { leg: "cvr_down", root: "weighted_cvr_down" },
+  { leg: "delta", root: "weighted_value", perTenorRoot: "weighted_value_per_tenor" },
+  { leg: "vega", root: "weighted_value", perTenorRoot: "weighted_value_per_tenor" },
+  { leg: "cvr_up", root: "weighted_cvr_up", perTenorRoot: "weighted_cvr_up_per_tenor" },
+  { leg: "cvr_down", root: "weighted_cvr_down", perTenorRoot: "weighted_cvr_down_per_tenor" },
 ]);
 
 // Bracket-notation JSON path so digit-prefixed tenor labels ("3M", "10Y") are
@@ -79,11 +85,14 @@ export function buildSchemaFields(schema) {
     const classLower = className.toLowerCase();
     const tenorNodes = cfg.tenor && Array.isArray(cfg.tenor.nodes) ? cfg.tenor.nodes : [];
     const isPerTenor = PER_TENOR_CLASSES.includes(className) && tenorNodes.length > 0;
-    for (const { leg, root } of WS_LEGS) {
+    for (const { leg, root, perTenorRoot } of WS_LEGS) {
       if (isPerTenor) {
+        // Wave 5.83F — per-tenor leg now points at the dedicated
+        // `*_per_tenor` JSONPath; the scalar `$.<root>` stays free for the
+        // class-level NUMERIC field (used by Equity/FX) without colliding.
         for (const tenor of tenorNodes) {
           out.push({
-            path: tenorJsonPath(root, tenor),
+            path: tenorJsonPath(perTenorRoot, tenor),
             as: `ws_${classLower}_${leg}_${tenor}`,
             type: "NUMERIC",
             sortable: true,

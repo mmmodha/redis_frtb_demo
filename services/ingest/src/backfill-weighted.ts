@@ -33,13 +33,25 @@ export interface BackfillReport { patched: number; skipped: number; errors: numb
 // when the `_calibration` tag is missing/wrong. Curvature → weighted_cvr_*;
 // Delta/Vega → weighted_value. Docs with unknown sensitivity_type still get
 // the `_calibration` tag stamped.
+//
+// Wave 5.83F — also flag the old GIRR shape (where `weighted_value` /
+// `weighted_cvr_*` held an Object) for re-patching: post-fix the bare
+// `$.weighted_value` and `$.weighted_cvr_*` paths must be scalar numbers,
+// with the per-tenor maps living at `*_per_tenor`. An Object at the bare
+// path is the pre-Wave-5.83F shape that broke idx:sens indexing.
 function needsPatch(doc: Record<string, unknown>): boolean {
   if (doc._calibration !== CALIBRATION_TAG) return true;
   const sensType = typeof doc.sensitivity_type === "string" ? doc.sensitivity_type : "";
   if (sensType === "Curvature") {
-    return doc.weighted_cvr_up === undefined || doc.weighted_cvr_down === undefined;
+    if (doc.weighted_cvr_up === undefined || doc.weighted_cvr_down === undefined) return true;
+    // Old per-tenor GIRR shape: scalar paths held Objects → re-enrich.
+    if (typeof doc.weighted_cvr_up === "object") return true;
+    if (typeof doc.weighted_cvr_down === "object") return true;
+    return false;
   }
-  return doc.weighted_value === undefined;
+  if (doc.weighted_value === undefined) return true;
+  if (typeof doc.weighted_value === "object") return true;
+  return false;
 }
 
 export async function backfill(

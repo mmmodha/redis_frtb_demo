@@ -190,11 +190,14 @@ describe("@frtb/rqe — buildSchemaFields / buildCreateArgs (Wave 5.83A)", () =>
         expect(byAlias[alias].sortable).toBe(true);
       }
     }
-    // delta + vega share $.weighted_value[...]; curvature splits per direction.
-    expect(byAlias.ws_girr_delta_3M.path).toBe('$.weighted_value["3M"]');
-    expect(byAlias.ws_girr_vega_10Y.path).toBe('$.weighted_value["10Y"]');
-    expect(byAlias.ws_girr_cvr_up_2Y.path).toBe('$.weighted_cvr_up["2Y"]');
-    expect(byAlias.ws_girr_cvr_down_30Y.path).toBe('$.weighted_cvr_down["30Y"]');
+    // Wave 5.83F — per-tenor maps now live at the `*_per_tenor` JSONPaths so
+    // the bare $.weighted_value / $.weighted_cvr_* paths can stay scalar
+    // (NUMERIC) across every risk class without colliding with the GIRR
+    // Object value (which used to abort idx:sens indexing).
+    expect(byAlias.ws_girr_delta_3M.path).toBe('$.weighted_value_per_tenor["3M"]');
+    expect(byAlias.ws_girr_vega_10Y.path).toBe('$.weighted_value_per_tenor["10Y"]');
+    expect(byAlias.ws_girr_cvr_up_2Y.path).toBe('$.weighted_cvr_up_per_tenor["2Y"]');
+    expect(byAlias.ws_girr_cvr_down_30Y.path).toBe('$.weighted_cvr_down_per_tenor["30Y"]');
   });
 
   it("emits scalar ws_<class>_<leg> NUMERIC SORTABLE for Equity/FX (no tenor suffix)", () => {

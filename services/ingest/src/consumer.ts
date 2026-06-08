@@ -108,17 +108,32 @@ function legWeight(
 // field, so a downstream FT.AGGREGATE SUM over `ws_*` matches the per-row
 // `w · s` accumulation the Lua kernels do (with w=1.0).
 //
+// Wave 5.83F — per-tenor classes (GIRR) now emit per-tenor data at a
+// distinct JSONPath and keep `$.weighted_value` / `$.weighted_cvr_*` as
+// SCALAR signed sums (Σ over tenors). This unblocks idx:sens: the NUMERIC
+// field declarations on `$.weighted_value` (and `$.weighted_cvr_*`) used
+// by Equity/FX no longer collide with an Object value on GIRR docs, so
+// RediSearch stops aborting indexing on the GIRR PREFIX-matched rows.
+//   - GIRR Delta/Vega per-tenor object → scalar at `$.weighted_value`
+//     (Σ_t w_t * s_t) and the per-tenor map at `$.weighted_value_per_tenor`.
+//   - GIRR Curvature per-tenor arrays → scalar at `$.weighted_cvr_{up,down}`
+//     and the per-tenor map at `$.weighted_cvr_{up,down}_per_tenor`.
+// Equity / FX scalar shapes are unchanged.
+//
 // Shapes (see shared/schema/src/types.ts `SensitivityRiskValue`):
 //   - Delta/Vega per-tenor object `{ "3M": v0, "6M": v1, ... }` → produces
-//     `weighted_value: { "3M": w_k*v0, "6M": w_k*v1, ... }` (per-tenor object).
+//     `weighted_value_per_tenor: { "3M": w_k*v0, ... }` AND scalar
+//     `weighted_value = Σ_k w_k*v0` (signed sum, matches S_b in girr_delta.lua).
 //   - Delta/Vega scalar `{ spot: v }` or bare `number` → produces a scalar
 //     `weighted_value = w * v` (Equity / FX convention).
 //   - Delta/Vega legacy array `[v0, v1, ...]` (test fixtures) → zipped against
 //     `doc.tenor` (when an array of labels) or the schema's class tenor nodes;
-//     produces a per-tenor object. Skipped silently if no tenor labels.
+//     produces a per-tenor map at `weighted_value_per_tenor` + scalar
+//     `weighted_value`. Skipped silently if no tenor labels.
 //   - Curvature per-tenor `{ cvr_up: number[], cvr_down: number[] }` → emits
-//     `weighted_cvr_up` / `weighted_cvr_down` as per-tenor objects keyed by
-//     the schema's class tenor nodes.
+//     per-tenor maps at `weighted_cvr_{up,down}_per_tenor` + scalar
+//     `weighted_cvr_{up,down}` (signed sums), keyed by the schema's class
+//     tenor nodes.
 //   - Curvature scalar `{ cvr_up: number, cvr_down: number }` (Equity / FX) →
 //     emits scalar `weighted_cvr_up` / `weighted_cvr_down`.
 //
@@ -146,19 +161,30 @@ export function enrichDoc(
   if (sensType === "Curvature" && rv != null && typeof rv === "object" && !Array.isArray(rv)) {
     const cvrObj = rv as { cvr_up?: unknown; cvr_down?: unknown };
     if (Array.isArray(cvrObj.cvr_up) && Array.isArray(cvrObj.cvr_down) && tenorNodes) {
+      // Wave 5.83F — per-tenor classes (GIRR): per-tenor maps move to
+      // `_per_tenor` paths; scalar `weighted_cvr_{up,down}` carry signed
+      // Σ_t WS_t so the NUMERIC index field stays scalar across all classes.
       const up = cvrObj.cvr_up as number[];
       const down = cvrObj.cvr_down as number[];
       const upOut: Record<string, number> = {};
       const downOut: Record<string, number> = {};
+      let upSum = 0;
+      let downSum = 0;
       const n = Math.min(up.length, down.length, tenorNodes.length);
       for (let i = 0; i < n; i++) {
         const t = tenorNodes[i]!;
         const w = legWeight(sensType, table, bucket, t);
-        upOut[t] = w * up[i]!;
-        downOut[t] = w * down[i]!;
+        const u = w * up[i]!;
+        const d = w * down[i]!;
+        upOut[t] = u;
+        downOut[t] = d;
+        upSum += u;
+        downSum += d;
       }
-      enriched.weighted_cvr_up = upOut;
-      enriched.weighted_cvr_down = downOut;
+      enriched.weighted_cvr_up_per_tenor = upOut;
+      enriched.weighted_cvr_down_per_tenor = downOut;
+      enriched.weighted_cvr_up = upSum;
+      enriched.weighted_cvr_down = downSum;
     } else if (typeof cvrObj.cvr_up === "number" && typeof cvrObj.cvr_down === "number") {
       const w = legWeight(sensType, table, bucket, null);
       enriched.weighted_cvr_up = w * cvrObj.cvr_up;
@@ -177,15 +203,21 @@ export function enrichDoc(
       const w = legWeight(sensType, table, bucket, null);
       enriched.weighted_value = w * obj.spot;
     } else {
-      // Per-tenor object: keys are tenor labels.
+      // Wave 5.83F — per-tenor object (GIRR): per-tenor map lives at
+      // `weighted_value_per_tenor`; scalar `weighted_value` carries the
+      // signed Σ_k WS_k so the NUMERIC index field stays scalar.
       const out: Record<string, number> = {};
+      let sum = 0;
       for (const k of keys) {
         const v = obj[k];
         if (typeof v !== "number") continue;
         const w = legWeight(sensType, table, bucket, k);
-        out[k] = w * v;
+        const ws = w * v;
+        out[k] = ws;
+        sum += ws;
       }
-      enriched.weighted_value = out;
+      enriched.weighted_value_per_tenor = out;
+      enriched.weighted_value = sum;
     }
   } else if (Array.isArray(rv)) {
     // Legacy array shape (test fixtures): zip against doc.tenor when it's
@@ -195,16 +227,21 @@ export function enrichDoc(
       ? (docTenor as string[])
       : tenorNodes;
     if (labels) {
+      // Wave 5.83F — same per-tenor split as the object branch above.
       const out: Record<string, number> = {};
+      let sum = 0;
       const n = Math.min(rv.length, labels.length);
       for (let i = 0; i < n; i++) {
         const v = rv[i];
         if (typeof v !== "number") continue;
         const t = labels[i]!;
         const w = legWeight(sensType, table, bucket, t);
-        out[t] = w * v;
+        const ws = w * v;
+        out[t] = ws;
+        sum += ws;
       }
-      enriched.weighted_value = out;
+      enriched.weighted_value_per_tenor = out;
+      enriched.weighted_value = sum;
     }
   } else if (typeof rv === "number") {
     // Bare scalar (Equity / FX legacy fixture shape).

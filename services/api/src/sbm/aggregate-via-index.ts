@@ -44,11 +44,15 @@ function escapeTag(v: string): string {
   return v.replace(TAG_SPECIALS, (m) => `\\${m}`);
 }
 
-// Per-tenor classes — GIRR ships its weighted_value / weighted_cvr_* as an
-// object keyed by tenor labels, so the index has one numeric field per tenor
-// (`ws_girr_<leg>_<tenor>`). Equity / FX emit scalar `weighted_value` and
-// `weighted_cvr_*`, so the index has a single field per leg (`ws_<class>_<leg>`).
-// Keep this in lock-step with shared/rqe/src/index.mjs PER_TENOR_CLASSES.
+// Per-tenor classes — GIRR ships its per-tenor weighted maps under the
+// `*_per_tenor` JSONPaths (e.g. `$.weighted_value_per_tenor["3M"]`), so the
+// index has one numeric field per tenor (`ws_girr_<leg>_<tenor>`). The bare
+// `$.weighted_value` / `$.weighted_cvr_*` paths stay scalar on every class
+// (Wave 5.83F — moved to a distinct path to stop the GIRR Object value from
+// aborting indexing on the Equity/FX scalar NUMERIC declarations). Equity /
+// FX emit scalar `weighted_value` and `weighted_cvr_*` and get a single
+// field per leg (`ws_<class>_<leg>`). Keep this in lock-step with
+// shared/rqe/src/index.mjs PER_TENOR_CLASSES.
 const PER_TENOR_CLASSES = new Set(["GIRR"]);
 
 interface LegFields {
