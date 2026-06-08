@@ -73,7 +73,11 @@ export function buildFrtbSnippets(schema: Schema): FrtbLibrarySnippet[] {
     buildGirrVegaSnippet({ weight: girrVegaW.constant, rho: girrVegaRho.value, tenors: tenorNodes }),
     buildEquityDeltaSnippet({ weights: equityW.by_bucket, rho: equityRho.value }),
     buildEquityVegaSnippet({ weight: 1.0, rho: equityRho.value }),
-    buildFxDeltaSnippet({ weight: fxW.constant }),
+    // Wave 5.83G — pass ρ through so the Lua kernel matches the schema's
+    // intra-bucket correlation (fx_rho). Without it the snippet defaults ρ
+    // to 0, reducing K_b to √Σws² and diverging from the FT.AGGREGATE fast
+    // path which reads fx_rho via resolveRho().
+    buildFxDeltaSnippet({ weight: fxW.constant, rho: fxRho.value }),
     buildFxVegaSnippet({ weight: 1.0 }),
     buildGirrCurvatureSnippet({ tenors: tenorNodes.length, rho: girrRho.value * girrRho.value }),
     buildEquityCurvatureSnippet({ rho: equityRho.value * equityRho.value }),

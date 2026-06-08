@@ -78,6 +78,29 @@ describe("bootstrap — buildFrtbSnippets", () => {
     // entries (regression) and duplicates.
     expect(new Set(snippets.map((snip) => snip.name))).toEqual(new Set(EXPECTED_SNIPPET_NAMES));
   });
+
+  // Wave 5.83G — fx_delta snippet must substitute the schema's fx_rho into
+  // __FX_DELTA_RHO__. The buildFxDeltaSnippet default of 0 silently mis-wires
+  // the Lua kernel to K_b = √Σws² (single-factor specialisation) while the
+  // FT.AGGREGATE fast path uses fx_rho=0.60 via resolveRho — the source of
+  // the 5.83E divergence (3.869 vs 2.370 on the live 20k FX corpus).
+  it("fx_delta snippet substitutes schema fx_rho (not 0) into __FX_DELTA_RHO__", () => {
+    const schema = loadSchema(SCHEMA_PATH);
+    const snippets = buildFrtbSnippets(schema);
+    const fx = snippets.find((s) => s.name === "fx_delta");
+    expect(fx).toBeDefined();
+    const fxRhoSpec = schema.correlations.fx_rho;
+    expect(fxRhoSpec?.kind).toBe("constant");
+    const fxRho = (fxRhoSpec as { kind: "constant"; value: number }).value;
+    expect(fxRho).toBeGreaterThan(0);
+    // The substitution token must be gone and the rho assignment must carry
+    // the schema literal. Match `local rho = <number>` so a stray 0 default
+    // fails the assertion loudly.
+    expect(fx!.code).not.toContain("__FX_DELTA_RHO__");
+    const rhoMatch = fx!.code.match(/local\s+rho\s*=\s*([0-9eE+\-.]+)/);
+    expect(rhoMatch, "fx_delta snippet must contain `local rho = <number>`").toBeTruthy();
+    expect(Number(rhoMatch![1])).toBeCloseTo(fxRho, 12);
+  });
 });
 
 describe("bootstrap — resolveMasterNodes", () => {

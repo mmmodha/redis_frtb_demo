@@ -49,7 +49,11 @@ function diffSchema() {
         cross_bucket_correlation_ref: "equity_gamma",
       },
       FX: {
-        dimensions: [], buckets: { naming: "fx_pair_bucket", values: ["EURUSD"] },
+        dimensions: [],
+        // Wave 5.83G — multi-bucket FX so the differential matrix can
+        // exercise the bucket-discovery → per-bucket reduce path the live
+        // 20k-doc divergence was hiding in.
+        buckets: { naming: "fx_pair_bucket", values: ["EURUSD", "GBPUSD", "USDJPY"] },
         risk_weights_ref: "fx_weights",
         intra_bucket_correlation_ref: "fx_rho",
         cross_bucket_correlation_ref: "fx_gamma",
@@ -64,7 +68,13 @@ function diffSchema() {
       girr_rho_kl: { kind: "constant", value: 0.4 },
       girr_vega_rho_kl: { kind: "constant", value: 0.3 },
       equity_rho: { kind: "constant", value: 0.5 },
-      fx_rho: { kind: "constant", value: 0 },
+      // Wave 5.83G — fx_rho lifted from 0 to 0.6 (Basel MAR21.88 default).
+      // The previous 0 masked the bootstrap mis-wiring that defaulted the
+      // Lua kernel's __FX_DELTA_RHO__ to 0 while the fast path used 0.6
+      // via resolveRho — the source of the live 20k FX Delta divergence
+      // (3.869259 vs 2.370157).
+      fx_rho: { kind: "constant", value: 0.6 },
+      fx_gamma: { kind: "constant", value: 0.6 },
     },
   } as unknown as Parameters<typeof createServer>[0]["schema"];
 }
@@ -474,6 +484,109 @@ describe("Wave 5.83D-1 — Lua ⇄ FT.AGGREGATE differential parity (9 variants)
       luaFcallReply: lua,
       fastAggregateRow: fastFields,
     });
+  });
+
+  // ---- Wave 5.83G — multi-bucket FX Delta (ρ_fx = 0.6) ----
+  // The single-bucket FX Delta variant above used ρ=0, which collapsed
+  // K_b to √Σws² and masked the 5.83E live-corpus divergence (the Lua
+  // kernel was being loaded with __FX_DELTA_RHO__=0 because bootstrap.ts
+  // omitted `rho: fxRho.value` when calling buildFxDeltaSnippet). This
+  // case spans three FX pairs with mixed signs so the closed-form cross
+  // term Σ ws² − (Σ ws)² is non-trivial and the reduce step rolls three
+  // buckets up into a single risk-class charge — exactly the live shape.
+  it("FX Delta — multi-bucket parity with ρ_fx = 0.6 (Wave 5.83G regression)", async () => {
+    const schema = diffSchema() as any;
+    const w = schema.risk_weights.fx_weights.constant;
+    const rho = schema.correlations.fx_rho.value;
+    expect(rho).toBe(0.6);
+    // Three FX pairs, mixed-sign spots so Σ ws and Σ ws² diverge meaningfully.
+    const bucketSpots: Record<string, number[]> = {
+      EURUSD: [0.50, -0.30, 0.20, 0.45, -0.10],
+      GBPUSD: [-0.40, 0.25, -0.15, 0.05, 0.30],
+      USDJPY: [0.60, 0.10, -0.35, -0.20, 0.15],
+    };
+    const buckets = Object.keys(bucketSpots);
+    // Per-bucket Lua + Fast aggregates derived from the same raw spots.
+    const perBucket = buckets.map((b) => {
+      const spots = bucketSpots[b]!;
+      let sumWs = 0, sumWsSq = 0;
+      for (const s of spots) { const ws = w * s; sumWs += ws; sumWsSq += ws * ws; }
+      return { bucket: b, sumWs, sumWsSq, count: spots.length, K_b: kbConstantRho(sumWs, sumWsSq, rho) };
+    });
+
+    const savedFlag = process.env.CALC_FAST_PATH;
+    try {
+      // --- Lua path ---
+      process.env.CALC_FAST_PATH = "0";
+      __resetCalcCacheForTests();
+      const luaFr = fakeRedis();
+      luaFr.setResponse("FT.AGGREGATE", ftDiscoverReply(buckets));
+      luaFr.setResponse("FCALL", (args: unknown[]) => {
+        // FCALL fx_delta 1 <routeKey> <risk_class> <bucket> ...
+        const b = String(args[4]);
+        const r = perBucket.find((p) => p.bucket === b)!;
+        return JSON.stringify({ K_b: r.K_b, S_b: r.sumWs, count: r.count, ms: 0 });
+      });
+      const luaApp = await createServer({ redis: luaFr, schema });
+      const luaRes = await luaApp.inject({
+        method: "POST", url: "/calc/sbm",
+        payload: { risk_class: "FX", sensitivity_type: "Delta" },
+      });
+      expect(luaRes.statusCode).toBe(200);
+      const lua = luaRes.json();
+      expect(lua.engine).toBe("fcall_lua");
+      await luaApp.close();
+
+      // --- Fast path ---
+      process.env.CALC_FAST_PATH = "1";
+      __resetCalcCacheForTests();
+      const fastFr: FakeRedis = fakeRedis();
+      fastFr.setResponse("FT.AGGREGATE", (args: unknown[]) => {
+        if (!args.includes("APPLY")) return ftDiscoverReply(buckets);
+        const rows: unknown[] = [perBucket.length];
+        for (const p of perBucket) {
+          rows.push(ftAggRow(p.bucket, {
+            sum_d_ws_fx_delta: p.sumWs,
+            sum_d_ws_fx_delta_sq: p.sumWsSq,
+            row_count: p.count,
+          }));
+        }
+        return rows;
+      });
+      const fastApp = await createServer({ redis: fastFr, schema });
+      const fastRes = await fastApp.inject({
+        method: "POST", url: "/calc/sbm",
+        payload: { risk_class: "FX", sensitivity_type: "Delta" },
+      });
+      expect(fastRes.statusCode).toBe(200);
+      const fast = fastRes.json();
+      expect(fast.engine).toBe("ft_aggregate");
+      await fastApp.close();
+
+      // Per-bucket parity gate across all three FX pairs.
+      expect(lua.per_bucket).toHaveLength(buckets.length);
+      expect(fast.per_bucket).toHaveLength(buckets.length);
+      const byBucketLua = new Map<string, any>(lua.per_bucket.map((r: any) => [r.bucket, r]));
+      const byBucketFast = new Map<string, any>(fast.per_bucket.map((r: any) => [r.bucket, r]));
+      for (const p of perBucket) {
+        const L = byBucketLua.get(p.bucket);
+        const F = byBucketFast.get(p.bucket);
+        expect(L, `lua per_bucket missing ${p.bucket}`).toBeDefined();
+        expect(F, `fast per_bucket missing ${p.bucket}`).toBeDefined();
+        expect(Math.abs(L.K_b - F.K_b)).toBeLessThanOrEqual(1e-9);
+        expect(Math.abs(L.S_b - F.S_b)).toBeLessThanOrEqual(1e-9);
+        expect(L.count).toBe(F.count);
+        // Each per-bucket K_b must match the closed form computed with
+        // the schema's fx_rho — this is the bit that would fail if either
+        // path silently used ρ=0.
+        expect(Math.abs(L.K_b - p.K_b)).toBeLessThanOrEqual(1e-9);
+      }
+      // Risk-class roll-up parity across both paths.
+      expect(Math.abs(lua.charge - fast.charge)).toBeLessThanOrEqual(1e-9);
+    } finally {
+      if (savedFlag === undefined) delete process.env.CALC_FAST_PATH;
+      else process.env.CALC_FAST_PATH = savedFlag;
+    }
   });
 });
 
