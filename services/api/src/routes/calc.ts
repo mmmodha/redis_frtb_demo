@@ -12,6 +12,12 @@ import {
   type CorrelationRegime,
   type CorrelationSpec,
 } from "../sbm/reduce.ts";
+import {
+  calcCacheKey,
+  getDataVersion,
+  lookupCalcCache,
+  storeCalcCache,
+} from "../sbm/calc-cache.ts";
 
 interface CalcBody {
   risk_class?: string;
@@ -333,6 +339,29 @@ export function registerCalcRoute(
 
     const t0 = process.hrtime.bigint();
 
+    // Wave 5.83C-2 — short-TTL response cache lookup. Key combines the
+    // normalised request body (post-validation, post-uppercase, post-dedup)
+    // with a data-version stamp INCR'd on every /admin/flush. A hit returns
+    // the cached body verbatim with cache:"hit" + cached_at_iso markers;
+    // miss falls through to the FT.AGGREGATE + FCALL fan-out below.
+    const cacheBody = {
+      risk_class,
+      sensitivity_type: leg,
+      bucket_subset: [...bucket_subset].sort(),
+      correlation_regime: regime,
+      exclude: excludeCsv,
+    };
+    const dataVersion = await getDataVersion(redis);
+    const cacheKey = calcCacheKey(cacheBody, dataVersion);
+    const hit = lookupCalcCache(cacheKey);
+    if (hit) {
+      return {
+        ...(hit.value as Record<string, unknown>),
+        cache: "hit" as const,
+        cached_at_iso: hit.cachedAtIso,
+      };
+    }
+
     // Wave 5.31a: build the discovery query string ONCE so the FT.AGGREGATE
     // call and the observability `commands.discovery.query` mirror agree by
     // construction. When a subset is supplied, push the @bucket TAG predicate
@@ -548,7 +577,7 @@ export function registerCalcRoute(
         : `No sensitivities on '${target_label}' — ingest data to run calculations.`
       : undefined;
 
-    return {
+    const body = {
       charge,
       per_bucket: results,
       total_ms: Math.round(total_ms * 1000) / 1000,
@@ -562,5 +591,10 @@ export function registerCalcRoute(
       ...(curvatureBranch !== undefined ? { curvature_branch: curvatureBranch } : {}),
       ...(note ? { ok: true, note } : {}),
     };
+    // Wave 5.83C-2 — cache the successful response body so repeat requests
+    // with the same canonicalised inputs short-circuit above. The cache:"miss"
+    // marker on the wire mirrors the cache:"hit" marker added on lookup.
+    storeCalcCache(cacheKey, body);
+    return { ...body, cache: "miss" as const };
   });
 }

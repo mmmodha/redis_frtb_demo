@@ -19,6 +19,7 @@ import {
   resetActiveTarget,
   type ActiveTarget,
 } from "../src/active-target.ts";
+import { __resetCalcCacheForTests } from "../src/sbm/calc-cache.ts";
 
 function ftAggregateReply(buckets: string[]): unknown[] {
   const out: unknown[] = [buckets.length];
@@ -39,6 +40,7 @@ describe("Wave 5.16t — api routes follow active-target per-request", () => {
   beforeEach(() => {
     resetActiveTarget();
     resetBootstrapStatusForTests();
+    __resetCalcCacheForTests();
     delete process.env.REDIS_URL;
   });
 
@@ -89,10 +91,13 @@ describe("Wave 5.16t — api routes follow active-target per-request", () => {
     expect(fr2.calls.filter((c) => c.command === "FCALL")).toHaveLength(0);
 
     current = fr2;
+    // Wave 5.83C-2 — vary sensitivity_type so the response cache miss path
+    // exercises the swapped `current` redis. With identical body this call
+    // would hit the in-process cache from r1 and never consult fr2.
     const r2 = await app.inject({
       method: "POST",
       url: "/calc/sbm",
-      payload: { risk_class: "GIRR", sensitivity_type: "Delta" },
+      payload: { risk_class: "GIRR", sensitivity_type: "Vega" },
     });
     expect(r2.statusCode).toBe(200);
     expect(fr2.calls.filter((c) => c.command === "FCALL")).toHaveLength(1);

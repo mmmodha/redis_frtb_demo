@@ -27,6 +27,7 @@ import {
   type RedisLike as BootstrapRedis,
 } from "../bootstrap.ts";
 import { translateRedisError } from "../redis-errors.ts";
+import { bumpDataVersion } from "../sbm/calc-cache.ts";
 
 export interface AdminRoutesOpts {
   // Threaded through from createServer so the post-flush bootstrap can rebuild
@@ -70,6 +71,11 @@ export function registerAdminRoutes(
       throw err;
     }
     const ms = Math.round(Number(process.hrtime.bigint() - t0) / 1e6);
+
+    // Wave 5.83C-2 — bump the /calc/sbm response-cache data version so the
+    // freshly-wiped target serves a cache miss on the next Calculate call.
+    // Best-effort: a failed INCR still invalidates the in-process map.
+    await bumpDataVersion(redis);
 
     let bootstrap: { ok: boolean; error?: string };
     if (!opts.schema) {

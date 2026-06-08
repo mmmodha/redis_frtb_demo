@@ -1,6 +1,7 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, beforeEach } from "vitest";
 import { createServer } from "../src/server.ts";
 import { fakeRedis } from "./helpers/fake-redis.ts";
+import { __resetCalcCacheForTests } from "../src/sbm/calc-cache.ts";
 
 // FT.AGGREGATE reply for GROUPBY @bucket → returns ["total", "@bucket", "USD-IRS", "@bucket", "EUR-IRS", ...]
 // Per Redis docs, FT.AGGREGATE returns [total, ...replies]
@@ -12,6 +13,12 @@ function ftAggregateReply(buckets: string[]) {
 
 describe("POST /calc/sbm — MVP endpoint", () => {
   let app: Awaited<ReturnType<typeof createServer>>;
+  beforeEach(() => {
+    // Wave 5.83C-2 — the route now caches successful response bodies for 30 s
+    // keyed by body+data_version. Tests share the default identity, so reset
+    // module-global cache state between cases to avoid cross-test bleed.
+    __resetCalcCacheForTests();
+  });
   afterEach(async () => {
     if (app) await app.close();
   });
