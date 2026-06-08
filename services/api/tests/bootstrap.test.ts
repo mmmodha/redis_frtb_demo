@@ -101,6 +101,26 @@ describe("bootstrap — buildFrtbSnippets", () => {
     expect(rhoMatch, "fx_delta snippet must contain `local rho = <number>`").toBeTruthy();
     expect(Number(rhoMatch![1])).toBeCloseTo(fxRho, 12);
   });
+
+  // Wave 5.83J2 — same wiring rule as fx_delta above, applied to fx_vega.
+  // resolveRho() returns fx_rho for FX Vega (no separate fx_vega_rho spec),
+  // so the Lua kernel must carry the schema literal too — otherwise K_b
+  // collapses to √Σws² and the live 200k parity sweep diverges (8.6% gap
+  // observed in 5.83I before this fix landed alongside the 5.83G Delta wire).
+  it("fx_vega snippet substitutes schema fx_rho (not 0) into __FX_VEGA_RHO__", () => {
+    const schema = loadSchema(SCHEMA_PATH);
+    const snippets = buildFrtbSnippets(schema);
+    const fx = snippets.find((s) => s.name === "fx_vega");
+    expect(fx).toBeDefined();
+    const fxRhoSpec = schema.correlations.fx_rho;
+    expect(fxRhoSpec?.kind).toBe("constant");
+    const fxRho = (fxRhoSpec as { kind: "constant"; value: number }).value;
+    expect(fxRho).toBeGreaterThan(0);
+    expect(fx!.code).not.toContain("__FX_VEGA_RHO__");
+    const rhoMatch = fx!.code.match(/local\s+rho\s*=\s*([0-9eE+\-.]+)/);
+    expect(rhoMatch, "fx_vega snippet must contain `local rho = <number>`").toBeTruthy();
+    expect(Number(rhoMatch![1])).toBeCloseTo(fxRho, 12);
+  });
 });
 
 describe("bootstrap — resolveMasterNodes", () => {

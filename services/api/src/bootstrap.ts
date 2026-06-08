@@ -73,12 +73,15 @@ export function buildFrtbSnippets(schema: Schema): FrtbLibrarySnippet[] {
     buildGirrVegaSnippet({ weight: girrVegaW.constant, rho: girrVegaRho.value, tenors: tenorNodes }),
     buildEquityDeltaSnippet({ weights: equityW.by_bucket, rho: equityRho.value }),
     buildEquityVegaSnippet({ weight: 1.0, rho: equityRho.value }),
-    // Wave 5.83G — pass ρ through so the Lua kernel matches the schema's
-    // intra-bucket correlation (fx_rho). Without it the snippet defaults ρ
-    // to 0, reducing K_b to √Σws² and diverging from the FT.AGGREGATE fast
-    // path which reads fx_rho via resolveRho().
+    // Wave 5.83G / 5.83J2 — pass ρ through so the Lua kernel matches the
+    // schema's intra-bucket correlation (fx_rho). Without it the snippet
+    // defaults ρ to 0, reducing K_b to √Σws² and diverging from the
+    // FT.AGGREGATE fast path which reads fx_rho via resolveRho(). 5.83G
+    // wired Delta; 5.83J2 extends the same fix to Vega — fx_vega uses the
+    // same intra-bucket ρ as fx_delta per §MAR21.91 (no separate fx_vega_rho
+    // spec) and resolveRho() returns the same value for both legs.
     buildFxDeltaSnippet({ weight: fxW.constant, rho: fxRho.value }),
-    buildFxVegaSnippet({ weight: 1.0 }),
+    buildFxVegaSnippet({ weight: 1.0, rho: fxRho.value }),
     buildGirrCurvatureSnippet({ tenors: tenorNodes.length, rho: girrRho.value * girrRho.value }),
     buildEquityCurvatureSnippet({ rho: equityRho.value * equityRho.value }),
     buildFxCurvatureSnippet({ rho: fxRho.value * fxRho.value }),
