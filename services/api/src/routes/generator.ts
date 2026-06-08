@@ -39,6 +39,12 @@ interface GeneratorStartBody {
     memory_pct?: number;
     elapsed_seconds?: number;
   };
+  // Wave 5.84A — generator-throughput knobs. Both optional. batch_size sets
+  // the XADD pipeline batch size (default DEFAULT_BATCH_SIZE). pipeline_window
+  // bounds how many pipeline.exec() calls may be in flight at once (default
+  // DEFAULT_PIPELINE_WINDOW=1, bit-identical to pre-5.84A).
+  batch_size?: number;
+  pipeline_window?: number;
 }
 
 // Wave 5.47c — resolved stop_when after validation; same shape as the input
@@ -69,6 +75,15 @@ export interface GeneratorRoutesOpts {
 const DEFAULT_ROWS = 200;
 const DEFAULT_CLASSES = ["GIRR", "Equity", "FX"] as const;
 const DEFAULT_SENSITIVITY_TYPES = ["Delta", "Vega"] as const;
+
+// Wave 5.84A — generator throughput defaults. DEFAULT_BATCH_SIZE was bumped
+// from 200 to 1000 (the CLI default) to halve round-trip overhead on the
+// in-process api path. DEFAULT_PIPELINE_WINDOW=1 keeps single-in-flight
+// semantics by default; callers opt into windowing via `pipeline_window`.
+const DEFAULT_BATCH_SIZE = 1000;
+const DEFAULT_PIPELINE_WINDOW = 1;
+const MAX_BATCH_SIZE = 50_000;
+const MAX_PIPELINE_WINDOW_API = 8;
 
 // Wave 5.40a — module-local registry of in-flight + recently-terminal runs.
 // The generation loop runs as a detached promise that owns the lifecycle of
@@ -155,6 +170,10 @@ interface ParsedGeneratorRequest {
   factorPool: number | undefined;
   picker: ClassPicker;
   stopWhen: StopWhen;
+  // Wave 5.84A — resolved generator-throughput knobs (always populated; fall
+  // back to DEFAULT_BATCH_SIZE / DEFAULT_PIPELINE_WINDOW when omitted).
+  batchSize: number;
+  pipelineWindow: number;
 }
 interface ParsedGeneratorError {
   ok: false;
@@ -325,11 +344,44 @@ function parseGeneratorRequest(
     }
   }
 
+  // Wave 5.84A — validate optional generator-throughput knobs.
+  let batchSize = DEFAULT_BATCH_SIZE;
+  if (body.batch_size !== undefined) {
+    const bs = body.batch_size;
+    if (
+      typeof bs !== "number"
+      || !Number.isFinite(bs)
+      || !Number.isInteger(bs)
+      || bs < 1
+      || bs > MAX_BATCH_SIZE
+    ) {
+      return { ok: false, status: 400, error: `batch_size must be an integer in 1..${MAX_BATCH_SIZE}` };
+    }
+    batchSize = bs;
+  }
+  let pipelineWindow = DEFAULT_PIPELINE_WINDOW;
+  if (body.pipeline_window !== undefined) {
+    const pw = body.pipeline_window;
+    if (
+      typeof pw !== "number"
+      || !Number.isFinite(pw)
+      || !Number.isInteger(pw)
+      || pw < 1
+      || pw > MAX_PIPELINE_WINDOW_API
+    ) {
+      return { ok: false, status: 400, error: `pipeline_window must be an integer in 1..${MAX_PIPELINE_WINDOW_API}` };
+    }
+    pipelineWindow = pw;
+  }
+
   const picker: ClassPicker = classSplitResolved
     ? sequencePicker(interleavedSequence(classSplitResolved))
     : roundRobinPicker(resolvedClasses);
 
-  return { ok: true, rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker, stopWhen };
+  return {
+    ok: true, rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker, stopWhen,
+    batchSize, pipelineWindow,
+  };
 }
 
 // Wave 5.47c — parse Redis "INFO memory" text into the numeric fields used
@@ -389,7 +441,7 @@ export function registerGeneratorRoutes(
       reply.code(parsed.status);
       return { error: parsed.error };
     }
-    const { rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker, stopWhen } = parsed;
+    const { rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker, stopWhen, batchSize, pipelineWindow } = parsed;
 
     const run_id = ulid();
     const t0 = process.hrtime.bigint();
@@ -408,7 +460,7 @@ export function registerGeneratorRoutes(
     });
     const producer = createStreamProducer(
       redis as unknown as Parameters<typeof createStreamProducer>[0],
-      { stream: streamName, batchSize: 200 },
+      { stream: streamName, batchSize, pipelineWindow },
     );
 
     // Wave 5.47c — track which condition halts the loop. Defaults to "rows"
@@ -583,7 +635,7 @@ export function registerGeneratorRoutes(
       reply.code(parsed.status);
       return { error: parsed.error };
     }
-    const { rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker, stopWhen } = parsed;
+    const { rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker, stopWhen, batchSize, pipelineWindow } = parsed;
 
     const run_id = ulid();
     const t0 = process.hrtime.bigint();

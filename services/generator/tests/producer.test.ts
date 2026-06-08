@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { resolve, join } from "node:path";
 import { setTimeout as wait } from "node:timers/promises";
 import { Redis } from "ioredis";
-import { createStreamProducer, type SensitivityRow } from "../src/producer.ts";
+import { createStreamProducer, MAX_PIPELINE_WINDOW, type SensitivityRow } from "../src/producer.ts";
 
 // Local ephemeral redis-server keeps the producer test self-contained and fast.
 // Skipped automatically when redis-server is not on PATH.
@@ -117,5 +117,125 @@ describe("createStreamProducer (XADD batching + pipelining)", () => {
     await producer.flush();
     expect(producer.rowsSent).toBe(25);
     expect(producer.byClass.EQUITY).toBe(25);
+  });
+});
+
+// Wave 5.84A — pipeline-window concurrency. These tests do NOT need a live
+// redis: they wire createStreamProducer to a stub pipeline client that
+// records per-exec XADD arg-tuples and tracks the high-water mark of
+// concurrent in-flight pipelines. The bit-equivalence test is the canary
+// guarding the entire 5.84 wave — `pipelineWindow=1` (the default) MUST
+// produce the same XADD command sequence as the pre-5.84A producer.
+type StubPipelineClient = {
+  execCalls: string[][][];
+  readonly maxInFlight: number;
+  pipeline(): {
+    xadd(...args: string[]): unknown;
+    exec(): Promise<Array<[Error | null, unknown]>>;
+  };
+};
+
+function stubPipelineClient(): StubPipelineClient {
+  const execCalls: string[][][] = [];
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const client = {
+    execCalls,
+    get maxInFlight() { return maxInFlight; },
+    pipeline() {
+      const buffered: string[][] = [];
+      return {
+        xadd(...args: string[]) {
+          buffered.push(args);
+          return this;
+        },
+        async exec(): Promise<Array<[Error | null, unknown]>> {
+          inFlight++;
+          if (inFlight > maxInFlight) maxInFlight = inFlight;
+          // Two setImmediate ticks per exec so additional dispatches under
+          // window>1 actually overlap in flight before this one resolves.
+          await new Promise<void>((r) => setImmediate(r));
+          await new Promise<void>((r) => setImmediate(r));
+          inFlight--;
+          execCalls.push(buffered);
+          return buffered.map(() => [null, "0-0"] as [Error | null, unknown]);
+        },
+      };
+    },
+  };
+  return client;
+}
+
+function makeRow(i: number): SensitivityRow {
+  return {
+    risk_class: "GIRR",
+    bucket: "USD",
+    risk_value: i,
+    _hash_tag: "GIRR:USD",
+    _id: `01HXTESTEQUIV${String(i).padStart(13, "0")}`,
+  };
+}
+
+describe("Wave 5.84A — pipeline window", () => {
+  it("window=1 (default) is bit-identical to explicit pipelineWindow=1", async () => {
+    const a = stubPipelineClient();
+    const b = stubPipelineClient();
+    const pa = createStreamProducer(a as never, { stream: "s", batchSize: 50 });
+    const pb = createStreamProducer(b as never, { stream: "s", batchSize: 50, pipelineWindow: 1 });
+    for (let i = 0; i < 137; i++) {
+      await pa.add(makeRow(i));
+      await pb.add(makeRow(i));
+    }
+    await pa.flush();
+    await pb.flush();
+    expect(a.execCalls).toEqual(b.execCalls);
+    expect(a.execCalls.length).toBe(3); // 50 + 50 + 37
+    expect(a.execCalls[0]!.length).toBe(50);
+    expect(a.execCalls[1]!.length).toBe(50);
+    expect(a.execCalls[2]!.length).toBe(37);
+    expect(a.maxInFlight).toBe(1);
+    expect(b.maxInFlight).toBe(1);
+  });
+
+  it("window=4 keeps ≤4 in flight; totals + per-class counts unchanged vs window=1", async () => {
+    // Drive each producer through its OWN sequential loop. Interleaving the
+    // two would force a macrotask yield on every pa.add() that fills, which
+    // drains pb's queue between pb's dispatches and hides the windowing.
+    const a = stubPipelineClient();
+    const pa = createStreamProducer(a as never, { stream: "s", batchSize: 50, pipelineWindow: 1 });
+    for (let i = 0; i < 537; i++) await pa.add(makeRow(i));
+    await pa.flush();
+
+    const b = stubPipelineClient();
+    const pb = createStreamProducer(b as never, { stream: "s", batchSize: 50, pipelineWindow: 4 });
+    for (let i = 0; i < 537; i++) await pb.add(makeRow(i));
+    await pb.flush();
+
+    expect(pb.batchCount).toBe(pa.batchCount);
+    expect(pb.rowsSent).toBe(pa.rowsSent);
+    expect(pb.byClass).toEqual(pa.byClass);
+    expect(b.execCalls.length).toBe(a.execCalls.length);
+    expect(a.maxInFlight).toBe(1);
+    expect(b.maxInFlight).toBeGreaterThan(1);
+    expect(b.maxInFlight).toBeLessThanOrEqual(4);
+  });
+
+  it("clamps pipelineWindow to MAX_PIPELINE_WINDOW (8)", async () => {
+    const c = stubPipelineClient();
+    const p = createStreamProducer(c as never, { stream: "s", batchSize: 10, pipelineWindow: 99 });
+    for (let i = 0; i < 200; i++) await p.add(makeRow(i));
+    await p.flush();
+    expect(c.maxInFlight).toBeLessThanOrEqual(MAX_PIPELINE_WINDOW);
+  });
+
+  it("flush() drains all in-flight pipelines before returning", async () => {
+    const c = stubPipelineClient();
+    const p = createStreamProducer(c as never, { stream: "s", batchSize: 25, pipelineWindow: 4 });
+    for (let i = 0; i < 200; i++) await p.add(makeRow(i));
+    await p.flush();
+    expect(c.execCalls.length).toBe(8);
+    const totalXadds = c.execCalls.reduce((acc, batch) => acc + batch.length, 0);
+    expect(totalXadds).toBe(200);
+    expect(p.rowsSent).toBe(200);
   });
 });

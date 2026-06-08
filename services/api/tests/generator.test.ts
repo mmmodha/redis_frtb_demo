@@ -329,11 +329,13 @@ describe("POST /generator/start/stream (Wave 5.20c) — SSE progress + cancellat
     app = await createServer({ redis: fr, schema, generatorSseProgressIntervalMs: 5 });
 
     // Start the stream; with batchSize=200 + setImmediate per exec, 600 rows
-    // means at least one yield point where the cancel inject can land.
+    // means at least one yield point where the cancel inject can land. Wave
+    // 5.84A bumped DEFAULT_BATCH_SIZE to 1000 so this test now pins the small
+    // batch via the new body field (also covers the validated batch_size).
     const streamPromise = app.inject({
       method: "POST",
       url: "/generator/start/stream",
-      payload: { rows: 600 },
+      payload: { rows: 600, batch_size: 200 },
       headers: { accept: "text/event-stream" },
       payloadAsStream: true,
     });

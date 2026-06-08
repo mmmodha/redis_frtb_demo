@@ -19,6 +19,9 @@ interface CliOptions {
   redisUrl?: string;
   stream: string;
   batchSize: string;
+  // Wave 5.84A — bounded pipeline-window concurrency (1..8). Default 1 is
+  // bit-identical to pre-5.84A single-in-flight behaviour.
+  pipelineWindow: string;
 }
 
 async function main(): Promise<void> {
@@ -33,7 +36,8 @@ async function main(): Promise<void> {
     .option("--schema-file <path>", "schema YAML override (else SCHEMA_FILE env)")
     .option("--redis-url <url>", "redis target URL override (else REDIS_URL env)")
     .option("--stream <key>", "target stream key", process.env.STREAM_KEY ?? "sensitivities:in")
-    .option("--batch-size <n>", "XADD batch / pipeline size", "1000");
+    .option("--batch-size <n>", "XADD batch / pipeline size", "1000")
+    .option("--pipeline-window <n>", "max pipeline.exec() calls in flight (1..8, default 1)", "1");
 
   program.parse(process.argv);
   const opts = program.opts<CliOptions>();
@@ -51,11 +55,12 @@ async function main(): Promise<void> {
   const classes = pickRiskClasses(schema, opts.classes);
   const totalRows = Number(opts.rows);
   const batchSize = Number(opts.batchSize);
+  const pipelineWindow = Number(opts.pipelineWindow);
   const rate = opts.rate ? Number(opts.rate) : undefined;
 
   const client = createClient(redisUrl);
   const generator = createRowGenerator(schema, { seed: opts.seed });
-  const producer = createStreamProducer(client, { stream: opts.stream, batchSize });
+  const producer = createStreamProducer(client, { stream: opts.stream, batchSize, pipelineWindow });
 
   log.info({ totalRows, classes, schemaPath, stream: opts.stream }, "generator starting");
   const start = Date.now();

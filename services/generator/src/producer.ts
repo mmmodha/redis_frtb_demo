@@ -11,7 +11,14 @@ export type SensitivityRow = {
 export interface StreamProducerOptions {
   stream: string;
   batchSize?: number;
+  // Wave 5.84A — keep up to `pipelineWindow` pipeline.exec() calls in flight
+  // at once. Default 1 is bit-identical to the pre-5.84A single-in-flight
+  // behaviour; max 8 (the host TCP/redis-side sane upper bound for a single
+  // producer connection).
+  pipelineWindow?: number;
 }
+
+export const MAX_PIPELINE_WINDOW = 8;
 
 export interface StreamProducer {
   add(row: SensitivityRow): Promise<void>;
@@ -34,29 +41,88 @@ export function createStreamProducer(
 ): StreamProducer {
   const stream = opts.stream;
   const batchSize = Math.max(1, opts.batchSize ?? 1000);
+  // Wave 5.84A — clamp pipeline window into [1, MAX_PIPELINE_WINDOW]. Default
+  // 1 keeps today's "one pipeline in flight, awaited before next" semantics
+  // bit-identical (proven by the stub-redis equivalence test).
+  const pipelineWindow = Math.min(
+    MAX_PIPELINE_WINDOW,
+    Math.max(1, opts.pipelineWindow ?? 1),
+  );
   const buffer: SensitivityRow[] = [];
   const stats = {
     rowsSent: 0,
     batchCount: 0,
     byClass: {} as Record<string, number>,
   };
+  // Pipelines currently dispatched but not yet resolved. Bounded by
+  // `pipelineWindow`; flush()/close() must drain this before returning.
+  const inFlight = new Set<Promise<void>>();
+  // First pipeline error observed across any in-flight dispatch — re-thrown
+  // on the next dispatch/drain so a background rejection cannot silently
+  // disappear when window>1 (the auto-removal in `finally` would otherwise
+  // drop a rejected promise out of the set before drain could observe it).
+  let firstError: unknown = null;
 
-  async function flushBuffer(): Promise<void> {
+  async function dispatchBatch(): Promise<void> {
+    if (firstError) throw firstError;
     if (buffer.length === 0) return;
+    const batch = buffer.slice();
+    buffer.length = 0;
+    stats.batchCount += 1;
     const pipeline = client.pipeline();
-    for (const row of buffer) {
+    for (const row of batch) {
       const fields = serializeRow(row);
       pipeline.xadd(stream, "*", ...fields);
     }
-    const result = await pipeline.exec();
-    if (result) {
-      for (const [err] of result) {
-        if (err) throw err;
+    // Window=1 keeps the pre-5.84A flushBuffer code path exactly: dispatch
+    // and immediately await this batch's exec before returning. This is the
+    // bit-equivalence guarantee — same XADD sequence to Redis AND the same
+    // per-batch macrotask yield timing (callers that depend on the await
+    // landing per batch, like the api SSE cancel test, see no behavioural
+    // change at window=1).
+    if (pipelineWindow === 1) {
+      const result = await pipeline.exec();
+      if (result) {
+        for (const [err] of result) {
+          if (err) throw err;
+        }
       }
+      stats.rowsSent += batch.length;
+      return;
     }
-    stats.rowsSent += buffer.length;
-    stats.batchCount += 1;
-    buffer.length = 0;
+    // Window>1 — keep up to `pipelineWindow` pipeline.exec() calls in flight.
+    let p!: Promise<void>;
+    p = (async () => {
+      try {
+        const result = await pipeline.exec();
+        if (result) {
+          for (const [err] of result) {
+            if (err) throw err;
+          }
+        }
+        stats.rowsSent += batch.length;
+      } catch (e) {
+        if (!firstError) firstError = e;
+        throw e;
+      } finally {
+        inFlight.delete(p);
+      }
+    })();
+    inFlight.add(p);
+    // Swallow unhandled-rejection here — the error is captured in firstError
+    // and will be re-thrown on the next dispatch or drain call.
+    p.catch(() => undefined);
+    if (inFlight.size >= pipelineWindow) {
+      await Promise.race([...inFlight]).catch(() => undefined);
+      if (firstError) throw firstError;
+    }
+  }
+
+  async function drainInFlight(): Promise<void> {
+    while (inFlight.size > 0) {
+      await Promise.allSettled([...inFlight]);
+    }
+    if (firstError) throw firstError;
   }
 
   return {
@@ -64,14 +130,16 @@ export function createStreamProducer(
       buffer.push(row);
       stats.byClass[row.risk_class] = (stats.byClass[row.risk_class] ?? 0) + 1;
       if (buffer.length >= batchSize) {
-        await flushBuffer();
+        await dispatchBatch();
       }
     },
     async flush(): Promise<void> {
-      await flushBuffer();
+      await dispatchBatch();
+      await drainInFlight();
     },
     async close(): Promise<void> {
-      await flushBuffer();
+      await dispatchBatch();
+      await drainInFlight();
     },
     get rowsSent() {
       return stats.rowsSent;
