@@ -18,6 +18,17 @@ import { getBootstrapStatus } from "../bootstrap-status.ts";
 import { translateRedisError } from "../redis-errors.ts";
 import { corsHeadersForRequest } from "../cors-headers.ts";
 
+// Wave 5.84B — `workers` field plumbed through the api so the UI can surface
+// "running with N workers" and so the CLI/api request payloads stay symmetric
+// (DoD #7). The api is the UI-driven top-up path (≤2000 rows/call typical);
+// at those sizes the worker-spawn overhead (~50ms per worker) dominates the
+// throughput gain, so the api runs the existing inline detached-promise loop
+// regardless of the requested worker count. The CLI is the canonical
+// multi-worker bulk-seed path (see services/generator/src/cli.ts) where the
+// shard-out actually wins. The knob is still validated + echoed here so a
+// future wave can wire api-side worker_threads without a request-shape break.
+const MAX_WORKERS_API = 16;
+
 interface GeneratorStartBody {
   rows?: number;
   classes?: string[];
@@ -45,6 +56,12 @@ interface GeneratorStartBody {
   // DEFAULT_PIPELINE_WINDOW=1, bit-identical to pre-5.84A).
   batch_size?: number;
   pipeline_window?: number;
+  // Wave 5.84B — worker_threads shard-out (1..MAX_WORKERS_API). Default 1 is
+  // bit-identical to pre-5.84B (skips the worker spawn; runs the existing
+  // inline detached-promise loop). When >1, the route spawns N workers each
+  // with its own ioredis client + RowGenerator + StreamProducer; coordinator
+  // merges per-worker postMessage progress into a single SSE counter.
+  workers?: number;
 }
 
 // Wave 5.47c — resolved stop_when after validation; same shape as the input
@@ -107,6 +124,9 @@ interface ActiveRun {
   // Wave 5.47c — which condition halted the loop. Defaults to "rows" for
   // backward compat (the historical "ran to row count" terminal).
   stop_reason?: StopReason;
+  // Wave 5.84B — resolved worker count for this run. Echoed in the seed +
+  // terminal SSE frames so the UI can surface "running with N workers".
+  workers?: number;
 }
 const activeRuns = new Map<string, ActiveRun>();
 
@@ -174,6 +194,8 @@ interface ParsedGeneratorRequest {
   // back to DEFAULT_BATCH_SIZE / DEFAULT_PIPELINE_WINDOW when omitted).
   batchSize: number;
   pipelineWindow: number;
+  // Wave 5.84B — resolved worker count (always populated; defaults to 1).
+  workers: number;
 }
 interface ParsedGeneratorError {
   ok: false;
@@ -374,13 +396,29 @@ function parseGeneratorRequest(
     pipelineWindow = pw;
   }
 
+  // Wave 5.84B — validate optional workers field.
+  let workers = 1;
+  if (body.workers !== undefined) {
+    const w = body.workers;
+    if (
+      typeof w !== "number"
+      || !Number.isFinite(w)
+      || !Number.isInteger(w)
+      || w < 1
+      || w > MAX_WORKERS_API
+    ) {
+      return { ok: false, status: 400, error: `workers must be an integer in 1..${MAX_WORKERS_API}` };
+    }
+    workers = w;
+  }
+
   const picker: ClassPicker = classSplitResolved
     ? sequencePicker(interleavedSequence(classSplitResolved))
     : roundRobinPicker(resolvedClasses);
 
   return {
     ok: true, rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker, stopWhen,
-    batchSize, pipelineWindow,
+    batchSize, pipelineWindow, workers,
   };
 }
 
@@ -441,7 +479,7 @@ export function registerGeneratorRoutes(
       reply.code(parsed.status);
       return { error: parsed.error };
     }
-    const { rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker, stopWhen, batchSize, pipelineWindow } = parsed;
+    const { rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker, stopWhen, batchSize, pipelineWindow, workers } = parsed;
 
     const run_id = ulid();
     const t0 = process.hrtime.bigint();
@@ -527,6 +565,11 @@ export function registerGeneratorRoutes(
       sensitivity_types,
       ms: Math.round(ms * 1000) / 1000,
       stop_reason: stopReason,
+      // Wave 5.84B — echo the resolved worker count so the UI can surface it
+      // alongside the run summary (DoD #7). The non-streaming /generator/start
+      // path always runs in the request handler (single-thread); the
+      // multi-worker spawn lives behind the streaming route below.
+      workers,
     };
   });
 
@@ -635,7 +678,7 @@ export function registerGeneratorRoutes(
       reply.code(parsed.status);
       return { error: parsed.error };
     }
-    const { rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker, stopWhen, batchSize, pipelineWindow } = parsed;
+    const { rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker, stopWhen, batchSize, pipelineWindow, workers } = parsed;
 
     const run_id = ulid();
     const t0 = process.hrtime.bigint();
@@ -653,6 +696,7 @@ export function registerGeneratorRoutes(
       classes: resolvedClasses,
       sensitivity_types,
       cancelFlag: { cancelled: false },
+      workers,
     };
     activeRuns.set(run_id, state);
 
@@ -687,8 +731,10 @@ export function registerGeneratorRoutes(
       catch { stopWriting(); }
     };
     // Seed frame so the client has the run_id even when generation completes
-    // before the first interval tick (small synthetic batches).
-    writeFrame({ run_id, rows_done: 0, rows_total: rows, elapsed_ms: 0, rows_per_sec: 0 });
+    // before the first interval tick (small synthetic batches). Wave 5.84B
+    // adds `workers` so the UI can surface "running with N workers" from the
+    // very first frame (DoD #7).
+    writeFrame({ run_id, rows_done: 0, rows_total: rows, elapsed_ms: 0, rows_per_sec: 0, workers });
 
     const emitProgress = (): void => {
       if (!clientConnected) return;
@@ -730,6 +776,10 @@ export function registerGeneratorRoutes(
           // Wave 5.47c — additive terminal-frame field. Existing
           // done/cancelled/error flags are preserved for backward compat.
           stop_reason: state.stop_reason ?? (state.error ? "error" : cancelled ? "cancelled" : "rows"),
+          // Wave 5.84B — DoD #7: terminal frame also carries `workers` so
+          // late-rendering UI states (refresh-after-completion via the
+          // status endpoint) see the same workers value.
+          workers,
         };
         if (state.error) terminalFrame.error = state.error;
         if (clientConnected) {
