@@ -310,8 +310,8 @@ describe("<CalcPanel />", () => {
   });
 
   // Wave 5.16n: standalone Redis has a single shard with sub-ms FCALL, so
-  // per-shard timing is noise — suppress the panel entirely in that case.
-  it("Wave 5.16n: suppresses the per-shard timing panel on standalone (single shard / all zero ms)", async () => {
+  // per-bucket timing is noise — suppress the panel entirely in that case.
+  it("Wave 5.16n: suppresses the per-bucket timing panel on standalone (single shard / all zero ms)", async () => {
     const standalone: CalcSbmResponse = {
       ...baseResponse,
       shard_breakdown: [{ shard: "shard-1", buckets: ["USD-IRS", "EUR-IRS", "JPY-IRS"], ms: 0 }],
@@ -320,15 +320,15 @@ describe("<CalcPanel />", () => {
     render(<CalcPanel />);
     fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
     await waitFor(() => expect(screen.getByTestId("calc-charge")).toBeInTheDocument());
-    expect(screen.queryByText(/per-shard timing/i)).toBeNull();
+    expect(screen.queryByText(/per-bucket timing/i)).toBeNull();
   });
 
-  it("Wave 5.16n: still renders the per-shard timing panel on multi-shard cluster with non-zero ms", async () => {
+  it("Wave 5.16n: still renders the per-bucket timing panel on multi-shard cluster with non-zero ms", async () => {
     mockCalcResponse(baseResponse);
     render(<CalcPanel />);
     fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
     await waitFor(() => expect(screen.getByTestId("calc-charge")).toBeInTheDocument());
-    expect(screen.getByText(/per-shard timing/i)).toBeInTheDocument();
+    expect(screen.getByText(/per-bucket timing/i)).toBeInTheDocument();
   });
 
   it("Wave 5.16n: renders the per-bucket K_b chart sorted by K_b descending alongside the table", async () => {

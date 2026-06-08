@@ -1069,7 +1069,7 @@ function CalcResult({
       </PanelCard>
 
       {hasMeaningfulShardTiming(result) ? (
-        <PanelCard title="Per-shard timing">
+        <PanelCard title="Per-bucket timing">
           <TimingStrip shards={shardsFromResponse(result)} />
         </PanelCard>
       ) : null}
