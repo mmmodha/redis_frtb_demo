@@ -236,6 +236,79 @@ describe("<CalcPanel />", () => {
     expect(screen.queryByTestId("redis-commands")).toBeNull();
   });
 
+  // Wave 5.83D-2: engine/cache badge on the "Redis commands executed" header.
+  // Three states: green FT.AGGREGATE fast path, amber legacy Lua, blue cache
+  // hit (which overrides the engine label since a cache hit didn't run the
+  // kernel at all). All three share the same testid + data-state attribute.
+  describe("Wave 5.83D-2: calc-engine-pill", () => {
+    const commandsStub: CalcSbmResponse["commands"] = {
+      discovery: {
+        command: "FT.AGGREGATE",
+        index: "idx:sens",
+        query: "@risk_class:{GIRR}",
+        groupby: ["@bucket"],
+        reducers: ["COUNT 0 AS n"],
+      },
+      fcall: {
+        command: "FCALL",
+        function: "sbm_delta_bucket",
+        library: "frtb",
+        arg_template: "FCALL sbm_delta_bucket 1 sens:{GIRR:<bucket>}:_route GIRR <bucket>",
+        dispatched_keys: ["sens:{GIRR:USD-IRS}:_route"],
+      },
+    };
+
+    async function renderWithResponse(body: CalcSbmResponse) {
+      mockCalcResponse(body);
+      render(<CalcPanel />);
+      fireEvent.click(screen.getByTestId("calc-show-redis-commands-toggle"));
+      fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
+      await waitFor(() =>
+        expect(screen.getByRole("heading", { name: /redis commands executed/i })).toBeInTheDocument(),
+      );
+    }
+
+    it("renders the green FT.AGGREGATE pill when engine === 'ft_aggregate'", async () => {
+      await renderWithResponse({
+        ...baseResponse,
+        total_ms: 12,
+        engine: "ft_aggregate",
+        cache: "miss",
+        commands: commandsStub,
+      });
+      const pill = screen.getByTestId("calc-engine-pill");
+      expect(pill).toHaveAttribute("data-state", "ft_aggregate");
+      expect(pill.textContent).toBe("via FT.AGGREGATE · 12ms");
+    });
+
+    it("renders the amber FCALL (Lua) pill when engine === 'fcall_lua'", async () => {
+      await renderWithResponse({
+        ...baseResponse,
+        total_ms: 47,
+        engine: "fcall_lua",
+        cache: "miss",
+        commands: commandsStub,
+      });
+      const pill = screen.getByTestId("calc-engine-pill");
+      expect(pill).toHaveAttribute("data-state", "fcall_lua");
+      expect(pill.textContent).toBe("via FCALL (Lua) · 47ms");
+    });
+
+    it("renders the blue 'served from cache' pill when cache === 'hit' (overrides engine)", async () => {
+      await renderWithResponse({
+        ...baseResponse,
+        total_ms: 1,
+        engine: "ft_aggregate",
+        cache: "hit",
+        cached_at_iso: "2026-06-08T12:00:00.000Z",
+        commands: commandsStub,
+      });
+      const pill = screen.getByTestId("calc-engine-pill");
+      expect(pill).toHaveAttribute("data-state", "cache");
+      expect(pill.textContent).toBe("served from cache · 1ms");
+    });
+  });
+
   // Wave 5.16n: standalone Redis has a single shard with sub-ms FCALL, so
   // per-shard timing is noise — suppress the panel entirely in that case.
   it("Wave 5.16n: suppresses the per-shard timing panel on standalone (single shard / all zero ms)", async () => {

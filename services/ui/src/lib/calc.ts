@@ -74,6 +74,12 @@ export interface CalcCommands {
   };
 }
 
+// Wave 5.83C-1 — engine label echoed from the api so the UI can render the
+// "via FT.AGGREGATE" / "via FCALL (Lua)" badge.
+export type CalcEngine = "ft_aggregate" | "fcall_lua";
+// Wave 5.83C-2 — short-TTL response cache markers stamped onto every response.
+export type CalcCacheState = "hit" | "miss";
+
 export interface CalcSbmResponse {
   charge: number;
   per_bucket: BucketResult[];
@@ -88,6 +94,11 @@ export interface CalcSbmResponse {
   // Wave 5.31b: echoed regime that was applied (low/medium/high). Optional
   // for forward-compat with older api responses.
   correlation_regime?: CorrelationRegime;
+  // Wave 5.83C-1 / 5.83D-2: engine + cache markers feeding the calc-engine-pill.
+  // Both optional so older api responses still parse.
+  engine?: CalcEngine;
+  cache?: CalcCacheState;
+  cached_at_iso?: string;
 }
 
 export async function postCalcSbm(body: CalcSbmRequest): Promise<CalcSbmResponse> {

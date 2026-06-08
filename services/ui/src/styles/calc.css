@@ -43,6 +43,37 @@
   color: #f0b429;
 }
 
+/* Wave 5.83D-2: engine/cache badge in the "Redis commands executed" header.
+   Three tones — green for the FT.AGGREGATE fast path, amber for the legacy
+   Lua kernel, blue for short-TTL cache hits (cache hits never run a kernel
+   so they get their own colour rather than borrowing the engine accent). */
+.calc-engine-pill {
+  display: inline-block;
+  padding: 0.125rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  border: 1px solid transparent;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.calc-engine-pill[data-state="ft_aggregate"] {
+  background: rgba(91, 211, 123, 0.10);
+  border-color: rgba(91, 211, 123, 0.45);
+  color: #5BD37B;
+}
+.calc-engine-pill[data-state="fcall_lua"] {
+  background: rgba(240, 180, 41, 0.12);
+  border-color: rgba(240, 180, 41, 0.50);
+  color: #f0b429;
+}
+.calc-engine-pill[data-state="cache"] {
+  background: rgba(70, 144, 240, 0.12);
+  border-color: rgba(70, 144, 240, 0.50);
+  color: #4690f0;
+}
+
 /* Wave 5.18: class-aware bucket pill. Single rule per data-class drives
    the accent so adding a new risk class is just one more selector. */
 .bucket-pill {

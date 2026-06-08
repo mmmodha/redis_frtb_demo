@@ -5,7 +5,9 @@ import type { ShardTiming } from "../components/TimingStrip";
 import {
   postCalcSbm,
   type BucketResult,
+  type CalcCacheState,
   type CalcCommands,
+  type CalcEngine,
   type CalcSbmResponse,
   type CorrelationRegime,
   type SensitivityType,
@@ -1072,7 +1074,14 @@ function CalcResult({
         </PanelCard>
       ) : null}
 
-      {showRedisCommands && result.commands ? <CommandsPanel commands={result.commands} /> : null}
+      {showRedisCommands && result.commands ? (
+        <CommandsPanel
+          commands={result.commands}
+          engine={result.engine}
+          cache={result.cache}
+          totalMs={result.total_ms}
+        />
+      ) : null}
 
       {/* Inlined panel-card so the heading can carry a `title` attribute
           tooltip — the shared PanelCard component renders the title as plain
@@ -1566,12 +1575,73 @@ function TradeJsonDrawer({ row, onClose }: { row: PivotRow; onClose: () => void 
   );
 }
 
+// Wave 5.83D-2: engine/cache badge that rides on the "Redis commands executed"
+// header. `cache === "hit"` takes precedence over engine — a cache hit didn't
+// hit the kernel at all, so labelling it as "via FT.AGGREGATE" would be
+// misleading. Three states: green (fast path), amber (legacy Lua), blue
+// (cache). `totalMs` is rounded to an integer for compactness.
+function CalcEnginePill({
+  engine,
+  cache,
+  totalMs,
+}: {
+  engine: CalcEngine | undefined;
+  cache: CalcCacheState | undefined;
+  totalMs: number;
+}) {
+  const ms = Math.round(totalMs);
+  if (cache === "hit") {
+    return (
+      <span
+        className="calc-engine-pill"
+        data-testid="calc-engine-pill"
+        data-state="cache"
+      >
+        served from cache · {ms}ms
+      </span>
+    );
+  }
+  if (engine === "ft_aggregate") {
+    return (
+      <span
+        className="calc-engine-pill"
+        data-testid="calc-engine-pill"
+        data-state="ft_aggregate"
+      >
+        via FT.AGGREGATE · {ms}ms
+      </span>
+    );
+  }
+  if (engine === "fcall_lua") {
+    return (
+      <span
+        className="calc-engine-pill"
+        data-testid="calc-engine-pill"
+        data-state="fcall_lua"
+      >
+        via FCALL (Lua) · {ms}ms
+      </span>
+    );
+  }
+  return null;
+}
+
 // Wave 5.16m: read-only observability panel that renders the exact Redis
 // commands the api dispatched. Surfaces the Redis Enterprise primitives
 // (RediSearch FT.AGGREGATE for discovery, Redis Functions FCALL for the
 // slot-local fan-out) in plain view for the bank demo. Display-only — no
 // re-execution, no logging beyond the api response.
-function CommandsPanel({ commands }: { commands: CalcCommands }) {
+function CommandsPanel({
+  commands,
+  engine,
+  cache,
+  totalMs,
+}: {
+  commands: CalcCommands;
+  engine: CalcEngine | undefined;
+  cache: CalcCacheState | undefined;
+  totalMs: number;
+}) {
   const codeStyle: CSSProperties = {
     fontFamily: "var(--font-mono, ui-monospace, monospace)",
     whiteSpace: "pre-wrap",
@@ -1589,7 +1659,10 @@ function CommandsPanel({ commands }: { commands: CalcCommands }) {
   const f = commands.fcall;
 
   return (
-    <PanelCard title="Redis commands executed">
+    <PanelCard
+      title="Redis commands executed"
+      actions={<CalcEnginePill engine={engine} cache={cache} totalMs={totalMs} />}
+    >
       <div aria-live="polite" data-testid="redis-commands">
         <h3 style={{ margin: "0 0 0.5rem", fontSize: "0.9375rem" }}>Discovery (FT.AGGREGATE)</h3>
         <pre style={codeStyle}>
