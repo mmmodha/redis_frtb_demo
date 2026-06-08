@@ -2,6 +2,11 @@ import { describe, it, expect, afterEach, beforeEach } from "vitest";
 import { createServer } from "../src/server.ts";
 import { fakeRedis } from "./helpers/fake-redis.ts";
 import { __resetCalcCacheForTests } from "../src/sbm/calc-cache.ts";
+// Wave 5.83B-fix — pull enrichDoc straight from the ingest package so the
+// parity tests below build the FT.AGGREGATE row from the same code path the
+// consumer runs at ingest time (no risk of the test drifting from the live
+// per-leg weighting rule).
+import { enrichDoc } from "../../ingest/src/consumer.ts";
 
 // FT.AGGREGATE reply for GROUPBY @bucket → returns ["total", "@bucket", "USD-IRS", "@bucket", "EUR-IRS", ...]
 // Per Redis docs, FT.AGGREGATE returns [total, ...replies]
@@ -1458,6 +1463,122 @@ describe("POST /calc/sbm — MVP endpoint", () => {
       // Single-bucket γ=0 reduce → charge = K_b.
       expect(body.charge).toBeCloseTo(Math.sqrt(14.5), 9);
       expect(body.curvature_branch).toBe("positive_interior");
+    });
+
+    // Wave 5.83B-fix — parity proofs for the per-leg weighting rule. Each test
+    // drives raw rows through enrichDoc, aggregates the resulting weighted_*
+    // fields exactly as FT.AGGREGATE would on the index, and asserts the
+    // fast-path K_b matches the Lua reference closed form within 1e-9. Because
+    // bootstrap.ts loads equity_vega / fx_vega with w=1.0 and *_curvature.lua
+    // applies no weight at all, the Lua reference reduces to the same constant-ρ
+    // (Vega) or ψ-gated (Curvature) formula the fast path uses — but ONLY when
+    // enrichDoc's pre-weighting is identity for those legs, which is what the
+    // 5.83B-fix delivered.
+    it("Equity Vega parity: enrichDoc + fast path matches Lua w=1.0 closed form", async () => {
+      const schema = fastPathSchema() as any;
+      const rho = schema.correlations.equity_rho.value;  // 0.5
+      // Raw vega sensitivities — mix signs so the cross term exercises both branches.
+      const rows = [0.10, 0.20, -0.05, 0.30, 0.15].map((spot) => ({
+        risk_class: "EQUITY", bucket: "1", sensitivity_type: "Vega", risk_value: { spot },
+      }));
+      // Aggregate enrichDoc's weighted_value as the index would (SUM, SUM(sq)).
+      let sumWs = 0, sumWsSq = 0;
+      for (const r of rows) {
+        const wv = enrichDoc(r, schema as any).weighted_value as number;
+        sumWs += wv; sumWsSq += wv * wv;
+      }
+      // Lua reference (w=1.0 hardcoded in bootstrap.ts for equity_vega):
+      //   WS_k = 1.0 · s_k → S, SQ identical to the aggregates above.
+      let refS = 0, refSQ = 0;
+      for (const r of rows) {
+        const s = (r.risk_value as { spot: number }).spot;
+        refS += 1.0 * s; refSQ += (1.0 * s) ** 2;
+      }
+      const refKbSq = refSQ + rho * Math.max(0, refS * refS - refSQ);
+      const refKb = Math.sqrt(Math.max(0, refKbSq));
+
+      const fr = fakeRedis();
+      fr.setResponse("FT.AGGREGATE", (args: unknown[]) => {
+        if (!args.includes("APPLY")) return ftAggregateReply(["1"]);
+        return [1, ftAggRow("1", {
+          sum_v_ws_equity_vega: sumWs,
+          sum_v_ws_equity_vega_sq: sumWsSq,
+          row_count: rows.length,
+        })];
+      });
+      app = await createServer({ redis: fr, schema });
+      const res = await app.inject({
+        method: "POST", url: "/calc/sbm",
+        payload: { risk_class: "Equity", sensitivity_type: "Vega" },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.engine).toBe("ft_aggregate");
+      // Parity gate: ≤1e-9 between fast-path K_b and Lua w=1.0 closed form.
+      expect(Math.abs(body.per_bucket[0].K_b - refKb)).toBeLessThanOrEqual(1e-9);
+      expect(Math.abs(body.per_bucket[0].S_b - refS)).toBeLessThanOrEqual(1e-9);
+    });
+
+    it("Equity Curvature parity: enrichDoc + fast path matches §21.5(3) ψ-gated reference", async () => {
+      const schema = fastPathSchema() as any;
+      const rhoDelta = schema.correlations.equity_rho.value;  // 0.5
+      const rhoCurv = rhoDelta * rhoDelta;                    // 0.25 per §21.5(3)
+      // Raw CVR pairs — mix signs so ψ-gate actually drops cross terms.
+      const rows = [
+        { cvr_up:  0.40, cvr_down:  0.10 },
+        { cvr_up: -0.30, cvr_down:  0.20 },
+        { cvr_up:  0.50, cvr_down: -0.15 },
+        { cvr_up: -0.10, cvr_down: -0.25 },
+        { cvr_up:  0.20, cvr_down:  0.05 },
+      ].map((rv) => ({
+        risk_class: "EQUITY", bucket: "1", sensitivity_type: "Curvature", risk_value: rv,
+      }));
+      // Aggregate enrichDoc's weighted_cvr_* values as the index would. Sign-
+      // split aggregates mirror buildFastPathAggregateArgs (u/n prefix groups).
+      const acc = { uS: 0, uSQ: 0, uN: 0, uSQN: 0, dS: 0, dSQ: 0, dN: 0, dSQN: 0 };
+      for (const r of rows) {
+        const e = enrichDoc(r, schema as any);
+        const u = e.weighted_cvr_up as number; const d = e.weighted_cvr_down as number;
+        acc.uS += u; acc.uSQ += u * u; acc.uN += u < 0 ? u : 0; acc.uSQN += u < 0 ? u * u : 0;
+        acc.dS += d; acc.dSQ += d * d; acc.dN += d < 0 ? d : 0; acc.dSQN += d < 0 ? d * d : 0;
+      }
+      // Lua reference: with no weight applied (equity_curvature.lua passes raw
+      // CVR), §21.5(3) collapses to the same ψ-gated cross the fast-path
+      // sign-split closed form recovers from the per-bucket aggregates.
+      const refDir = (S: number, SQ: number, N: number, SQN: number) => {
+        const totalCross = S * S - SQ; const negCross = N * N - SQN;
+        const kbSq = Math.max(0, SQ + rhoCurv * (totalCross - negCross));
+        return { K_b: Math.sqrt(kbSq), S_b: S };
+      };
+      const up = refDir(acc.uS, acc.uSQ, acc.uN, acc.uSQN);
+      const dn = refDir(acc.dS, acc.dSQ, acc.dN, acc.dSQN);
+      const winner = dn.K_b > up.K_b ? dn : up;
+
+      const fr = fakeRedis();
+      fr.setResponse("FT.AGGREGATE", (args: unknown[]) => {
+        if (!args.includes("APPLY")) return ftAggregateReply(["1"]);
+        return [1, ftAggRow("1", {
+          sum_u_ws_equity_cvr_up: acc.uS,
+          sum_u_ws_equity_cvr_up_sq: acc.uSQ,
+          sum_u_ws_equity_cvr_up_neg: acc.uN,
+          sum_u_ws_equity_cvr_up_negsq: acc.uSQN,
+          sum_n_ws_equity_cvr_down: acc.dS,
+          sum_n_ws_equity_cvr_down_sq: acc.dSQ,
+          sum_n_ws_equity_cvr_down_neg: acc.dN,
+          sum_n_ws_equity_cvr_down_negsq: acc.dSQN,
+          row_count: rows.length,
+        })];
+      });
+      app = await createServer({ redis: fr, schema });
+      const res = await app.inject({
+        method: "POST", url: "/calc/sbm",
+        payload: { risk_class: "Equity", sensitivity_type: "Curvature" },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.engine).toBe("ft_aggregate");
+      expect(Math.abs(body.per_bucket[0].K_b - winner.K_b)).toBeLessThanOrEqual(1e-9);
+      expect(Math.abs(body.per_bucket[0].S_b - winner.S_b)).toBeLessThanOrEqual(1e-9);
     });
 
     it("commands.fcall.dispatched_keys still mirrors the per-bucket key shape on the fast path", async () => {

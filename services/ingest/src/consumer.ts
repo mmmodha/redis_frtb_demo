@@ -74,11 +74,39 @@ function weightFor(table: RiskWeightTable | undefined, bucket: string, tenor: st
   return 0;
 }
 
+// Wave 5.83B-fix — per-leg weighting must mirror the Lua kernels exactly:
+//   Delta     → schema's `<class>_delta_weights` (table above).
+//   Vega      → identity (the schema's vega weights are 1.0; equity_vega and
+//               fx_vega kernels hardcode 1.0 in bootstrap.ts, girr_vega reads
+//               girr_vega_weights.constant which is 1.0 in the locked schema).
+//   Curvature → identity (no schema weight applied; ψ-gate + max happen in the
+//               reduce step).
+// Returning 1.0 for Vega/Curvature pre-multiplies by 1.0 so the stored
+// `weighted_value` / `weighted_cvr_*` field is the bare sensitivity — which is
+// exactly what the FT.AGGREGATE fast path needs to match the Lua reference.
+function legWeight(
+  sensType: string,
+  table: RiskWeightTable | undefined,
+  bucket: string,
+  tenor: string | null,
+): number {
+  if (sensType === "Vega" || sensType === "Curvature") return 1.0;
+  return weightFor(table, bucket, tenor);
+}
+
 // Wave 5.83B — additive enrichment step run before JSON.SET. Computes the
 // per-tenor (or scalar) pre-weighted sensitivities so the calc fast path
 // can FT.AGGREGATE on `ws_*` numeric fields without a per-row JSON.GET.
 // The raw `risk_value` and `weight` fields are preserved untouched — this
 // is purely additive so the Lua differential-test path keeps working.
+//
+// Wave 5.83B-fix — per-leg weight rule (mirrors the Lua kernels exactly):
+//   Delta     → schema's `<class>_delta_weights` (per-tenor or by-bucket).
+//   Vega      → identity (no schema weight applied).
+//   Curvature → identity (ψ-gate + max applied in the reduce step).
+// Both Vega and Curvature pass the bare sensitivity through as the weighted
+// field, so a downstream FT.AGGREGATE SUM over `ws_*` matches the per-row
+// `w · s` accumulation the Lua kernels do (with w=1.0).
 //
 // Shapes (see shared/schema/src/types.ts `SensitivityRiskValue`):
 //   - Delta/Vega per-tenor object `{ "3M": v0, "6M": v1, ... }` → produces
@@ -113,6 +141,8 @@ export function enrichDoc(
   const rv = doc.risk_value;
 
   // Curvature first — distinct field names (weighted_cvr_up / weighted_cvr_down).
+  // Lua kernels apply no weight, so legWeight returns 1.0 here regardless of
+  // bucket/tenor — pass the bare CVR value through.
   if (sensType === "Curvature" && rv != null && typeof rv === "object" && !Array.isArray(rv)) {
     const cvrObj = rv as { cvr_up?: unknown; cvr_down?: unknown };
     if (Array.isArray(cvrObj.cvr_up) && Array.isArray(cvrObj.cvr_down) && tenorNodes) {
@@ -123,27 +153,28 @@ export function enrichDoc(
       const n = Math.min(up.length, down.length, tenorNodes.length);
       for (let i = 0; i < n; i++) {
         const t = tenorNodes[i]!;
-        const w = weightFor(table, bucket, t);
+        const w = legWeight(sensType, table, bucket, t);
         upOut[t] = w * up[i]!;
         downOut[t] = w * down[i]!;
       }
       enriched.weighted_cvr_up = upOut;
       enriched.weighted_cvr_down = downOut;
     } else if (typeof cvrObj.cvr_up === "number" && typeof cvrObj.cvr_down === "number") {
-      const w = weightFor(table, bucket, null);
+      const w = legWeight(sensType, table, bucket, null);
       enriched.weighted_cvr_up = w * cvrObj.cvr_up;
       enriched.weighted_cvr_down = w * cvrObj.cvr_down;
     }
     return enriched;
   }
 
-  // Delta / Vega — single `weighted_value` field.
+  // Delta / Vega — single `weighted_value` field. Delta multiplies by the
+  // class's delta-weight table; Vega is identity (legWeight returns 1.0).
   if (rv != null && typeof rv === "object" && !Array.isArray(rv)) {
     const obj = rv as Record<string, unknown>;
     const keys = Object.keys(obj);
     if (keys.length === 1 && keys[0] === "spot" && typeof obj.spot === "number") {
       // Equity / FX scalar shape.
-      const w = weightFor(table, bucket, null);
+      const w = legWeight(sensType, table, bucket, null);
       enriched.weighted_value = w * obj.spot;
     } else {
       // Per-tenor object: keys are tenor labels.
@@ -151,7 +182,7 @@ export function enrichDoc(
       for (const k of keys) {
         const v = obj[k];
         if (typeof v !== "number") continue;
-        const w = weightFor(table, bucket, k);
+        const w = legWeight(sensType, table, bucket, k);
         out[k] = w * v;
       }
       enriched.weighted_value = out;
@@ -170,14 +201,14 @@ export function enrichDoc(
         const v = rv[i];
         if (typeof v !== "number") continue;
         const t = labels[i]!;
-        const w = weightFor(table, bucket, t);
+        const w = legWeight(sensType, table, bucket, t);
         out[t] = w * v;
       }
       enriched.weighted_value = out;
     }
   } else if (typeof rv === "number") {
     // Bare scalar (Equity / FX legacy fixture shape).
-    const w = weightFor(table, bucket, null);
+    const w = legWeight(sensType, table, bucket, null);
     enriched.weighted_value = w * rv;
   }
   return enriched;

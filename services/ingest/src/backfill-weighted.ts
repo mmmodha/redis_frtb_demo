@@ -5,6 +5,12 @@
 // `_calibration` tag. Idempotent — re-running on already-enriched data is a
 // no-op aside from a SCAN pass. Prints `{patched: N, skipped: M}` to stdout
 // on completion.
+//
+// Wave 5.83B-fix — `--force` (or `BACKFILL_FORCE=1`) re-runs enrichDoc on
+// every scanned doc regardless of the `_calibration` tag / weighted_* presence.
+// Required to correct rows ingested before the per-leg weighting fix (Vega/
+// Curvature legs were previously written with delta weights). Default mode
+// stays idempotent so steady-state demo runs remain a no-op.
 
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -36,9 +42,14 @@ function needsPatch(doc: Record<string, unknown>): boolean {
   return doc.weighted_value === undefined;
 }
 
-export async function backfill(client: RedisLike, schema: Schema, opts?: { match?: string; count?: number }): Promise<BackfillReport> {
+export async function backfill(
+  client: RedisLike,
+  schema: Schema,
+  opts?: { match?: string; count?: number; force?: boolean },
+): Promise<BackfillReport> {
   const match = opts?.match ?? KEY_MATCH;
   const count = opts?.count ?? SCAN_COUNT;
+  const force = opts?.force ?? false;
   const report: BackfillReport = { patched: 0, skipped: 0, errors: 0, scanned: 0 };
   let cursor = "0";
   do {
@@ -61,7 +72,9 @@ export async function backfill(client: RedisLike, schema: Schema, opts?: { match
       let doc: Record<string, unknown>;
       try { doc = JSON.parse(raw) as Record<string, unknown>; }
       catch { report.errors++; continue; }
-      if (!needsPatch(doc)) { report.skipped++; continue; }
+      // Force mode skips the needsPatch gate so docs already carrying a
+      // stale `_calibration` tag get re-weighted with the per-leg fix.
+      if (!force && !needsPatch(doc)) { report.skipped++; continue; }
       const enriched = enrichDoc(doc, schema);
       setPipe.call("JSON.SET", keys[i]!, "$", JSON.stringify(enriched));
       setCount++;
@@ -83,14 +96,18 @@ async function main(): Promise<void> {
   }
   const schema = loadSchema(SCHEMA_PATH);
   const redisUrl = process.env.REDIS_URL ?? "redis://127.0.0.1:6379";
+  // `--force` (or BACKFILL_FORCE=1) re-weights every doc, ignoring the
+  // _calibration tag. Required after the per-leg weighting fix to correct
+  // Vega/Curvature rows ingested under the old (delta-weight-for-all-legs) rule.
+  const force = process.argv.includes("--force") || process.env.BACKFILL_FORCE === "1";
   const client = createRedisClient({ url: redisUrl }) as unknown as RedisLike;
   try {
     const t0 = Date.now();
-    const report = await backfill(client, schema);
+    const report = await backfill(client, schema, { force });
     const ms = Date.now() - t0;
     // Final line is JSON so it's machine-parseable by demo scripts.
     // eslint-disable-next-line no-console
-    console.log(JSON.stringify({ ...report, elapsed_ms: ms, schema: SCHEMA_PATH, redis: redisUrl }));
+    console.log(JSON.stringify({ ...report, elapsed_ms: ms, schema: SCHEMA_PATH, redis: redisUrl, force }));
   } finally {
     await (client as Redis).quit().catch(() => undefined);
   }
