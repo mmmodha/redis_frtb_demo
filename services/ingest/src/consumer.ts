@@ -1,4 +1,5 @@
 import type { Redis, Cluster } from "ioredis";
+import type { Schema, RiskWeightTable } from "@frtb/schema";
 
 // Stream consumer for the FRTB ingest service.
 // Reads from Redis Stream `sensitivities:in` via XREADGROUP, builds the locked
@@ -15,6 +16,13 @@ export interface ConsumerOptions {
   consumerName: string;
   batchSize?: number;
   blockMs?: number;
+  // Wave 5.83B — schema is loaded once at consumer creation and threaded
+  // through processBatch so enrichDoc can pre-compute per-tenor
+  // weighted_value (and weighted_cvr_up/down for Curvature) from the
+  // schema's risk_weights block. Omitted in unit-test stubs that only
+  // exercise pipeline-call ordering — enrichDoc still stamps the
+  // `_calibration: "demo"` tag in that case.
+  schema?: Schema;
 }
 
 export interface ConsumerStats {
@@ -48,6 +56,131 @@ export function buildDoc(message: Record<string, string>): Record<string, unknow
   void _h; void _i;
   const parsed: Record<string, unknown> = payload ? JSON.parse(payload) : {};
   return { risk_class, bucket, ...rest, ...parsed };
+}
+
+// Wave 5.83B — literal calibration tag stamped on every ingested doc. Powers
+// the `_calibration` TAG on idx:sens; demo-only literal here, the actual
+// versioning hook lands in a later wave.
+export const CALIBRATION_TAG = "demo";
+
+// Resolves the per-(class, bucket, tenor) risk weight from the schema's
+// `risk_weights` block — by_tenor, by_bucket, or constant — falling back to 0
+// when the table is missing or the key is absent. Pure / synchronous; no IO.
+function weightFor(table: RiskWeightTable | undefined, bucket: string, tenor: string | null): number {
+  if (!table) return 0;
+  if ("constant" in table) return table.constant;
+  if ("by_tenor" in table) return tenor != null ? (table.by_tenor[tenor] ?? 0) : 0;
+  if ("by_bucket" in table) return table.by_bucket[bucket] ?? 0;
+  return 0;
+}
+
+// Wave 5.83B — additive enrichment step run before JSON.SET. Computes the
+// per-tenor (or scalar) pre-weighted sensitivities so the calc fast path
+// can FT.AGGREGATE on `ws_*` numeric fields without a per-row JSON.GET.
+// The raw `risk_value` and `weight` fields are preserved untouched — this
+// is purely additive so the Lua differential-test path keeps working.
+//
+// Shapes (see shared/schema/src/types.ts `SensitivityRiskValue`):
+//   - Delta/Vega per-tenor object `{ "3M": v0, "6M": v1, ... }` → produces
+//     `weighted_value: { "3M": w_k*v0, "6M": w_k*v1, ... }` (per-tenor object).
+//   - Delta/Vega scalar `{ spot: v }` or bare `number` → produces a scalar
+//     `weighted_value = w * v` (Equity / FX convention).
+//   - Delta/Vega legacy array `[v0, v1, ...]` (test fixtures) → zipped against
+//     `doc.tenor` (when an array of labels) or the schema's class tenor nodes;
+//     produces a per-tenor object. Skipped silently if no tenor labels.
+//   - Curvature per-tenor `{ cvr_up: number[], cvr_down: number[] }` → emits
+//     `weighted_cvr_up` / `weighted_cvr_down` as per-tenor objects keyed by
+//     the schema's class tenor nodes.
+//   - Curvature scalar `{ cvr_up: number, cvr_down: number }` (Equity / FX) →
+//     emits scalar `weighted_cvr_up` / `weighted_cvr_down`.
+//
+// `_calibration: "demo"` is always stamped, even when no schema is provided
+// (preserves the SUGADD-only unit-test stub path).
+export function enrichDoc(
+  doc: Record<string, unknown>,
+  schema?: Schema,
+): Record<string, unknown> {
+  const enriched: Record<string, unknown> = { ...doc, _calibration: CALIBRATION_TAG };
+  if (!schema) return enriched;
+  const riskClass = typeof doc.risk_class === "string" ? doc.risk_class : undefined;
+  const bucket = typeof doc.bucket === "string" ? doc.bucket : "";
+  if (!riskClass) return enriched;
+  const cls = schema.risk_classes?.[riskClass];
+  if (!cls) return enriched;
+  const table = cls.risk_weights_ref ? schema.risk_weights[cls.risk_weights_ref] : undefined;
+  const tenorNodes: readonly string[] | undefined = cls.tenor?.nodes;
+  const sensType = typeof doc.sensitivity_type === "string" ? doc.sensitivity_type : "";
+  const rv = doc.risk_value;
+
+  // Curvature first — distinct field names (weighted_cvr_up / weighted_cvr_down).
+  if (sensType === "Curvature" && rv != null && typeof rv === "object" && !Array.isArray(rv)) {
+    const cvrObj = rv as { cvr_up?: unknown; cvr_down?: unknown };
+    if (Array.isArray(cvrObj.cvr_up) && Array.isArray(cvrObj.cvr_down) && tenorNodes) {
+      const up = cvrObj.cvr_up as number[];
+      const down = cvrObj.cvr_down as number[];
+      const upOut: Record<string, number> = {};
+      const downOut: Record<string, number> = {};
+      const n = Math.min(up.length, down.length, tenorNodes.length);
+      for (let i = 0; i < n; i++) {
+        const t = tenorNodes[i]!;
+        const w = weightFor(table, bucket, t);
+        upOut[t] = w * up[i]!;
+        downOut[t] = w * down[i]!;
+      }
+      enriched.weighted_cvr_up = upOut;
+      enriched.weighted_cvr_down = downOut;
+    } else if (typeof cvrObj.cvr_up === "number" && typeof cvrObj.cvr_down === "number") {
+      const w = weightFor(table, bucket, null);
+      enriched.weighted_cvr_up = w * cvrObj.cvr_up;
+      enriched.weighted_cvr_down = w * cvrObj.cvr_down;
+    }
+    return enriched;
+  }
+
+  // Delta / Vega — single `weighted_value` field.
+  if (rv != null && typeof rv === "object" && !Array.isArray(rv)) {
+    const obj = rv as Record<string, unknown>;
+    const keys = Object.keys(obj);
+    if (keys.length === 1 && keys[0] === "spot" && typeof obj.spot === "number") {
+      // Equity / FX scalar shape.
+      const w = weightFor(table, bucket, null);
+      enriched.weighted_value = w * obj.spot;
+    } else {
+      // Per-tenor object: keys are tenor labels.
+      const out: Record<string, number> = {};
+      for (const k of keys) {
+        const v = obj[k];
+        if (typeof v !== "number") continue;
+        const w = weightFor(table, bucket, k);
+        out[k] = w * v;
+      }
+      enriched.weighted_value = out;
+    }
+  } else if (Array.isArray(rv)) {
+    // Legacy array shape (test fixtures): zip against doc.tenor when it's
+    // an array of labels, else fall back to the schema's class tenor nodes.
+    const docTenor = doc.tenor;
+    const labels: readonly string[] | undefined = Array.isArray(docTenor) && docTenor.every((t) => typeof t === "string")
+      ? (docTenor as string[])
+      : tenorNodes;
+    if (labels) {
+      const out: Record<string, number> = {};
+      const n = Math.min(rv.length, labels.length);
+      for (let i = 0; i < n; i++) {
+        const v = rv[i];
+        if (typeof v !== "number") continue;
+        const t = labels[i]!;
+        const w = weightFor(table, bucket, t);
+        out[t] = w * v;
+      }
+      enriched.weighted_value = out;
+    }
+  } else if (typeof rv === "number") {
+    // Bare scalar (Equity / FX legacy fixture shape).
+    const w = weightFor(table, bucket, null);
+    enriched.weighted_value = w * rv;
+  }
+  return enriched;
 }
 
 // Creates the consumer group on the stream, MKSTREAM to handle the
@@ -107,7 +240,11 @@ export async function processBatch(
         continue;
       }
       const key = buildKey(hashTag, ulid);
-      const doc = buildDoc(msg);
+      // Wave 5.83B — enrichDoc folds in per-tenor `weighted_value`
+      // (and `weighted_cvr_up/down` for Curvature) from the schema, plus
+      // the `_calibration: "demo"` literal tag, then JSON.SET writes the
+      // full enriched doc in one shot.
+      const doc = enrichDoc(buildDoc(msg), opts.schema);
       pipeline.call("JSON.SET", key, "$", JSON.stringify(doc));
       // Wave 5.30a — autocomplete suggester live-populate. INCR bumps the
       // score on duplicate values so frequent terms rank higher in FT.SUGGET.

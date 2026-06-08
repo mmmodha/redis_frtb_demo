@@ -6,13 +6,30 @@ import { join } from "node:path";
 import { setTimeout as wait } from "node:timers/promises";
 import { Redis } from "ioredis";
 import { monotonicFactory } from "ulid";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   buildKey,
   buildDoc,
+  enrichDoc,
+  CALIBRATION_TAG,
   ensureGroup,
   processBatch,
   createConsumer,
 } from "../src/consumer.ts";
+import { backfill } from "../src/backfill-weighted.ts";
+import { loadSchema, type Schema } from "@frtb/schema";
+
+// Wave 5.83B — schema loaded from the locked default YAML so the
+// enrichDoc tests assert against the committed risk_weights values
+// (girr_delta_weights, equity_weights, fx_weights).
+const here = resolve(fileURLToPath(import.meta.url), "..");
+const SCHEMA_PATH = resolve(here, "../../../config/schema/frtb-default.yaml");
+const SCHEMA: Schema = loadSchema(SCHEMA_PATH);
+const GIRR_W = SCHEMA.risk_weights.girr_delta_weights as { by_tenor: Record<string, number> };
+const EQUITY_W = SCHEMA.risk_weights.equity_weights as { by_bucket: Record<string, number> };
+const FX_W = SCHEMA.risk_weights.fx_weights as { constant: number };
+const TOL = 1e-12;
 
 // Wave 5.73e — prefer driving redis-server with explicit --loadmodule pointing
 // at the apt-installed redis-stack .so files (the apt redis-stack-server
@@ -155,6 +172,104 @@ describe("consumer pure helpers", () => {
     expect(doc).not.toHaveProperty("_hash_tag");
     expect(doc).not.toHaveProperty("_id");
     expect(doc).not.toHaveProperty("payload");
+  });
+});
+
+// Wave 5.83B — enrichDoc folds per-tenor `weighted_value` (and
+// `weighted_cvr_up/down` for Curvature) into every doc before JSON.SET,
+// using the schema's risk_weights block, and stamps `_calibration: "demo"`.
+// Math correctness is verified to ≤1e-12 (linearity-of-weighting holds
+// trivially for IEEE-754 multiplies — only rounding within the multiply
+// itself). Per-class fixtures cover all three (3 × class, 3 × leg) variants.
+describe("enrichDoc — Wave 5.83B pre-weighting", () => {
+  it("stamps _calibration='demo' on every doc, even with no schema", () => {
+    const out = enrichDoc({ risk_class: "GIRR", bucket: "USD" });
+    expect(out._calibration).toBe(CALIBRATION_TAG);
+    expect(out._calibration).toBe("demo");
+  });
+
+  it("preserves the raw risk_value and weight fields (purely additive)", () => {
+    const rv = { "3M": 0.1, "6M": 0.2 };
+    const out = enrichDoc({ risk_class: "GIRR", bucket: "USD", sensitivity_type: "Delta", risk_value: rv, weight: 0.017 }, SCHEMA);
+    expect(out.risk_value).toEqual(rv);
+    expect(out.weight).toBe(0.017);
+  });
+
+  it("GIRR Delta per-tenor object → weighted_value object keyed by same tenor labels (≤1e-12)", () => {
+    const rv = { "3M": 0.1, "6M": -0.2, "10Y": 0.5 };
+    const out = enrichDoc({ risk_class: "GIRR", bucket: "USD", sensitivity_type: "Delta", risk_value: rv }, SCHEMA);
+    const wv = out.weighted_value as Record<string, number>;
+    expect(Object.keys(wv).sort()).toEqual(["10Y", "3M", "6M"]);
+    expect(Math.abs(wv["3M"]! - GIRR_W.by_tenor["3M"]! * 0.1)).toBeLessThanOrEqual(TOL);
+    expect(Math.abs(wv["6M"]! - GIRR_W.by_tenor["6M"]! * -0.2)).toBeLessThanOrEqual(TOL);
+    expect(Math.abs(wv["10Y"]! - GIRR_W.by_tenor["10Y"]! * 0.5)).toBeLessThanOrEqual(TOL);
+  });
+
+  it("GIRR Vega object → same per-tenor object shape (delta/vega share weighted_value)", () => {
+    const out = enrichDoc({ risk_class: "GIRR", bucket: "EUR", sensitivity_type: "Vega", risk_value: { "1Y": 0.3 } }, SCHEMA);
+    const wv = out.weighted_value as Record<string, number>;
+    expect(Math.abs(wv["1Y"]! - GIRR_W.by_tenor["1Y"]! * 0.3)).toBeLessThanOrEqual(TOL);
+  });
+
+  it("GIRR legacy array shape zipped via doc.tenor (test-fixture compat)", () => {
+    const out = enrichDoc({
+      risk_class: "GIRR", bucket: "USD", sensitivity_type: "Delta",
+      tenor: ["3M", "1Y", "10Y"], risk_value: [0.1, 0.2, 0.3],
+    }, SCHEMA);
+    const wv = out.weighted_value as Record<string, number>;
+    expect(Math.abs(wv["3M"]! - GIRR_W.by_tenor["3M"]! * 0.1)).toBeLessThanOrEqual(TOL);
+    expect(Math.abs(wv["1Y"]! - GIRR_W.by_tenor["1Y"]! * 0.2)).toBeLessThanOrEqual(TOL);
+    expect(Math.abs(wv["10Y"]! - GIRR_W.by_tenor["10Y"]! * 0.3)).toBeLessThanOrEqual(TOL);
+  });
+
+  it("EQUITY scalar {spot} → scalar weighted_value via by_bucket", () => {
+    const out = enrichDoc({ risk_class: "EQUITY", bucket: "1", sensitivity_type: "Delta", risk_value: { spot: 0.42 } }, SCHEMA);
+    expect(Math.abs((out.weighted_value as number) - EQUITY_W.by_bucket["1"]! * 0.42)).toBeLessThanOrEqual(TOL);
+  });
+
+  it("EQUITY bare-number risk_value → scalar weighted_value (legacy fixture shape)", () => {
+    const out = enrichDoc({ risk_class: "EQUITY", bucket: "2", sensitivity_type: "Delta", risk_value: 0.5 }, SCHEMA);
+    expect(Math.abs((out.weighted_value as number) - EQUITY_W.by_bucket["2"]! * 0.5)).toBeLessThanOrEqual(TOL);
+  });
+
+  it("FX scalar → scalar weighted_value via constant weight", () => {
+    const out = enrichDoc({ risk_class: "FX", bucket: "EURUSD", sensitivity_type: "Delta", risk_value: { spot: 0.75 } }, SCHEMA);
+    expect(Math.abs((out.weighted_value as number) - FX_W.constant * 0.75)).toBeLessThanOrEqual(TOL);
+  });
+
+  it("GIRR Curvature per-tenor arrays → weighted_cvr_up / weighted_cvr_down objects (≤1e-12)", () => {
+    const tenors = SCHEMA.risk_classes.GIRR!.tenor!.nodes;
+    const up = tenors.map((_, i) => 0.1 * (i + 1));
+    const down = tenors.map((_, i) => -0.05 * (i + 1));
+    const out = enrichDoc({
+      risk_class: "GIRR", bucket: "USD", sensitivity_type: "Curvature",
+      risk_value: { cvr_up: up, cvr_down: down },
+    }, SCHEMA);
+    const wu = out.weighted_cvr_up as Record<string, number>;
+    const wd = out.weighted_cvr_down as Record<string, number>;
+    expect(out.weighted_value).toBeUndefined();
+    for (let i = 0; i < tenors.length; i++) {
+      const t = tenors[i]!;
+      const w = GIRR_W.by_tenor[t]!;
+      expect(Math.abs(wu[t]! - w * up[i]!)).toBeLessThanOrEqual(TOL);
+      expect(Math.abs(wd[t]! - w * down[i]!)).toBeLessThanOrEqual(TOL);
+    }
+  });
+
+  it("EQUITY Curvature scalars → scalar weighted_cvr_up / weighted_cvr_down (≤1e-12)", () => {
+    const out = enrichDoc({
+      risk_class: "EQUITY", bucket: "5", sensitivity_type: "Curvature",
+      risk_value: { cvr_up: 0.4, cvr_down: -0.3 },
+    }, SCHEMA);
+    const w = EQUITY_W.by_bucket["5"]!;
+    expect(Math.abs((out.weighted_cvr_up as number) - w * 0.4)).toBeLessThanOrEqual(TOL);
+    expect(Math.abs((out.weighted_cvr_down as number) - w * -0.3)).toBeLessThanOrEqual(TOL);
+  });
+
+  it("unknown risk_class → only _calibration stamped, no weighted fields", () => {
+    const out = enrichDoc({ risk_class: "UNKNOWN", bucket: "x", sensitivity_type: "Delta", risk_value: { spot: 1 } }, SCHEMA);
+    expect(out._calibration).toBe("demo");
+    expect(out.weighted_value).toBeUndefined();
   });
 });
 
@@ -357,5 +472,84 @@ describe("XREADGROUP consumer → JSON.SET", () => {
 
     expect((await redis.keys("sens:*")).length).toBe(50);
     expect(runner.stats.acked).toBeGreaterThanOrEqual(50);
+  });
+
+  // Wave 5.83B — end-to-end check that the consumer writes the pre-weighted
+  // fields and the `_calibration` tag through JSON.SET. Uses the locked
+  // default schema so the assertions are byte-identical to a production
+  // deployment.
+  integration("with schema, stored doc includes weighted_value (≤1e-12 of w*s) and _calibration='demo'", async () => {
+    await ensureGroup(redis, "sensitivities:in", "ingest");
+    const girr = makeRow("GIRR", "USD", {
+      sensitivity_type: "Delta",
+      tenor: ["3M", "1Y", "10Y"],
+      risk_value: [0.1, 0.2, 0.3],
+      trade_id: "T-w1",
+    });
+    const equity = makeRow("EQUITY", "1", { sensitivity_type: "Delta", risk_value: { spot: 0.42 }, trade_id: "T-w2" });
+    const fx = makeRow("FX", "EURUSD", { sensitivity_type: "Vega", risk_value: { spot: 0.75 }, trade_id: "T-w3" });
+    for (const r of [girr, equity, fx]) await xaddRow("sensitivities:in", r);
+
+    await processBatch(redis, {
+      stream: "sensitivities:in", group: "ingest", consumerName: "ingest-w", batchSize: 100, schema: SCHEMA,
+    }, ">");
+
+    const girrStored = JSON.parse(await redis.call("JSON.GET", `sens:{GIRR:USD}:${girr._id}`) as string);
+    expect(girrStored._calibration).toBe("demo");
+    const gwv = girrStored.weighted_value as Record<string, number>;
+    expect(Math.abs(gwv["3M"] - GIRR_W.by_tenor["3M"]! * 0.1)).toBeLessThanOrEqual(TOL);
+    expect(Math.abs(gwv["1Y"] - GIRR_W.by_tenor["1Y"]! * 0.2)).toBeLessThanOrEqual(TOL);
+    expect(Math.abs(gwv["10Y"] - GIRR_W.by_tenor["10Y"]! * 0.3)).toBeLessThanOrEqual(TOL);
+    // Raw fields preserved
+    expect(girrStored.risk_value).toEqual([0.1, 0.2, 0.3]);
+
+    const eqStored = JSON.parse(await redis.call("JSON.GET", `sens:{EQUITY:1}:${equity._id}`) as string);
+    expect(eqStored._calibration).toBe("demo");
+    expect(Math.abs(eqStored.weighted_value - EQUITY_W.by_bucket["1"]! * 0.42)).toBeLessThanOrEqual(TOL);
+
+    const fxStored = JSON.parse(await redis.call("JSON.GET", `sens:{FX:EURUSD}:${fx._id}`) as string);
+    expect(fxStored._calibration).toBe("demo");
+    expect(Math.abs(fxStored.weighted_value - FX_W.constant * 0.75)).toBeLessThanOrEqual(TOL);
+  });
+
+  // Wave 5.83B — backfill CLI: seeds an unpatched doc directly via JSON.SET,
+  // runs backfill(), then re-runs to verify idempotency. Reports
+  // {patched, skipped} consistent with the seeded population.
+  integration("backfill patches docs missing weighted_value, then re-runs as a no-op", async () => {
+    // Seed three docs WITHOUT _calibration / weighted_* (mimics 5.83A-era data).
+    const seeds = [
+      { key: "sens:{GIRR:USD}:bf01", doc: { risk_class: "GIRR", bucket: "USD", sensitivity_type: "Delta", risk_value: { "3M": 0.1, "6M": 0.2 } } },
+      { key: "sens:{EQUITY:1}:bf02", doc: { risk_class: "EQUITY", bucket: "1", sensitivity_type: "Delta", risk_value: { spot: 0.5 } } },
+      { key: "sens:{FX:EURUSD}:bf03", doc: { risk_class: "FX", bucket: "EURUSD", sensitivity_type: "Curvature", risk_value: { cvr_up: 0.3, cvr_down: -0.2 } } },
+    ];
+    for (const { key, doc } of seeds) {
+      await redis.call("JSON.SET", key, "$", JSON.stringify(doc));
+    }
+    // Also seed one already-enriched doc so we exercise the skip path.
+    await redis.call("JSON.SET", "sens:{GIRR:USD}:bf04", "$", JSON.stringify({
+      risk_class: "GIRR", bucket: "USD", sensitivity_type: "Delta",
+      risk_value: { "3M": 0.5 }, weighted_value: { "3M": GIRR_W.by_tenor["3M"]! * 0.5 },
+      _calibration: "demo",
+    }));
+
+    const first = await backfill(redis, SCHEMA);
+    expect(first.patched).toBe(3);
+    expect(first.skipped).toBe(1);
+    expect(first.errors).toBe(0);
+
+    // Verify the patches landed and raw fields preserved.
+    const girrAfter = JSON.parse(await redis.call("JSON.GET", "sens:{GIRR:USD}:bf01") as string);
+    expect(girrAfter._calibration).toBe("demo");
+    expect(Math.abs((girrAfter.weighted_value as Record<string, number>)["3M"]! - GIRR_W.by_tenor["3M"]! * 0.1)).toBeLessThanOrEqual(TOL);
+    expect(girrAfter.risk_value).toEqual({ "3M": 0.1, "6M": 0.2 });
+    const fxAfter = JSON.parse(await redis.call("JSON.GET", "sens:{FX:EURUSD}:bf03") as string);
+    expect(Math.abs(fxAfter.weighted_cvr_up - FX_W.constant * 0.3)).toBeLessThanOrEqual(TOL);
+    expect(Math.abs(fxAfter.weighted_cvr_down - FX_W.constant * -0.2)).toBeLessThanOrEqual(TOL);
+
+    // Second run is a pure no-op — everything is already enriched.
+    const second = await backfill(redis, SCHEMA);
+    expect(second.patched).toBe(0);
+    expect(second.skipped).toBe(4);
+    expect(second.errors).toBe(0);
   });
 });

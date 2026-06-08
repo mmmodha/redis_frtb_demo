@@ -17,11 +17,13 @@ LABEL org.opencontainers.image.title="@frtb/ingest" \
 RUN apk add --no-cache curl
 
 # Workspace manifests first so layer cache hits when only sources change.
-# @frtb/redis-client is a workspace: sibling dep of @frtb/ingest — its
-# directory must exist before `npm ci` so the workspace symlink resolves.
+# @frtb/redis-client and @frtb/schema are workspace: sibling deps of
+# @frtb/ingest — their directories must exist before `npm ci` so the
+# workspace symlinks resolve.
 COPY package.json package-lock.json ./
 COPY services/ingest/package.json services/ingest/
 COPY shared/redis-client shared/redis-client
+COPY shared/schema shared/schema
 # Wave 2: prod-only install with BuildKit npm cache. tsx is now a runtime
 # dep so --omit=dev keeps it while shedding typescript/vitest/@types/*.
 RUN --mount=type=cache,target=/root/.npm,sharing=locked \
@@ -30,6 +32,10 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
 # Service sources.
 COPY services/ingest/tsconfig.json services/ingest/
 COPY services/ingest/src services/ingest/src
+# Schema YAMLs loaded at runtime via SCHEMA_FILE (Wave 5.83B). Copied here
+# so the consumer runs inside the container without bind-mounting the repo.
+COPY config/schema /app/config/schema
+ENV SCHEMA_FILE=/app/config/schema/frtb-default.yaml
 
 WORKDIR /app/services/ingest
 
