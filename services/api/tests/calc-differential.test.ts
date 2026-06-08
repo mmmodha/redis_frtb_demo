@@ -589,6 +589,125 @@ describe("Wave 5.83D-1 — Lua ⇄ FT.AGGREGATE differential parity (9 variants)
     }
   });
 
+  // ---- Wave 5.83J2 — multi-bucket FX Delta + Vega including OTHER (ρ_fx = 0.6) ----
+  // The 5.83I live sweep showed FX K_b diverging on 5 of 11 buckets (AUDUSD,
+  // NZDUSD, OTHER, USDCHF, USDJPY) on top of the rolled-up charge gap. The
+  // 5.83G multi-bucket gate above covers Delta over 3 EUR/GBP pairs, but the
+  // analogous bootstrap mis-wiring for Vega (buildFxVegaSnippet called
+  // without `rho`, so the Lua kernel ran with ρ=0 while the fast path used
+  // 0.6) survived because no Vega multi-bucket gate existed. This test
+  // spans 5 buckets including OTHER (the fallback bucket the live sweep
+  // flagged) and asserts per-bucket K_b parity ≤1e-9 across BOTH legs, so
+  // any future bootstrap call that drops the ρ parameter for either leg
+  // trips the gate immediately.
+  for (const leg of ["Delta", "Vega"] as const) {
+    it(`FX ${leg} — multi-bucket parity including OTHER bucket (Wave 5.83J2 regression)`, async () => {
+      const schema = diffSchema() as any;
+      // Override the schema's FX bucket list to span the OTHER fallback and
+      // four currency-pair buckets that were divergent in 5.83I.
+      schema.risk_classes.FX.buckets.values = ["EURUSD", "GBPUSD", "USDJPY", "USDCHF", "OTHER"];
+      // FX Vega weight is 1.0 (matches buildFxVegaSnippet({weight:1.0,...})
+      // and consumer.legWeight for sensitivity_type=Vega). FX Delta weight
+      // is schema.risk_weights.fx_weights.constant.
+      const w = leg === "Delta" ? schema.risk_weights.fx_weights.constant : 1.0;
+      const rho = schema.correlations.fx_rho.value;
+      expect(rho).toBe(0.6);
+      // Mixed-sign sensitivities so the cross term (Σws)² − Σws² is
+      // meaningfully non-zero — without it ρ wouldn't matter and the test
+      // would pass even with the bug present.
+      const bucketSpots: Record<string, number[]> = {
+        EURUSD: [0.50, -0.30, 0.20, 0.45, -0.10],
+        GBPUSD: [-0.40, 0.25, -0.15, 0.05, 0.30],
+        USDJPY: [0.60, 0.10, -0.35, -0.20, 0.15],
+        USDCHF: [0.35, 0.40, -0.10, 0.25, -0.05],
+        OTHER:  [0.20, -0.15, 0.10, 0.30, 0.25],
+      };
+      const buckets = Object.keys(bucketSpots);
+      const perBucket = buckets.map((b) => {
+        const spots = bucketSpots[b]!;
+        let sumWs = 0, sumWsSq = 0;
+        for (const s of spots) { const ws = w * s; sumWs += ws; sumWsSq += ws * ws; }
+        return { bucket: b, sumWs, sumWsSq, count: spots.length, K_b: kbConstantRho(sumWs, sumWsSq, rho) };
+      });
+      const sumPrefix = leg === "Delta" ? "d" : "v";
+      const fieldRoot = leg === "Delta" ? "ws_fx_delta" : "ws_fx_vega";
+
+      const savedFlag = process.env.CALC_FAST_PATH;
+      try {
+        // --- Lua path ---
+        process.env.CALC_FAST_PATH = "0";
+        __resetCalcCacheForTests();
+        const luaFr = fakeRedis();
+        luaFr.setResponse("FT.AGGREGATE", ftDiscoverReply(buckets));
+        luaFr.setResponse("FCALL", (args: unknown[]) => {
+          const b = String(args[4]);
+          const r = perBucket.find((p) => p.bucket === b)!;
+          return JSON.stringify({ K_b: r.K_b, S_b: r.sumWs, count: r.count, ms: 0 });
+        });
+        const luaApp = await createServer({ redis: luaFr, schema });
+        const luaRes = await luaApp.inject({
+          method: "POST", url: "/calc/sbm",
+          payload: { risk_class: "FX", sensitivity_type: leg },
+        });
+        expect(luaRes.statusCode).toBe(200);
+        const lua = luaRes.json();
+        expect(lua.engine).toBe("fcall_lua");
+        await luaApp.close();
+
+        // --- Fast path ---
+        process.env.CALC_FAST_PATH = "1";
+        __resetCalcCacheForTests();
+        const fastFr: FakeRedis = fakeRedis();
+        fastFr.setResponse("FT.AGGREGATE", (args: unknown[]) => {
+          if (!args.includes("APPLY")) return ftDiscoverReply(buckets);
+          const rows: unknown[] = [perBucket.length];
+          for (const p of perBucket) {
+            rows.push(ftAggRow(p.bucket, {
+              [`sum_${sumPrefix}_${fieldRoot}`]: p.sumWs,
+              [`sum_${sumPrefix}_${fieldRoot}_sq`]: p.sumWsSq,
+              row_count: p.count,
+            }));
+          }
+          return rows;
+        });
+        const fastApp = await createServer({ redis: fastFr, schema });
+        const fastRes = await fastApp.inject({
+          method: "POST", url: "/calc/sbm",
+          payload: { risk_class: "FX", sensitivity_type: leg },
+        });
+        expect(fastRes.statusCode).toBe(200);
+        const fast = fastRes.json();
+        expect(fast.engine).toBe("ft_aggregate");
+        await fastApp.close();
+
+        // Per-bucket parity gate across all 5 buckets (the gate that would
+        // catch a future bootstrap.ts call that drops `rho` for either leg).
+        expect(lua.per_bucket).toHaveLength(buckets.length);
+        expect(fast.per_bucket).toHaveLength(buckets.length);
+        const byBucketLua = new Map<string, any>(lua.per_bucket.map((r: any) => [r.bucket, r]));
+        const byBucketFast = new Map<string, any>(fast.per_bucket.map((r: any) => [r.bucket, r]));
+        for (const p of perBucket) {
+          const L = byBucketLua.get(p.bucket);
+          const F = byBucketFast.get(p.bucket);
+          expect(L, `lua per_bucket missing ${p.bucket}`).toBeDefined();
+          expect(F, `fast per_bucket missing ${p.bucket}`).toBeDefined();
+          expect(Math.abs(L.K_b - F.K_b)).toBeLessThanOrEqual(1e-9);
+          expect(Math.abs(L.S_b - F.S_b)).toBeLessThanOrEqual(1e-9);
+          expect(L.count).toBe(F.count);
+          // Closed-form K_b must match the schema's fx_rho on both sides —
+          // a path that silently used ρ=0 would fail this on every bucket
+          // whose spots aren't perfectly cancelling.
+          expect(Math.abs(L.K_b - p.K_b)).toBeLessThanOrEqual(1e-9);
+        }
+        // Risk-class roll-up parity.
+        expect(Math.abs(lua.charge - fast.charge)).toBeLessThanOrEqual(1e-9);
+      } finally {
+        if (savedFlag === undefined) delete process.env.CALC_FAST_PATH;
+        else process.env.CALC_FAST_PATH = savedFlag;
+      }
+    });
+  }
+
   // ---- Wave 5.83J1 — multi-bucket GIRR Delta + Vega across full tenor span ----
   // The 5.83I live sweep surfaced a fast-path 500 on GIRR because each per-tenor
   // doc only populates the tenors it carries, so referencing
