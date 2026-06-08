@@ -588,6 +588,152 @@ describe("Wave 5.83D-1 — Lua ⇄ FT.AGGREGATE differential parity (9 variants)
       else process.env.CALC_FAST_PATH = savedFlag;
     }
   });
+
+  // ---- Wave 5.83J1 — multi-bucket GIRR Delta + Vega across full tenor span ----
+  // The 5.83I live sweep surfaced a fast-path 500 on GIRR because each per-tenor
+  // doc only populates the tenors it carries, so referencing
+  // `@ws_girr_delta_3M` in APPLY trips RediSearch's "could not find the value"
+  // error. The fix (`case(exists(@f),@f,0)` coalesce) is exercised here via a
+  // 3-bucket × 3-tenor parity gate. The per-tenor Lua kernel sums first then
+  // weights, so the fast-path aggregates need to match those per-tenor SUMs.
+  for (const leg of ["Delta", "Vega"] as const) {
+    it(`GIRR ${leg} — multi-bucket × full tenor span parity (Wave 5.83J1 regression)`, async () => {
+      const schema = diffSchema() as any;
+      // Lift GIRR to three buckets with a non-zero cross-bucket γ so the
+      // roll-up exercises the same code path as the live 200k corpus.
+      schema.risk_classes.GIRR.buckets.values = ["USD", "EUR", "JPY"];
+      schema.correlations.girr_gamma_bc = { kind: "constant", value: 0.5 };
+      const tenors: string[] = schema.risk_classes.GIRR.tenor.nodes;
+      const weights = schema.risk_weights.girr_delta_weights.by_tenor as Record<string, number>;
+      const rho = leg === "Delta"
+        ? schema.correlations.girr_rho_kl.value
+        : schema.correlations.girr_vega_rho_kl.value;
+      // Mixed-sign per-tenor sensitivities per bucket so the cross term in
+      // K_b² is meaningfully non-zero.
+      const bucketRows: Record<string, Array<Record<string, number>>> = {
+        USD: [
+          { "3M": 0.50, "6M": 0.30, "1Y": -0.10 },
+          { "3M": -0.20, "6M": 0.40, "1Y": 0.25 },
+          { "3M": 0.15, "6M": -0.05, "1Y": 0.35 },
+        ],
+        EUR: [
+          { "3M": -0.30, "6M": 0.20, "1Y": 0.15 },
+          { "3M": 0.10, "6M": -0.25, "1Y": 0.40 },
+          { "3M": 0.05, "6M": 0.30, "1Y": -0.20 },
+        ],
+        JPY: [
+          { "3M": 0.40, "6M": -0.15, "1Y": 0.10 },
+          { "3M": -0.05, "6M": 0.35, "1Y": -0.30 },
+          { "3M": 0.25, "6M": 0.20, "1Y": 0.05 },
+        ],
+      };
+      const buckets = Object.keys(bucketRows);
+      // Per-bucket Lua + Fast aggregates, derived per the per-tenor kernel.
+      const perBucket = buckets.map((b) => {
+        const rows = bucketRows[b]!;
+        if (leg === "Delta") {
+          // GIRR Delta: per-tenor SUM across rows, then WS_k = w_k · sum_s[k].
+          const perTenorSum: Record<string, number> = Object.fromEntries(tenors.map((t) => [t, 0]));
+          for (const r of rows) for (const t of tenors) perTenorSum[t]! += r[t]!;
+          const wsPerTenor = tenors.map((t) => weights[t]! * perTenorSum[t]!);
+          const sumWs = wsPerTenor.reduce((a, b2) => a + b2, 0);
+          const sumWsSq = wsPerTenor.reduce((a, x) => a + x * x, 0);
+          return { bucket: b, sumWs, count: rows.length, K_b: kbConstantRho(sumWs, sumWsSq, rho), perTenor: perTenorSum };
+        }
+        // GIRR Vega: per-row per-tenor accumulation with w=1.0.
+        let sumWs = 0, sumWsSq = 0;
+        const perTenorSum: Record<string, number> = Object.fromEntries(tenors.map((t) => [t, 0]));
+        const perTenorSumSq: Record<string, number> = Object.fromEntries(tenors.map((t) => [t, 0]));
+        for (const r of rows) for (const t of tenors) {
+          const ws = r[t]!;
+          sumWs += ws; sumWsSq += ws * ws;
+          perTenorSum[t]! += ws; perTenorSumSq[t]! += ws * ws;
+        }
+        return { bucket: b, sumWs, count: rows.length, K_b: kbConstantRho(sumWs, sumWsSq, rho), perTenor: perTenorSum, perTenorSq: perTenorSumSq };
+      });
+
+      const savedFlag = process.env.CALC_FAST_PATH;
+      try {
+        // --- Lua path ---
+        process.env.CALC_FAST_PATH = "0";
+        __resetCalcCacheForTests();
+        const luaFr = fakeRedis();
+        luaFr.setResponse("FT.AGGREGATE", ftDiscoverReply(buckets));
+        luaFr.setResponse("FCALL", (args: unknown[]) => {
+          const b = String(args[4]);
+          const r = perBucket.find((p) => p.bucket === b)!;
+          return JSON.stringify({ K_b: r.K_b, S_b: r.sumWs, count: r.count, ms: 0 });
+        });
+        const luaApp = await createServer({ redis: luaFr, schema });
+        const luaRes = await luaApp.inject({
+          method: "POST", url: "/calc/sbm",
+          payload: { risk_class: "GIRR", sensitivity_type: leg },
+        });
+        expect(luaRes.statusCode).toBe(200);
+        const lua = luaRes.json();
+        expect(lua.engine).toBe("fcall_lua");
+        await luaApp.close();
+
+        // --- Fast path ---
+        process.env.CALC_FAST_PATH = "1";
+        __resetCalcCacheForTests();
+        const fastFr: FakeRedis = fakeRedis();
+        fastFr.setResponse("FT.AGGREGATE", (args: unknown[]) => {
+          if (!args.includes("APPLY")) return ftDiscoverReply(buckets);
+          // Wave 5.83J1 — assert the per-tenor coalesce wrapper is in the
+          // argv so a future regression on the APPLY shape fails loudly.
+          expect(args.some((a) => typeof a === "string" && a.startsWith("case(exists(@ws_girr_")), `${leg} APPLY argv missing case(exists(...)) wrapper`).toBe(true);
+          const rows: unknown[] = [perBucket.length];
+          for (const p of perBucket) {
+            const kv: Record<string, number> = { row_count: p.count };
+            if (leg === "Delta") {
+              for (const t of tenors) {
+                kv[`sum_d_ws_girr_delta_${t}`] = weights[t]! * p.perTenor[t]!;
+                kv[`sum_d_ws_girr_delta_${t}_sq`] = 0;
+              }
+            } else {
+              for (const t of tenors) {
+                kv[`sum_v_ws_girr_vega_${t}`] = p.perTenor[t]!;
+                kv[`sum_v_ws_girr_vega_${t}_sq`] = (p as any).perTenorSq[t];
+              }
+            }
+            rows.push(ftAggRow(p.bucket, kv));
+          }
+          return rows;
+        });
+        const fastApp = await createServer({ redis: fastFr, schema });
+        const fastRes = await fastApp.inject({
+          method: "POST", url: "/calc/sbm",
+          payload: { risk_class: "GIRR", sensitivity_type: leg },
+        });
+        expect(fastRes.statusCode).toBe(200);
+        const fast = fastRes.json();
+        expect(fast.engine).toBe("ft_aggregate");
+        await fastApp.close();
+
+        // Per-bucket parity gate across all three GIRR buckets.
+        expect(lua.per_bucket).toHaveLength(buckets.length);
+        expect(fast.per_bucket).toHaveLength(buckets.length);
+        const byBucketLua = new Map<string, any>(lua.per_bucket.map((r: any) => [r.bucket, r]));
+        const byBucketFast = new Map<string, any>(fast.per_bucket.map((r: any) => [r.bucket, r]));
+        for (const p of perBucket) {
+          const L = byBucketLua.get(p.bucket);
+          const F = byBucketFast.get(p.bucket);
+          expect(L, `lua per_bucket missing ${p.bucket}`).toBeDefined();
+          expect(F, `fast per_bucket missing ${p.bucket}`).toBeDefined();
+          expect(Math.abs(L.K_b - F.K_b)).toBeLessThanOrEqual(1e-9);
+          expect(Math.abs(L.S_b - F.S_b)).toBeLessThanOrEqual(1e-9);
+          expect(L.count).toBe(F.count);
+          expect(Math.abs(L.K_b - p.K_b)).toBeLessThanOrEqual(1e-9);
+        }
+        // Risk-class roll-up parity (multi-bucket, γ=0.5).
+        expect(Math.abs(lua.charge - fast.charge)).toBeLessThanOrEqual(1e-9);
+      } finally {
+        if (savedFlag === undefined) delete process.env.CALC_FAST_PATH;
+        else process.env.CALC_FAST_PATH = savedFlag;
+      }
+    });
+  }
 });
 
 

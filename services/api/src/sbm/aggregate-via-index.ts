@@ -157,30 +157,46 @@ export { FT_AGGREGATE_TIMEOUT_MS, resolveLegFields, resolveRho, resolveQueryNode
 //   Delta/Vega:    sum_<root>[_<tenor>], sum_<root>[_<tenor>]_sq
 //   Curvature:     same + sum_<root>_neg + sum_<root>_neg_sq per direction
 // `count` is always the COUNT 0 reducer (one per bucket).
+//
+// Wave 5.83J1 — per-tenor classes (GIRR) leave most `ws_<class>_<leg>_<tenor>`
+// fields unset on any given doc (each row populates only the tenors it carries),
+// so referencing them directly in APPLY trips RediSearch's "Could not find the
+// value for a parameter name, consider using EXISTS" error. For perTenor=true,
+// pre-coalesce each per-tenor field to 0 via `case(exists(@f),@f,0)` then drive
+// every downstream APPLY + REDUCE off the safe alias.
 export function buildFastPathAggregateArgs(
   query: string,
   fields: LegFields,
+  perTenor: boolean = false,
 ): unknown[] {
   const args: unknown[] = ["idx:sens", query];
   const applyClauses: Array<[string, string]> = [];
   const sumReducers: Array<[string, string]> = [];
+  const safeRef = (f: string): string => {
+    if (!perTenor) return f;
+    const alias = `${f}_safe`;
+    applyClauses.push([`case(exists(@${f}),@${f},0)`, alias]);
+    return alias;
+  };
   const addNumericLeg = (roots: string[], prefix: string): void => {
     for (const f of roots) {
+      const safe = safeRef(f);
       const sqAlias = `${prefix}_${f}_sq`;
-      applyClauses.push([`(@${f}*@${f})`, sqAlias]);
-      sumReducers.push([f, `sum_${prefix}_${f}`]);
+      applyClauses.push([`(@${safe}*@${safe})`, sqAlias]);
+      sumReducers.push([safe, `sum_${prefix}_${f}`]);
       sumReducers.push([sqAlias, `sum_${prefix}_${f}_sq`]);
     }
   };
   const addCurvatureLeg = (roots: string[], prefix: string): void => {
     for (const f of roots) {
+      const safe = safeRef(f);
       const negAlias = `${prefix}_${f}_neg`;
       const sqAlias = `${prefix}_${f}_sq`;
       const negSqAlias = `${prefix}_${f}_negsq`;
-      applyClauses.push([`(@${f}<0)*@${f}`, negAlias]);
-      applyClauses.push([`(@${f}*@${f})`, sqAlias]);
-      applyClauses.push([`(((@${f}<0)*@${f})*((@${f}<0)*@${f}))`, negSqAlias]);
-      sumReducers.push([f, `sum_${prefix}_${f}`]);
+      applyClauses.push([`(@${safe}<0)*@${safe}`, negAlias]);
+      applyClauses.push([`(@${safe}*@${safe})`, sqAlias]);
+      applyClauses.push([`(((@${safe}<0)*@${safe})*((@${safe}<0)*@${safe}))`, negSqAlias]);
+      sumReducers.push([safe, `sum_${prefix}_${f}`]);
       sumReducers.push([sqAlias, `sum_${prefix}_${f}_sq`]);
       sumReducers.push([negAlias, `sum_${prefix}_${f}_neg`]);
       sumReducers.push([negSqAlias, `sum_${prefix}_${f}_negsq`]);
@@ -340,7 +356,7 @@ export async function aggregateBucketsViaIndex(opts: AggregateBucketsOpts): Prom
   const rho = resolveRho(opts.schema, riskClass, opts.leg);
   const perTenor = PER_TENOR_CLASSES.has(riskClass) && (opts.schema.risk_classes[riskClass]?.tenor?.nodes?.length ?? 0) > 0;
   const query = buildFastPathQuery(riskClass, fields.sensitivityType, opts.filters);
-  const argv = buildFastPathAggregateArgs(query, fields);
+  const argv = buildFastPathAggregateArgs(query, fields, perTenor);
   const nodes = resolveQueryNodes(opts.redis);
   const merged = new Map<string, Record<string, string>>();
   for (const node of nodes) {
