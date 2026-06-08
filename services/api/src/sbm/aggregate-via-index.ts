@@ -161,19 +161,25 @@ export { FT_AGGREGATE_TIMEOUT_MS, resolveLegFields, resolveRho, resolveQueryNode
 // Wave 5.83J1 — per-tenor classes (GIRR) leave most `ws_<class>_<leg>_<tenor>`
 // fields unset on any given doc (each row populates only the tenors it carries),
 // so referencing them directly in APPLY trips RediSearch's "Could not find the
-// value for a parameter name, consider using EXISTS" error. For perTenor=true,
-// pre-coalesce each per-tenor field to 0 via `case(exists(@f),@f,0)` then drive
-// every downstream APPLY + REDUCE off the safe alias.
+// value for a parameter name, consider using EXISTS" error. Pre-coalesce each
+// indexed field to 0 via `case(exists(@f),@f,0)` then drive every downstream
+// APPLY + REDUCE off the safe alias.
+// Wave 5.83J3 — extended the coalesce to the scalar classes (EQUITY / FX /
+// Curvature). The live 5.84A/B throughput smokes can write rows where the
+// per-class `ws_*` field never lands (ingest-side pollution), and the bare
+// `@ws_equity_delta` / `@ws_fx_delta` reference tripped the same EXISTS
+// error J1 fixed for GIRR. The `perTenor` parameter is retained for the
+// public signature but no longer gates the safe-alias rewrite.
 export function buildFastPathAggregateArgs(
   query: string,
   fields: LegFields,
   perTenor: boolean = false,
 ): unknown[] {
+  void perTenor;
   const args: unknown[] = ["idx:sens", query];
   const applyClauses: Array<[string, string]> = [];
   const sumReducers: Array<[string, string]> = [];
   const safeRef = (f: string): string => {
-    if (!perTenor) return f;
     const alias = `${f}_safe`;
     applyClauses.push([`case(exists(@${f}),@${f},0)`, alias]);
     return alias;

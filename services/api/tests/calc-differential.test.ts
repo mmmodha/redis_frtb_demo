@@ -854,6 +854,81 @@ describe("Wave 5.83D-1 — Lua ⇄ FT.AGGREGATE differential parity (9 variants)
       }
     });
   }
+
+  // ---- Wave 5.83J3 — EQUITY + FX fast path with missing `ws_*` fields ----
+  // The 5.84A/B throughput smokes wrote rows into the index without the
+  // pre-weighted `ws_equity_*` / `ws_fx_*` field landing on every doc.
+  // Referencing the bare `@ws_equity_delta` (and the vega / FX equivalents)
+  // in APPLY then trips the same RediSearch "could not find the value"
+  // error J1 fixed on GIRR. The J3 fix extends the `case(exists(@f),@f,0)`
+  // coalesce to the scalar classes. This gate asserts the wrapper is
+  // emitted on the EQUITY + FX fast paths and that the call still returns
+  // 200 with missing-field rows contributing 0.
+  for (const cfg of [
+    { rc: "EQUITY", st: "Delta" as const, prefix: "d", root: "ws_equity_delta", buckets: ["1"] },
+    { rc: "EQUITY", st: "Vega" as const,  prefix: "v", root: "ws_equity_vega",  buckets: ["1"] },
+    { rc: "FX",     st: "Delta" as const, prefix: "d", root: "ws_fx_delta",     buckets: ["EURUSD", "GBPUSD", "USDJPY"] },
+    { rc: "FX",     st: "Vega" as const,  prefix: "v", root: "ws_fx_vega",      buckets: ["EURUSD", "GBPUSD", "USDJPY"] },
+  ]) {
+    it(`${cfg.rc} ${cfg.st} — fast path returns 200 with missing-field rows contributing 0 (Wave 5.83J3 regression)`, async () => {
+      const schema = diffSchema();
+      const savedFlag = process.env.CALC_FAST_PATH;
+      try {
+        process.env.CALC_FAST_PATH = "1";
+        __resetCalcCacheForTests();
+        const fastFr: FakeRedis = fakeRedis();
+        let sawCoalesce = false;
+        fastFr.setResponse("FT.AGGREGATE", (args: unknown[]) => {
+          if (!args.includes("APPLY")) return ftDiscoverReply(cfg.buckets);
+          // J3 gate: APPLY argv must wrap the scalar `ws_<class>_<leg>` field
+          // in `case(exists(@f),@f,0)`. Without this wrap the live index would
+          // 500 on the polluted corpus.
+          sawCoalesce = args.some(
+            (a) => typeof a === "string" && a.startsWith(`case(exists(@${cfg.root}`),
+          );
+          // Mimic the polluted corpus: aggregate replies omit the
+          // `sum_<prefix>_<root>` field on some buckets, so `bucketResultFromRow`
+          // must coerce missing aggregates to 0 (Number(undefined ?? 0)).
+          const rows: unknown[] = [cfg.buckets.length];
+          cfg.buckets.forEach((b, idx) => {
+            const kv: Record<string, number> = { row_count: 3 };
+            // First bucket gets a real aggregate; the others simulate
+            // rows where every doc was missing the pre-weighted field
+            // (sum collapses to 0 across the bucket).
+            if (idx === 0) {
+              kv[`sum_${cfg.prefix}_${cfg.root}`] = 1.5;
+              kv[`sum_${cfg.prefix}_${cfg.root}_sq`] = 0.75;
+            }
+            rows.push(ftAggRow(b, kv));
+          });
+          return rows;
+        });
+        const app = await createServer({ redis: fastFr, schema });
+        const res = await app.inject({
+          method: "POST", url: "/calc/sbm",
+          payload: { risk_class: cfg.rc, sensitivity_type: cfg.st },
+        });
+        expect(res.statusCode).toBe(200);
+        const body = res.json();
+        expect(body.engine).toBe("ft_aggregate");
+        expect(sawCoalesce, `${cfg.rc} ${cfg.st} APPLY argv missing case(exists(@${cfg.root}...)) wrapper`).toBe(true);
+        // Per-bucket math must be finite — missing-field buckets contribute
+        // K_b = 0 / S_b = 0 (no NaN, no infinities) and still appear in the
+        // reply alongside the bucket that carried real aggregates.
+        expect(body.per_bucket).toHaveLength(cfg.buckets.length);
+        for (const r of body.per_bucket) {
+          expect(Number.isFinite(r.K_b)).toBe(true);
+          expect(Number.isFinite(r.S_b)).toBe(true);
+        }
+        const carriers = body.per_bucket.filter((r: { K_b: number }) => r.K_b > 0);
+        expect(carriers).toHaveLength(1);
+        await app.close();
+      } finally {
+        if (savedFlag === undefined) delete process.env.CALC_FAST_PATH;
+        else process.env.CALC_FAST_PATH = savedFlag;
+      }
+    });
+  }
 });
 
 
