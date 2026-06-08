@@ -27,6 +27,10 @@ export const IDX_PREFIX = "sens:";
 //
 // Wave 5.17a — added `risk_factor` (HSBC tag dimension; pool of 16 per
 // class). `trade_id` was already indexed and stays indexed.
+// Wave 5.83A — added `trader` (per-row attribution) and `_calibration`
+// (low-cardinality ingest tag) as static TAGs; per-class per-tenor
+// pre-weighted NUMERIC SORTABLE fields are derived from the schema via
+// buildSchemaFields(schema) below.
 export const IDX_SCHEMA_FIELDS = Object.freeze([
   { path: "$.risk_class", as: "risk_class", type: "TAG" },
   { path: "$.bucket", as: "bucket", type: "TAG" },
@@ -34,19 +38,86 @@ export const IDX_SCHEMA_FIELDS = Object.freeze([
   { path: "$.book", as: "book", type: "TAG" },
   { path: "$.trade_id", as: "trade_id", type: "TAG" },
   { path: "$.risk_factor", as: "risk_factor", type: "TAG" },
+  { path: "$.trader", as: "trader", type: "TAG" },
+  { path: "$._calibration", as: "_calibration", type: "TAG" },
 ]);
 
+// Wave 5.83A — risk classes whose pre-weighted sensitivities live under a
+// per-tenor object (e.g. `weighted_value["3M"]`). Other classes (Equity, FX)
+// emit scalar `weighted_value` / `weighted_cvr_*` and get a single ws_* alias
+// per leg with no tenor suffix.
+const PER_TENOR_CLASSES = Object.freeze(["GIRR"]);
+// Legs and their JSON root path. `delta` and `vega` share `$.weighted_value`
+// (sensitivity_type discriminates at query time); curvature splits into two
+// per-direction paths.
+const WS_LEGS = Object.freeze([
+  { leg: "delta", root: "weighted_value" },
+  { leg: "vega", root: "weighted_value" },
+  { leg: "cvr_up", root: "weighted_cvr_up" },
+  { leg: "cvr_down", root: "weighted_cvr_down" },
+]);
+
+// Bracket-notation JSON path so digit-prefixed tenor labels ("3M", "10Y") are
+// safe — dot notation `$.weighted_value.3M` is ambiguous to RediSearch's
+// JSONPath parser.
+function tenorJsonPath(root, tenor) {
+  return `$.${root}["${tenor}"]`;
+}
+
+// buildSchemaFields — full ordered field list for FT.CREATE. Returns the
+// static base (TAG attributes) plus dynamic per-class per-tenor (or scalar)
+// pre-weighted NUMERIC SORTABLE fields derived from the schema. Pass no
+// schema (or one without risk_classes) to get just the static base — the
+// CLI's `print` / `ensure` paths use this back-compat shape.
+export function buildSchemaFields(schema) {
+  const out = IDX_SCHEMA_FIELDS.slice();
+  const riskClasses = schema && schema.risk_classes ? schema.risk_classes : null;
+  if (!riskClasses) return out;
+  for (const className of Object.keys(riskClasses)) {
+    const cfg = riskClasses[className];
+    if (!cfg) continue;
+    const classLower = className.toLowerCase();
+    const tenorNodes = cfg.tenor && Array.isArray(cfg.tenor.nodes) ? cfg.tenor.nodes : [];
+    const isPerTenor = PER_TENOR_CLASSES.includes(className) && tenorNodes.length > 0;
+    for (const { leg, root } of WS_LEGS) {
+      if (isPerTenor) {
+        for (const tenor of tenorNodes) {
+          out.push({
+            path: tenorJsonPath(root, tenor),
+            as: `ws_${classLower}_${leg}_${tenor}`,
+            type: "NUMERIC",
+            sortable: true,
+          });
+        }
+      } else {
+        out.push({
+          path: `$.${root}`,
+          as: `ws_${classLower}_${leg}`,
+          type: "NUMERIC",
+          sortable: true,
+        });
+      }
+    }
+  }
+  return out;
+}
+
 // Builds the FT.CREATE argv (everything after the command name). Exposed so
-// the CLI can echo the exact command it's about to run for the demo.
-export function buildCreateArgs() {
+// the CLI can echo the exact command it's about to run for the demo. When a
+// schema is provided, includes the per-class per-tenor pre-weighted NUMERIC
+// SORTABLE fields; without one, just the static base (preserves CLI
+// back-compat — `print` / `ensure` without a schema still emit a valid
+// FT.CREATE for the TAG-only portion).
+export function buildCreateArgs(schema) {
   const args = [
     IDX_NAME,
     "ON", "JSON",
     "PREFIX", "1", IDX_PREFIX,
     "SCHEMA",
   ];
-  for (const f of IDX_SCHEMA_FIELDS) {
+  for (const f of buildSchemaFields(schema)) {
     args.push(f.path, "AS", f.as, f.type);
+    if (f.sortable) args.push("SORTABLE");
   }
   return args;
 }
@@ -68,9 +139,12 @@ function isUnknownIndexError(err) {
 // ensureSensIndex — idempotently create idx:sens.
 // Safe to call concurrently from multiple processes (api boot + CLI demo run);
 // any caller that loses the race sees "already exists" and returns happily.
-export async function ensureSensIndex(client) {
+// Wave 5.83A — accepts an optional schema so the per-class per-tenor
+// pre-weighted NUMERIC fields are included. Omit the schema (CLI demo path)
+// to create the static TAG-only portion.
+export async function ensureSensIndex(client, schema) {
   if (!client) throw new TypeError("ensureSensIndex: redis client required");
-  const args = buildCreateArgs();
+  const args = buildCreateArgs(schema);
   try {
     await client.call("FT.CREATE", ...args);
     return { created: true, name: IDX_NAME };

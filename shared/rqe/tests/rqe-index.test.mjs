@@ -12,6 +12,8 @@ import {
   IDX_NAME,
   IDX_PREFIX,
   IDX_SCHEMA_FIELDS,
+  buildCreateArgs,
+  buildSchemaFields,
 } from "../src/index.mjs";
 
 // Integration tests run against a real Redis with the RediSearch + RedisJSON
@@ -147,6 +149,90 @@ describe("@frtb/rqe — module constants (locked Wave 2 contract)", () => {
       expect(byAlias[alias].path).toBe(`$.${alias}`);
       expect(byAlias[alias].type).toBe("TAG");
     }
+  });
+
+  // Wave 5.83A — trader (per-row attribution) and _calibration
+  // (low-cardinality ingest tag) are part of the static base now.
+  it("declares trader and _calibration as static TAGs", () => {
+    const byAlias = Object.fromEntries(IDX_SCHEMA_FIELDS.map((f) => [f.as, f]));
+    expect(byAlias.trader).toEqual({ path: "$.trader", as: "trader", type: "TAG" });
+    expect(byAlias._calibration).toEqual({ path: "$._calibration", as: "_calibration", type: "TAG" });
+  });
+});
+
+// Wave 5.83A — buildSchemaFields drives the per-class per-tenor pre-weighted
+// NUMERIC SORTABLE field set off the schema (GIRR per-tenor; Equity/FX
+// scalar). These tests pin the shape so the FT.CREATE argv the api boot
+// emits stays a deterministic function of the schema.
+describe("@frtb/rqe — buildSchemaFields / buildCreateArgs (Wave 5.83A)", () => {
+  const tenors = ["3M", "6M", "1Y", "2Y", "3Y", "5Y", "10Y", "15Y", "20Y", "30Y"];
+  const fakeSchema = {
+    risk_classes: {
+      GIRR: { tenor: { nodes: tenors } },
+      EQUITY: {},
+      FX: {},
+    },
+  };
+
+  it("returns the static base unchanged when called with no schema", () => {
+    const fields = buildSchemaFields();
+    expect(fields).toEqual([...IDX_SCHEMA_FIELDS]);
+  });
+
+  it("emits ws_girr_<leg>_<tenor> NUMERIC SORTABLE for every (leg × tenor) on GIRR", () => {
+    const fields = buildSchemaFields(fakeSchema);
+    const byAlias = Object.fromEntries(fields.map((f) => [f.as, f]));
+    for (const leg of ["delta", "vega", "cvr_up", "cvr_down"]) {
+      for (const t of tenors) {
+        const alias = `ws_girr_${leg}_${t}`;
+        expect(byAlias[alias], `${alias} must be declared`).toBeDefined();
+        expect(byAlias[alias].type).toBe("NUMERIC");
+        expect(byAlias[alias].sortable).toBe(true);
+      }
+    }
+    // delta + vega share $.weighted_value[...]; curvature splits per direction.
+    expect(byAlias.ws_girr_delta_3M.path).toBe('$.weighted_value["3M"]');
+    expect(byAlias.ws_girr_vega_10Y.path).toBe('$.weighted_value["10Y"]');
+    expect(byAlias.ws_girr_cvr_up_2Y.path).toBe('$.weighted_cvr_up["2Y"]');
+    expect(byAlias.ws_girr_cvr_down_30Y.path).toBe('$.weighted_cvr_down["30Y"]');
+  });
+
+  it("emits scalar ws_<class>_<leg> NUMERIC SORTABLE for Equity/FX (no tenor suffix)", () => {
+    const fields = buildSchemaFields(fakeSchema);
+    const byAlias = Object.fromEntries(fields.map((f) => [f.as, f]));
+    for (const klass of ["equity", "fx"]) {
+      for (const [leg, path] of [
+        ["delta", "$.weighted_value"],
+        ["vega", "$.weighted_value"],
+        ["cvr_up", "$.weighted_cvr_up"],
+        ["cvr_down", "$.weighted_cvr_down"],
+      ]) {
+        const alias = `ws_${klass}_${leg}`;
+        expect(byAlias[alias], `${alias} must be declared`).toBeDefined();
+        expect(byAlias[alias].path).toBe(path);
+        expect(byAlias[alias].type).toBe("NUMERIC");
+        expect(byAlias[alias].sortable).toBe(true);
+        // No tenor-suffixed variant for scalar classes.
+        expect(byAlias[`${alias}_3M`]).toBeUndefined();
+      }
+    }
+  });
+
+  it("buildCreateArgs(schema) appends SORTABLE for every dynamic NUMERIC field", () => {
+    const args = buildCreateArgs(fakeSchema);
+    // The static head is unchanged shape — ON JSON PREFIX 1 sens: SCHEMA …
+    expect(args.slice(0, 7)).toEqual([IDX_NAME, "ON", "JSON", "PREFIX", "1", IDX_PREFIX, "SCHEMA"]);
+    // Every "NUMERIC" token in the argv is immediately followed by "SORTABLE".
+    let numericCount = 0;
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] === "NUMERIC") {
+        numericCount += 1;
+        expect(args[i + 1], `NUMERIC at arg ${i} must be followed by SORTABLE`).toBe("SORTABLE");
+      }
+    }
+    // 4 legs × (10 GIRR tenors + 1 Equity scalar + 1 FX scalar) = 48 dynamic
+    // NUMERIC fields. Pin the count so a leg/tenor change is loud.
+    expect(numericCount).toBe(48);
   });
 });
 

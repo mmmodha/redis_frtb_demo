@@ -6,6 +6,14 @@ export interface SensIndexField {
   readonly path: string;
   readonly as: string;
   readonly type: "TAG" | "TEXT" | "NUMERIC" | "GEO" | "VECTOR";
+  readonly sortable?: boolean;
+}
+
+// Minimal shape buildSchemaFields / buildCreateArgs need from a schema. Kept
+// structural (not an import from @frtb/schema) so @frtb/rqe stays a leaf
+// dependency — the api passes its full Schema; the CLI passes nothing.
+export interface SensIndexSchemaInput {
+  risk_classes?: Record<string, { tenor?: { nodes?: ReadonlyArray<string> } } | undefined>;
 }
 
 export const IDX_NAME: string;
@@ -30,6 +38,10 @@ export interface RqeRedisLike {
   call(command: string, ...args: unknown[]): Promise<unknown>;
 }
 
-export function buildCreateArgs(): string[];
-export function ensureSensIndex(client: RqeRedisLike): Promise<EnsureResult>;
+export function buildSchemaFields(schema?: SensIndexSchemaInput): SensIndexField[];
+export function buildCreateArgs(schema?: SensIndexSchemaInput): string[];
+export function ensureSensIndex(
+  client: RqeRedisLike,
+  schema?: SensIndexSchemaInput,
+): Promise<EnsureResult>;
 export function dropSensIndex(client: RqeRedisLike): Promise<DropResult>;

@@ -11,7 +11,7 @@
 // snippets at startup (previously a docs-scoped runtime helper).
 
 import type { Cluster, Redis } from "ioredis";
-import { ensureSensIndex } from "@frtb/rqe";
+import { dropSensIndex, ensureSensIndex } from "@frtb/rqe";
 import type { Schema } from "@frtb/schema";
 import {
   loadFrtbLibrary,
@@ -97,9 +97,15 @@ export async function bootstrapFrtb(
   log: (entry: Record<string, unknown>) => void = (e) => console.log(JSON.stringify(e)),
 ): Promise<BootstrapResult> {
   const nodes = resolveMasterNodes(client);
-  // Step 1: idx:sens on every master.
+  // Step 1: idx:sens on every master. Wave 5.83A — drop-then-recreate so the
+  // index picks up the per-class per-tenor pre-weighted NUMERIC SORTABLE
+  // fields when the schema evolves. FT.DROPINDEX is called without DD so
+  // existing JSON docs are preserved; the index is rebuilt from them on
+  // re-create. dropSensIndex is idempotent against a missing index (cold
+  // start) so this is safe on first boot too.
   for (const node of nodes) {
-    await ensureSensIndex(node);
+    await dropSensIndex(node);
+    await ensureSensIndex(node, schema);
   }
   log({ service: "api", bootstrap: "idx:sens", action: "created", nodes: nodes.length });
 
