@@ -33,6 +33,18 @@ interface BucketResultWithEngine extends BucketResult {
   engine: EngineTag;
 }
 
+// Wave 5.83E — benchmark-only query parameters. Both are off by default so
+// any caller that omits them gets byte-identical behaviour vs. pre-5.83E.
+//   • nocache=1     → skip cache lookup AND skip cache store so each call
+//                     forces a cold FT.AGGREGATE / FCALL fan-out.
+//   • force_path=lua|fast → override the CALC_FAST_PATH env per request so a
+//                     single api process can be benchmarked on both paths
+//                     without a restart. Unknown values are ignored.
+interface CalcQuery {
+  nocache?: string;
+  force_path?: string;
+}
+
 interface CalcBody {
   risk_class?: string;
   sensitivity_type?: string;
@@ -252,7 +264,7 @@ export function registerCalcRoute(
   getRedis: () => RedisLike,
   opts: CalcOpts,
 ): void {
-  app.post<{ Body: CalcBody }>("/calc/sbm", async (req, reply) => {
+  app.post<{ Body: CalcBody; Querystring: CalcQuery }>("/calc/sbm", async (req, reply) => {
     const risk_class_raw = req.body?.risk_class;
     const legRaw = req.body?.sensitivity_type;
     if (!risk_class_raw || !legRaw) {
@@ -380,15 +392,25 @@ export function registerCalcRoute(
       correlation_regime: regime,
       exclude: excludeCsv,
     };
+    // Wave 5.83E — `?nocache=1` and `?force_path=lua|fast` are benchmark-only
+    // query knobs. nocache=1 skips both lookup and store so every call forces
+    // a cold fan-out. force_path participates in the cache key so the two
+    // engines don't collide when the cache IS used.
+    const noCache = req.query?.nocache === "1";
+    const forcePathRaw = req.query?.force_path;
+    const forcePath: "lua" | "fast" | null =
+      forcePathRaw === "lua" || forcePathRaw === "fast" ? forcePathRaw : null;
     const dataVersion = await getDataVersion(redis);
-    const cacheKey = calcCacheKey(cacheBody, dataVersion);
-    const hit = lookupCalcCache(cacheKey);
-    if (hit) {
-      return {
-        ...(hit.value as Record<string, unknown>),
-        cache: "hit" as const,
-        cached_at_iso: hit.cachedAtIso,
-      };
+    const cacheKey = calcCacheKey({ ...cacheBody, force_path: forcePath }, dataVersion);
+    if (!noCache) {
+      const hit = lookupCalcCache(cacheKey);
+      if (hit) {
+        return {
+          ...(hit.value as Record<string, unknown>),
+          cache: "hit" as const,
+          cached_at_iso: hit.cachedAtIso,
+        };
+      }
     }
 
     // Wave 5.31a: build the discovery query string ONCE so the FT.AGGREGATE
@@ -510,7 +532,14 @@ export function registerCalcRoute(
     //    same shape on both modes (the fast path didn't actually issue the
     //    FCALLs — the keys describe what the legacy path WOULD have dispatched
     //    for the same input).
-    const useFastPath = fastPathEnabled(opts.schema);
+    // Wave 5.83E — force_path overrides the CALC_FAST_PATH env at the request
+    // level. Still requires opts.schema to be present (the fast path needs the
+    // schema to resolve per-tenor weighted field names).
+    const useFastPath = forcePath === "fast"
+      ? opts.schema !== undefined
+      : forcePath === "lua"
+      ? false
+      : fastPathEnabled(opts.schema);
     const fanoutStart = process.hrtime.bigint();
     const dispatchedKeys = buckets.map((b) => `sens:{${risk_class}:${b}}:_route`);
     let results: BucketResultWithEngine[];
@@ -664,7 +693,8 @@ export function registerCalcRoute(
     // Wave 5.83C-2 — cache the successful response body so repeat requests
     // with the same canonicalised inputs short-circuit above. The cache:"miss"
     // marker on the wire mirrors the cache:"hit" marker added on lookup.
-    storeCalcCache(cacheKey, body);
+    // Wave 5.83E — `?nocache=1` skips store too so subsequent calls stay cold.
+    if (!noCache) storeCalcCache(cacheKey, body);
     return { ...body, cache: "miss" as const };
   });
 }

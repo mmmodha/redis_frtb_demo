@@ -163,7 +163,7 @@ export function buildFastPathAggregateArgs(
   const addNumericLeg = (roots: string[], prefix: string): void => {
     for (const f of roots) {
       const sqAlias = `${prefix}_${f}_sq`;
-      applyClauses.push([`pow(@${f},2)`, sqAlias]);
+      applyClauses.push([`(@${f}*@${f})`, sqAlias]);
       sumReducers.push([f, `sum_${prefix}_${f}`]);
       sumReducers.push([sqAlias, `sum_${prefix}_${f}_sq`]);
     }
@@ -174,8 +174,8 @@ export function buildFastPathAggregateArgs(
       const sqAlias = `${prefix}_${f}_sq`;
       const negSqAlias = `${prefix}_${f}_negsq`;
       applyClauses.push([`(@${f}<0)*@${f}`, negAlias]);
-      applyClauses.push([`pow(@${f},2)`, sqAlias]);
-      applyClauses.push([`pow((@${f}<0)*@${f},2)`, negSqAlias]);
+      applyClauses.push([`(@${f}*@${f})`, sqAlias]);
+      applyClauses.push([`(((@${f}<0)*@${f})*((@${f}<0)*@${f}))`, negSqAlias]);
       sumReducers.push([f, `sum_${prefix}_${f}`]);
       sumReducers.push([sqAlias, `sum_${prefix}_${f}_sq`]);
       sumReducers.push([negAlias, `sum_${prefix}_${f}_neg`]);

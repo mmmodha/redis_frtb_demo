@@ -1309,7 +1309,7 @@ describe("POST /calc/sbm — MVP endpoint", () => {
       fr.setResponse("FT.AGGREGATE", (args: unknown[]) => {
         // Two FT.AGGREGATEs land here: the discovery call (groupby @bucket,
         // count-only) AND the fast-path call (groupby + per-leg reducers).
-        // Discovery: no APPLY / no `pow(...)` clause; fast-path: APPLY present.
+        // Discovery: no APPLY clause; fast-path: APPLY present.
         const hasApply = args.includes("APPLY");
         if (!hasApply) return ftAggregateReply(["1"]);
         return [
