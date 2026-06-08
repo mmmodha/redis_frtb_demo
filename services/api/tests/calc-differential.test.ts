@@ -22,6 +22,7 @@ import { fakeRedis, type FakeRedis } from "./helpers/fake-redis.ts";
 import { __resetCalcCacheForTests } from "../src/sbm/calc-cache.ts";
 import { enrichDoc } from "../../ingest/src/consumer.ts";
 import { kbSquaredForDirection } from "@frtb/calc/src/curvatureCommon.ts";
+import type { CorrelationSpec } from "../src/sbm/reduce.ts";
 
 // Shared in-memory schema mirroring the fast-path test fixture in
 // calc-sbm.test.ts. Picks bucket/weight values so the closed-form K_b is
@@ -853,6 +854,141 @@ describe("Wave 5.83D-1 — Lua ⇄ FT.AGGREGATE differential parity (9 variants)
       }
     });
   }
+});
+
+
+// Wave 5.83L — rolled-up cross-bucket reduce ORACLE gate. The 5.83J1/J2
+// multi-bucket gates above assert per-path parity but instantiate the
+// server without `correlations`, so reduceRiskClassCharge sees the
+// default γ_bc = 0 and the off-diagonal term Σ_{b≠c} γ_bc · S_b · S_c
+// collapses to zero. A regression that bypassed the cross-bucket reducer
+// (5.83K's H1: fast path skips reduceRiskClassCharge and returns a
+// pre-rolled √Σ K_b² instead) would still pass the J1/J2 gates because
+// both charges would degenerate to the diagonal-only term.
+//
+// This block plugs that gap by passing a non-zero γ_bc through
+// `correlations` and computing the expected rolled-up charge from the
+// §21.4(5) closed form in TS as an oracle, then asserting BOTH paths
+// match the oracle ≤1e-9 AND match each other. If either path drops the
+// off-diagonal cross term the oracle gate trips immediately: the
+// observed charge would degenerate to √Σ K_b² which differs from the
+// oracle by exactly the dropped Σ_{b≠c} γ_bc · S_b · S_c contribution.
+describe("Wave 5.83L — multi-bucket cross-bucket reduce oracle parity", () => {
+  beforeEach(() => __resetCalcCacheForTests());
+  afterEach(() => __resetCalcCacheForTests());
+
+  // Compute √(Σ K_b² + Σ_{b≠c} γ_bc · S_b · S_c) directly per §21.4(5)
+  // so the assertion catches any path that drops the off-diagonal term.
+  function oracleCharge(per: Array<{ K_b: number; S_b: number }>, gamma: number): number {
+    let sumK2 = 0;
+    for (const p of per) sumK2 += p.K_b * p.K_b;
+    let cross = 0;
+    for (let i = 0; i < per.length; i++) {
+      for (let j = 0; j < per.length; j++) {
+        if (i === j) continue;
+        cross += gamma * per[i]!.S_b * per[j]!.S_b;
+      }
+    }
+    return Math.sqrt(Math.max(0, sumK2 + cross));
+  }
+
+  it("Equity Delta — 3-bucket γ_bc=0.4 cross term: both paths match oracle", async () => {
+    const schema = diffSchema() as any;
+    // Extend to three Equity buckets with distinct per-bucket weights so
+    // each S_b is meaningfully different (cross term swings on bucket
+    // pairing). Wire γ_bc=0.4 via the cross_bucket_correlation_ref the
+    // production buildCrossBucketCorrelations path consumes.
+    schema.risk_classes.EQUITY.buckets.values = ["1", "2", "3"];
+    schema.risk_weights.equity_weights.by_bucket = { "1": 0.55, "2": 0.45, "3": 0.65 };
+    schema.correlations.equity_gamma = { kind: "constant", value: 0.4 };
+    const rho = schema.correlations.equity_rho.value;
+    const gamma = 0.4;
+    // Mixed-sign spots per bucket so (Σ ws)² − Σ ws² is non-trivial AND
+    // S_b changes sign across buckets — the cross term Σ_{b≠c} S_b·S_c
+    // then has both positive and negative contributions.
+    const bucketSpots: Record<string, number[]> = {
+      "1": [0.50, -0.30, 0.20, 0.45, -0.10],
+      "2": [-0.40, 0.25, -0.15, 0.05, 0.30],
+      "3": [0.60, 0.10, -0.35, -0.20, 0.15],
+    };
+    const buckets = Object.keys(bucketSpots);
+    const perBucket = buckets.map((b) => {
+      const w = schema.risk_weights.equity_weights.by_bucket[b];
+      const spots = bucketSpots[b]!;
+      let sumWs = 0, sumWsSq = 0;
+      for (const s of spots) { const ws = w * s; sumWs += ws; sumWsSq += ws * ws; }
+      return { bucket: b, sumWs, sumWsSq, count: spots.length, K_b: kbConstantRho(sumWs, sumWsSq, rho) };
+    });
+    const expected = oracleCharge(
+      perBucket.map((p) => ({ K_b: p.K_b, S_b: p.sumWs })),
+      gamma,
+    );
+    // Oracle must actually exercise the cross term — otherwise this gate
+    // is no stronger than the J1/J2 per-path-parity gates.
+    const diagonalOnly = Math.sqrt(perBucket.reduce((a, p) => a + p.K_b * p.K_b, 0));
+    expect(Math.abs(expected - diagonalOnly)).toBeGreaterThan(1e-6);
+
+    const correlations: Record<string, CorrelationSpec> = {
+      EQUITY: { kind: "constant", value: gamma },
+    };
+    const savedFlag = process.env.CALC_FAST_PATH;
+    try {
+      // --- Lua path ---
+      process.env.CALC_FAST_PATH = "0";
+      __resetCalcCacheForTests();
+      const luaFr = fakeRedis();
+      luaFr.setResponse("FT.AGGREGATE", ftDiscoverReply(buckets));
+      luaFr.setResponse("FCALL", (args: unknown[]) => {
+        const b = String(args[4]);
+        const r = perBucket.find((p) => p.bucket === b)!;
+        return JSON.stringify({ K_b: r.K_b, S_b: r.sumWs, count: r.count, ms: 0 });
+      });
+      const luaApp = await createServer({ redis: luaFr, schema, correlations });
+      const luaRes = await luaApp.inject({
+        method: "POST", url: "/calc/sbm",
+        payload: { risk_class: "EQUITY", sensitivity_type: "Delta" },
+      });
+      expect(luaRes.statusCode).toBe(200);
+      const lua = luaRes.json();
+      await luaApp.close();
+
+      // --- Fast path ---
+      process.env.CALC_FAST_PATH = "1";
+      __resetCalcCacheForTests();
+      const fastFr: FakeRedis = fakeRedis();
+      fastFr.setResponse("FT.AGGREGATE", (args: unknown[]) => {
+        if (!args.includes("APPLY")) return ftDiscoverReply(buckets);
+        const rows: unknown[] = [perBucket.length];
+        for (const p of perBucket) {
+          rows.push(ftAggRow(p.bucket, {
+            sum_d_ws_equity_delta: p.sumWs,
+            sum_d_ws_equity_delta_sq: p.sumWsSq,
+            row_count: p.count,
+          }));
+        }
+        return rows;
+      });
+      const fastApp = await createServer({ redis: fastFr, schema, correlations });
+      const fastRes = await fastApp.inject({
+        method: "POST", url: "/calc/sbm",
+        payload: { risk_class: "EQUITY", sensitivity_type: "Delta" },
+      });
+      expect(fastRes.statusCode).toBe(200);
+      const fast = fastRes.json();
+      await fastApp.close();
+
+      // The triple gate: oracle vs lua, oracle vs fast, lua vs fast.
+      // A missing cross-term on either side fails the oracle assertion
+      // first; a per-path divergence (the original 5.83K shape) fails
+      // the lua-vs-fast assertion.
+      expect(Math.abs(Number(lua.charge) - expected)).toBeLessThanOrEqual(1e-9);
+      expect(Math.abs(Number(fast.charge) - expected)).toBeLessThanOrEqual(1e-9);
+      expect(Math.abs(Number(lua.charge) - Number(fast.charge))).toBeLessThanOrEqual(1e-9);
+    } finally {
+      if (savedFlag === undefined) delete process.env.CALC_FAST_PATH;
+      else process.env.CALC_FAST_PATH = savedFlag;
+    }
+  });
 });
 
 
