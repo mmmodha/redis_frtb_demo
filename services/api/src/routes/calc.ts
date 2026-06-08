@@ -1,4 +1,5 @@
 import type { FastifyInstance } from "fastify";
+import type { Schema } from "@frtb/schema";
 import type { RedisLike } from "../redis-like.ts";
 import { getActiveTarget } from "../active-target.ts";
 import { getBootstrapStatus } from "../bootstrap-status.ts";
@@ -13,11 +14,24 @@ import {
   type CorrelationSpec,
 } from "../sbm/reduce.ts";
 import {
+  aggregateBucketsViaIndex,
+  FAST_PATH_ENGINE,
+  LUA_PATH_ENGINE,
+} from "../sbm/aggregate-via-index.ts";
+import {
   calcCacheKey,
   getDataVersion,
   lookupCalcCache,
   storeCalcCache,
 } from "../sbm/calc-cache.ts";
+
+// Wave 5.83C-1 — engine label stamped on every per-bucket result so the UI can
+// render the badge (fast path vs. legacy Lua kernel). Mirrors the literals in
+// sbm/aggregate-via-index.ts.
+type EngineTag = typeof FAST_PATH_ENGINE | typeof LUA_PATH_ENGINE;
+interface BucketResultWithEngine extends BucketResult {
+  engine: EngineTag;
+}
 
 interface CalcBody {
   risk_class?: string;
@@ -65,6 +79,21 @@ interface CalcOpts {
   // config/schema/frtb-default.yaml on server startup (server.ts), or passed
   // inline by unit tests.
   correlations: Record<string, CorrelationSpec>;
+  // Wave 5.83C-1 — schema required by the FT.AGGREGATE fast path to resolve
+  // per-class field names (per-tenor vs. scalar `ws_*`), intra-bucket ρ, and
+  // the curvature ρ² closed-form. Optional so the existing test surface that
+  // skips the schema can keep exercising the Lua kernel path via
+  // CALC_FAST_PATH=0 (set in vitest.setup.ts).
+  schema?: Schema;
+}
+
+// Wave 5.83C-1 — env toggle for the FT.AGGREGATE fast path. Default ON in
+// production; vitest.setup.ts forces "0" so the legacy FCALL-stub tests keep
+// passing. Read per request so an operator can flip it without restarting and
+// individual fast-path tests can opt-in via beforeEach/afterEach.
+function fastPathEnabled(schema: Schema | undefined): boolean {
+  if (!schema) return false;
+  return process.env.CALC_FAST_PATH !== "0";
 }
 
 const ALLOWED_LEG = new Set(["delta", "vega", "curvature"]);
@@ -466,38 +495,75 @@ export function registerCalcRoute(
       };
     }
 
-    // 2) Fan out one FCALL per bucket — runs slot-local on the owning shard
-    //    because the routing key carries the {risk_class:bucket} hash-tag.
-    //    Build dispatchedKeys synchronously off `buckets` so the order matches
-    //    `results` (Promise.all preserves input order) for the Wave 5.16m
-    //    observability response.
+    // 2) Per-bucket K_b/S_b. Two execution paths share the same downstream
+    //    reducer shape:
+    //      • Wave 5.83C-1 fast path (default when opts.schema is present and
+    //        CALC_FAST_PATH !== "0"): a single FT.AGGREGATE returns the per-
+    //        bucket pre-weighted aggregates and TS computes K_b in-process via
+    //        the constant-ρ closed form (Delta/Vega) or the §21.5(3) ψ-gated
+    //        closed form (Curvature). Stamps engine="ft_aggregate" per bucket.
+    //      • Legacy Lua path: one FCALL per bucket, runs slot-local on the
+    //        owning shard because the routing key carries the
+    //        {risk_class:bucket} hash-tag. Stamps engine="fcall_lua".
+    //    `dispatchedKeys` is built off `buckets` regardless of path so the
+    //    Wave 5.16m observability `commands.fcall.dispatched_keys` stays the
+    //    same shape on both modes (the fast path didn't actually issue the
+    //    FCALLs — the keys describe what the legacy path WOULD have dispatched
+    //    for the same input).
+    const useFastPath = fastPathEnabled(opts.schema);
     const fanoutStart = process.hrtime.bigint();
     const dispatchedKeys = buckets.map((b) => `sens:{${risk_class}:${b}}:_route`);
-    let results: BucketResult[];
+    let results: BucketResultWithEngine[];
     try {
-      results = await Promise.all(
-        buckets.map(async (b, i): Promise<BucketResult> => {
-          const routeKey = dispatchedKeys[i]!;
-          // Wave 5.31c: positional args 3/4/5 are the exclude CSVs. Empty
-          // strings are passed through unconditionally so the FCALL arity is
-          // stable — the kernel's `_frtb_parse_csv_set` returns nil for "" and
-          // takes the short-circuit "no exclusion" path.
-          const r = (await redis.call(
-            "FCALL",
-            funcName,
-            "1",
-            routeKey,
-            risk_class,
-            b,
-            excludeCsv.book,
-            excludeCsv.trade_id,
-            excludeCsv.risk_factor
-          )) as unknown;
-          const parsed = parseBucketReply(r) ?? { bucket: "", K_b: 0, S_b: 0, count: 0, ms: 0 };
-          parsed.bucket = b;
-          return parsed;
-        })
-      );
+      if (useFastPath) {
+        const fast = await aggregateBucketsViaIndex({
+          redis,
+          schema: opts.schema!,
+          riskClass: risk_class,
+          leg: leg as Leg,
+          filters: {
+            bucketSubset: bucket_subset,
+            exclude: {
+              book: excludeCsv.book ? excludeCsv.book.split(",") : [],
+              trade_id: excludeCsv.trade_id ? excludeCsv.trade_id.split(",") : [],
+              risk_factor: excludeCsv.risk_factor ? excludeCsv.risk_factor.split(",") : [],
+            },
+          },
+        });
+        // Match the legacy bucket order (input `buckets` from discovery) so the
+        // dispatched_keys[i]/results[i] correspondence holds. Missing fast-path
+        // entries (e.g. a bucket the index sees in discovery but has zero rows
+        // matching the sensitivity_type) collapse to zeroed BucketResults.
+        const byBucket = new Map(fast.map((r) => [r.bucket, r]));
+        results = buckets.map((b) => {
+          const r = byBucket.get(b) ?? { bucket: b, K_b: 0, S_b: 0, count: 0, ms: 0 };
+          return { ...r, engine: FAST_PATH_ENGINE };
+        });
+      } else {
+        results = await Promise.all(
+          buckets.map(async (b, i): Promise<BucketResultWithEngine> => {
+            const routeKey = dispatchedKeys[i]!;
+            // Wave 5.31c: positional args 3/4/5 are the exclude CSVs. Empty
+            // strings are passed through unconditionally so the FCALL arity is
+            // stable — the kernel's `_frtb_parse_csv_set` returns nil for "" and
+            // takes the short-circuit "no exclusion" path.
+            const r = (await redis.call(
+              "FCALL",
+              funcName,
+              "1",
+              routeKey,
+              risk_class,
+              b,
+              excludeCsv.book,
+              excludeCsv.trade_id,
+              excludeCsv.risk_factor
+            )) as unknown;
+            const parsed = parseBucketReply(r) ?? { bucket: "", K_b: 0, S_b: 0, count: 0, ms: 0 };
+            parsed.bucket = b;
+            return { ...parsed, engine: LUA_PATH_ENGINE };
+          })
+        );
+      }
     } catch (err) {
       const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
       if (translated) {
@@ -587,6 +653,10 @@ export function registerCalcRoute(
       // Wave 5.31b: echo the regime that was actually applied so the UI badge
       // shows what was computed, not what the user thought they requested.
       correlation_regime: regime,
+      // Wave 5.83C-1 — top-level engine field for the UI badge. All per-bucket
+      // entries share the same engine within a single request, so a single
+      // field is sufficient (and cheaper for the UI than scanning per_bucket).
+      engine: useFastPath ? FAST_PATH_ENGINE : LUA_PATH_ENGINE,
       commands,
       ...(curvatureBranch !== undefined ? { curvature_branch: curvatureBranch } : {}),
       ...(note ? { ok: true, note } : {}),

@@ -1224,4 +1224,260 @@ describe("POST /calc/sbm — MVP endpoint", () => {
       expect(res.json().error).toMatch(/object/);
     });
   });
+
+  // Wave 5.83C-1 — FT.AGGREGATE fast path replaces the per-bucket FCALL
+  // fan-out with a single FT.AGGREGATE per master that returns per-bucket
+  // pre-weighted aggregates (per-tenor for GIRR, scalar for Equity/FX). The
+  // Lua kernel is retained behind CALC_FAST_PATH=0 for differential testing —
+  // vitest.setup.ts defaults the flag to "0" so the legacy tests above keep
+  // their FCALL-stub fakeRedis surface; these tests opt-in to fast path via
+  // beforeEach/afterEach.
+  describe("Wave 5.83C-1: FT.AGGREGATE fast path", () => {
+    let savedFlag: string | undefined;
+    beforeEach(() => {
+      savedFlag = process.env.CALC_FAST_PATH;
+      process.env.CALC_FAST_PATH = "1";
+    });
+    afterEach(() => {
+      if (savedFlag === undefined) delete process.env.CALC_FAST_PATH;
+      else process.env.CALC_FAST_PATH = savedFlag;
+    });
+
+    // Minimal in-memory schema fixture covering the three classes the fast
+    // path exercises. ρ values are picked so the closed-form K_b is hand-
+    // computable from the canned FT.AGGREGATE rows below.
+    function fastPathSchema() {
+      return {
+        version: 1,
+        dimensions: [],
+        frtb_binding: {
+          risk_class: "risk_class", bucket: "bucket", tenor: "tenor",
+          risk_value: "risk_value", weight: "weight", sensitivity_type: "sensitivity_type",
+        },
+        risk_classes: {
+          GIRR: {
+            dimensions: [], buckets: { naming: "currency", values: ["USD"] },
+            tenor: { count: 3, nodes: ["3M", "6M", "1Y"] },
+            risk_weights_ref: "girr_delta_weights",
+            intra_bucket_correlation_ref: "girr_rho_kl",
+            cross_bucket_correlation_ref: "girr_gamma_bc",
+          },
+          EQUITY: {
+            dimensions: [], buckets: { naming: "equity_bucket", values: ["1"] },
+            risk_weights_ref: "equity_weights",
+            intra_bucket_correlation_ref: "equity_rho",
+            cross_bucket_correlation_ref: "equity_gamma",
+          },
+          FX: {
+            dimensions: [], buckets: { naming: "fx_pair_bucket", values: ["EURUSD"] },
+            risk_weights_ref: "fx_weights",
+            intra_bucket_correlation_ref: "fx_rho",
+            cross_bucket_correlation_ref: "fx_gamma",
+          },
+        },
+        risk_weights: {
+          girr_delta_weights: { by_tenor: { "3M": 0.017, "6M": 0.017, "1Y": 0.016 } },
+          equity_weights: { by_bucket: { "1": 0.55 } },
+          fx_weights: { constant: 0.075 },
+        },
+        correlations: {
+          girr_rho_kl: { kind: "constant", value: 0 },
+          girr_vega_rho_kl: { kind: "constant", value: 0 },
+          equity_rho: { kind: "constant", value: 0.5 },
+          fx_rho: { kind: "constant", value: 0 },
+        },
+      } as unknown as Parameters<typeof createServer>[0]["schema"];
+    }
+
+    // Helper: build a fast-path FT.AGGREGATE reply for one bucket with the
+    // alias keys the helper expects. RESP2 flat key/value row shape.
+    function ftAggRow(bucket: string, kv: Record<string, number | string>): unknown[] {
+      const row: unknown[] = ["bucket", bucket];
+      for (const [k, v] of Object.entries(kv)) row.push(k, String(v));
+      return row;
+    }
+
+    it("Equity Delta: single FT.AGGREGATE drives K_b via the constant-ρ closed form (γ=0)", async () => {
+      // ρ=0.5; sumWs=10, sumWsSq=50 → K_b² = 50 + 0.5·(100−50) = 75 → K_b = √75.
+      // γ=0 (no Equity entry in opts.correlations) → charge = K_b = √75.
+      const fr = fakeRedis();
+      fr.setResponse("FT.AGGREGATE", (args: unknown[]) => {
+        // Two FT.AGGREGATEs land here: the discovery call (groupby @bucket,
+        // count-only) AND the fast-path call (groupby + per-leg reducers).
+        // Discovery: no APPLY / no `pow(...)` clause; fast-path: APPLY present.
+        const hasApply = args.includes("APPLY");
+        if (!hasApply) return ftAggregateReply(["1"]);
+        return [
+          1,
+          ftAggRow("1", {
+            sum_d_ws_equity_delta: 10,
+            sum_d_ws_equity_delta_sq: 50,
+            row_count: 5,
+          }),
+        ];
+      });
+      app = await createServer({ redis: fr, schema: fastPathSchema() });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: { risk_class: "Equity", sensitivity_type: "Delta" },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.charge).toBeCloseTo(Math.sqrt(75), 9);
+      expect(body.engine).toBe("ft_aggregate");
+      expect(body.per_bucket).toHaveLength(1);
+      expect(body.per_bucket[0]).toMatchObject({
+        bucket: "1",
+        K_b: expect.any(Number),
+        S_b: 10,
+        count: 5,
+        engine: "ft_aggregate",
+      });
+      expect(body.per_bucket[0].K_b).toBeCloseTo(Math.sqrt(75), 9);
+      // No FCALL was issued — fast path is single-FT.AGGREGATE end-to-end.
+      expect(fr.calls.find((c) => c.command === "FCALL")).toBeUndefined();
+    });
+
+    it("CALC_FAST_PATH=0 reverts to the Lua FCALL path and tags engine=fcall_lua", async () => {
+      process.env.CALC_FAST_PATH = "0";
+      const fr = fakeRedis();
+      fr.setResponse("FT.AGGREGATE", ftAggregateReply(["1"]));
+      fr.setResponse("FCALL", ["K_b", "3", "S_b", "3", "count", "5", "ms", "1"]);
+      app = await createServer({
+        redis: fr,
+        schema: fastPathSchema(),
+        correlations: { EQUITY: { kind: "constant", value: 0 } },
+      });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: { risk_class: "Equity", sensitivity_type: "Delta" },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.engine).toBe("fcall_lua");
+      expect(body.per_bucket[0].engine).toBe("fcall_lua");
+      // FCALL fired in the legacy path.
+      expect(fr.calls.find((c) => c.command === "FCALL")).toBeDefined();
+    });
+
+    it("Wave 5.41 TIMEOUT clause preserved on the fast-path FT.AGGREGATE", async () => {
+      const fr = fakeRedis();
+      fr.setResponse("FT.AGGREGATE", (args: unknown[]) => {
+        if (!args.includes("APPLY")) return ftAggregateReply(["1"]);
+        return [1, ftAggRow("1", { sum_d_ws_equity_delta: 0, sum_d_ws_equity_delta_sq: 0, row_count: 1 })];
+      });
+      app = await createServer({ redis: fr, schema: fastPathSchema() });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: { risk_class: "Equity", sensitivity_type: "Delta" },
+      });
+      expect(res.statusCode).toBe(200);
+      // The fast-path FT.AGGREGATE (the one carrying APPLY) must include
+      // TIMEOUT 30000 in its arg list so a slow cluster surfaces as a 502
+      // instead of an indefinite hang.
+      const fastCall = fr.calls.find(
+        (c) => c.command === "FT.AGGREGATE" && c.args.includes("APPLY"),
+      );
+      expect(fastCall).toBeDefined();
+      const ti = fastCall!.args.indexOf("TIMEOUT");
+      expect(ti).toBeGreaterThan(-1);
+      expect(fastCall!.args[ti + 1]).toBe("30000");
+    });
+
+    it("GIRR Delta per-tenor: K_b uses per-tenor sums (not per-row squared sums)", async () => {
+      // 3 tenors with per-tenor sums [3, 4, 0] → sumWs=7, sumWsSq=9+16=25.
+      // ρ=0 → K_b² = 25; K_b = 5.
+      const fr = fakeRedis();
+      fr.setResponse("FT.AGGREGATE", (args: unknown[]) => {
+        if (!args.includes("APPLY")) return ftAggregateReply(["USD"]);
+        return [
+          1,
+          ftAggRow("USD", {
+            sum_d_ws_girr_delta_3M: 3,
+            sum_d_ws_girr_delta_3M_sq: 999,  // unused — Delta path squares per-tenor SUMS
+            sum_d_ws_girr_delta_6M: 4,
+            sum_d_ws_girr_delta_6M_sq: 999,
+            sum_d_ws_girr_delta_1Y: 0,
+            sum_d_ws_girr_delta_1Y_sq: 999,
+            row_count: 7,
+          }),
+        ];
+      });
+      app = await createServer({ redis: fr, schema: fastPathSchema() });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: { risk_class: "GIRR", sensitivity_type: "Delta" },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.per_bucket[0].K_b).toBeCloseTo(5, 9);
+      expect(body.per_bucket[0].S_b).toBeCloseTo(7, 9);
+      expect(body.per_bucket[0].count).toBe(7);
+    });
+
+    it("Equity Curvature scalar: sign-split aggregates reproduce the §21.5(3) ψ-gated K_b", async () => {
+      // up = [2, 3, -1] (a 3-row bucket). S=4, SQ=4+9+1=14, N=-1, SQN=1.
+      // totalCross = 16-14 = 2; negCross = 1-1 = 0; gated = 2.
+      // ρ_curv = 0.5² = 0.25; K_b_up² = 14 + 0.25·2 = 14.5 → K_b_up = √14.5.
+      // down all-positive: e.g. [1, 1, 1] → S=3, SQ=3, totalCross=6, neg=0.
+      // K_b_down² = 3 + 0.25·6 = 4.5 → K_b_down = √4.5.
+      // K_b = max = √14.5 (up wins); S_b = 4 (up sum).
+      const fr = fakeRedis();
+      fr.setResponse("FT.AGGREGATE", (args: unknown[]) => {
+        if (!args.includes("APPLY")) return ftAggregateReply(["1"]);
+        return [
+          1,
+          ftAggRow("1", {
+            sum_u_ws_equity_cvr_up: 4,
+            sum_u_ws_equity_cvr_up_sq: 14,
+            sum_u_ws_equity_cvr_up_neg: -1,
+            sum_u_ws_equity_cvr_up_negsq: 1,
+            sum_n_ws_equity_cvr_down: 3,
+            sum_n_ws_equity_cvr_down_sq: 3,
+            sum_n_ws_equity_cvr_down_neg: 0,
+            sum_n_ws_equity_cvr_down_negsq: 0,
+            row_count: 3,
+          }),
+        ];
+      });
+      app = await createServer({ redis: fr, schema: fastPathSchema() });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: { risk_class: "Equity", sensitivity_type: "Curvature" },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.per_bucket[0].K_b).toBeCloseTo(Math.sqrt(14.5), 9);
+      expect(body.per_bucket[0].S_b).toBeCloseTo(4, 9);
+      expect(body.per_bucket[0].count).toBe(3);
+      // Single-bucket γ=0 reduce → charge = K_b.
+      expect(body.charge).toBeCloseTo(Math.sqrt(14.5), 9);
+      expect(body.curvature_branch).toBe("positive_interior");
+    });
+
+    it("commands.fcall.dispatched_keys still mirrors the per-bucket key shape on the fast path", async () => {
+      // Stability gate: the UI commands panel keys off this list. Fast path
+      // didn't actually issue the FCALLs, but the keys describe what the
+      // legacy path WOULD have dispatched for the same input.
+      const fr = fakeRedis();
+      fr.setResponse("FT.AGGREGATE", (args: unknown[]) => {
+        if (!args.includes("APPLY")) return ftAggregateReply(["1"]);
+        return [1, ftAggRow("1", { sum_d_ws_equity_delta: 0, sum_d_ws_equity_delta_sq: 0, row_count: 1 })];
+      });
+      app = await createServer({ redis: fr, schema: fastPathSchema() });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: { risk_class: "Equity", sensitivity_type: "Delta" },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.commands.fcall.dispatched_keys).toEqual(["sens:{EQUITY:1}:_route"]);
+    });
+  });
 });
