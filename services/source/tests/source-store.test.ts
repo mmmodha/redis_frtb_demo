@@ -39,12 +39,15 @@ describe("createSourceStore", () => {
     expect(got).toEqual(s);
   });
 
-  it("list() returns all sources via SCAN over source:*", async () => {
+  it("list() returns all sources via the source:index SET (no SCAN)", async () => {
     await store.create({ name: "a", format: "csv", origin: "upload", path: "/tmp/a" });
     await store.create({ name: "b", format: "jsonl", origin: "upload", path: "/tmp/b" });
+    redis.calls.length = 0;
     const all = await store.list();
     expect(all).toHaveLength(2);
     expect(all.map((s) => s.name).sort()).toEqual(["a", "b"]);
+    expect(redis.calls).not.toContain("SCAN");
+    expect(redis.calls).toContain("SMEMBERS");
   });
 
   it("update() merges fields and bumps updated_at", async () => {
@@ -61,11 +64,50 @@ describe("createSourceStore", () => {
     expect(await store.update("does-not-exist", { status: "mapped" })).toBeNull();
   });
 
-  it("delete() removes the source from redis", async () => {
+  it("delete() removes the source from redis and from the source:index SET", async () => {
     const s = await store.create({ name: "x", format: "csv", origin: "upload", path: "/tmp/x" });
+    expect(redis.sets.get("source:index")?.has(s.id)).toBe(true);
     expect(await store.delete(s.id)).toBe(true);
     expect(await store.get(s.id)).toBeNull();
     expect(redis.data.has(`source:${s.id}`)).toBe(false);
+    expect(redis.sets.get("source:index")?.has(s.id) ?? false).toBe(false);
+  });
+
+  it("list() lazily seeds the index from SCAN when source:<id> keys exist but the index is empty", async () => {
+    const orphanId = "01HZZZZZZZZZZZZZZZZZZZZZZZ";
+    const payload: Source = {
+      id: orphanId,
+      name: "pre-existing.csv",
+      format: "csv",
+      origin: "upload",
+      path: "/data/uploads/pre-existing.csv",
+      status: "uploaded",
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    redis.data.set(`source:${orphanId}`, JSON.stringify(payload));
+
+    const all = await store.list();
+    expect(all).toHaveLength(1);
+    expect(all[0]?.id).toBe(orphanId);
+    expect(redis.sets.get("source:index")?.has(orphanId)).toBe(true);
+
+    redis.calls.length = 0;
+    const again = await store.list();
+    expect(again).toHaveLength(1);
+    expect(redis.calls).not.toContain("SCAN");
+  });
+
+  it("list() prunes orphaned index entries whose underlying source:<id> key is missing", async () => {
+    const s = await store.create({ name: "real", format: "csv", origin: "upload", path: "/tmp/real" });
+    const ghostId = "01HZZZZZZZZZZZZZZZZZZZZZZG";
+    redis.sets.get("source:index")?.add(ghostId);
+
+    const all = await store.list();
+    expect(all).toHaveLength(1);
+    expect(all[0]?.id).toBe(s.id);
+    expect(redis.sets.get("source:index")?.has(ghostId)).toBe(false);
+    expect(redis.sets.get("source:index")?.has(s.id)).toBe(true);
   });
 
   it("setMapping() stores the mapping on the source and moves status to 'mapped'", async () => {

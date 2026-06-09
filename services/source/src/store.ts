@@ -52,6 +52,7 @@ export interface SourceStore {
 }
 
 const KEY_PREFIX = "source:";
+const INDEX_KEY = "source:index";
 
 export function createSourceStore({ redis }: { redis: RedisLike }): SourceStore {
   const key = (id: string) => `${KEY_PREFIX}${id}`;
@@ -87,25 +88,63 @@ export function createSourceStore({ redis }: { redis: RedisLike }): SourceStore 
         created_at: now,
         updated_at: now,
       };
+      await redis.call("SADD", INDEX_KEY, s.id);
       return write(s);
     },
     get: read,
     async list() {
-      const result: Source[] = [];
-      let cursor = "0";
-      do {
-        const reply = (await redis.call("SCAN", cursor, "MATCH", `${KEY_PREFIX}*`, "COUNT", 100)) as [string, string[]];
-        cursor = reply[0];
-        for (const k of reply[1]) {
-          const raw = (await redis.call("GET", k)) as string | null;
-          if (raw) result.push(JSON.parse(raw) as Source);
+      let members = (await redis.call("SMEMBERS", INDEX_KEY)) as string[];
+      if (members.length === 0) {
+        // One-time migration: if the index has never been populated, SCAN
+        // the keyspace once to seed it from any pre-existing source:<ulid>
+        // keys. Subsequent calls skip the SCAN because SCARD will be > 0
+        // (or the keyspace will simply have no sources).
+        const card = Number(await redis.call("SCARD", INDEX_KEY));
+        if (card === 0) {
+          let cursor = "0";
+          const found: string[] = [];
+          do {
+            const reply = (await redis.call(
+              "SCAN",
+              cursor,
+              "MATCH",
+              `${KEY_PREFIX}*`,
+              "COUNT",
+              100,
+            )) as [string, string[]];
+            cursor = reply[0];
+            for (const k of reply[1]) {
+              if (k !== INDEX_KEY && k.startsWith(KEY_PREFIX)) {
+                found.push(k.slice(KEY_PREFIX.length));
+              }
+            }
+          } while (cursor !== "0");
+          if (found.length > 0) {
+            await redis.call("SADD", INDEX_KEY, ...found);
+          }
+          members = found;
         }
-      } while (cursor !== "0");
+      }
+      if (members.length === 0) return [];
+      const keys = members.map((id) => key(id));
+      const raws = (await redis.call("MGET", ...keys)) as (string | null)[];
+      const result: Source[] = [];
+      const orphans: string[] = [];
+      for (let i = 0; i < members.length; i++) {
+        const id = members[i]!;
+        const raw = raws[i];
+        if (raw) result.push(JSON.parse(raw) as Source);
+        else orphans.push(id);
+      }
+      if (orphans.length > 0) {
+        await redis.call("SREM", INDEX_KEY, ...orphans);
+      }
       return result;
     },
     update: applyPatch,
     async delete(id) {
       const removed = (await redis.call("DEL", key(id))) as number;
+      await redis.call("SREM", INDEX_KEY, id);
       return Number(removed) > 0;
     },
     async setColumns(id, columns, row_count_sample) {
