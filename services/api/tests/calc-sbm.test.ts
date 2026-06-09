@@ -299,6 +299,74 @@ describe("POST /calc/sbm — MVP endpoint", () => {
     });
   });
 
+  // Wave 5.96G-api — distinguish "no rows scanned" from "real zero" so the
+  // UI can render "no data ingested" on cells where the discovery DID find
+  // buckets but every bucket's kernel scan returned count=0. The 503
+  // no-data-or-index path still handles "whole class has no buckets at all".
+  it("Wave 5.96G: data_status='empty' when every bucket scans zero rows", async () => {
+    const fr = fakeRedis();
+    fr.setResponse("FT.AGGREGATE", ftAggregateReply(["USD-IRS", "EUR-IRS"]));
+    // Every bucket reports count=0 — simulates the curvature-without-rows case
+    // (buckets discovered via @risk_class index, kernel returns K_b=S_b=0).
+    fr.setResponse("FCALL", ["K_b", "0", "S_b", "0", "count", "0", "ms", "1"]);
+    app = await createServer({
+      redis: fr,
+      correlations: { GIRR: { kind: "constant", value: 0 } },
+    });
+    const res = await app.inject({
+      method: "POST",
+      url: "/calc/sbm?nocache=1",
+      payload: { risk_class: "GIRR", sensitivity_type: "Curvature" },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.data_status).toBe("empty");
+    expect(body.charge).toBe(0);
+    expect(body.per_bucket.every((b: { count: number }) => b.count === 0)).toBe(true);
+  });
+
+  it("Wave 5.96G: data_status='populated' when at least one bucket has rows", async () => {
+    const fr = fakeRedis();
+    fr.setResponse("FT.AGGREGATE", ftAggregateReply(["USD-IRS"]));
+    fr.setResponse("FCALL", ["K_b", "3", "S_b", "3", "count", "100", "ms", "1"]);
+    app = await createServer({
+      redis: fr,
+      correlations: { GIRR: { kind: "constant", value: 0 } },
+    });
+    const res = await app.inject({
+      method: "POST",
+      url: "/calc/sbm?nocache=1",
+      payload: { risk_class: "GIRR", sensitivity_type: "Delta" },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().data_status).toBe("populated");
+  });
+
+  it("Wave 5.96G: data_status survives a cache hit", async () => {
+    const fr = fakeRedis();
+    fr.setResponse("FT.AGGREGATE", ftAggregateReply(["USD-IRS"]));
+    fr.setResponse("FCALL", ["K_b", "0", "S_b", "0", "count", "0", "ms", "1"]);
+    app = await createServer({
+      redis: fr,
+      correlations: { GIRR: { kind: "constant", value: 0 } },
+    });
+    const cold = await app.inject({
+      method: "POST",
+      url: "/calc/sbm",
+      payload: { risk_class: "GIRR", sensitivity_type: "Curvature" },
+    });
+    expect(cold.json().data_status).toBe("empty");
+    expect(cold.json().cache).toBe("miss");
+    const warm = await app.inject({
+      method: "POST",
+      url: "/calc/sbm",
+      payload: { risk_class: "GIRR", sensitivity_type: "Curvature" },
+    });
+    expect(warm.json().cache).toBe("hit");
+    expect(warm.json().data_status).toBe("empty");
+  });
+
+
   // Wave 5.41: explicit per-call TIMEOUT on the discovery FT.AGGREGATE so a
   // slow cluster surfaces as a captured 502 instead of an indefinite hang
   // behind the module's implicit default. Locked in the call-args mirror so

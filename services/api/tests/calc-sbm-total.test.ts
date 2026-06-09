@@ -248,6 +248,76 @@ describe("POST /calc/sbm/total — Wave 5.96B orchestrator", () => {
       expect(entry.skipped).toBe(true);
       for (const s of ["low", "medium", "high"]) {
         expect(entry.scenarios[s].charge).toBe(0);
+        // Wave 5.96G-api — skipped cells carry data_status 'skipped' so the
+        // UI can tell them apart from real-zero ("empty") cells.
+        expect(entry.scenarios[s].data_status).toBe("skipped");
+      }
+    }
+    expect(body.performance.cells_empty).toBe(0);
+  });
+
+  // Wave 5.96G-api — per-cell data_status threading. When discovery DOES find
+  // buckets but every kernel scan returns count=0 (the curvature-without-rows
+  // case), the orchestrator must mark each affected scenarios[s] with
+  // data_status='empty' and aggregate them into performance.cells_empty so
+  // the UI can render a single "no data ingested" banner.
+  it("populated cells with zero-row buckets land as data_status='empty' and bump cells_empty", async () => {
+    const fr = fakeRedis();
+    fr.setResponse("FT.AGGREGATE", ftAggregateReply(["USD-IRS"]));
+    // Every FCALL — across all 27 cells — returns count=0. The 27 cells split
+    // into 9 (class, leg) rows × 3 scenarios; every scenario is "empty".
+    fr.setResponse("FCALL", ["K_b", "0", "S_b", "0", "count", "0", "ms", "1"]);
+    fr.setResponse("FT.INFO", ["index_name", "idx:sens", "num_docs", "1000"]);
+    app = await createServer({
+      redis: fr,
+      correlations: {
+        GIRR: { kind: "constant", value: 0 },
+        EQUITY: { kind: "constant", value: 0 },
+        FX: { kind: "constant", value: 0 },
+      },
+    });
+    const res = await app.inject({
+      method: "POST",
+      url: "/calc/sbm/total?nocache=1",
+      payload: {},
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.total_sbm).toBe(0);
+    // None of the cells skipped — discovery succeeded everywhere.
+    expect(body.performance.ops_skipped).toBe(0);
+    expect(body.performance.redis_ops_count).toBe(27);
+    expect(body.performance.cells_empty).toBe(27);
+    for (const entry of body.breakdown) {
+      expect(entry.skipped).toBe(false);
+      for (const s of ["low", "medium", "high"]) {
+        expect(entry.scenarios[s].data_status).toBe("empty");
+        expect(entry.scenarios[s].charge).toBe(0);
+      }
+    }
+  });
+
+  it("populated cells with non-zero buckets land as data_status='populated' and cells_empty=0", async () => {
+    const fr = delayedFakeRedis(0, ["USD-IRS"]);
+    app = await createServer({
+      redis: fr,
+      correlations: {
+        GIRR: { kind: "constant", value: 0 },
+        EQUITY: { kind: "constant", value: 0 },
+        FX: { kind: "constant", value: 0 },
+      },
+    });
+    const res = await app.inject({
+      method: "POST",
+      url: "/calc/sbm/total?nocache=1",
+      payload: {},
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.performance.cells_empty).toBe(0);
+    for (const entry of body.breakdown) {
+      for (const s of ["low", "medium", "high"]) {
+        expect(entry.scenarios[s].data_status).toBe("populated");
       }
     }
   });

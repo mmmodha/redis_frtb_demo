@@ -560,6 +560,15 @@ async function computeSbmCharge(
       : `No sensitivities on '${target_label}' — ingest data to run calculations.`
     : undefined;
 
+  // Wave 5.96G-api — distinguish "no rows scanned" from "real zero". A cell
+  // reaches this branch only when the precondition probe found data somewhere
+  // (numDocs > 0) OR buckets were discovered for this class. `data_status`
+  // rides on per_bucket[].count — if every bucket scanned zero rows (or the
+  // discovery returned an empty bucket set despite a populated index), the
+  // UI renders "no data ingested" instead of $0.0000.
+  const data_status: "populated" | "empty" =
+    results.some((r) => Number(r.count) > 0) ? "populated" : "empty";
+
   const body: Record<string, unknown> = {
     charge,
     per_bucket: results,
@@ -569,6 +578,7 @@ async function computeSbmCharge(
     correlation_regime: regime,
     engine: useFastPath ? FAST_PATH_ENGINE : LUA_PATH_ENGINE,
     commands,
+    data_status,
     ...(curvatureBranch !== undefined ? { curvature_branch: curvatureBranch } : {}),
     ...(note ? { ok: true, note } : {}),
   };
@@ -897,24 +907,36 @@ export function registerCalcRoute(
       // cold cost was X s" tooltips. cumulative_ms / parallelism_factor are
       // derived from the fresh cell_ms so the wall-clock invariant
       // max(cell_ms) ≤ wall_clock_ms always holds.
+      // Wave 5.96G-api — `data_status` rides next to `charge`/`ms` so the
+      // UI can render "no data ingested" on cells whose buckets all scanned
+      // zero rows (still 200, just an empty result), separate from the 503
+      // "skipped" branch (whole class has no buckets at all).
+      type CellDataStatus = "populated" | "empty" | "skipped";
       type CellInfo = {
         charge: number;
         ms: number;
         original_compute_ms?: number;
         cache?: "hit" | "miss";
         skipped: boolean;
+        data_status: CellDataStatus;
       };
       const cellByKey = new Map<string, CellInfo>();
       let cumulative_ms = 0;
       let original_cumulative_ms = 0;
       let opsFired = 0;
       let cacheHits = 0;
+      let cellsEmpty = 0;
       const opsSkippedSet = new Set<string>();
       for (const c of cells) {
         const key = `${c.plan.risk_class}|${c.plan.leg}|${c.plan.regime}`;
         const cellMsRounded = Math.round(c.cell_ms * 1000) / 1000;
         if (!c.outcome.ok) {
-          cellByKey.set(key, { charge: 0, ms: cellMsRounded, skipped: true });
+          cellByKey.set(key, {
+            charge: 0,
+            ms: cellMsRounded,
+            skipped: true,
+            data_status: "skipped",
+          });
           opsSkippedSet.add(`${c.plan.risk_class}|${c.plan.leg}`);
         } else {
           const b = c.outcome.body as {
@@ -922,6 +944,7 @@ export function registerCalcRoute(
             total_ms?: number;
             original_compute_ms?: number;
             cache?: "hit" | "miss";
+            data_status?: "populated" | "empty";
           };
           // On a cache hit the inner body's `total_ms` is already the fresh
           // hit elapsed (overwritten in computeSbmCharge) and the stored
@@ -933,17 +956,20 @@ export function registerCalcRoute(
           const originalComputeMs = Number.isFinite(innerOriginal)
             ? innerOriginal
             : Number.isFinite(innerTotal) ? innerTotal : 0;
+          const cellStatus: CellDataStatus = b.data_status === "empty" ? "empty" : "populated";
           const info: CellInfo = {
             charge: Number(b.charge) || 0,
             ms: cellMsRounded,
             original_compute_ms: Math.round(originalComputeMs * 1000) / 1000,
             cache: b.cache,
             skipped: false,
+            data_status: cellStatus,
           };
           cellByKey.set(key, info);
           cumulative_ms += c.cell_ms;
           original_cumulative_ms += originalComputeMs;
           if (b.cache === "hit") cacheHits += 1;
+          if (cellStatus === "empty") cellsEmpty += 1;
           opsFired += 1;
         }
       }
@@ -956,17 +982,28 @@ export function registerCalcRoute(
           );
           const scenarioBlock: Record<
             CorrelationRegime,
-            { charge: number; ms: number; original_compute_ms?: number }
+            {
+              charge: number;
+              ms: number;
+              original_compute_ms?: number;
+              data_status: CellDataStatus;
+            }
           > = {
-            low: { charge: 0, ms: 0 },
-            medium: { charge: 0, ms: 0 },
-            high: { charge: 0, ms: 0 },
+            low: { charge: 0, ms: 0, data_status: "skipped" },
+            medium: { charge: 0, ms: 0, data_status: "skipped" },
+            high: { charge: 0, ms: 0, data_status: "skipped" },
           };
           for (const s of scenarios) {
             const info = cellByKey.get(`${cls}|${lg}|${s}`)!;
-            const cell: { charge: number; ms: number; original_compute_ms?: number } = {
+            const cell: {
+              charge: number;
+              ms: number;
+              original_compute_ms?: number;
+              data_status: CellDataStatus;
+            } = {
               charge: info.charge,
               ms: info.ms,
+              data_status: info.data_status,
             };
             if (info.original_compute_ms !== undefined) {
               cell.original_compute_ms = info.original_compute_ms;
@@ -1024,6 +1061,11 @@ export function registerCalcRoute(
           parallelism_factor,
           redis_ops_count: opsFired,
           ops_skipped,
+          // Wave 5.96G-api — single banner trigger for the UI. Counts cells
+          // where every bucket scanned zero rows (data_status === "empty").
+          // Skipped (503) cells are NOT counted here — the existing
+          // `ops_skipped` already covers that branch.
+          cells_empty: cellsEmpty,
           ...(orchestratorCache ? { cache: orchestratorCache, cache_hits: cacheHits } : {}),
         },
         resolved_command_summary: `${plan.length} FT.AGGREGATE+FCALL fan-out via /calc/sbm (${classes.length} classes × ${legs.length} legs × ${scenarios.length} scenarios)`,
