@@ -20,64 +20,50 @@
 -- floating-point summation is order-stable across the reshape.
 
 -- Wave 5.31c: args 3/4/5 carry the exclude_book / trade / factor CSV sets.
+-- Wave 5.96.5: SCAN+JSON.GET+type/exclude gate live in _frtb_scan_bucket
+-- (FRTB_PRELUDE). GIRR vega count semantics: every type+exclude pass
+-- counts (matches pre-refactor behavior).
 local function _vega_iter_bucket(risk_class, bucket, tenors, book_set, trade_set, factor_set)
-  local pattern = 'sens:{' .. risk_class .. ':' .. bucket .. '}:*'
-  local cursor = '0'
   local sum_ws = 0.0
   local sum_ws_sq = 0.0
   local row_count = 0
   local w = __GIRR_VEGA_WEIGHT__
   local T = #tenors
-  repeat
-    local res = redis.call('SCAN', cursor, 'MATCH', pattern, 'COUNT', 500)
-    cursor = res[1]
-    local keys = res[2]
-    for i = 1, #keys do
-      local ok_j, raw = pcall(redis.call, 'JSON.GET', keys[i])
-      if not ok_j then
-        local ok_g, plain = pcall(redis.call, 'GET', keys[i])
-        raw = ok_g and plain or nil
-      end
-      if raw then
-        local ok, doc = pcall(cjson.decode, raw)
-        if ok and type(doc) == 'table' and doc.sensitivity_type == 'Vega'
-           and not _frtb_excluded(doc, book_set, trade_set, factor_set) then
-          local rv = doc.risk_value
-          if type(rv) == 'table' then
-            if rv[1] ~= nil then
-              -- Array form (legacy / test fixtures).
-              for t = 1, #rv do
-                local s = tonumber(rv[t])
-                if s then
-                  local ws = w * s
-                  sum_ws = sum_ws + ws
-                  sum_ws_sq = sum_ws_sq + ws * ws
-                end
-              end
-            else
-              -- Object form keyed by tenor labels (Wave 5.17a production).
-              for k = 1, T do
-                local s = tonumber(rv[tenors[k]])
-                if s then
-                  local ws = w * s
-                  sum_ws = sum_ws + ws
-                  sum_ws_sq = sum_ws_sq + ws * ws
-                end
-              end
-            end
-          elseif rv then
-            local s = tonumber(rv)
+  _frtb_scan_bucket(risk_class, bucket, 'Vega',
+    book_set, trade_set, factor_set, function(doc)
+      local rv = doc.risk_value
+      if type(rv) == 'table' then
+        if rv[1] ~= nil then
+          -- Array form (legacy / test fixtures).
+          for t = 1, #rv do
+            local s = tonumber(rv[t])
             if s then
               local ws = w * s
               sum_ws = sum_ws + ws
               sum_ws_sq = sum_ws_sq + ws * ws
             end
           end
-          row_count = row_count + 1
+        else
+          -- Object form keyed by tenor labels (Wave 5.17a production).
+          for k = 1, T do
+            local s = tonumber(rv[tenors[k]])
+            if s then
+              local ws = w * s
+              sum_ws = sum_ws + ws
+              sum_ws_sq = sum_ws_sq + ws * ws
+            end
+          end
+        end
+      elseif rv then
+        local s = tonumber(rv)
+        if s then
+          local ws = w * s
+          sum_ws = sum_ws + ws
+          sum_ws_sq = sum_ws_sq + ws * ws
         end
       end
-    end
-  until cursor == '0'
+      row_count = row_count + 1
+    end)
   return sum_ws, sum_ws_sq, row_count
 end
 
@@ -94,11 +80,7 @@ redis.register_function('sbm_vega_bucket', function(keys, args)
   local t0 = redis.call('TIME')
   local sum_ws, sum_ws_sq, count = _vega_iter_bucket(risk_class, bucket, tenors, book_set, trade_set, factor_set)
   local rho = __GIRR_VEGA_RHO__
-  local cross = sum_ws * sum_ws - sum_ws_sq
-  if cross < 0 then cross = 0 end
-  local kb_sq = sum_ws_sq + rho * cross
-  if kb_sq < 0 then kb_sq = 0 end
-  local kb = math.sqrt(kb_sq)
+  local kb = _frtb_constant_rho_kb(sum_ws, sum_ws_sq, rho)
   local t1 = redis.call('TIME')
   local ms = (tonumber(t1[1]) - tonumber(t0[1])) * 1000.0
               + (tonumber(t1[2]) - tonumber(t0[2])) / 1000.0

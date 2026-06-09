@@ -15,45 +15,24 @@
 -- Only rows with sensitivity_type == "Delta" contribute.
 
 -- Wave 5.31c: args 3/4/5 carry the exclude_book / trade / factor CSV sets.
+-- Wave 5.96.5: SCAN+JSON.GET+type/exclude gate live in _frtb_scan_bucket
+-- (FRTB_PRELUDE); risk_value reshape (number vs `{ spot }`) lives in
+-- _frtb_read_scalar. FX count semantics: only rows where risk_value
+-- parses count (matches pre-refactor behavior).
 local function _fx_delta_iter_bucket(risk_class, bucket, w, book_set, trade_set, factor_set)
-  local pattern = 'sens:{' .. risk_class .. ':' .. bucket .. '}:*'
-  local cursor = '0'
   local sum_ws = 0.0
   local sum_ws_sq = 0.0
   local row_count = 0
-  repeat
-    local res = redis.call('SCAN', cursor, 'MATCH', pattern, 'COUNT', 500)
-    cursor = res[1]
-    local keys = res[2]
-    for i = 1, #keys do
-      local ok_j, raw = pcall(redis.call, 'JSON.GET', keys[i])
-      if not ok_j then
-        local ok_g, plain = pcall(redis.call, 'GET', keys[i])
-        raw = ok_g and plain or nil
+  _frtb_scan_bucket(risk_class, bucket, 'Delta',
+    book_set, trade_set, factor_set, function(doc)
+      local s = _frtb_read_scalar(doc.risk_value)
+      if s then
+        local ws = w * s
+        sum_ws = sum_ws + ws
+        sum_ws_sq = sum_ws_sq + ws * ws
+        row_count = row_count + 1
       end
-      if raw then
-        local ok, doc = pcall(cjson.decode, raw)
-        if ok and type(doc) == 'table' and doc.sensitivity_type == 'Delta'
-           and not _frtb_excluded(doc, book_set, trade_set, factor_set) then
-          -- Wave 5.17a — FX Delta risk_value reshape: production `{ spot }`,
-          -- bare number tolerated for legacy / test fixtures.
-          local rv = doc.risk_value
-          local s
-          if type(rv) == 'number' then
-            s = rv
-          elseif type(rv) == 'table' then
-            s = tonumber(rv.spot)
-          end
-          if s then
-            local ws = w * s
-            sum_ws = sum_ws + ws
-            sum_ws_sq = sum_ws_sq + ws * ws
-            row_count = row_count + 1
-          end
-        end
-      end
-    end
-  until cursor == '0'
+    end)
   return sum_ws, sum_ws_sq, row_count
 end
 
@@ -70,11 +49,7 @@ redis.register_function('fx_delta', function(keys, args)
   local rho = __FX_DELTA_RHO__
   local t0 = redis.call('TIME')
   local sum_ws, sum_ws_sq, count = _fx_delta_iter_bucket(risk_class, bucket, w, book_set, trade_set, factor_set)
-  local cross = sum_ws * sum_ws - sum_ws_sq
-  if cross < 0 then cross = 0 end
-  local kb_sq = sum_ws_sq + rho * cross
-  if kb_sq < 0 then kb_sq = 0 end
-  local kb = math.sqrt(kb_sq)
+  local kb = _frtb_constant_rho_kb(sum_ws, sum_ws_sq, rho)
   local t1 = redis.call('TIME')
   local ms = (tonumber(t1[1]) - tonumber(t0[1])) * 1000.0
               + (tonumber(t1[2]) - tonumber(t0[2])) / 1000.0
