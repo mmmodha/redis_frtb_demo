@@ -19,7 +19,8 @@
   - `SOURCE_DATA_DIR=/abs/path/to/data/sources`
   - `API_BASE=http://localhost:8080` (UI default)
 - [ ] **Bring up the app stack:** `docker compose up -d --build`. Wait for all 7 services healthy.
-- [ ] **Smoke check the api:** `curl -fsS http://localhost:8080/healthz` returns `{"ok":true}`.
+- [ ] **Smoke check the api process is up:** `curl -fsS http://localhost:8080/healthz` returns `{"service":"api","status":"alive"}`.
+- [ ] **Smoke check the api is Redis-ready:** `curl -fsS http://localhost:8080/readyz` returns `{"service":"api","status":"ok","bootstrap":"ready"}` (503 with `bootstrap-failed` until an active Redis connection is wired via the Connections panel).
 - [ ] **Smoke check `GET /redis/active-target`** — returns `demo-cluster` host/port/tls (no password leak).
 - [ ] **Open the UI:** `http://localhost:5173`. Confirm:
   - Active-target pill in header shows green `demo-cluster`.

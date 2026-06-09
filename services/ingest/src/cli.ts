@@ -56,7 +56,12 @@ function createClientFromUrl(target: string): RedisLike {
 function startHealth(port: number, host: string, state: { ready: boolean; consumed: () => number; errors: () => number }): http.Server {
   const server = http.createServer((req, res) => {
     if (req.url === "/healthz") {
-      res.writeHead(state.ready ? 200 : 503, { "content-type": "application/json" });
+      // Wave 5.97D.1 — liveness only. Always 200 once the process is
+      // accepting HTTP so the compose healthcheck passes before Redis is
+      // wired, matching the api's /healthz semantics. The body's `status`
+      // field still surfaces readiness (`starting` vs `ok`) for callers
+      // that inspect it; the HTTP status code is process-alive.
+      res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ service: "ingest", status: state.ready ? "ok" : "starting", consumed: state.consumed(), errors: state.errors() }));
       return;
     }

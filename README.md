@@ -75,6 +75,24 @@ minimal one with generated secrets on first run. See
 **Advanced: environment overrides** below if you need custom ports, custom
 secrets, or want to pre-seed `REDIS_URL`.
 
+### API health endpoints (Wave 5.97D.1)
+
+The `api` service exposes two k8s-style health probes:
+
+- `GET /healthz` → **liveness**. Always 200 once the api process is accepting
+  traffic. Body `{"service":"api","status":"alive"}`. Used by the compose
+  healthcheck, `scripts/run-local.sh`, and any orchestrator that needs to
+  know "is the process up?"
+- `GET /readyz` → **readiness**. 503 with `{"status":"bootstrap-failed", ...}`
+  until an active Redis connection is configured (via the UI Connections
+  panel or `REDIS_URL`) AND the FRTB library bootstrap resolves. 200 with
+  `{"service":"api","status":"ok","bootstrap":"ready"}` once ready. Used by
+  callers that need to know "is the api ready to serve Redis-backed routes?"
+
+Splitting the two lets `docker compose up -d --wait` pass on a fresh clone
+without any environment editing — process-alive is enough for compose, and
+operators wire Redis afterwards through the UI.
+
 ### Fault-isolation smoke tests
 
 ```bash

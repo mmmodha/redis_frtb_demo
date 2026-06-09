@@ -150,7 +150,22 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
 
   if (opts.activeTarget) setActiveTarget(opts.activeTarget);
 
-  app.get("/healthz", async (_req, reply) => {
+  // Wave 5.97D.1 — split health into k8s-style liveness + readiness probes.
+  //   /healthz: liveness. Always 200 once the api process is accepting
+  //     traffic. Never gates on Redis or bootstrap. Used by Docker /
+  //     orchestrators / `scripts/run-local.sh` to know "is the process up?"
+  //   /readyz: readiness. 503 with `bootstrap-failed` until Redis is reachable
+  //     and bootstrapFrtb() resolves; 200 thereafter. Replicates the pre-split
+  //     /healthz behaviour verbatim. Used by callers that need to know "is the
+  //     api ready to serve Redis-backed routes?"
+  // Splitting the two unblocks the fresh-clone `docker compose up -d --wait`
+  // happy path: the compose healthcheck (process-alive) can pass before any
+  // Redis is configured, and downstream services no longer wedge themselves
+  // believing the api is down when only Redis is missing.
+  app.get("/healthz", async () => {
+    return { service: "api", status: "alive" };
+  });
+  app.get("/readyz", async (_req, reply) => {
     const s = getBootstrapStatus();
     if (!s.ok) {
       reply.code(503);

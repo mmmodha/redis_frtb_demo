@@ -89,7 +89,18 @@ export function createActiveTargetWatcher(opts: WatcherOpts): ActiveTargetWatche
   async function swapTo(t: ActiveTargetFull): Promise<void> {
     if (t.version === currentVersion) return;
     const next = redisFactory(t);
-    await next.ping();
+    try {
+      await next.ping();
+    } catch (err) {
+      // Wave 5.97D.1 — api reports an active target but Redis itself isn't
+      // reachable yet (e.g. MaxRetriesPerRequestError against a placeholder
+      // host). Discard the half-built client and keep polling instead of
+      // tearing the watcher down. Callers see the previous `current` (or
+      // null) until the next swap.
+      try { next.disconnect(); } catch { /* ignore */ }
+      logger.warn(`active target ${t.label}: not reachable yet (waiting)`, err);
+      return;
+    }
     const prev = current;
     current = next;
     currentVersion = t.version;
@@ -121,12 +132,18 @@ export function createActiveTargetWatcher(opts: WatcherOpts): ActiveTargetWatche
       try {
         const t = await fetchTarget();
         await swapTo(t);
-        startPolling();
-        return;
+        if (current) {
+          startPolling();
+          return;
+        }
+        // swapTo returned without setting `current` (Redis ping failed —
+        // treated as "not configured yet"). Loop and retry until the
+        // deadline; if we never get a reachable target we still keep
+        // polling below so the service stays alive.
       } catch (err) {
         lastErr = err;
-        await sleep(initialRetryMs);
       }
+      await sleep(initialRetryMs);
     }
     if (opts.fallbackUrl) {
       const client = new Redis(opts.fallbackUrl, { lazyConnect: true, maxRetriesPerRequest: 3 });
@@ -137,7 +154,14 @@ export function createActiveTargetWatcher(opts: WatcherOpts): ActiveTargetWatche
       startPolling();
       return;
     }
-    throw new Error(`active-target watcher: api unreachable after ${initialTimeoutMs}ms (${String(lastErr)})`);
+    // Wave 5.97D.1 — deadline reached with no reachable target. Stay alive
+    // (the source service still answers /healthz) and keep polling so an
+    // operator can wire Redis via the UI Connections panel without
+    // restarting source. Previously this threw, killing the process.
+    logger.warn(
+      `active-target watcher: no active target after ${initialTimeoutMs}ms; continuing to poll (${String(lastErr)})`,
+    );
+    startPolling();
   }
 
   async function stop(): Promise<void> {
