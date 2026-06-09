@@ -120,6 +120,16 @@ function formatServedMs(ms: number): string {
   if (ms < 1) return `<1 ms`;
   return `${Math.round(ms)} ms`;
 }
+// Wave 5.96N — parallelism factor on cold runs lands in the 1–N range
+// (e.g. ×18.00); on cache hits it can blow up to the hundreds of
+// thousands (e.g. ×146,770) once we source the cold cumulative. Format
+// big values as comma-grouped integers and small values with two
+// decimals so both regimes read naturally.
+function formatParallelismFactor(factor: number): string {
+  if (!Number.isFinite(factor)) return `${factor}`;
+  if (Math.abs(factor) >= 1000) return Math.round(factor).toLocaleString("en-US");
+  return factor.toFixed(2);
+}
 
 // Re-export so unit tests can import the formatter alongside the panel.
 export { formatCharge };
@@ -1947,7 +1957,7 @@ function BucketKbDrilldown({
                   math={
                     `K_b^{+} = ${fmt5(curvature.k_plus)},\\quad ` +
                     `K_b^{-} = ${fmt5(curvature.k_minus)}\\;\\Rightarrow\\;` +
-                    `\\text{winner} = K_b^{${curvature.winner === "plus" ? "+" : "-"}}`
+                    `\\text{binding direction} = K_b^{${curvature.winner === "plus" ? "+" : "-"}}`
                   }
                 />
               </div>
@@ -2254,7 +2264,7 @@ function CvrComponentsBreakdown({
           <tfoot>
             <tr data-testid="bucket-drilldown-cvr-total">
               <td>
-                Σ (winner: K<sub>b</sub><sup>{winner === "plus" ? "+" : "−"}</sup>)
+                Σ (binding direction: K<sub>b</sub><sup>{winner === "plus" ? "+" : "−"}</sup>)
               </td>
               <td>
                 {fmt5(sumUp)} → K<sub>b</sub><sup>+</sup>={fmt5(kPlus)}

@@ -400,7 +400,7 @@ describe("CalcPanel Wave 5.18 polish + drill-down", () => {
         .toMatch(/^FT\.AGGREGATE/);
     });
 
-    it("Curvature fast path: surfaces K_b^+ and K_b^- with the winner label", async () => {
+    it("Curvature fast path: surfaces K_b^+ and K_b^- with the binding direction label", async () => {
       fetchRouter({
         calc: () =>
           new Response(JSON.stringify({
@@ -429,7 +429,7 @@ describe("CalcPanel Wave 5.18 polish + drill-down", () => {
       // numeric tokens we substituted, not on the surrounding LaTeX commands.
       expect(curv).toContain(Math.sqrt(14.5).toFixed(5));
       expect(curv).toContain(Math.sqrt(4.5).toFixed(5));
-      expect(curv).toMatch(/winner/);
+      expect(curv).toMatch(/binding direction/);
     });
 
     it("Lua path: shows 'computed in Lua FCALL, intermediates not surfaced'", async () => {
@@ -625,9 +625,9 @@ describe("CalcPanel Wave 5.18 polish + drill-down", () => {
       // WS and cross tables are not rendered on curvature buckets.
       expect(screen.queryByTestId("bucket-drilldown-ws-breakdown")).toBeNull();
       expect(screen.queryByTestId("bucket-drilldown-cross-breakdown")).toBeNull();
-      // Totals row mentions the winner direction.
+      // Totals row mentions the binding direction.
       const total = screen.getByTestId("bucket-drilldown-cvr-total").textContent ?? "";
-      expect(total).toMatch(/winner/);
+      expect(total).toMatch(/binding direction/);
     });
 
     it("Lua path hides component tables (intermediate.path === 'lua')", async () => {
