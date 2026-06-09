@@ -428,3 +428,398 @@ button.drilldown-pill:focus-visible {
   outline: 2px solid var(--redis-text-link, #5BD37B);
   outline-offset: 1px;
 }
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Wave 5.96C — Total SBM card
+   Lead, CTA, headline, KaTeX formula block, per-scenario columns, perf
+   chip strip, footer. Mirrors the BucketKbDrilldown surface card idiom
+   (subtle inset background, 1px border, 4px radius) so the two surfaces
+   read as siblings. Colours come from tokens.css; nothing hard-coded.
+   ───────────────────────────────────────────────────────────────────────── */
+
+.calc-panel__lead {
+  margin: 0 0 calc(var(--grid) * 1.5);
+  color: var(--redis-text-secondary, #C8D1D5);
+  font-size: 0.9375rem;
+  line-height: 1.5;
+  max-width: 72ch;
+}
+
+.calc-panel__cta-row {
+  display: flex;
+  gap: calc(var(--grid) * 1.5);
+  align-items: center;
+  margin-bottom: calc(var(--grid) * 2);
+}
+.calc-panel__cta {
+  min-height: 40px;
+  padding: 0 calc(var(--grid) * 2.5);
+  background: var(--redis-hyper, #FF4438);
+  color: var(--redis-text-primary, #F0F4F5);
+  border: 1px solid var(--redis-hyper, #FF4438);
+  border-radius: var(--radius, 5px);
+  font-size: 0.9375rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  transition: background 120ms, border-color 120ms, color 120ms, opacity 120ms;
+}
+.calc-panel__cta:hover:not(:disabled),
+.calc-panel__cta:focus-visible:not(:disabled) {
+  background: var(--redis-deep-hyper, #EB352A);
+  border-color: var(--redis-deep-hyper, #EB352A);
+  color: var(--redis-text-primary, #F0F4F5);
+  outline: none;
+}
+.calc-panel__cta:focus-visible {
+  outline: 2px solid var(--redis-text-link, #8AB4C7);
+  outline-offset: 2px;
+}
+.calc-panel__cta:disabled {
+  opacity: 0.55;
+  cursor: progress;
+}
+
+/* Result container: stacks the five sections with consistent 8-px rhythm. */
+.calc-panel__total-result {
+  display: flex;
+  flex-direction: column;
+  gap: calc(var(--grid) * 2);
+}
+
+/* 1. Headline ----------------------------------------------------------- */
+.calc-panel__total-headline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: calc(var(--grid) * 2);
+  padding-bottom: calc(var(--grid) * 1.5);
+  border-bottom: 1px solid var(--redis-border-primary, #2D4754);
+}
+.calc-panel__total-headline-main {
+  display: flex;
+  flex-direction: column;
+  gap: 0.125rem;
+}
+.calc-panel__total-headline-label {
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--redis-text-secondary, #C8D1D5);
+}
+.calc-panel__total-headline-value {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 2.25rem;
+  font-weight: 600;
+  line-height: 1.1;
+  color: var(--redis-text-primary, #F0F4F5);
+  font-variant-numeric: tabular-nums;
+}
+.calc-panel__total-winner-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.25rem 0.625rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  border: 1px solid transparent;
+  background: rgba(91, 211, 123, 0.10);
+  border-color: rgba(91, 211, 123, 0.45);
+  color: #5BD37B;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.calc-panel__total-winner-pill[data-scenario="low"] {
+  background: rgba(138, 180, 199, 0.12);
+  border-color: rgba(138, 180, 199, 0.45);
+  color: var(--redis-text-link, #8AB4C7);
+}
+.calc-panel__total-winner-pill[data-scenario="medium"] {
+  background: rgba(240, 180, 41, 0.12);
+  border-color: rgba(240, 180, 41, 0.50);
+  color: #f0b429;
+}
+.calc-panel__total-winner-pill[data-scenario="high"] {
+  background: rgba(255, 68, 56, 0.12);
+  border-color: rgba(255, 68, 56, 0.50);
+  color: var(--redis-hyper, #FF4438);
+}
+
+/* 2. §21.4(8) formula --------------------------------------------------- */
+.calc-panel__total-formula {
+  padding: calc(var(--grid) * 1.5) calc(var(--grid) * 2);
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--redis-border-primary, #2D4754);
+  border-radius: var(--radius, 5px);
+}
+.calc-panel__total-section-title {
+  margin: 0 0 calc(var(--grid) * 1.25);
+  font-size: 0.8125rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--redis-text-secondary, #C8D1D5);
+}
+.calc-panel__total-formula-symbolic,
+.calc-panel__total-formula-substituted {
+  overflow-x: auto;
+  font-size: 0.9375rem;
+}
+.calc-panel__total-formula-substituted {
+  margin-top: 0.25rem;
+  padding: 0.5rem 0.75rem;
+  background: rgba(0, 0, 0, 0.18);
+  border: 1px solid var(--redis-border-primary, #2D4754);
+  border-radius: var(--radius, 5px);
+}
+.calc-panel__total-formula-caption {
+  margin: 0.5rem 0 0;
+  font-size: 0.8125rem;
+  color: var(--redis-text-secondary, #C8D1D5);
+}
+.calc-panel__total-formula-all {
+  margin-top: calc(var(--grid) * 1.25);
+  font-size: 0.8125rem;
+}
+.calc-panel__total-formula-all > summary {
+  cursor: pointer;
+  color: var(--redis-text-link, #8AB4C7);
+  font-weight: 500;
+  list-style: none;
+}
+.calc-panel__total-formula-all > summary::-webkit-details-marker { display: none; }
+.calc-panel__total-formula-all > summary::before {
+  content: "▸ ";
+  display: inline-block;
+  margin-right: 0.125rem;
+  transition: transform 120ms;
+}
+.calc-panel__total-formula-all[open] > summary::before { content: "▾ "; }
+.calc-panel__total-formula-all > summary:hover,
+.calc-panel__total-formula-all > summary:focus-visible {
+  color: var(--redis-hyper, #FF4438);
+  outline: none;
+}
+.calc-panel__total-formula-all-list {
+  list-style: none;
+  margin: calc(var(--grid) * 1) 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: calc(var(--grid) * 0.75);
+}
+.calc-panel__total-formula-all-item {
+  padding: 0.375rem 0.625rem;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  overflow-x: auto;
+}
+.calc-panel__total-formula-all-item--winner {
+  background: rgba(91, 211, 123, 0.06);
+  border-color: rgba(91, 211, 123, 0.35);
+}
+
+/* 3. Scenario columns --------------------------------------------------- */
+.calc-panel__total-scenarios {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: calc(var(--grid) * 1.5);
+}
+@media (max-width: 900px) {
+  .calc-panel__total-scenarios { grid-template-columns: minmax(0, 1fr); }
+}
+.calc-panel__total-scenario {
+  display: flex;
+  flex-direction: column;
+  gap: calc(var(--grid) * 1.25);
+  padding: calc(var(--grid) * 1.5);
+  background: var(--redis-bg-tertiary, #1C3A47);
+  border: 1px solid var(--redis-border-primary, #2D4754);
+  border-radius: var(--radius, 5px);
+}
+.calc-panel__total-scenario--winner {
+  background: rgba(91, 211, 123, 0.06);
+  border-color: rgba(91, 211, 123, 0.45);
+  box-shadow: 0 0 0 1px rgba(91, 211, 123, 0.18);
+}
+.calc-panel__total-scenario-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding-bottom: calc(var(--grid) * 0.75);
+  border-bottom: 1px solid var(--redis-border-primary, #2D4754);
+}
+.calc-panel__total-scenario-name {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--redis-text-secondary, #C8D1D5);
+}
+.calc-panel__total-scenario-total {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 1.0625rem;
+  font-weight: 600;
+  color: var(--redis-text-primary, #F0F4F5);
+  font-variant-numeric: tabular-nums;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.375rem;
+}
+.calc-panel__total-scenario-star {
+  color: #5BD37B;
+  font-size: 0.9375rem;
+  line-height: 1;
+}
+.calc-panel__total-scenario-classes {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: calc(var(--grid) * 1.25);
+}
+.calc-panel__total-class {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+.calc-panel__total-class--empty { opacity: 0.55; }
+.calc-panel__total-class-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+.calc-panel__total-class-name {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--redis-text-primary, #F0F4F5);
+  text-transform: uppercase;
+}
+.calc-panel__total-class-empty {
+  font-size: 0.75rem;
+  font-style: italic;
+  color: var(--redis-text-muted, #5A6A72);
+}
+.calc-panel__total-class-legs {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.125rem 0.75rem;
+  margin: 0;
+  padding-left: 0.5rem;
+  font-size: 0.8125rem;
+  font-variant-numeric: tabular-nums;
+}
+.calc-panel__total-class-leg-label {
+  color: var(--redis-text-secondary, #C8D1D5);
+  font-family: var(--font-mono, ui-monospace, monospace);
+}
+.calc-panel__total-class-leg-value {
+  margin: 0;
+  text-align: right;
+  color: var(--redis-text-primary, #F0F4F5);
+  font-family: var(--font-mono, ui-monospace, monospace);
+}
+.calc-panel__total-class-leg-value--empty {
+  color: var(--redis-text-muted, #5A6A72);
+  font-style: italic;
+}
+.calc-panel__total-class-subtotal {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.125rem;
+  padding-right: 0.125rem;
+}
+.calc-panel__total-class-subtotal-rule {
+  flex: 0 0 2rem;
+  height: 1px;
+  background: var(--redis-border-secondary, #3D5764);
+}
+.calc-panel__total-class-subtotal-value {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.875rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--redis-text-primary, #F0F4F5);
+  border-top: 1px solid var(--redis-text-secondary, #C8D1D5);
+  padding-top: 0.125rem;
+}
+
+/* 4. Performance / parallelism chip strip ------------------------------- */
+.calc-panel__total-performance {
+  display: flex;
+  flex-wrap: wrap;
+  gap: calc(var(--grid) * 0.75);
+  padding: calc(var(--grid) * 1) calc(var(--grid) * 1.25);
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--redis-border-primary, #2D4754);
+  border-radius: var(--radius, 5px);
+  cursor: help;
+}
+.calc-panel__total-perf-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.3125rem;
+  padding: 0.25rem 0.625rem;
+  border-radius: 999px;
+  background: var(--redis-bg-tertiary, #1C3A47);
+  border: 1px solid var(--redis-border-primary, #2D4754);
+  font-size: 0.8125rem;
+  color: var(--redis-text-secondary, #C8D1D5);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.calc-panel__total-perf-chip > strong {
+  color: var(--redis-text-primary, #F0F4F5);
+  font-weight: 600;
+}
+.calc-panel__total-perf-chip[data-chip="parallel"] {
+  background: rgba(91, 211, 123, 0.10);
+  border-color: rgba(91, 211, 123, 0.45);
+  color: #5BD37B;
+}
+.calc-panel__total-perf-chip[data-chip="parallel"] > strong { color: #5BD37B; }
+.calc-panel__total-perf-chip[data-chip="skipped"] {
+  background: rgba(240, 180, 41, 0.10);
+  border-color: rgba(240, 180, 41, 0.45);
+  color: #f0b429;
+}
+
+/* 5. Footer ------------------------------------------------------------- */
+.calc-panel__total-footnote {
+  margin: 0;
+  font-size: 0.75rem;
+  color: var(--redis-text-secondary, #C8D1D5);
+  line-height: 1.5;
+}
+.calc-panel__total-footnote > code {
+  display: inline-block;
+  padding: 0.0625rem 0.375rem;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--redis-border-primary, #2D4754);
+  border-radius: 3px;
+  font-size: 0.6875rem;
+  color: var(--redis-text-secondary, #C8D1D5);
+  word-break: break-word;
+}
+
+/* Error state (re-used from /calc/sbm result; kept here so the total card
+   carries its own error styling without depending on shell.css). */
+.calc-panel__error {
+  margin: 0;
+  padding: calc(var(--grid) * 1) calc(var(--grid) * 1.5);
+  background: rgba(255, 68, 56, 0.08);
+  border: 1px solid rgba(255, 68, 56, 0.45);
+  border-radius: var(--radius, 5px);
+  color: var(--redis-hyper, #FF4438);
+  font-size: 0.875rem;
+}

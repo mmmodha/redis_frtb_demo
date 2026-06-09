@@ -1,5 +1,5 @@
 import { Fragment, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent } from "react";
-import { BlockMath } from "react-katex";
+import { BlockMath, InlineMath } from "react-katex";
 import { EnterpriseCallout, PanelCard, Sparkline, TimingStrip } from "../components";
 import { SuggestCombobox } from "../components/SuggestCombobox";
 import type { ShardTiming } from "../components/TimingStrip";
@@ -16,6 +16,8 @@ import {
   type CrossComponent,
   type CvrComponent,
   type SensitivityType,
+  type TotalSbmBreakdownRow,
+  type TotalSbmLeg,
   type TotalSbmResponse,
   type WsComponent,
 } from "../lib/calc";
@@ -643,79 +645,309 @@ function TotalSbmCard({
   );
 }
 
+// Wave 5.96C — display labels for the §21.4(8) inner sum.  Δ / V / Crv
+// are the Basel shorthand for delta / vega / curvature; using the symbols
+// directly keeps the per-class subtotal rows compact and lines them up
+// with the KaTeX-rendered formula above.
+const TOTAL_SBM_SCENARIOS: CorrelationRegime[] = ["low", "medium", "high"];
+const TOTAL_SBM_SCENARIO_LABEL: Record<CorrelationRegime, string> = {
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+};
+const TOTAL_SBM_LEG_LABEL: Record<TotalSbmLeg, string> = {
+  delta: "Δ",
+  vega: "V",
+  curvature: "Crv",
+};
+const TOTAL_SBM_LEG_ORDER: TotalSbmLeg[] = ["delta", "vega", "curvature"];
+
+// Preserve first-seen class order from the server breakdown so the column
+// stack reads consistently across the three scenario columns.
+function groupBreakdownByClass(
+  breakdown: TotalSbmBreakdownRow[],
+): Array<{ riskClass: string; rows: TotalSbmBreakdownRow[] }> {
+  const order: string[] = [];
+  const byClass = new Map<string, TotalSbmBreakdownRow[]>();
+  for (const row of breakdown) {
+    if (!byClass.has(row.risk_class)) {
+      order.push(row.risk_class);
+      byClass.set(row.risk_class, []);
+    }
+    byClass.get(row.risk_class)!.push(row);
+  }
+  return order.map((riskClass) => ({ riskClass, rows: byClass.get(riskClass)! }));
+}
+
+// Per-class (Δ + V + Crv) subtotal for one scenario column.  `allSkipped`
+// distinguishes "no data" from a computed-zero subtotal so the column can
+// render "(no data)" instead of "$0.00" — matches the user's request to
+// keep empty vs. zero visually distinct.
+function classSubtotalForScenario(
+  rows: TotalSbmBreakdownRow[],
+  scenario: CorrelationRegime,
+): { value: number; allSkipped: boolean } {
+  let value = 0;
+  let computed = 0;
+  for (const row of rows) {
+    if (!row.skipped) {
+      value += row.scenarios[scenario].charge;
+      computed += 1;
+    }
+  }
+  return { value, allSkipped: computed === 0 };
+}
+
 function TotalSbmResultView({ result }: { result: TotalSbmResponse }) {
   const perf = result.performance;
   const totalCells = perf.redis_ops_count + perf.ops_skipped;
+  const classGroups = useMemo(() => groupBreakdownByClass(result.breakdown), [result.breakdown]);
+  const winningScenario = result.winning_scenario;
+
+  // KaTeX expressions for the §21.4(8) total-charge derivation.  Symbolic
+  // form stays scenario-agnostic; the substituted form below pins it to
+  // the winning scenario so the headline number is the visible result.
+  const symbolicMath =
+    "\\text{Total SBM} = \\max_{s \\in \\{\\text{low}, \\text{med}, \\text{high}\\}} " +
+    "\\sum_{c} \\left( \\Delta_{c} + V_{c} + \\mathrm{Crv}_{c} \\right)_{s}";
+
+  // Build the substituted (Δ + V + Crv) terms per class for a given scenario.
+  // Skipped cells contribute nothing — matches the server-side semantics.
+  function buildSubstitutedTerms(scenario: CorrelationRegime): {
+    terms: string[];
+    total: number;
+  } {
+    const terms: string[] = [];
+    let total = 0;
+    for (const { riskClass, rows } of classGroups) {
+      const sub = classSubtotalForScenario(rows, scenario);
+      if (sub.allSkipped) continue;
+      const byLeg: Record<TotalSbmLeg, number> = { delta: 0, vega: 0, curvature: 0 };
+      for (const r of rows) {
+        if (!r.skipped) byLeg[r.leg] = r.scenarios[scenario].charge;
+      }
+      const safe = riskClass.replace(/[^A-Za-z0-9]/g, "");
+      terms.push(
+        `(${byLeg.delta.toFixed(2)} + ${byLeg.vega.toFixed(2)} + ${byLeg.curvature.toFixed(2)})_{\\text{${safe}}}`,
+      );
+      total += sub.value;
+    }
+    return { terms, total };
+  }
+
+  const winningSubst = buildSubstitutedTerms(winningScenario);
+  const winningSubstMath =
+    `\\text{Total SBM}\\big|_{s=\\text{${winningScenario}}} = ` +
+    (winningSubst.terms.length > 0 ? winningSubst.terms.join(" + ") : "0") +
+    ` = ${winningSubst.total.toFixed(2)}`;
+
+  const perfTooltip =
+    `Cumulative compute time across ${perf.redis_ops_count} cells: ${perf.cumulative_ms.toFixed(1)} ms. ` +
+    `Wall-clock elapsed: ${perf.total_ms.toFixed(1)} ms. ` +
+    `Parallelism factor = cumulative / wall-clock = ${perf.parallelism_factor.toFixed(2)}×.`;
+
   return (
     <div className="calc-panel__total-result" data-testid="calc-total-result">
+      {/* 1. Headline — prominent total + winning scenario pill */}
       <div className="calc-panel__total-headline">
-        <span className="calc-panel__total-headline-label">Total SBM charge</span>
-        <strong data-testid="calc-total-charge">{formatCharge(result.total_sbm)}</strong>
-        <span className="calc-panel__total-headline-meta">
-          winning scenario: <code>{result.winning_scenario}</code>
+        <div className="calc-panel__total-headline-main">
+          <span className="calc-panel__total-headline-label">Total SBM charge</span>
+          <strong
+            className="calc-panel__total-headline-value"
+            data-testid="calc-total-charge"
+          >
+            {formatCharge(result.total_sbm)}
+          </strong>
+        </div>
+        <span
+          className="calc-panel__total-winner-pill"
+          data-scenario={winningScenario}
+          data-testid="calc-total-winner-pill"
+        >
+          winning scenario: {winningScenario.toUpperCase()}
         </span>
       </div>
-      <div className="calc-panel__total-performance" data-testid="calc-total-performance">
-        <span>
+
+      {/* 2. §21.4(8) formula — symbolic + substituted for the winning scenario */}
+      <section
+        className="calc-panel__total-formula"
+        data-testid="calc-total-formula"
+        aria-label="Section 21.4(8) total SBM derivation"
+      >
+        <h3 className="calc-panel__total-section-title">How the Total SBM was calculated</h3>
+        <div className="calc-panel__total-formula-symbolic">
+          <BlockMath math={symbolicMath} />
+        </div>
+        <p className="calc-panel__total-formula-caption">
+          Substituting the winning scenario (<InlineMath math={`s = \\text{${winningScenario}}`} />):
+        </p>
+        <div
+          className="calc-panel__total-formula-substituted"
+          data-testid="calc-total-formula-substituted"
+        >
+          <BlockMath math={winningSubstMath} />
+        </div>
+        <details
+          className="calc-panel__total-formula-all"
+          data-testid="calc-total-formula-all"
+        >
+          <summary>Show derivation for all scenarios</summary>
+          <ul className="calc-panel__total-formula-all-list">
+            {TOTAL_SBM_SCENARIOS.map((s) => {
+              const subst = buildSubstitutedTerms(s);
+              const expr =
+                `\\text{Total SBM}\\big|_{s=\\text{${s}}} = ` +
+                (subst.terms.length > 0 ? subst.terms.join(" + ") : "0") +
+                ` = ${subst.total.toFixed(2)}`;
+              return (
+                <li
+                  key={s}
+                  className={
+                    s === winningScenario
+                      ? "calc-panel__total-formula-all-item calc-panel__total-formula-all-item--winner"
+                      : "calc-panel__total-formula-all-item"
+                  }
+                >
+                  <BlockMath math={expr} />
+                </li>
+              );
+            })}
+          </ul>
+        </details>
+      </section>
+
+      {/* 3. Per-scenario subtotals — three columns, winner tinted + starred */}
+      <section
+        className="calc-panel__total-scenarios"
+        data-testid="calc-total-matrix"
+        aria-label="Per-scenario subtotals by class"
+      >
+        {TOTAL_SBM_SCENARIOS.map((scenario) => {
+          const isWinner = scenario === winningScenario;
+          return (
+            <div
+              key={scenario}
+              className={
+                isWinner
+                  ? "calc-panel__total-scenario calc-panel__total-scenario--winner"
+                  : "calc-panel__total-scenario"
+              }
+              data-scenario={scenario}
+              data-winner={isWinner ? "true" : "false"}
+              data-testid={`calc-total-scenario-${scenario}`}
+            >
+              <header className="calc-panel__total-scenario-header">
+                <span className="calc-panel__total-scenario-name">
+                  {TOTAL_SBM_SCENARIO_LABEL[scenario]}
+                </span>
+                <span className="calc-panel__total-scenario-total">
+                  {formatCharge(result.scenario_totals[scenario])}
+                  {isWinner ? (
+                    <span
+                      className="calc-panel__total-scenario-star"
+                      aria-label="winning scenario"
+                      title="Winning scenario (max across low / medium / high)"
+                    >
+                      {"\u2605"}
+                    </span>
+                  ) : null}
+                </span>
+              </header>
+              <ul className="calc-panel__total-scenario-classes">
+                {classGroups.map(({ riskClass, rows }) => {
+                  const sub = classSubtotalForScenario(rows, scenario);
+                  return (
+                    <li
+                      key={riskClass}
+                      className={
+                        sub.allSkipped
+                          ? "calc-panel__total-class calc-panel__total-class--empty"
+                          : "calc-panel__total-class"
+                      }
+                      data-class={riskClass}
+                    >
+                      <div className="calc-panel__total-class-header">
+                        <span className="calc-panel__total-class-name">{riskClass}</span>
+                        {sub.allSkipped ? (
+                          <span className="calc-panel__total-class-empty">(no data)</span>
+                        ) : null}
+                      </div>
+                      {sub.allSkipped ? null : (
+                        <>
+                          <dl className="calc-panel__total-class-legs">
+                            {TOTAL_SBM_LEG_ORDER.map((leg) => {
+                              const row = rows.find((r) => r.leg === leg);
+                              const skipped = !row || row.skipped;
+                              return (
+                                <Fragment key={leg}>
+                                  <dt className="calc-panel__total-class-leg-label">
+                                    {TOTAL_SBM_LEG_LABEL[leg]}
+                                  </dt>
+                                  <dd
+                                    className={
+                                      skipped
+                                        ? "calc-panel__total-class-leg-value calc-panel__total-class-leg-value--empty"
+                                        : "calc-panel__total-class-leg-value"
+                                    }
+                                  >
+                                    {skipped
+                                      ? "(no data)"
+                                      : formatCharge(row!.scenarios[scenario].charge)}
+                                  </dd>
+                                </Fragment>
+                              );
+                            })}
+                          </dl>
+                          <div className="calc-panel__total-class-subtotal">
+                            <span className="calc-panel__total-class-subtotal-rule" aria-hidden />
+                            <span className="calc-panel__total-class-subtotal-value">
+                              {formatCharge(sub.value)}
+                            </span>
+                          </div>
+                        </>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          );
+        })}
+      </section>
+
+      {/* 4. Performance / parallelism evidence — compact chip strip */}
+      <div
+        className="calc-panel__total-performance"
+        data-testid="calc-total-performance"
+        title={perfTooltip}
+      >
+        <span className="calc-panel__total-perf-chip" data-chip="ops">
+          <span aria-hidden>{"\u26A1"}</span> {perf.redis_ops_count}/{totalCells} cells
+        </span>
+        <span className="calc-panel__total-perf-chip" data-chip="wall">
           wall-clock <strong>{perf.total_ms.toFixed(1)} ms</strong>
         </span>
-        <span>
+        <span className="calc-panel__total-perf-chip" data-chip="cumulative">
           cumulative <strong>{perf.cumulative_ms.toFixed(1)} ms</strong>
         </span>
-        <span>
-          parallelism ×<strong data-testid="calc-total-parallelism">
+        <span className="calc-panel__total-perf-chip" data-chip="parallel">
+          ×<strong data-testid="calc-total-parallelism">
             {perf.parallelism_factor.toFixed(2)}
-          </strong>
+          </strong>{" "}
+          parallel speedup
         </span>
-        <span>
-          {perf.redis_ops_count}/{totalCells} cells
-          {perf.ops_skipped > 0 ? ` (${perf.ops_skipped} skipped)` : ""}
-        </span>
+        {perf.ops_skipped > 0 ? (
+          <span className="calc-panel__total-perf-chip" data-chip="skipped">
+            {perf.ops_skipped} skipped
+          </span>
+        ) : null}
       </div>
-      <div className="calc-panel__total-scenarios">
-        {(["low", "medium", "high"] as CorrelationRegime[]).map((s) => (
-          <div
-            key={s}
-            className={`calc-panel__total-scenario${
-              s === result.winning_scenario ? " calc-panel__total-scenario--winner" : ""
-            }`}
-          >
-            <span className="calc-panel__total-scenario-name">{s}</span>
-            <strong>{formatCharge(result.scenario_totals[s])}</strong>
-          </div>
-        ))}
-      </div>
-      <details className="calc-panel__total-breakdown">
-        <summary>Breakdown (class × leg × scenario)</summary>
-        <table className="calc-panel__total-table" data-testid="calc-total-matrix">
-          <thead>
-            <tr>
-              <th>Class</th>
-              <th>Leg</th>
-              <th>Low</th>
-              <th>Medium</th>
-              <th>High</th>
-            </tr>
-          </thead>
-          <tbody>
-            {result.breakdown.map((row) => (
-              <tr
-                key={`${row.risk_class}-${row.leg}`}
-                className={row.skipped ? "calc-panel__total-row--skipped" : undefined}
-              >
-                <td>{row.risk_class}</td>
-                <td>{row.leg}</td>
-                <td>{formatCharge(row.scenarios.low.charge)}</td>
-                <td>{formatCharge(row.scenarios.medium.charge)}</td>
-                <td>{formatCharge(row.scenarios.high.charge)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </details>
+
+      {/* 5. Footer — unsupported classes + resolved command summary */}
       {result.unsupported_classes.length > 0 ? (
         <p className="calc-panel__total-footnote">
-          Unsupported classes (omitted): <code>{result.unsupported_classes.join(", ")}</code>
+          Unsupported classes (omitted):{" "}
+          <code>{result.unsupported_classes.join(", ")}</code>
         </p>
       ) : null}
       <p className="calc-panel__total-footnote">
