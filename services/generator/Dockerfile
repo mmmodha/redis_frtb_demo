@@ -15,6 +15,7 @@ COPY package.json package-lock.json ./
 COPY services/generator/package.json ./services/generator/package.json
 COPY shared/schema ./shared/schema
 COPY shared/redis-client ./shared/redis-client
+COPY shared/stream-router ./shared/stream-router
 # Runtime deps only (drops typescript/vitest/@types). tsx is installed
 # globally with the same pinned version used elsewhere so the CLI loader
 # can resolve .ts files without a TS build step in this service.
@@ -49,6 +50,7 @@ COPY --from=builder /usr/local/lib/node_modules /usr/local/lib/node_modules
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/shared/schema ./shared/schema
 COPY --from=builder /app/shared/redis-client ./shared/redis-client
+COPY --from=builder /app/shared/stream-router ./shared/stream-router
 COPY services/generator/package.json ./services/generator/package.json
 COPY services/generator/tsconfig.json ./services/generator/tsconfig.json
 COPY services/generator/src ./services/generator/src

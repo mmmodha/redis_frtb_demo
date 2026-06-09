@@ -28,6 +28,7 @@ COPY services/api/package.json ./services/api/package.json
 COPY shared/schema ./shared/schema
 COPY shared/rqe ./shared/rqe
 COPY shared/redis-client ./shared/redis-client
+COPY shared/stream-router ./shared/stream-router
 COPY services/calc/package.json ./services/calc/package.json
 COPY services/calc/src ./services/calc/src
 COPY services/calc/lib ./services/calc/lib

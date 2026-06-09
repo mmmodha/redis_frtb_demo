@@ -26,6 +26,7 @@ COPY package.json package-lock.json ./
 COPY services/source/package.json ./services/source/package.json
 COPY shared/schema ./shared/schema
 COPY shared/redis-client ./shared/redis-client
+COPY shared/stream-router ./shared/stream-router
 # Wave 2: prod-only install with BuildKit npm cache. tsx is now a runtime
 # dep so --omit=dev keeps it while shedding typescript/vitest/@types/*.
 RUN --mount=type=cache,target=/root/.npm,sharing=locked \
