@@ -12,6 +12,7 @@
 
 import { describe, it, expect, afterEach } from "vitest";
 import { createServer } from "../src/server.ts";
+import type { Shard } from "../src/routes/observability.ts";
 import { fakeRedis } from "./helpers/fake-redis.ts";
 
 const CLUSTER_NODES_THREE_PRIMARIES = [
@@ -276,5 +277,166 @@ describe("GET /observability/shards/stream (SSE)", () => {
     expect(Array.isArray(payload)).toBe(true);
     expect(payload[0]).toHaveProperty("shardId");
     expect(payload[0]).toHaveProperty("opsPerSec");
+  });
+});
+
+// Wave 5.85 — per-node INFO fan-out. The pre-fix code called redis.info()
+// once and stamped the same memory/network/ops onto every tile; now the
+// cluster path uses Cluster.nodes("master") and stitches per-node values by
+// host:port. The fake below adds `.nodes("master")` to the existing fakeRedis
+// so we exercise the new path without booting a real ioredis Cluster.
+
+interface SubFake {
+  options: { host: string; port: number };
+  info: (section?: string) => Promise<string>;
+}
+
+interface ClusterFake extends ReturnType<typeof fakeRedis> {
+  nodes: (role?: "master" | "slave" | "all") => SubFake[];
+}
+
+function clusterFakeRedis(perNodeInfo: Record<string, { memory: string; stats: string }>): ClusterFake {
+  const fr = fakeRedis();
+  const subs: SubFake[] = Object.entries(perNodeInfo).map(([endpoint, bodies]) => {
+    const [host, portStr] = endpoint.split(":");
+    return {
+      options: { host: host ?? "", port: Number(portStr ?? 0) },
+      info: async (section?: string) => {
+        if (section === "memory") return bodies.memory;
+        if (section === "stats") return bodies.stats;
+        return `${bodies.memory}\r\n${bodies.stats}`;
+      },
+    };
+  });
+  const cf = fr as ClusterFake;
+  cf.nodes = (role?: "master" | "slave" | "all") => {
+    if (role === "slave") return [];
+    return subs;
+  };
+  return cf;
+}
+
+const CLUSTER_NODES_FOUR_PRIMARIES = [
+  "1111111111111111 10.0.0.11:6379@16379 myself,master - 0 0 1 connected 0-4095",
+  "2222222222222222 10.0.0.12:6379@16379 master - 0 1700000000000 2 connected 4096-8191",
+  "3333333333333333 10.0.0.13:6379@16379 master - 0 1700000000000 3 connected 8192-12287",
+  "4444444444444444 10.0.0.14:6379@16379 master - 0 1700000000000 4 connected 12288-16383",
+].join("\n");
+
+function infoMemory(used: number): string {
+  return ["# Memory", `used_memory:${used}`, "used_memory_human:1M"].join("\r\n");
+}
+function infoStats(netIn: number, netOut: number, ops: number): string {
+  return [
+    "# Stats",
+    `total_net_input_bytes:${netIn}`,
+    `total_net_output_bytes:${netOut}`,
+    `instantaneous_ops_per_sec:${ops}`,
+  ].join("\r\n");
+}
+
+describe("GET /observability/shards — per-node INFO fan-out (Wave 5.85)", () => {
+  let app: Awaited<ReturnType<typeof createServer>>;
+  afterEach(async () => {
+    if (app) await app.close();
+  });
+
+  it("stitches distinct memory/network/ops per shard via Cluster.nodes('master')", async () => {
+    const cf = clusterFakeRedis({
+      "10.0.0.11:6379": { memory: infoMemory(100_000_000), stats: infoStats(11_000, 12_000, 100) },
+      "10.0.0.12:6379": { memory: infoMemory(200_000_000), stats: infoStats(21_000, 22_000, 200) },
+      "10.0.0.13:6379": { memory: infoMemory(300_000_000), stats: infoStats(31_000, 32_000, 300) },
+      "10.0.0.14:6379": { memory: infoMemory(400_000_000), stats: infoStats(41_000, 42_000, 400) },
+    });
+    cf.setResponse("CLUSTER", CLUSTER_NODES_FOUR_PRIMARIES);
+    cf.setInfo(INFO_TEXT); // single-INFO fallback — should NOT leak into tiles
+    app = await createServer({ redis: cf });
+
+    const res = await app.inject({ method: "GET", url: "/observability/shards" });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as Shard[];
+    expect(body).toHaveLength(4);
+
+    const byId = Object.fromEntries(body.map((s) => [s.shardId, s]));
+    expect(byId["11111111"].usedMemoryBytes).toBe(100_000_000);
+    expect(byId["11111111"].netInBytes).toBe(11_000);
+    expect(byId["11111111"].netOutBytes).toBe(12_000);
+    expect(byId["11111111"].opsPerSec).toBe(100);
+
+    expect(byId["22222222"].usedMemoryBytes).toBe(200_000_000);
+    expect(byId["22222222"].opsPerSec).toBe(200);
+    expect(byId["33333333"].usedMemoryBytes).toBe(300_000_000);
+    expect(byId["33333333"].opsPerSec).toBe(300);
+    expect(byId["44444444"].usedMemoryBytes).toBe(400_000_000);
+    expect(byId["44444444"].opsPerSec).toBe(400);
+
+    // Distinct values across every tile — the bug the fix is closing.
+    expect(new Set(body.map((s) => s.usedMemoryBytes)).size).toBe(4);
+    expect(new Set(body.map((s) => s.opsPerSec)).size).toBe(4);
+  });
+
+  it("falls back to single-INFO numbers (no throw) when nodes('master') returns []", async () => {
+    const fr = fakeRedis();
+    fr.setResponse("CLUSTER", CLUSTER_NODES_FOUR_PRIMARIES);
+    fr.setInfo(INFO_TEXT);
+    // Transient slot-table miss: cluster client exists but returns [].
+    const cf = fr as ClusterFake;
+    cf.nodes = () => [];
+
+    app = await createServer({ redis: cf });
+    const res = await app.inject({ method: "GET", url: "/observability/shards" });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as Shard[];
+    expect(body).toHaveLength(4);
+    // Pre-fix shape: every tile shares the single-INFO snapshot. We don't crash.
+    for (const s of body) {
+      expect(s.usedMemoryBytes).toBe(524288000);
+      expect(s.opsPerSec).toBe(4242);
+    }
+  });
+});
+
+describe("GET /observability/topology (Wave 5.85)", () => {
+  let app: Awaited<ReturnType<typeof createServer>>;
+  afterEach(async () => {
+    if (app) await app.close();
+  });
+
+  it("returns the parsed CLUSTER NODES list joined to per-node INFO for cluster clients", async () => {
+    const cf = clusterFakeRedis({
+      "10.0.0.11:6379": { memory: infoMemory(100_000_000), stats: infoStats(11_000, 12_000, 100) },
+      "10.0.0.12:6379": { memory: infoMemory(200_000_000), stats: infoStats(21_000, 22_000, 200) },
+      "10.0.0.13:6379": { memory: infoMemory(300_000_000), stats: infoStats(31_000, 32_000, 300) },
+      "10.0.0.14:6379": { memory: infoMemory(400_000_000), stats: infoStats(41_000, 42_000, 400) },
+    });
+    cf.setResponse("CLUSTER", CLUSTER_NODES_FOUR_PRIMARIES);
+    cf.setInfo(INFO_TEXT);
+    app = await createServer({ redis: cf });
+
+    const res = await app.inject({ method: "GET", url: "/observability/topology" });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      clusterClient: boolean;
+      nodes: Array<{ id: string; endpoint: string; slotCount: number; role: string }>;
+      perNode: Record<string, { usedMemoryBytes: number; opsPerSec: number }>;
+    };
+    expect(body.clusterClient).toBe(true);
+    expect(body.nodes).toHaveLength(4);
+    expect(body.nodes[0].endpoint).toBe("10.0.0.11:6379");
+    expect(body.perNode["10.0.0.13:6379"].usedMemoryBytes).toBe(300_000_000);
+    expect(body.perNode["10.0.0.13:6379"].opsPerSec).toBe(300);
+  });
+
+  it("returns clusterClient=false with empty perNode on a standalone fake (no .nodes)", async () => {
+    const fr = fakeRedis();
+    fr.setInfo(INFO_STANDALONE);
+    app = await createServer({ redis: fr });
+
+    const res = await app.inject({ method: "GET", url: "/observability/topology" });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { clusterClient: boolean; nodes: unknown[]; perNode: Record<string, unknown> };
+    expect(body.clusterClient).toBe(false);
+    expect(body.nodes).toEqual([]);
+    expect(body.perNode).toEqual({});
   });
 });

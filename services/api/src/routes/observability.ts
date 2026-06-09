@@ -1,4 +1,5 @@
 import type { FastifyInstance } from "fastify";
+import { Cluster } from "ioredis";
 import type { RedisLike } from "../redis-like.ts";
 import { getActiveTarget } from "../active-target.ts";
 import { getBootstrapStatus } from "../bootstrap-status.ts";
@@ -58,6 +59,9 @@ interface ParsedNode {
   id: string;
   role: "master" | "slave";
   slotCount: number;
+  // `<host>:<port>` extracted from `parts[1]` (`<ip:port@cport[,hostname]>`).
+  // Used by readShards() to stitch per-node INFO into the matching shard tile.
+  endpoint: string;
 }
 
 // CLUSTER NODES line layout (per https://redis.io/commands/cluster-nodes/):
@@ -73,6 +77,11 @@ export function parseClusterNodes(text: string): ParsedNode[] {
     const parts = line.trim().split(/\s+/);
     if (parts.length < 8) continue;
     const id = parts[0] ?? "";
+    const addr = parts[1] ?? "";
+    // Strip `@cport` and optional `,hostname` to get the bare host:port that
+    // ioredis Cluster sub-clients expose on `.options.host`/`.options.port`.
+    const atIdx = addr.indexOf("@");
+    const endpoint = atIdx >= 0 ? addr.slice(0, atIdx) : addr.split(",")[0] ?? addr;
     const flags = (parts[2] ?? "").split(",");
     const isMaster = flags.includes("master");
     const isSlave = flags.includes("slave");
@@ -91,7 +100,7 @@ export function parseClusterNodes(text: string): ParsedNode[] {
         if (Number.isFinite(n)) slotCount += 1;
       }
     }
-    out.push({ id, role: isMaster ? "master" : "slave", slotCount });
+    out.push({ id, role: isMaster ? "master" : "slave", slotCount, endpoint });
   }
   return out;
 }
@@ -127,6 +136,80 @@ export interface ShardLogger {
   warn: (obj: Record<string, unknown>) => void;
 }
 
+// Wave 5.85 — minimal ioredis Cluster sub-client surface used by the per-node
+// INFO fan-out. Real `ioredis.Cluster.nodes("master")` returns `Redis[]` whose
+// instances expose `.info(section)` and an `.options` bag with `host`/`port`.
+// Typed loosely here so the unit-test fakeRedis can plug into the same path
+// without booting a real cluster.
+export interface ClusterSubClient {
+  info: (section?: string) => Promise<string>;
+  options?: { host?: string; port?: number | string };
+}
+
+export interface ClusterFanoutClient {
+  nodes: (role?: "master" | "slave" | "all") => ClusterSubClient[];
+}
+
+// Cluster detection: real ioredis Cluster (instanceof) OR an object that
+// duck-types `.nodes(role)` as a function. The duck-type fallback exists so
+// unit tests can inject a fake without constructing a real Cluster. NOTE:
+// per-node topology probing on a non-Cluster ioredis Redis client is not
+// supported — that path keeps the single-INFO fallback (today's behaviour).
+function asClusterClient(redis: unknown): ClusterFanoutClient | null {
+  if (redis instanceof Cluster) return redis as unknown as ClusterFanoutClient;
+  if (redis && typeof (redis as { nodes?: unknown }).nodes === "function") {
+    return redis as ClusterFanoutClient;
+  }
+  return null;
+}
+
+interface PerNodeInfo {
+  usedMemoryBytes: number;
+  netInBytes: number;
+  netOutBytes: number;
+  opsPerSec: number;
+}
+
+// Fan `INFO memory` + `INFO stats` out across every master sub-client and
+// return a map keyed by `host:port` (matching ParsedNode.endpoint). Sub-clients
+// that fail are skipped — the caller falls back to single-INFO for any shard
+// missing from the map.
+async function readPerNodeInfo(
+  cluster: ClusterFanoutClient,
+  log?: ShardLogger,
+): Promise<Map<string, PerNodeInfo>> {
+  const masters = cluster.nodes("master") ?? [];
+  const map = new Map<string, PerNodeInfo>();
+  await Promise.all(
+    masters.map(async (node) => {
+      const host = node.options?.host ?? "";
+      const port = node.options?.port ?? "";
+      const endpoint = `${host}:${port}`;
+      try {
+        const [memText, statsText] = await Promise.all([
+          node.info("memory"),
+          node.info("stats"),
+        ]);
+        const mem = parseInfo(memText);
+        const stats = parseInfo(statsText);
+        map.set(endpoint, {
+          usedMemoryBytes: Number(mem.used_memory ?? 0),
+          netInBytes: Number(stats.total_net_input_bytes ?? 0),
+          netOutBytes: Number(stats.total_net_output_bytes ?? 0),
+          opsPerSec: Number(stats.instantaneous_ops_per_sec ?? 0),
+        });
+      } catch (err) {
+        log?.warn?.({
+          warn: "observability-shards-per-node-info-failed",
+          endpoint,
+          reason: String(err),
+        });
+      }
+    }),
+  );
+  return map;
+}
+
 export async function readShards(
   redis: RedisLike,
   log?: ShardLogger,
@@ -156,21 +239,45 @@ export async function readShards(
     ]);
     const parsed = parseClusterNodes(typeof nodesText === "string" ? nodesText : "");
     const info = parseInfo(infoText);
-    const usedMemoryBytes = Number(info.used_memory ?? 0);
-    const netInBytes = Number(info.total_net_input_bytes ?? 0);
-    const netOutBytes = Number(info.total_net_output_bytes ?? 0);
-    const opsPerSec = Number(info.instantaneous_ops_per_sec ?? 0);
+    // Single-INFO numbers — used as a per-shard fallback when the per-node
+    // fan-out can't reach a given endpoint (or when redis isn't a Cluster
+    // client at all). Pre-Wave-5.85, every tile carried these identical values.
+    const fbUsedMemoryBytes = Number(info.used_memory ?? 0);
+    const fbNetInBytes = Number(info.total_net_input_bytes ?? 0);
+    const fbNetOutBytes = Number(info.total_net_output_bytes ?? 0);
+    const fbOpsPerSec = Number(info.instantaneous_ops_per_sec ?? 0);
+
+    // Wave 5.85 — fan INFO out across master sub-clients so each tile carries
+    // that node's own memory/network/ops. `nodes("master")` can briefly return
+    // [] during a slot-table refresh; treat that as "not yet" and fall back to
+    // the single-INFO numbers rather than throwing.
+    const cluster = asClusterClient(redis);
+    let perNode: Map<string, PerNodeInfo> | null = null;
+    if (cluster) {
+      perNode = await readPerNodeInfo(cluster, log);
+      if (perNode.size === 0) {
+        log?.warn?.({
+          warn: "observability-shards-cluster-nodes-empty",
+          reason: "nodes('master') returned [] — slot-table refresh? falling back to single INFO",
+        });
+        perNode = null;
+      }
+    }
+
     return parsed
       .filter((n) => n.role === "master")
-      .map((n) => ({
-        shardId: n.id.slice(0, 8),
-        role: n.role,
-        opsPerSec,
-        slotCount: n.slotCount,
-        usedMemoryBytes,
-        netInBytes,
-        netOutBytes,
-      }));
+      .map((n) => {
+        const pn = perNode?.get(n.endpoint);
+        return {
+          shardId: n.id.slice(0, 8),
+          role: n.role,
+          opsPerSec: pn?.opsPerSec ?? fbOpsPerSec,
+          slotCount: n.slotCount,
+          usedMemoryBytes: pn?.usedMemoryBytes ?? fbUsedMemoryBytes,
+          netInBytes: pn?.netInBytes ?? fbNetInBytes,
+          netOutBytes: pn?.netOutBytes ?? fbNetOutBytes,
+        };
+      });
   } catch (err) {
     // Defensive fallback: managed DBs that report `cluster_enabled:1` but
     // still block the CLUSTER command (some Redis Cloud configurations) hit
@@ -186,6 +293,36 @@ export async function readShards(
     }
     throw err;
   }
+}
+
+// Wave 5.85 — debug aid for "is the api seeing my cluster?". Returns the
+// parsed CLUSTER NODES list joined to the per-master INFO summary. Read-only,
+// no metric writes, no side effects. Standalone targets return an empty
+// `nodes` array and an empty `perNode` map so the response shape is stable.
+export interface TopologyPayload {
+  nodes: ParsedNode[];
+  perNode: Record<string, PerNodeInfo>;
+  clusterClient: boolean;
+}
+
+export async function readTopology(
+  redis: RedisLike,
+  log?: ShardLogger,
+): Promise<TopologyPayload> {
+  const cluster = asClusterClient(redis);
+  let nodes: ParsedNode[] = [];
+  try {
+    const nodesText = await (redis.call("CLUSTER", "NODES") as Promise<string>);
+    nodes = parseClusterNodes(typeof nodesText === "string" ? nodesText : "");
+  } catch {
+    // CLUSTER blocked or standalone — leave nodes empty.
+  }
+  const perNode = cluster ? await readPerNodeInfo(cluster, log) : new Map<string, PerNodeInfo>();
+  return {
+    nodes,
+    perNode: Object.fromEntries(perNode),
+    clusterClient: cluster !== null,
+  };
 }
 
 export interface RegisterObservabilityOpts {
@@ -281,6 +418,25 @@ export function registerObservabilityRoutes(
       void writeMetric(redis, "shard_count", shards.length, target_label);
       void writeMetric(redis, "ops_per_sec", totalOps, target_label);
       return shards;
+    } catch (err) {
+      const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
+      if (translated) {
+        reply.code(translated.status);
+        return translated.body;
+      }
+      throw err;
+    }
+  });
+
+  // Wave 5.85 — debug aid: surface the parsed CLUSTER NODES + per-node INFO
+  // summary so an operator can answer "is the api seeing my cluster?". Read
+  // only, no metric writes. Standalone targets return empty arrays/maps.
+  app.get("/observability/topology", async (req, reply) => {
+    const redis = getRedis();
+    const target_label = getActiveTarget().label;
+    try {
+      const topology = await readTopology(redis, req.log);
+      return topology;
     } catch (err) {
       const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
       if (translated) {
