@@ -36,20 +36,22 @@ describe("Wave 5.84C — pickProfile (auto-select from cluster shape)", () => {
 });
 
 describe("Wave 5.84C — profileDials (concrete dial values)", () => {
-  it("small profile: workers=1 batch=500 window=1", () => {
+  it("small profile: workers=1 batch=500 window=1 streamShards=1", () => {
     expect(profileDials("small", shape("standalone", 1), 8)).toEqual({
-      workers: 1, batchSize: 500, pipelineWindow: 1,
+      workers: 1, batchSize: 500, pipelineWindow: 1, streamShards: 1,
     });
   });
-  it("medium profile: workers=2 batch=1500 window=2", () => {
+  it("medium profile: workers=2 batch=1500 window=2 streamShards=shards", () => {
     expect(profileDials("medium", shape("cluster", 3), 8)).toEqual({
-      workers: 2, batchSize: 1500, pipelineWindow: 2,
+      workers: 2, batchSize: 1500, pipelineWindow: 2, streamShards: 3,
     });
   });
-  it("large profile: workers=min(shards, host_cores), batch=2000, window=2", () => {
+  it("large profile: workers=min(shards, host_cores), batch=2000, window=2, streamShards=min(shards,32)", () => {
     expect(profileDials("large", shape("cluster", 6), 8).workers).toBe(6);
     expect(profileDials("large", shape("cluster", 6), 4).workers).toBe(4);
     expect(profileDials("large", shape("cluster", 12), 8).workers).toBe(8);
+    expect(profileDials("large", shape("cluster", 6), 8).streamShards).toBe(6);
+    expect(profileDials("large", shape("cluster", 64), 8).streamShards).toBe(32);
   });
   it("large profile: never returns workers < 1 even when hostCores=0", () => {
     expect(profileDials("large", shape("cluster", 4), 0).workers).toBe(1);
@@ -60,8 +62,8 @@ describe("Wave 5.84C — resolveDials (manual overrides always win — DoD #4)",
   const s = shape("cluster", 6);
   it("no overrides → profile dials passthrough", () => {
     const r = resolveDials("large", s, 8);
-    expect(r).toMatchObject({ profile: "large", workers: 6, batchSize: 2000, pipelineWindow: 2 });
-    expect(r.overrides).toEqual({ workers: false, batchSize: false, pipelineWindow: false });
+    expect(r).toMatchObject({ profile: "large", workers: 6, batchSize: 2000, pipelineWindow: 2, streamShards: 6 });
+    expect(r.overrides).toEqual({ workers: false, batchSize: false, pipelineWindow: false, streamShards: false });
   });
   it("manual workers wins over profile", () => {
     const r = resolveDials("large", s, 8, { workers: 1 });
@@ -78,10 +80,15 @@ describe("Wave 5.84C — resolveDials (manual overrides always win — DoD #4)",
     expect(r.pipelineWindow).toBe(8);
     expect(r.overrides.pipelineWindow).toBe(true);
   });
-  it("all three overridden simultaneously", () => {
-    const r = resolveDials("large", s, 8, { workers: 1, batchSize: 100, pipelineWindow: 1 });
-    expect(r).toMatchObject({ workers: 1, batchSize: 100, pipelineWindow: 1 });
-    expect(r.overrides).toEqual({ workers: true, batchSize: true, pipelineWindow: true });
+  it("manual streamShards wins over profile (Wave 5.92A)", () => {
+    const r = resolveDials("small", s, 8, { streamShards: 8 });
+    expect(r.streamShards).toBe(8);
+    expect(r.overrides.streamShards).toBe(true);
+  });
+  it("all four overridden simultaneously", () => {
+    const r = resolveDials("large", s, 8, { workers: 1, batchSize: 100, pipelineWindow: 1, streamShards: "per-bucket" });
+    expect(r).toMatchObject({ workers: 1, batchSize: 100, pipelineWindow: 1, streamShards: "per-bucket" });
+    expect(r.overrides).toEqual({ workers: true, batchSize: true, pipelineWindow: true, streamShards: true });
   });
 });
 

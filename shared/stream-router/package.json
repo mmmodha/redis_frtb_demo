@@ -1,0 +1,20 @@
+{
+  "name": "@frtb/stream-router",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "FRTB SBM PoV — Wave 5.92A — hash-tag → stream key router shared by the generator and source services.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.8"
+  }
+}

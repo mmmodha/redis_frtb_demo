@@ -6,6 +6,7 @@ import { resolve, join } from "node:path";
 import { setTimeout as wait } from "node:timers/promises";
 import { Redis } from "ioredis";
 import { createStreamProducer, MAX_PIPELINE_WINDOW, type SensitivityRow } from "../src/producer.ts";
+import { createStreamRouter } from "@frtb/stream-router";
 
 // Local ephemeral redis-server keeps the producer test self-contained and fast.
 // Skipped automatically when redis-server is not on PATH.
@@ -237,5 +238,96 @@ describe("Wave 5.84A — pipeline window", () => {
     const totalXadds = c.execCalls.reduce((acc, batch) => acc + batch.length, 0);
     expect(totalXadds).toBe(200);
     expect(p.rowsSent).toBe(200);
+  });
+});
+
+// Wave 5.92A — multi-stream routing. The producer accepts an optional
+// `StreamRouter`; when N>1, rows fan out across N hash-tag-partitioned
+// streams keyed by FNV-1a(_hash_tag) % N. Single-buffer / single-key
+// bit-equivalence is already covered by the Wave 5.84A canary above; these
+// tests assert the new behaviour without disturbing it.
+function makeRowWithTag(i: number, hashTag: string): SensitivityRow {
+  return {
+    risk_class: "GIRR",
+    bucket: "B0",
+    risk_value: i,
+    _hash_tag: hashTag,
+    _id: `01HXTESTSHARD${String(i).padStart(13, "0")}`,
+  };
+}
+
+describe("Wave 5.92A — stream-router fan-out", () => {
+  it("N=1 router is bit-identical to no router (same XADD sequence)", async () => {
+    const a = stubPipelineClient();
+    const b = stubPipelineClient();
+    const router = createStreamRouter("sensitivities:in", 1);
+    const pa = createStreamProducer(a as never, { stream: "sensitivities:in", batchSize: 50 });
+    const pb = createStreamProducer(b as never, { stream: "sensitivities:in", batchSize: 50, router });
+    for (let i = 0; i < 137; i++) {
+      await pa.add(makeRowWithTag(i, `GIRR:B${i % 20}`));
+      await pb.add(makeRowWithTag(i, `GIRR:B${i % 20}`));
+    }
+    await pa.flush();
+    await pb.flush();
+    expect(b.execCalls).toEqual(a.execCalls);
+  });
+
+  it("N=4 router fans XADDs across all 4 stream keys (every key receives rows)", async () => {
+    const c = stubPipelineClient();
+    const router = createStreamRouter("sensitivities:in", 4);
+    const p = createStreamProducer(c as never, { stream: "sensitivities:in", batchSize: 50, router });
+    // Wide tag spread so FNV-1a hits every modulo bucket.
+    const classes = ["GIRR", "FX", "EQUITY", "CSR", "CMD", "EQDELTA", "FXVEGA", "GIRRSWP"];
+    let i = 0;
+    for (const rc of classes) {
+      for (let b = 0; b < 80; b++) await p.add(makeRowWithTag(i++, `${rc}:B${b}`));
+    }
+    await p.flush();
+    const streamsHit = new Set<string>();
+    for (const batch of c.execCalls) {
+      for (const args of batch) streamsHit.add(args[0]!);
+    }
+    expect(streamsHit.size).toBe(4);
+    for (const key of router.shardKeys()!) expect(streamsHit.has(key)).toBe(true);
+  });
+
+  it("router preserves per-stream XADD order (rows with same hash-tag stay sequential within their stream)", async () => {
+    const c = stubPipelineClient();
+    const router = createStreamRouter("sensitivities:in", 4);
+    const p = createStreamProducer(c as never, { stream: "sensitivities:in", batchSize: 10, router });
+    // Tag each row with its index inside _id; we'll recover per-stream
+    // ordering and assert it's monotonically non-decreasing per stream key.
+    for (let i = 0; i < 200; i++) {
+      await p.add(makeRowWithTag(i, `GIRR:B${i % 16}`));
+    }
+    await p.flush();
+    const perStreamIds = new Map<string, number[]>();
+    for (const batch of c.execCalls) {
+      for (const args of batch) {
+        const streamKey = args[0]!;
+        const idIdx = args.indexOf("_id");
+        const id = args[idIdx + 1]!;
+        const seq = Number(id.slice(-13));
+        if (!perStreamIds.has(streamKey)) perStreamIds.set(streamKey, []);
+        perStreamIds.get(streamKey)!.push(seq);
+      }
+    }
+    for (const [, seqs] of perStreamIds) {
+      for (let i = 1; i < seqs.length; i++) {
+        expect(seqs[i]!).toBeGreaterThan(seqs[i - 1]!);
+      }
+    }
+  });
+
+  it("pipelineWindow is the GLOBAL cap across all per-stream pipelines (≤window in flight, summed)", async () => {
+    const c = stubPipelineClient();
+    const router = createStreamRouter("sensitivities:in", 4);
+    const p = createStreamProducer(c as never, { stream: "sensitivities:in", batchSize: 25, pipelineWindow: 2, router });
+    for (let i = 0; i < 400; i++) {
+      await p.add(makeRowWithTag(i, `GIRR:B${i % 16}`));
+    }
+    await p.flush();
+    expect(c.maxInFlight).toBeLessThanOrEqual(2);
+    expect(p.rowsSent).toBe(400);
   });
 });

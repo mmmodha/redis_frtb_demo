@@ -4,25 +4,39 @@
 // merge on top via `resolveDials` so manual always wins (DoD #4).
 //
 // Profile table (matches the task note's informational table):
-//   small  : standalone OR 1 master shard      → workers=1, batch=500,  window=1
-//   medium : 2..3 master shards                → workers=2, batch=1500, window=2
-//   large  : 4+  master shards                 → workers=min(shards,cpus), batch=2000, window=2
+//   small  : standalone OR 1 master shard      → workers=1, batch=500,  window=1, streamShards=1
+//   medium : 2..3 master shards                → workers=2, batch=1500, window=2, streamShards=shards
+//   large  : 4+  master shards                 → workers=min(shards,cpus), batch=2000, window=2, streamShards=min(shards,STREAM_SHARDS_CAP)
+//
+// Wave 5.92A — `streamShards` is the new hash-tag stream-router dial. It
+// fans XADDs across N hash-tag-partitioned input streams so the producer
+// stops bottlenecking on a single Redis shard at high concurrency. Default
+// for `small` is 1 (bit-equivalent to pre-5.92); medium/large match the
+// probed master-shard count up to STREAM_SHARDS_CAP (per the task spec).
 
 import { BYTES_PER_ROW, type ClusterShape } from "./probe.ts";
+import type { StreamShardsConfig } from "@frtb/stream-router";
 
 export type ProfileName = "small" | "medium" | "large";
+
+// Wave 5.92A — hard ceiling on profile-resolved streamShards. Matches the
+// generator CLI's MAX_WORKERS_HARD_CAP intent: keeps the in-flight
+// per-stream pipeline count bounded even on very wide clusters.
+export const STREAM_SHARDS_CAP = 32;
 
 export interface ProfileDials {
   workers: number;
   batchSize: number;
   pipelineWindow: number;
+  // Wave 5.92A — see file header. Number (modulo-N) or "per-bucket".
+  streamShards: StreamShardsConfig;
 }
 
 export interface ResolvedDials extends ProfileDials {
   /** Profile picked (or explicitly requested). */
   profile: ProfileName;
   /** Which dials were overridden manually (manual always wins — DoD #4). */
-  overrides: { workers: boolean; batchSize: boolean; pipelineWindow: boolean };
+  overrides: { workers: boolean; batchSize: boolean; pipelineWindow: boolean; streamShards: boolean };
 }
 
 // Auto-select a profile from the probed shape. Used when --profile=auto.
@@ -34,11 +48,21 @@ export function pickProfile(shape: ClusterShape): ProfileName {
 
 // Emit the concrete dials for a given profile + shape + host CPU count.
 // `large` caps workers at `min(shards, hostCores)` per the task spec.
+// Wave 5.92A — `streamShards` follows the same shape-driven shape: small=1
+// (legacy single-stream), medium=shards (one shard-per-master so XADDs
+// land slot-local), large=min(shards, STREAM_SHARDS_CAP) (bounded fan-out).
 export function profileDials(name: ProfileName, shape: ClusterShape, hostCores: number): ProfileDials {
   switch (name) {
-    case "small":  return { workers: 1, batchSize: 500,  pipelineWindow: 1 };
-    case "medium": return { workers: 2, batchSize: 1500, pipelineWindow: 2 };
-    case "large":  return { workers: Math.max(1, Math.min(shape.shards, Math.max(1, hostCores))), batchSize: 2000, pipelineWindow: 2 };
+    case "small":  return { workers: 1, batchSize: 500,  pipelineWindow: 1, streamShards: 1 };
+    case "medium": return {
+      workers: 2, batchSize: 1500, pipelineWindow: 2,
+      streamShards: Math.max(1, Math.min(shape.shards, STREAM_SHARDS_CAP)),
+    };
+    case "large":  return {
+      workers: Math.max(1, Math.min(shape.shards, Math.max(1, hostCores))),
+      batchSize: 2000, pipelineWindow: 2,
+      streamShards: Math.max(1, Math.min(shape.shards, STREAM_SHARDS_CAP)),
+    };
   }
 }
 
@@ -56,10 +80,12 @@ export function resolveDials(
     workers: manual.workers ?? base.workers,
     batchSize: manual.batchSize ?? base.batchSize,
     pipelineWindow: manual.pipelineWindow ?? base.pipelineWindow,
+    streamShards: manual.streamShards ?? base.streamShards,
     overrides: {
       workers: manual.workers !== undefined,
       batchSize: manual.batchSize !== undefined,
       pipelineWindow: manual.pipelineWindow !== undefined,
+      streamShards: manual.streamShards !== undefined,
     },
   };
 }

@@ -30,6 +30,15 @@ import {
   type ProfileName,
   type ResolvedDials,
 } from "@frtb/generator";
+// Wave 5.92A — hash-tag stream-shard fan-out. The api validates the
+// optional `stream_shards` body param and threads it into both the
+// producer (router-aware fan-out) and the seed-frame plan (so the UI can
+// show "fan-out across N streams" alongside the run).
+import {
+  createStreamRouter,
+  parseStreamShardsFlag,
+  type StreamShardsConfig,
+} from "@frtb/stream-router";
 import type { RedisLike } from "../redis-like.ts";
 import { getActiveTarget } from "../active-target.ts";
 import { getBootstrapStatus } from "../bootstrap-status.ts";
@@ -86,6 +95,11 @@ interface GeneratorStartBody {
   // pipeline_window in this same body still override the profile's dials
   // (manual always wins — DoD #4). Invalid values are rejected with 400.
   profile?: "auto" | "small" | "medium" | "large";
+  // Wave 5.92A — hash-tag stream-shard fan-out. Positive integer
+  // (modulo-N routing) or the literal "per-bucket". Default 1 keeps the
+  // pre-5.92 single-stream code path bit-identical. Manual override of
+  // the profile-resolved dial follows the same "manual wins" rule.
+  stream_shards?: number | "per-bucket";
 }
 
 // Wave 5.84C — accepted profile values for body validation.
@@ -227,6 +241,10 @@ interface ParsedGeneratorRequest {
   // medium|large). The seed-frame plan uses this together with the probed
   // shape to compute the resolved dials.
   profile: "auto" | ProfileName;
+  // Wave 5.92A — resolved hash-tag stream-shard config from the request
+  // body. `undefined` means "use the profile-resolved dial"; explicit
+  // values override (manual wins — DoD #4).
+  streamShards: StreamShardsConfig | undefined;
 }
 interface ParsedGeneratorError {
   ok: false;
@@ -452,13 +470,29 @@ function parseGeneratorRequest(
     profile = body.profile;
   }
 
+  // Wave 5.92A — validate optional stream_shards (positive integer or
+  // "per-bucket"). Reuses the shared parser so the api accepts the same
+  // shape as the CLI's --stream-shards flag.
+  let streamShards: StreamShardsConfig | undefined;
+  if (body.stream_shards !== undefined) {
+    const raw = body.stream_shards;
+    if (typeof raw !== "string" && typeof raw !== "number") {
+      return { ok: false, status: 400, error: "stream_shards must be a positive integer or \"per-bucket\"" };
+    }
+    try {
+      streamShards = parseStreamShardsFlag(raw);
+    } catch (e) {
+      return { ok: false, status: 400, error: (e instanceof Error ? e.message : String(e)) };
+    }
+  }
+
   const picker: ClassPicker = classSplitResolved
     ? sequencePicker(interleavedSequence(classSplitResolved))
     : roundRobinPicker(resolvedClasses);
 
   return {
     ok: true, rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker, stopWhen,
-    batchSize, pipelineWindow, workers, profile,
+    batchSize, pipelineWindow, workers, profile, streamShards,
   };
 }
 
@@ -564,7 +598,7 @@ export function registerGeneratorRoutes(
       reply.code(parsed.status);
       return { error: parsed.error };
     }
-    const { rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker, stopWhen, batchSize, pipelineWindow, workers } = parsed;
+    const { rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker, stopWhen, batchSize, pipelineWindow, workers, streamShards } = parsed;
 
     const run_id = ulid();
     const t0 = process.hrtime.bigint();
@@ -581,9 +615,15 @@ export function registerGeneratorRoutes(
       tradePoolSize: tradePool,
       factorPoolSize: factorPool,
     });
+    // Wave 5.92A — construct the router only when stream_shards is provided
+    // AND != 1; the default (no field, or stream_shards=1) goes through the
+    // legacy single-stream code path bit-identically.
+    const router = streamShards !== undefined && streamShards !== 1
+      ? createStreamRouter(streamName, streamShards)
+      : undefined;
     const producer = createStreamProducer(
       redis as unknown as Parameters<typeof createStreamProducer>[0],
-      { stream: streamName, batchSize, pipelineWindow },
+      { stream: streamName, batchSize, pipelineWindow, router },
     );
 
     // Wave 5.47c — track which condition halts the loop. Defaults to "rows"
@@ -763,7 +803,7 @@ export function registerGeneratorRoutes(
       reply.code(parsed.status);
       return { error: parsed.error };
     }
-    const { rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker, stopWhen, batchSize, pipelineWindow, workers, profile } = parsed;
+    const { rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker, stopWhen, batchSize, pipelineWindow, workers, profile, streamShards } = parsed;
 
     const run_id = ulid();
     const t0 = process.hrtime.bigint();
@@ -782,6 +822,8 @@ export function registerGeneratorRoutes(
       workers: body.workers,
       batchSize: body.batch_size,
       pipelineWindow: body.pipeline_window,
+      // Wave 5.92A — manual stream_shards from the body always wins.
+      streamShards,
     });
     const gate = refuseOrGo(shape, rows);
     const plan = {
@@ -793,7 +835,12 @@ export function registerGeneratorRoutes(
         fallback: !!shape.fallback,
       },
       host_cores: availableParallelism(),
-      dials: { workers: dials.workers, batch_size: dials.batchSize, pipeline_window: dials.pipelineWindow },
+      dials: {
+        workers: dials.workers, batch_size: dials.batchSize, pipeline_window: dials.pipelineWindow,
+        // Wave 5.92A — resolved stream-shard fan-out surfaces in the plan
+        // so the UI can show "fan-out across N streams" from frame 0.
+        stream_shards: dials.streamShards,
+      },
       overrides: dials.overrides,
       rows,
       bytes_per_row: BYTES_PER_ROW,
@@ -873,9 +920,16 @@ export function registerGeneratorRoutes(
       tradePoolSize: tradePool,
       factorPoolSize: factorPool,
     });
+    // Wave 5.92A — use the resolved dial (profile or manual override) to
+    // build the router; pre-5.92 behaviour (N=1) skips router construction
+    // entirely so the streaming-route XADDs stay byte-for-byte identical
+    // when stream_shards is omitted from the body.
+    const sseRouter = dials.streamShards !== 1
+      ? createStreamRouter(streamName, dials.streamShards)
+      : undefined;
     const producer = createStreamProducer(
       redis as unknown as Parameters<typeof createStreamProducer>[0],
-      { stream: streamName, batchSize: 200 },
+      { stream: streamName, batchSize: 200, router: sseRouter },
     );
 
     // Detached run — handle terminal frame + grace-eviction here so the

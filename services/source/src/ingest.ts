@@ -12,6 +12,11 @@ import { sampleCsv } from "./readers/csv.ts";
 import { sampleJsonl } from "./readers/jsonl.ts";
 import type { ColumnMapping, MappedField } from "./infer/mapping.ts";
 import type { RedisLike } from "./store.ts";
+import {
+  createStreamRouter,
+  parseStreamShardsFlag,
+  type StreamShardsConfig,
+} from "@frtb/stream-router";
 
 export const INBOUND_STREAM = "sensitivities:in";
 
@@ -22,6 +27,11 @@ export interface IngestArgs {
   mapping: ColumnMapping;
   onProgress?: (rows_ingested: number) => void;
   progressEvery?: number;
+  // Wave 5.92A — hash-tag stream-shard fan-out. Number (modulo-N), the
+  // literal "per-bucket", or undefined. When undefined the function reads
+  // SOURCE_STREAM_SHARDS from the env; if that is also unset it defaults to
+  // 1, preserving the pre-5.92 single-stream XADD path bit-identically.
+  streamShards?: StreamShardsConfig;
 }
 
 export interface IngestStats {
@@ -31,14 +41,23 @@ export interface IngestStats {
 export async function ingestFile(args: IngestArgs): Promise<IngestStats> {
   const rows = await readAllRows(args.path, args.format);
   const progressEvery = args.progressEvery ?? 1000;
+  // Wave 5.92A — resolve shards config: explicit arg > SOURCE_STREAM_SHARDS
+  // env > default 1. parseStreamShardsFlag throws on garbage so misconfig
+  // surfaces at boot rather than silently routing to one stream. When the
+  // resolved shard count is 1 we skip router construction entirely so the
+  // XADD payload is byte-for-byte identical to the pre-5.92 ingest.
+  const shards: StreamShardsConfig = args.streamShards
+    ?? parseStreamShardsFlag(process.env.SOURCE_STREAM_SHARDS);
+  const router = shards === 1 ? null : createStreamRouter(INBOUND_STREAM, shards);
   let n = 0;
 
   for (const row of rows) {
     const fields = applyMapping(row, args.mapping);
     const hashTag = `${fields.risk_class ?? ""}:${fields.bucket ?? ""}`;
+    const streamKey = router ? router.route(hashTag) : INBOUND_STREAM;
     const xargs: string[] = ["_hash_tag", hashTag];
     for (const [k, v] of Object.entries(fields)) xargs.push(k, v);
-    await args.redis.call("XADD", INBOUND_STREAM, "*", ...xargs);
+    await args.redis.call("XADD", streamKey, "*", ...xargs);
     n += 1;
     if (args.onProgress && n % progressEvery === 0) args.onProgress(n);
   }

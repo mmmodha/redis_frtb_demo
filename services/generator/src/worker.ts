@@ -25,6 +25,7 @@ import { loadSchema } from "@frtb/schema";
 import { createRowGenerator } from "./row-generator.ts";
 import { createStreamProducer } from "./producer.ts";
 import { runGenerationInline } from "./coordinator.ts";
+import { createStreamRouter, type StreamShardsConfig } from "@frtb/stream-router";
 
 export interface WorkerInitData {
   schemaPath: string;
@@ -32,6 +33,12 @@ export interface WorkerInitData {
   stream: string;
   batchSize: number;
   pipelineWindow: number;
+  // Wave 5.92A — hash-tag stream-shard config. Each worker constructs its
+  // own router locally so the producer fans XADDs across N stream keys
+  // (modulo-N or per-bucket). Default 1 keeps the pre-5.92 single-stream
+  // path bit-identical. Threaded through `workerData` because routers
+  // aren't serialisable across worker_threads.postMessage boundaries.
+  streamShards: StreamShardsConfig;
   /** Per-worker seed already includes the `:w${idx}` suffix; the row-generator
    * appends `:aux` for the aux RNG so isolation is preserved. */
   seed: string;
@@ -85,10 +92,12 @@ async function main(): Promise<void> {
     factorPoolSize: data.factorPoolSize,
   });
   const client = createClient(data.redisUrl);
+  const router = createStreamRouter(data.stream, data.streamShards);
   const producer = createStreamProducer(client, {
     stream: data.stream,
     batchSize: data.batchSize,
     pipelineWindow: data.pipelineWindow,
+    router,
   });
 
   const progressEvery = data.progressBatchSize ?? 1000;

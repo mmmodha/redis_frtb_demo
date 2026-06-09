@@ -22,6 +22,11 @@ import {
   type ProfileName,
   type ResolvedDials,
 } from "./profile.js";
+import {
+  createStreamRouter,
+  parseStreamShardsFlag,
+  type StreamShardsConfig,
+} from "@frtb/stream-router";
 
 const log = pino({ level: process.env.LOG_LEVEL ?? "info" });
 
@@ -55,6 +60,11 @@ interface CliOptions {
   // --batch-size / --pipeline-window override the profile's dial values
   // (manual always wins — DoD #4).
   profile: string;
+  // Wave 5.92A — hash-tag stream-shard fan-out. Positive integer (modulo-N
+  // routing) or the literal "per-bucket" (one stream per hash-tag). Default
+  // 1 keeps the pre-5.92 single-stream code path bit-identical. Manual
+  // wins over the profile-resolved dial (DoD #4).
+  streamShards?: string;
   dryRun?: boolean;
   force?: boolean;
 }
@@ -85,6 +95,10 @@ async function main(): Promise<void> {
       "--profile <name>",
       "cluster-adaptive profile (auto|small|medium|large, default auto) — auto probes the target and picks dials based on shard count",
       "auto",
+    )
+    .option(
+      "--stream-shards <n>",
+      "hash-tag stream-shard fan-out: positive integer or \"per-bucket\" (default 1 = bit-identical to pre-5.92)",
     )
     .option("--dry-run", "probe target, print plan, exit 0 without writing any rows")
     .option("--force", "bypass the memory-cap refuse-or-go gate");
@@ -117,6 +131,7 @@ async function main(): Promise<void> {
   const workersExplicit = program.getOptionValueSource("workers") === "cli";
   const batchExplicit = program.getOptionValueSource("batchSize") === "cli";
   const pipelineExplicit = program.getOptionValueSource("pipelineWindow") === "cli";
+  const streamShardsExplicit = opts.streamShards !== undefined;
   const hostCores = Math.max(1, availableParallelism());
   const shape = await probeForCli(redisUrl);
   const profileName: ProfileName = opts.profile === "auto" ? pickProfile(shape) : (opts.profile as ProfileName);
@@ -124,12 +139,17 @@ async function main(): Promise<void> {
     workers: workersExplicit ? Math.max(1, Math.min(MAX_WORKERS_HARD_CAP, Math.floor(Number(opts.workers)))) : undefined,
     batchSize: batchExplicit ? Number(opts.batchSize) : undefined,
     pipelineWindow: pipelineExplicit ? Number(opts.pipelineWindow) : undefined,
+    // Wave 5.92A — parse the optional --stream-shards flag (positive int or
+    // "per-bucket"). Throws on garbage so misconfig surfaces at boot rather
+    // than silently routing everything to one stream.
+    streamShards: streamShardsExplicit ? parseStreamShardsFlag(opts.streamShards) : undefined,
   });
   // Clamp profile-resolved workers to the hard cap; manual values already
   // clamped above so the explicit operator choice is preserved end-to-end.
   const requestedWorkers = Math.max(1, Math.min(MAX_WORKERS_HARD_CAP, dials.workers));
   const batchSize = dials.batchSize;
   const pipelineWindow = dials.pipelineWindow;
+  const streamShards: StreamShardsConfig = dials.streamShards;
   const gate = refuseOrGo(shape, totalRows);
   printPlan({ shape, dials, hostCores, rows: totalRows, profileRequested: opts.profile, gate });
 
@@ -153,10 +173,13 @@ async function main(): Promise<void> {
     // Bit-equivalence path — single inline coordinator with the original
     // seed (no `:w0` suffix), exactly the pre-5.84B XADD command sequence.
     // The workers.test.ts canary guards this byte-for-byte against the
-    // pre-wave inline loop shape.
+    // pre-wave inline loop shape. Wave 5.92A — only thread a router when
+    // streamShards !== 1; the N=1 / per-bucket=false branch leaves producer
+    // construction byte-for-byte identical to pre-5.92 (no router arg).
     const client = createClient(redisUrl);
     const generator = createRowGenerator(schema, { seed: baseSeed });
-    const producer = createStreamProducer(client, { stream: opts.stream, batchSize, pipelineWindow });
+    const router = streamShards === 1 ? undefined : createStreamRouter(opts.stream, streamShards);
+    const producer = createStreamProducer(client, { stream: opts.stream, batchSize, pipelineWindow, router });
     try {
       await runGenerationInline({
         totalRows, classes, offset: 0, stride: 1,
@@ -183,6 +206,7 @@ async function main(): Promise<void> {
   await runWithWorkers({
     schemaPath, redisUrl, stream: opts.stream, batchSize, pipelineWindow,
     baseSeed, totalRows, classes, totalWorkers: cappedWorkers, rate, start,
+    streamShards,
   });
 }
 
@@ -209,6 +233,10 @@ interface RunWithWorkersOpts {
   totalWorkers: number;
   rate?: number;
   start: number;
+  // Wave 5.92A — hash-tag fan-out config threaded through to each worker
+  // (workers build their own router locally — routers are not serialisable
+  // across postMessage).
+  streamShards: StreamShardsConfig;
 }
 
 async function runWithWorkers(opts: RunWithWorkersOpts): Promise<void> {
@@ -246,6 +274,7 @@ async function runWithWorkers(opts: RunWithWorkersOpts): Promise<void> {
       stream: opts.stream,
       batchSize: opts.batchSize,
       pipelineWindow: opts.pipelineWindow,
+      streamShards: opts.streamShards,
       seed: `${opts.baseSeed}:w${w}`,
       totalRows: opts.totalRows,
       workerIdx: w,
@@ -424,6 +453,7 @@ function printPlan(a: PrintPlanArgs): void {
           workers: a.dials.workers,
           batch_size: a.dials.batchSize,
           pipeline_window: a.dials.pipelineWindow,
+          stream_shards: a.dials.streamShards,
         },
         overrides: a.dials.overrides,
         rows: a.rows,
@@ -439,6 +469,7 @@ function printPlan(a: PrintPlanArgs): void {
     `plan — profile=${a.dials.profile} (requested=${a.profileRequested}) ` +
     `shape=${a.shape.mode}/${a.shape.shards}sh ` +
     `dials=workers:${a.dials.workers} batch:${a.dials.batchSize} window:${a.dials.pipelineWindow} ` +
+    `streamShards:${a.dials.streamShards} ` +
     `rows=${a.rows} est=${formatBytes(a.gate.estimatedBytes)} ` +
     `dur~${durationSec.toFixed(1)}s`,
   );

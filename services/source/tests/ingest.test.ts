@@ -78,6 +78,84 @@ describe("ingestFile — tenor-array mapping", () => {
   });
 });
 
+describe("ingestFile — Wave 5.92A hash-tag stream-shard fan-out", () => {
+  it("default (no streamShards arg + no SOURCE_STREAM_SHARDS env) writes to single stream `sensitivities:in`", async () => {
+    const prev = process.env.SOURCE_STREAM_SHARDS;
+    delete process.env.SOURCE_STREAM_SHARDS;
+    try {
+      const redis = makeFakeRedis();
+      await ingestFile({
+        redis,
+        path: resolve(FIXTURES, "girr-small.csv"),
+        format: "csv",
+        mapping: {
+          fields: {
+            risk_class: { from: "risk_class" },
+            bucket: { from: "bucket" },
+          },
+        },
+      });
+      for (const entry of redis.streams) expect(entry.stream).toBe("sensitivities:in");
+    } finally {
+      if (prev !== undefined) process.env.SOURCE_STREAM_SHARDS = prev;
+    }
+  });
+
+  it("streamShards=4 fans XADDs across `sensitivities:in:{0..3}` keyed on _hash_tag", async () => {
+    const redis = makeFakeRedis();
+    await ingestFile({
+      redis,
+      path: resolve(FIXTURES, "girr-small.csv"),
+      format: "csv",
+      mapping: {
+        fields: {
+          risk_class: { from: "risk_class" },
+          bucket: { from: "bucket" },
+        },
+      },
+      streamShards: 4,
+    });
+    const expected = new Set(["sensitivities:in:{0}", "sensitivities:in:{1}", "sensitivities:in:{2}", "sensitivities:in:{3}"]);
+    for (const entry of redis.streams) {
+      expect(expected.has(entry.stream)).toBe(true);
+      // Hash-tag must still be present and matched to the per-row payload.
+      expect(entry.fields._hash_tag).toMatch(/^GIRR:[A-Z]{3}-IRS$/);
+    }
+    // Same hash-tag → same stream key (router determinism).
+    const byTag = new Map<string, string>();
+    for (const entry of redis.streams) {
+      const t = entry.fields._hash_tag!;
+      if (byTag.has(t)) expect(byTag.get(t)).toBe(entry.stream);
+      else byTag.set(t, entry.stream);
+    }
+  });
+
+  it("SOURCE_STREAM_SHARDS=per-bucket env routes to one stream per hash-tag", async () => {
+    const prev = process.env.SOURCE_STREAM_SHARDS;
+    process.env.SOURCE_STREAM_SHARDS = "per-bucket";
+    try {
+      const redis = makeFakeRedis();
+      await ingestFile({
+        redis,
+        path: resolve(FIXTURES, "girr-small.csv"),
+        format: "csv",
+        mapping: {
+          fields: {
+            risk_class: { from: "risk_class" },
+            bucket: { from: "bucket" },
+          },
+        },
+      });
+      for (const entry of redis.streams) {
+        expect(entry.stream).toBe(`sensitivities:in:{${entry.fields._hash_tag}}`);
+      }
+    } finally {
+      if (prev === undefined) delete process.env.SOURCE_STREAM_SHARDS;
+      else process.env.SOURCE_STREAM_SHARDS = prev;
+    }
+  });
+});
+
 describe("ingestFile — progress callback", () => {
   it("invokes onProgress with cumulative row counts", async () => {
     const redis = makeFakeRedis();

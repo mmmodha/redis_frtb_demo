@@ -35,6 +35,7 @@ export {
   resolveDials,
   refuseOrGo,
   estimateDurationSec,
+  STREAM_SHARDS_CAP,
   type ProfileName,
   type ProfileDials,
   type ResolvedDials,

@@ -1,4 +1,5 @@
 import type { Redis, Cluster } from "ioredis";
+import type { StreamRouter } from "@frtb/stream-router";
 
 export type SensitivityRow = {
   risk_class: string;
@@ -16,6 +17,14 @@ export interface StreamProducerOptions {
   // behaviour; max 8 (the host TCP/redis-side sane upper bound for a single
   // producer connection).
   pipelineWindow?: number;
+  // Wave 5.92A — optional hash-tag → stream-key router. When omitted (or when
+  // the router's `shardCount === 1`), the producer runs the legacy single-
+  // buffer code path verbatim, preserving the pre-5.92 XADD command sequence
+  // (bit-equivalence canary in workers.test.ts). When N>1 (or per-bucket),
+  // the producer maintains one in-memory buffer per resolved stream key;
+  // pipelineWindow is the GLOBAL cap across all in-flight pipeline.exec()
+  // calls, not per-stream.
+  router?: StreamRouter;
 }
 
 export const MAX_PIPELINE_WINDOW = 8;
@@ -48,7 +57,14 @@ export function createStreamProducer(
     MAX_PIPELINE_WINDOW,
     Math.max(1, opts.pipelineWindow ?? 1),
   );
-  const buffer: SensitivityRow[] = [];
+  // Wave 5.92A — per-stream buffers. With no router (or N=1), every row
+  // resolves to the base `stream` key so the Map collapses to a single
+  // entry and the XADD command sequence is bit-identical to pre-5.92. With
+  // N>1 (or per-bucket), each distinct routed stream key gets its own
+  // buffer; pipelineWindow remains a GLOBAL cap across all in-flight
+  // dispatches (not per-stream).
+  const router = opts.router;
+  const buffers = new Map<string, SensitivityRow[]>();
   const stats = {
     rowsSent: 0,
     batchCount: 0,
@@ -63,16 +79,26 @@ export function createStreamProducer(
   // drop a rejected promise out of the set before drain could observe it).
   let firstError: unknown = null;
 
-  async function dispatchBatch(): Promise<void> {
+  function bufferFor(streamKey: string): SensitivityRow[] {
+    let b = buffers.get(streamKey);
+    if (!b) {
+      b = [];
+      buffers.set(streamKey, b);
+    }
+    return b;
+  }
+
+  async function dispatchBatch(streamKey: string): Promise<void> {
     if (firstError) throw firstError;
-    if (buffer.length === 0) return;
+    const buffer = buffers.get(streamKey);
+    if (!buffer || buffer.length === 0) return;
     const batch = buffer.slice();
     buffer.length = 0;
     stats.batchCount += 1;
     const pipeline = client.pipeline();
     for (const row of batch) {
       const fields = serializeRow(row);
-      pipeline.xadd(stream, "*", ...fields);
+      pipeline.xadd(streamKey, "*", ...fields);
     }
     // Window=1 keeps the pre-5.84A flushBuffer code path exactly: dispatch
     // and immediately await this batch's exec before returning. This is the
@@ -125,20 +151,38 @@ export function createStreamProducer(
     if (firstError) throw firstError;
   }
 
+  // Wave 5.92A — resolve the target stream key for a row. With no router,
+  // every row goes to the base `stream` (single-buffer collapse, byte-for-
+  // byte equal to the pre-5.92 XADD sequence — guarded by the canary test
+  // in workers.test.ts). With a router, the row's `_hash_tag` is FNV-1a
+  // hashed and routed to one of the N pre-enumerated stream keys.
+  const routeRow = router
+    ? (row: SensitivityRow): string => router.route(row._hash_tag)
+    : (_row: SensitivityRow): string => stream;
+
   return {
     async add(row: SensitivityRow): Promise<void> {
+      const streamKey = routeRow(row);
+      const buffer = bufferFor(streamKey);
       buffer.push(row);
       stats.byClass[row.risk_class] = (stats.byClass[row.risk_class] ?? 0) + 1;
       if (buffer.length >= batchSize) {
-        await dispatchBatch();
+        await dispatchBatch(streamKey);
       }
     },
     async flush(): Promise<void> {
-      await dispatchBatch();
+      // Snapshot keys before dispatching — dispatch may clear buffer entries
+      // but the Map keys persist so we iterate exactly the streams we know
+      // had rows queued at flush time.
+      for (const streamKey of [...buffers.keys()]) {
+        await dispatchBatch(streamKey);
+      }
       await drainInFlight();
     },
     async close(): Promise<void> {
-      await dispatchBatch();
+      for (const streamKey of [...buffers.keys()]) {
+        await dispatchBatch(streamKey);
+      }
       await drainInFlight();
     },
     get rowsSent() {
