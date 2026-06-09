@@ -792,7 +792,7 @@ function TotalSbmResultView({ result }: { result: TotalSbmResponse }) {
 
   // KaTeX expressions for the §21.4(8) total-charge derivation.  Symbolic
   // form stays scenario-agnostic; the substituted form below pins it to
-  // the winning scenario so the headline number is the visible result.
+  // the binding scenario so the headline number is the visible result.
   const symbolicMath =
     "\\text{Total SBM} = \\max_{s \\in \\{\\text{low}, \\text{med}, \\text{high}\\}} " +
     "\\sum_{c} \\left( \\Delta_{c} + V_{c} + \\mathrm{Crv}_{c} \\right)_{s}";
@@ -848,7 +848,7 @@ function TotalSbmResultView({ result }: { result: TotalSbmResponse }) {
 
   return (
     <div className="calc-panel__total-result" data-testid="calc-total-result">
-      {/* 1. Headline — prominent total + winning scenario pill */}
+      {/* 1. Headline — prominent total + binding scenario pill */}
       <div className="calc-panel__total-headline">
         <div className="calc-panel__total-headline-main">
           <span className="calc-panel__total-headline-label">Total SBM charge</span>
@@ -864,11 +864,11 @@ function TotalSbmResultView({ result }: { result: TotalSbmResponse }) {
           data-scenario={winningScenario}
           data-testid="calc-total-winner-pill"
         >
-          winning scenario: {winningScenario.toUpperCase()}
+          binding scenario: {winningScenario.toUpperCase()}
         </span>
       </div>
 
-      {/* 2. §21.4(8) formula — symbolic + substituted for the winning scenario */}
+      {/* 2. §21.4(8) formula — symbolic + substituted for the binding scenario */}
       <section
         className="calc-panel__total-formula"
         data-testid="calc-total-formula"
@@ -879,7 +879,7 @@ function TotalSbmResultView({ result }: { result: TotalSbmResponse }) {
           <BlockMath math={symbolicMath} />
         </div>
         <p className="calc-panel__total-formula-caption">
-          Substituting the winning scenario (<InlineMath math={`s = \\text{${winningScenario}}`} />):
+          Substituting the binding scenario (<InlineMath math={`s = \\text{${winningScenario}}`} />):
         </p>
         <div
           className="calc-panel__total-formula-substituted"
@@ -916,7 +916,7 @@ function TotalSbmResultView({ result }: { result: TotalSbmResponse }) {
         </details>
       </section>
 
-      {/* 3. Per-scenario subtotals — three columns, winner tinted + starred */}
+      {/* 3. Per-scenario subtotals — three columns, binding scenario tinted + starred */}
       <section
         className="calc-panel__total-scenarios"
         data-testid="calc-total-matrix"
@@ -945,8 +945,8 @@ function TotalSbmResultView({ result }: { result: TotalSbmResponse }) {
                   {isWinner ? (
                     <span
                       className="calc-panel__total-scenario-star"
-                      aria-label="winning scenario"
-                      title="Winning scenario (max across low / medium / high)"
+                      aria-label="binding scenario"
+                      title="Binding scenario (max across low / medium / high — the regime that drives the capital charge)"
                     >
                       {"\u2605"}
                     </span>

@@ -169,7 +169,7 @@ describe("<CalcPanel /> — Total SBM card (Wave 5.96B)", () => {
 
   // Wave 5.96C — per-class subtotals must equal Σ(Δ + V + Crv) over the
   // non-skipped legs of the scenario column. We use the GIRR / FX rows
-  // from buildTotalResponse() under the winning (high) scenario.
+  // from buildTotalResponse() under the binding (high) scenario.
   it("computes per-class subtotals correctly from scenarios.{low,med,high}.charge", async () => {
     mockTotalResponse(buildTotalResponse());
     render(<CalcPanel />);
@@ -190,9 +190,11 @@ describe("<CalcPanel /> — Total SBM card (Wave 5.96B)", () => {
     expect(within(fxLow).getByText("178.10")).toBeInTheDocument();
   });
 
-  // Wave 5.96C — the winning scenario column gets the --winner modifier
-  // class so the visual tint is applied; non-winning columns must not.
-  it("marks the winning scenario column with the --winner modifier", async () => {
+  // Wave 5.96C — the binding scenario column gets the --winner modifier
+  // class so the visual tint is applied; non-binding columns must not. The
+  // CSS modifier name (`--winner`) and `data-winner` attribute stay as-is to
+  // avoid breaking selectors used by other tests/screenshots (Wave 5.96H).
+  it("marks the binding scenario column with the --winner modifier", async () => {
     mockTotalResponse(buildTotalResponse());
     render(<CalcPanel />);
     fireEvent.click(screen.getByTestId("calc-total-cta"));
@@ -205,8 +207,10 @@ describe("<CalcPanel /> — Total SBM card (Wave 5.96B)", () => {
     expect(lowCol.className).not.toMatch(/--winner/);
     expect(lowCol.getAttribute("data-winner")).toBe("false");
 
-    // Headline pill carries the winning scenario name in upper case.
-    expect(screen.getByTestId("calc-total-winner-pill").textContent).toMatch(/HIGH/);
+    // Headline pill carries the binding scenario name in upper case after the
+    // Wave 5.96H copy rename ("winning scenario" → "binding scenario").
+    const pill = screen.getByTestId("calc-total-winner-pill");
+    expect(pill.textContent).toMatch(/binding scenario: HIGH/);
   });
 
   // Wave 5.96F — when the orchestrator reports cache participation, the
