@@ -1073,6 +1073,171 @@ export function registerCalcRoute(
     },
   );
 
+  // Wave 5.96I — single-bucket K_b drilldown. Returns the same per-bucket
+  // payload the parent /calc/sbm route surfaces inside per_bucket[i] (K_b,
+  // S_b, count, ms, intermediate, engine, resolved_command) plus the cache /
+  // timing envelope so the UI can refresh one bucket without re-running the
+  // whole risk class. Delegates to computeSbmCharge with bucket_subset=[bucket]
+  // so cache-key, fast/lua dispatch, regime scaling, and exclude predicates
+  // are byte-identical to /calc/sbm. Curvature reuses the same code path —
+  // the intermediate.curvature{k_plus, k_minus, winner, cvr_components} ride
+  // along on the per_bucket[0] entry exactly as on the parent route.
+  app.post<{
+    Body: CalcBody & { bucket?: string; scenario?: string };
+    Querystring: CalcQuery;
+  }>(
+    "/calc/sbm/bucket",
+    async (req, reply) => {
+      const risk_class_raw = req.body?.risk_class;
+      const legRaw = req.body?.sensitivity_type;
+      const bucketRaw = req.body?.bucket;
+      if (!risk_class_raw || !legRaw || !bucketRaw) {
+        reply.code(400);
+        return { error: "risk_class, sensitivity_type and bucket are required" };
+      }
+      const leg = String(legRaw).toLowerCase();
+      if (!ALLOWED_LEG.has(leg)) {
+        reply.code(400);
+        return { error: `sensitivity_type must be one of: Delta, Vega, Curvature (got ${legRaw})` };
+      }
+      if (typeof bucketRaw !== "string" || bucketRaw.length === 0) {
+        reply.code(400);
+        return { error: "bucket must be a non-empty string" };
+      }
+      const risk_class = String(risk_class_raw).toUpperCase();
+      const bucket = bucketRaw.toUpperCase();
+
+      // Scenario maps 1:1 onto the MAR21.6 correlation regime. Accept either
+      // `scenario` (the drilldown UI's term) or `correlation_regime` (the
+      // parent /calc/sbm payload key) so a caller can lift either shape.
+      const scenarioRaw = req.body?.scenario ?? req.body?.correlation_regime;
+      if (scenarioRaw !== undefined && scenarioRaw !== null) {
+        if (
+          typeof scenarioRaw !== "string"
+          || !ALLOWED_REGIME.has(scenarioRaw as CorrelationRegime)
+        ) {
+          reply.code(400);
+          return { error: "scenario must be one of: low, medium, high" };
+        }
+      }
+      const regime: CorrelationRegime = (scenarioRaw as CorrelationRegime | undefined) ?? "medium";
+
+      const excludeRaw = req.body?.exclude;
+      const excludeCsv: Record<ExcludeKey, string> = { book: "", trade_id: "", risk_factor: "" };
+      if (excludeRaw !== undefined && excludeRaw !== null) {
+        if (typeof excludeRaw !== "object" || Array.isArray(excludeRaw)) {
+          reply.code(400);
+          return { error: "exclude must be an object with optional book/trade_id/risk_factor arrays" };
+        }
+        for (const key of EXCLUDE_KEYS) {
+          const list = (excludeRaw as Record<string, unknown>)[key];
+          if (list === undefined || list === null) continue;
+          if (!Array.isArray(list)) {
+            reply.code(400);
+            return { error: `exclude.${key} must be an array of non-empty strings` };
+          }
+          if (list.length > MAX_EXCLUDE_LIST) {
+            reply.code(413);
+            return { error: `exclude.${key} exceeds maximum of ${MAX_EXCLUDE_LIST} entries` };
+          }
+          const seen = new Set<string>();
+          for (const v of list) {
+            if (typeof v !== "string" || v.length === 0) {
+              reply.code(400);
+              return { error: `exclude.${key} must be an array of non-empty strings` };
+            }
+            if (v.includes(",")) {
+              reply.code(400);
+              return { error: `exclude.${key} values may not contain commas` };
+            }
+            seen.add(v);
+          }
+          excludeCsv[key] = Array.from(seen).join(",");
+        }
+      }
+
+      const forcePath: "lua" | "fast" | null =
+        req.query?.force_path === "lua" || req.query?.force_path === "fast"
+          ? (req.query.force_path as "lua" | "fast")
+          : null;
+      const noCache = req.query?.nocache === "1";
+
+      const outcome = await computeSbmCharge(
+        {
+          risk_class,
+          leg: leg as Leg,
+          bucket_subset: [bucket],
+          regime,
+          excludeCsv,
+          forcePath,
+          noCache,
+        },
+        {
+          redis: getRedis(),
+          schema: opts.schema,
+          correlations: opts.correlations,
+          log: app.log,
+        },
+      );
+      if (!outcome.ok) {
+        reply.code(outcome.statusCode);
+        return outcome.body;
+      }
+      const cellBody = outcome.body;
+      const perBucket = Array.isArray(cellBody.per_bucket)
+        ? (cellBody.per_bucket as BucketResultWithEngine[])
+        : [];
+      // Discovery narrowed by bucket_subset=[bucket] returns at most one
+      // entry; pick the matching bucket and fall back to a zeroed stub when
+      // the bucket carries no rows for this (risk_class, leg) so the empty
+      // case stays a 200 with data_status="empty" instead of a 404.
+      const match = perBucket.find((r) => r.bucket === bucket) ?? perBucket[0];
+      const engineTag = (cellBody.engine as EngineTag | undefined)
+        ?? (match?.engine ?? FAST_PATH_ENGINE);
+      const result = match ?? {
+        bucket,
+        K_b: 0,
+        S_b: 0,
+        count: 0,
+        ms: 0,
+        engine: engineTag,
+        resolved_command: "",
+        intermediate: { path: engineTag === FAST_PATH_ENGINE ? ("fast" as const) : ("lua" as const) },
+      };
+
+      const body: Record<string, unknown> = {
+        risk_class,
+        sensitivity_type: leg,
+        scenario: regime,
+        bucket: result.bucket,
+        K_b: result.K_b,
+        S_b: result.S_b,
+        count: result.count,
+        ms: result.ms,
+        intermediate: result.intermediate,
+        engine: result.engine,
+        resolved_command: result.resolved_command,
+        data_status: cellBody.data_status,
+        total_ms: cellBody.total_ms,
+        fanout_ms: cellBody.fanout_ms,
+        correlation_regime: cellBody.correlation_regime,
+        commands: cellBody.commands,
+        cache: cellBody.cache,
+      };
+      if (cellBody.cached_at_iso !== undefined) body.cached_at_iso = cellBody.cached_at_iso;
+      if (cellBody.original_compute_ms !== undefined) {
+        body.original_compute_ms = cellBody.original_compute_ms;
+      }
+      if (cellBody.original_fanout_ms !== undefined) {
+        body.original_fanout_ms = cellBody.original_fanout_ms;
+      }
+      if (cellBody.curvature_branch !== undefined) {
+        body.curvature_branch = cellBody.curvature_branch;
+      }
+      return body;
+    },
+  );
+
   // Wave 5.96A.1 — full per-bucket cross-component listing. The /calc/sbm
   // response carries the top-10 pairs by |contrib| on each bucket; this
   // endpoint reuses the same fast-path reducer for a SINGLE bucket with the

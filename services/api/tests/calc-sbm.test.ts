@@ -2164,3 +2164,225 @@ describe("POST /calc/sbm — Wave 5.96F truthful cache-hit timing", () => {
     expect(r2.json().original_compute_ms).toBeUndefined();
   });
 });
+
+// Wave 5.96I — single-bucket drilldown endpoint. /calc/sbm/bucket reuses the
+// computeSbmCharge pipeline with bucket_subset=[bucket] and lifts per_bucket[0]
+// to the top level so the UI can refresh one bucket (K_b, intermediate.curvature,
+// engine, resolved_command) without re-running the whole risk class.
+describe("POST /calc/sbm/bucket — Wave 5.96I single-bucket drilldown", () => {
+  let app: Awaited<ReturnType<typeof createServer>>;
+  let savedFlag: string | undefined;
+  beforeEach(() => {
+    __resetCalcCacheForTests();
+    // Fast path opt-in (mirrors the Wave 5.83C-1 describe block) so
+    // computeSbmCharge dispatches FT.AGGREGATE instead of FCALL — required
+    // for the curvature intermediate to be surfaced (Wave 5.96A option B).
+    savedFlag = process.env.CALC_FAST_PATH;
+    process.env.CALC_FAST_PATH = "1";
+  });
+  afterEach(async () => {
+    if (app) await app.close();
+    if (savedFlag === undefined) delete process.env.CALC_FAST_PATH;
+    else process.env.CALC_FAST_PATH = savedFlag;
+  });
+
+  function fastPathSchemaLocal() {
+    return {
+      version: 1,
+      dimensions: [],
+      frtb_binding: {
+        risk_class: "risk_class", bucket: "bucket", tenor: "tenor",
+        risk_value: "risk_value", weight: "weight", sensitivity_type: "sensitivity_type",
+      },
+      risk_classes: {
+        EQUITY: {
+          dimensions: [], buckets: { naming: "equity_bucket", values: ["1"] },
+          risk_weights_ref: "equity_weights",
+          intra_bucket_correlation_ref: "equity_rho",
+          cross_bucket_correlation_ref: "equity_gamma",
+        },
+      },
+      risk_weights: { equity_weights: { by_bucket: { "1": 0.55 } } },
+      correlations: { equity_rho: { kind: "constant", value: 0.5 } },
+    } as unknown as Parameters<typeof createServer>[0]["schema"];
+  }
+
+  function ftAggRowLocal(bucket: string, kv: Record<string, number | string>): unknown[] {
+    const row: unknown[] = ["bucket", bucket];
+    for (const [k, v] of Object.entries(kv)) row.push(k, String(v));
+    return row;
+  }
+
+  it("Equity curvature/medium returns 200 with K_b, intermediate.curvature, engine, resolved_command", async () => {
+    // Same canned curvature aggregates as the per-bucket Wave 5.83C-1 test:
+    // up wins with K_b² = 14.5, down has K_b² = 4.5.
+    const fr = fakeRedis();
+    fr.setResponse("FT.AGGREGATE", (args: unknown[]) => {
+      if (!args.includes("APPLY")) return ftAggregateReply(["1"]);
+      return [
+        1,
+        ftAggRowLocal("1", {
+          sum_u_ws_equity_cvr_up: 4, sum_u_ws_equity_cvr_up_sq: 14,
+          sum_u_ws_equity_cvr_up_neg: -1, sum_u_ws_equity_cvr_up_negsq: 1,
+          sum_n_ws_equity_cvr_down: 3, sum_n_ws_equity_cvr_down_sq: 3,
+          sum_n_ws_equity_cvr_down_neg: 0, sum_n_ws_equity_cvr_down_negsq: 0,
+          row_count: 3,
+        }),
+      ];
+    });
+    app = await createServer({ redis: fr, schema: fastPathSchemaLocal() });
+    const res = await app.inject({
+      method: "POST",
+      url: "/calc/sbm/bucket",
+      payload: {
+        risk_class: "Equity",
+        bucket: "1",
+        sensitivity_type: "Curvature",
+        scenario: "medium",
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.bucket).toBe("1");
+    expect(body.risk_class).toBe("EQUITY");
+    expect(body.sensitivity_type).toBe("curvature");
+    expect(body.scenario).toBe("medium");
+    expect(body.engine).toBe("ft_aggregate");
+    expect(body.data_status).toBe("populated");
+    expect(body.K_b).toBeCloseTo(Math.sqrt(14.5), 9);
+    expect(body.intermediate).toMatchObject({ path: "fast", curvature: { winner: "plus" } });
+    expect(body.intermediate.curvature.k_plus).toBeCloseTo(Math.sqrt(14.5), 9);
+    expect(body.intermediate.curvature.k_minus).toBeCloseTo(Math.sqrt(4.5), 9);
+    expect(typeof body.resolved_command).toBe("string");
+    expect(body.resolved_command).toContain("@bucket:{1}");
+    expect(body.resolved_command).toContain("@sensitivity_type:{Curvature}");
+    // Wall-clock invariant: per-bucket compute ms ≤ request wall-clock total_ms.
+    expect(body.ms).toBeLessThanOrEqual(body.total_ms);
+    expect(body.cache).toBe("miss");
+  });
+
+  it("Empty bucket (no rows for risk_class/bucket) returns 200 with data_status='empty' and K_b=0/count=0", async () => {
+    // Discovery still sees the bucket (so we don't fall through to 503), but
+    // the per-bucket fast-path aggregate returns row_count=0 → no row scanned
+    // for this leg → data_status="empty".
+    const fr = fakeRedis();
+    fr.setResponse("FT.AGGREGATE", (args: unknown[]) => {
+      if (!args.includes("APPLY")) return ftAggregateReply(["1"]);
+      return [
+        1,
+        ftAggRowLocal("1", {
+          sum_u_ws_equity_cvr_up: 0, sum_u_ws_equity_cvr_up_sq: 0,
+          sum_u_ws_equity_cvr_up_neg: 0, sum_u_ws_equity_cvr_up_negsq: 0,
+          sum_n_ws_equity_cvr_down: 0, sum_n_ws_equity_cvr_down_sq: 0,
+          sum_n_ws_equity_cvr_down_neg: 0, sum_n_ws_equity_cvr_down_negsq: 0,
+          row_count: 0,
+        }),
+      ];
+    });
+    app = await createServer({ redis: fr, schema: fastPathSchemaLocal() });
+    const res = await app.inject({
+      method: "POST",
+      url: "/calc/sbm/bucket",
+      payload: {
+        risk_class: "Equity",
+        bucket: "1",
+        sensitivity_type: "Curvature",
+        scenario: "medium",
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.data_status).toBe("empty");
+    expect(body.K_b).toBe(0);
+    expect(body.count).toBe(0);
+  });
+
+  it("Invalid sensitivity_type → 400", async () => {
+    const fr = fakeRedis();
+    app = await createServer({ redis: fr, schema: fastPathSchemaLocal() });
+    const res = await app.inject({
+      method: "POST",
+      url: "/calc/sbm/bucket",
+      payload: { risk_class: "Equity", bucket: "1", sensitivity_type: "Bogus" },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toMatch(/sensitivity_type/);
+  });
+
+  it("Missing risk_class → 400", async () => {
+    const fr = fakeRedis();
+    app = await createServer({ redis: fr, schema: fastPathSchemaLocal() });
+    const res = await app.inject({
+      method: "POST",
+      url: "/calc/sbm/bucket",
+      payload: { bucket: "1", sensitivity_type: "Curvature" },
+    });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("Invalid scenario → 400", async () => {
+    const fr = fakeRedis();
+    app = await createServer({ redis: fr, schema: fastPathSchemaLocal() });
+    const res = await app.inject({
+      method: "POST",
+      url: "/calc/sbm/bucket",
+      payload: {
+        risk_class: "Equity", bucket: "1",
+        sensitivity_type: "Curvature", scenario: "extreme",
+      },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toMatch(/scenario/);
+  });
+
+  it("Cache hit replay preserves original_compute_ms (Wave 5.96F invariant)", async () => {
+    // Synthetic latency on the FT.AGGREGATE so the cold response carries a
+    // noticeably slow total_ms; the warm retry must come in under that and
+    // surface the cold cost in original_compute_ms.
+    const fr = fakeRedis();
+    fr.setResponse("FT.AGGREGATE", async (args: unknown[]) => {
+      await new Promise((r) => setTimeout(r, 50));
+      if (!args.includes("APPLY")) return ftAggregateReply(["1"]);
+      return [
+        1,
+        ftAggRowLocal("1", {
+          sum_u_ws_equity_cvr_up: 4, sum_u_ws_equity_cvr_up_sq: 14,
+          sum_u_ws_equity_cvr_up_neg: -1, sum_u_ws_equity_cvr_up_negsq: 1,
+          sum_n_ws_equity_cvr_down: 3, sum_n_ws_equity_cvr_down_sq: 3,
+          sum_n_ws_equity_cvr_down_neg: 0, sum_n_ws_equity_cvr_down_negsq: 0,
+          row_count: 3,
+        }),
+      ];
+    });
+    app = await createServer({ redis: fr, schema: fastPathSchemaLocal() });
+
+    const cold = await app.inject({
+      method: "POST",
+      url: "/calc/sbm/bucket",
+      payload: {
+        risk_class: "Equity", bucket: "1",
+        sensitivity_type: "Curvature", scenario: "medium",
+      },
+    });
+    expect(cold.statusCode).toBe(200);
+    const coldBody = cold.json();
+    expect(coldBody.cache).toBe("miss");
+    expect(coldBody.original_compute_ms).toBeUndefined();
+    const coldTotalMs = Number(coldBody.total_ms);
+
+    const warm = await app.inject({
+      method: "POST",
+      url: "/calc/sbm/bucket",
+      payload: {
+        risk_class: "Equity", bucket: "1",
+        sensitivity_type: "Curvature", scenario: "medium",
+      },
+    });
+    expect(warm.statusCode).toBe(200);
+    const warmBody = warm.json();
+    expect(warmBody.cache).toBe("hit");
+    expect(warmBody.original_compute_ms).toBe(coldTotalMs);
+    expect(warmBody.total_ms).toBeLessThan(coldTotalMs);
+    expect(warmBody.K_b).toBe(coldBody.K_b);
+  });
+});
