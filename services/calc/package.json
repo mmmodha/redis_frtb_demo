@@ -13,13 +13,11 @@
   "dependencies": {
     "@frtb/schema": "*",
     "ioredis": "^5.4.2",
-    "ulid": "^2.3.0",
-    "yaml": "^2.6.1"
+    "ulid": "^2.3.0"
   },
   "devDependencies": {
     "@frtb/generator": "*",
     "@types/node": "^22.10.2",
-    "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "vitest": "^4.1.8"
   }
