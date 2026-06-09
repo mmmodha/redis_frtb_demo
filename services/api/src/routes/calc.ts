@@ -1037,6 +1037,16 @@ export function registerCalcRoute(
       const parallelism_factor = wallClockMs > 0
         ? Math.round((cumulative_ms / wallClockMs) * 1000) / 1000
         : 0;
+      // Wave 5.96N — companion to `parallelism_factor` that mirrors the
+      // Σ-if-serial chip's data source. Sources the preserved cold
+      // `original_cumulative_ms` so cache-hit runs surface the true
+      // cold-vs-warm speedup (e.g. ×147,000) instead of the warm
+      // cache-lookup parallelism (e.g. ×25). On cold runs the two are
+      // identical because `original_cumulative_ms === cumulative_ms`.
+      // Always emitted — kept in lockstep with `original_cumulative_ms`.
+      const original_parallelism_factor = wallClockMs > 0
+        ? Math.round((original_cumulative_ms / wallClockMs) * 1000) / 1000
+        : 0;
       const ops_skipped = opsSkippedSet.size * scenarios.length;
       const orchestratorCache: "hit" | "miss" | "partial" | undefined =
         opsFired === 0 ? undefined
@@ -1059,6 +1069,7 @@ export function registerCalcRoute(
           cumulative_ms: Math.round(cumulative_ms * 1000) / 1000,
           original_cumulative_ms: Math.round(original_cumulative_ms * 1000) / 1000,
           parallelism_factor,
+          original_parallelism_factor,
           redis_ops_count: opsFired,
           ops_skipped,
           // Wave 5.96G-api — single banner trigger for the UI. Counts cells

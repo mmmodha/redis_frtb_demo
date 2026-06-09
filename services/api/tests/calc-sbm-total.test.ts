@@ -225,6 +225,26 @@ describe("POST /calc/sbm/total — Wave 5.96B orchestrator", () => {
     // cold-compute costs). It must roughly match the cold cumulative.
     expect(typeof warmBody.performance.original_cumulative_ms).toBe("number");
     expect(warmBody.performance.original_cumulative_ms).toBeGreaterThanOrEqual(coldCumulative * 0.5);
+    // Wave 5.96N — on a cache-hit run `original_parallelism_factor`
+    // mirrors the Σ-if-serial chip's data source: it equals
+    // `original_cumulative_ms / total_ms` so the perf strip can render
+    // one coherent cold-vs-warm speedup story. On a cold run it equals
+    // the legacy `parallelism_factor` because the two cumulatives match.
+    expect(typeof warmBody.performance.original_parallelism_factor).toBe("number");
+    const expectedWarm = warmBody.performance.original_cumulative_ms / warmBody.performance.total_ms;
+    expect(warmBody.performance.original_parallelism_factor).toBeGreaterThan(0);
+    const warmRatio = warmBody.performance.original_parallelism_factor / expectedWarm;
+    expect(warmRatio).toBeGreaterThan(0.99);
+    expect(warmRatio).toBeLessThan(1.01);
+    // Cold run: original cumulative ≈ cumulative, so the two factors
+    // line up to within ~5% (rounding + originalComputeMs vs cell_ms
+    // accounting differ by at most timing noise on a fresh compute).
+    expect(typeof coldBody.performance.original_parallelism_factor).toBe("number");
+    const coldRatio = coldBody.performance.parallelism_factor > 0
+      ? coldBody.performance.original_parallelism_factor / coldBody.performance.parallelism_factor
+      : 1;
+    expect(coldRatio).toBeGreaterThan(0.95);
+    expect(coldRatio).toBeLessThan(1.05);
   });
 
   it("a 503 no-data-or-index cell is recorded as skipped with charge 0", async () => {

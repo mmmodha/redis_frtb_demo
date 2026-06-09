@@ -866,19 +866,31 @@ function TotalSbmResultView({ result }: { result: TotalSbmResponse }) {
   const serialEquivalentMs = perfCache === "hit" || perfCache === "partial"
     ? originalCumulativeMs
     : perf.cumulative_ms;
+  // Wave 5.96N — the parallel-speedup chip mirrors the Σ-if-serial chip's
+  // data source. When `original_parallelism_factor` is present (API ≥
+  // 5.96N) use it; otherwise fall back to the legacy warm-cumulative
+  // `parallelism_factor`. On cache hits this surfaces the true
+  // cold-vs-warm speedup (e.g. ×146,770) instead of the warm cache-lookup
+  // parallelism that left the perf strip telling two contradictory stories.
+  const displayParallelismFactor = typeof perf.original_parallelism_factor === "number"
+    ? perf.original_parallelism_factor
+    : perf.parallelism_factor;
   const serialChipTooltip =
     `Sum of per-cell compute time across ${perf.redis_ops_count} cells. ` +
     `If we ran the cells one after another instead of in parallel, this is how long the user would wait. ` +
     `The wall-clock chip shows the actual wait time.`;
+  const parallelChipTooltip = perfCache === "hit" || perfCache === "partial"
+    ? `Speedup vs cold serial compute: ${originalCumulativeMs.toFixed(1)} ms (Σ if serial) / ${perf.total_ms.toFixed(1)} ms (wall-clock) = ${formatParallelismFactor(displayParallelismFactor)}×.`
+    : `Speedup vs serial: ${perf.cumulative_ms.toFixed(1)} ms (Σ if serial) / ${perf.total_ms.toFixed(1)} ms (wall-clock) = ${formatParallelismFactor(displayParallelismFactor)}×.`;
   const perfTooltip = perfCache === "hit" || perfCache === "partial"
     ? `Served from cache ${perfCache === "hit" ? "(all cells)" : `(${perf.cache_hits ?? 0}/${perf.redis_ops_count} cells)`}. ` +
       `Wall-clock this request: ${perf.total_ms.toFixed(1)} ms. ` +
       `Fresh per-cell cumulative: ${perf.cumulative_ms.toFixed(1)} ms. ` +
       `Σ if serial (original cold compute, preserved): ${originalCumulativeMs.toFixed(1)} ms across ${perf.redis_ops_count} cells. ` +
-      `Parallelism factor = Σ if serial / wall-clock = ${perf.parallelism_factor.toFixed(2)}×.`
+      `Parallelism factor = Σ if serial / wall-clock = ${formatParallelismFactor(displayParallelismFactor)}× (speedup vs cold serial compute).`
     : `Σ if serial (sum of per-cell compute across ${perf.redis_ops_count} cells): ${perf.cumulative_ms.toFixed(1)} ms. ` +
       `Wall-clock elapsed: ${perf.total_ms.toFixed(1)} ms. ` +
-      `Parallelism factor = Σ if serial / wall-clock = ${perf.parallelism_factor.toFixed(2)}×.`;
+      `Parallelism factor = Σ if serial / wall-clock = ${formatParallelismFactor(displayParallelismFactor)}×.`;
 
   return (
     <div className="calc-panel__total-result" data-testid="calc-total-result">
@@ -1118,9 +1130,13 @@ function TotalSbmResultView({ result }: { result: TotalSbmResponse }) {
         >
           {"\u03A3"} if serial · <strong>{formatComputeMs(serialEquivalentMs)}</strong>
         </span>
-        <span className="calc-panel__total-perf-chip" data-chip="parallel">
+        <span
+          className="calc-panel__total-perf-chip"
+          data-chip="parallel"
+          title={parallelChipTooltip}
+        >
           ×<strong data-testid="calc-total-parallelism">
-            {perf.parallelism_factor.toFixed(2)}
+            {formatParallelismFactor(displayParallelismFactor)}
           </strong>{" "}
           parallel speedup
         </span>

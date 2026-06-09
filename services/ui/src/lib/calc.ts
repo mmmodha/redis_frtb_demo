@@ -233,6 +233,11 @@ export interface TotalSbmPerformance {
   // populated when any cell participated in caching: "hit" = all cells were
   // cache hits, "miss" = none, "partial" = mixed.
   original_cumulative_ms?: number;
+  // Wave 5.96N — companion to `parallelism_factor` sourced from the
+  // preserved cold cumulative. On cache hits this is the true
+  // cold-vs-warm speedup (`original_cumulative_ms / total_ms`); on cold
+  // runs it equals `parallelism_factor`.
+  original_parallelism_factor?: number;
   cache?: "hit" | "miss" | "partial";
   cache_hits?: number;
   // Wave 5.96G-api — count of cells where every bucket scanned zero rows

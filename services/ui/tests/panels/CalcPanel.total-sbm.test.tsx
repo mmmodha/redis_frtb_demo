@@ -288,6 +288,62 @@ describe("<CalcPanel /> — Total SBM card (Wave 5.96B)", () => {
     expect(chipTitle).toMatch(/wall-clock chip shows the actual wait time/);
   });
 
+  // Wave 5.96N — on a cache-hit run the parallel-speedup chip must use
+  // `original_parallelism_factor` (cold cumulative / wall-clock) so it
+  // tells the same cold-vs-warm story as the Σ-if-serial chip, not the
+  // collapsed warm `parallelism_factor`.
+  it("renders the parallel-speedup chip using original_parallelism_factor on a cache hit", async () => {
+    mockTotalResponse(buildTotalResponse({
+      performance: {
+        total_ms: 1.09,
+        cumulative_ms: 26.46,
+        original_cumulative_ms: 159979.3,
+        parallelism_factor: 24.28,
+        original_parallelism_factor: 146770,
+        redis_ops_count: 27,
+        ops_skipped: 0,
+        cache: "hit",
+        cache_hits: 27,
+      },
+    }));
+    render(<CalcPanel />);
+    fireEvent.click(screen.getByTestId("calc-total-cta"));
+    await waitFor(() => expect(screen.getByTestId("calc-total-result")).toBeInTheDocument());
+
+    const parallelism = screen.getByTestId("calc-total-parallelism");
+    // Large factors render as comma-grouped integers — never the warm
+    // 24.28 that the legacy field would have shown.
+    expect(parallelism.textContent).toMatch(/146,770/);
+    expect(parallelism.textContent).not.toMatch(/24\.28/);
+
+    const perf = screen.getByTestId("calc-total-performance");
+    const parallelChip = perf.querySelector('[data-chip="parallel"]') as HTMLElement;
+    expect(parallelChip).toBeTruthy();
+    const parallelTitle = parallelChip.getAttribute("title") ?? "";
+    expect(parallelTitle).toMatch(/Speedup vs cold serial compute/);
+    expect(parallelTitle).toMatch(/146,770/);
+  });
+
+  // Wave 5.96N — when `original_parallelism_factor` is absent (older API)
+  // the chip falls back to the legacy `parallelism_factor` so old
+  // responses still render.
+  it("falls back to parallelism_factor when original_parallelism_factor is absent", async () => {
+    mockTotalResponse(buildTotalResponse({
+      performance: {
+        total_ms: 270,
+        cumulative_ms: 5400,
+        parallelism_factor: 20,
+        redis_ops_count: 27,
+        ops_skipped: 0,
+        cache: "miss",
+      },
+    }));
+    render(<CalcPanel />);
+    fireEvent.click(screen.getByTestId("calc-total-cta"));
+    await waitFor(() => expect(screen.getByTestId("calc-total-result")).toBeInTheDocument());
+    expect(screen.getByTestId("calc-total-parallelism").textContent).toMatch(/20\.00/);
+  });
+
   // Wave 5.96F — partial cache participation (some cells hit, some missed)
   // still surfaces the chip with an X/Y suffix instead of headline "served
   // from cache" wording.
