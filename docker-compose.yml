@@ -169,6 +169,16 @@ services:
       retries: 5
       start_period: 5s
 
+  # Wave 5.92B: ingest scales horizontally via per-stream consumer-groups.
+  # When STREAM_SHARDS > 1, each replica spawns one XREADGROUP loop per
+  # shard listed in SHARD_ASSIGNMENT (`"all"` / `"0,2,4"` / `"0-3"`) against
+  # the per-shard streams `sensitivities:in:{<n>}`. Scale replicas with:
+  #   STREAM_SHARDS=4 docker compose up -d --scale ingest=2 --build ingest
+  # Each replica shares the same consumer-group name, so giving them disjoint
+  # SHARD_ASSIGNMENT lists pins each replica to its own subset; leaving both
+  # on the default ("all") lets the consumer-group's natural load-balancing
+  # spread pending entries across replicas. With STREAM_SHARDS=1 (default)
+  # the service preserves the legacy single-stream, single-consumer behaviour.
   ingest:
     <<: *service-defaults
     build:
@@ -178,6 +188,8 @@ services:
     environment:
       <<: *app-env
       HEALTH_PORT: 8083
+      STREAM_SHARDS: ${STREAM_SHARDS:-1}
+      SHARD_ASSIGNMENT: ${SHARD_ASSIGNMENT:-all}
     volumes:
       - data:/data
     depends_on:

@@ -240,3 +240,101 @@ describe("createActiveTargetWatcher (ingest)", () => {
     expect(() => watcher.getRedis()).toThrow(/before start/i);
   });
 });
+
+// Wave 5.92B — multi-shard extension of the swap contract. The watcher hands
+// the cli's onTargetChange callback `(next, prev)` clients; with
+// STREAM_SHARDS>1 the callback now spawns one ConsumerRunner per assigned
+// shard and the previous swap's multi-consumer must be drained before the
+// old client is disconnected. We reuse the same drain-before-disconnect
+// guarantee, but assert it against a multi-shard consumer instead of a
+// single ConsumerRunner.
+describe("createActiveTargetWatcher (ingest) — multi-shard onTargetChange", () => {
+  interface ReadingFakeRedis extends FakeRedis {
+    reads: string[];
+    xreadgroup: (...args: unknown[]) => Promise<null>;
+    xgroup: () => Promise<string>;
+    pipeline: () => unknown;
+  }
+  function makeReadingFakeRedis(): ReadingFakeRedis {
+    const reads: string[] = [];
+    const r: ReadingFakeRedis = {
+      id: nextId++, disconnectCalls: 0,
+      disconnect() { this.disconnectCalls += 1; },
+      reads,
+      async xreadgroup(...args: unknown[]) {
+        const idx = args.indexOf("STREAMS");
+        if (idx >= 0) reads.push(String(args[idx + 1]));
+        await new Promise((r2) => setTimeout(r2, 5));
+        return null;
+      },
+      async xgroup() { return "OK"; },
+      pipeline() {
+        const pl = { call(): unknown { return pl; }, xack(): unknown { return pl; }, async exec() { return []; } };
+        return pl;
+      },
+    };
+    return r;
+  }
+
+  it("drains all per-shard runners on the previous client, then respawns them on the new client", async () => {
+    const { createMultiShardConsumer, ensureGroupsForShards } = await import("../src/multi-consumer.ts");
+    const { shardStreamKey } = await import("../src/sharding.ts");
+    const TOTAL = 4;
+    const ASSIGNMENT = [0, 1, 2, 3];
+
+    const built: ReadingFakeRedis[] = [];
+    const responses: ActiveTargetFull[] = [
+      { host: "h1", port: 6379, tls: false, db: 0, label: "first",  version: 1 },
+      { host: "h2", port: 6380, tls: false, db: 0, label: "second", version: 2 },
+    ];
+    let i = 0;
+    const fetchImpl = vi.fn(async () => mkResponse(responses[Math.min(i++, responses.length - 1)]!));
+
+    type MC = ReturnType<typeof createMultiShardConsumer>;
+    let multi: MC | null = null;
+    const watcher = createActiveTargetWatcher({
+      apiBase: "http://api:8080", token: "tok", pollMs: 60_000,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      redisFactory: () => {
+        const r = makeReadingFakeRedis();
+        built.push(r);
+        return r as unknown as RedisLike;
+      },
+      onTargetChange: async (next, prev) => {
+        if (multi && prev) {
+          // Drain must complete before the watcher disconnects prev.client.
+          expect((prev.client as unknown as ReadingFakeRedis).disconnectCalls).toBe(0);
+          await multi.stop();
+        }
+        const streams = ASSIGNMENT.map((s) => shardStreamKey("sensitivities:in", s, TOTAL));
+        await ensureGroupsForShards(next.client, streams, "ingest");
+        multi = createMultiShardConsumer(next.client, {
+          baseStream: "sensitivities:in", group: "ingest", consumerNameBase: "ingest-host-1",
+          totalShards: TOTAL, assignment: ASSIGNMENT, blockMs: 5,
+        });
+        multi.start();
+      },
+      logger: silentLogger,
+    });
+
+    await watcher.start();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(new Set(built[0]!.reads)).toEqual(new Set([
+      "sensitivities:in:{0}", "sensitivities:in:{1}",
+      "sensitivities:in:{2}", "sensitivities:in:{3}",
+    ]));
+
+    await watcher.pollOnce();
+    await new Promise((r) => setTimeout(r, 30));
+    // Previous client was disconnected after drain.
+    expect(built[0]!.disconnectCalls).toBe(1);
+    // New client has all 4 per-shard XREADGROUP loops running.
+    expect(new Set(built[1]!.reads)).toEqual(new Set([
+      "sensitivities:in:{0}", "sensitivities:in:{1}",
+      "sensitivities:in:{2}", "sensitivities:in:{3}",
+    ]));
+
+    if (multi) await (multi as MC).stop();
+    await watcher.stop();
+  });
+});

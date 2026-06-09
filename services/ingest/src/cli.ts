@@ -8,8 +8,10 @@ import { Redis, Cluster } from "ioredis";
 import { createRedisClient } from "@frtb/redis-client";
 import { loadSchema, type Schema } from "@frtb/schema";
 import pino from "pino";
-import { createConsumer, ensureGroup, type ConsumerRunner, type RedisLike } from "./consumer.js";
+import { type RedisLike } from "./consumer.ts";
 import { createActiveTargetWatcher, type ActiveTargetWatcher } from "./active-target-watcher.ts";
+import { parseShardAssignment, shardStreamKey } from "./sharding.ts";
+import { createMultiShardConsumer, ensureGroupsForShards, type MultiConsumer } from "./multi-consumer.ts";
 
 const log = pino({ level: process.env.LOG_LEVEL ?? "info" });
 
@@ -18,6 +20,14 @@ const GROUP = process.env.CONSUMER_GROUP ?? "ingest";
 const CONSUMER_NAME = process.env.CONSUMER_NAME ?? `ingest-${os.hostname()}-${process.pid}`;
 const BATCH_SIZE = Number(process.env.BATCH_SIZE ?? "500");
 const BLOCK_MS = Number(process.env.BLOCK_MS ?? "1000");
+// Wave 5.92B — STREAM_SHARDS declares how many input streams the producer
+// sprays into (default 1 → bare `sensitivities:in` key, byte-identical to
+// pre-5.92). SHARD_ASSIGNMENT picks the subset this replica owns
+// (`"all"` / `"0,2,4"` / `"0-3"`). When `STREAM_SHARDS > 1` the consumer
+// opens one XREADGROUP loop per assigned shard against `<STREAM>:{<n>}`.
+const STREAM_SHARDS = Math.max(1, Number(process.env.STREAM_SHARDS ?? "1"));
+const SHARD_ASSIGNMENT_SPEC = process.env.SHARD_ASSIGNMENT ?? "all";
+const SHARD_ASSIGNMENT = parseShardAssignment(SHARD_ASSIGNMENT_SPEC, STREAM_SHARDS);
 // Wave 5.83B — schema is loaded once at boot from $SCHEMA_FILE so enrichDoc
 // can pre-weight every row before JSON.SET. REPO_ROOT resolves relative to
 // this file so the default works both under tsx (cwd = services/ingest/)
@@ -85,74 +95,103 @@ async function main(): Promise<void> {
   // exactly as before.
   const useWatcher = !!(apiUrl && internalToken);
 
-  // Mutable runner reference — rebuilt on every target swap so the
-  // throughput log and shutdown hook always observe the live consumer.
-  let runner: ConsumerRunner | null = null;
+  // Mutable multi-consumer reference — rebuilt on every target swap so the
+  // throughput log and shutdown hook always observe the live runners.
+  // With STREAM_SHARDS=1 this holds exactly one ConsumerRunner against the
+  // bare `STREAM` key (byte-identical to pre-5.92); with STREAM_SHARDS>1 it
+  // holds one runner per assigned shard against `<STREAM>:{<n>}`.
+  let multi: MultiConsumer | null = null;
   let activeClient: RedisLike | null = null;
   const state = {
     ready: false,
-    consumed: () => runner?.stats.consumed ?? 0,
-    errors: () => runner?.stats.errors ?? 0,
+    consumed: () => multi?.stats.consumed ?? 0,
+    errors: () => multi?.stats.errors ?? 0,
   };
   const health = startHealth(HEALTH_PORT, HEALTH_HOST, state);
 
+  // Wave 5.92B — spawn one consumer per assigned shard against the shared
+  // ioredis client. Logs one `ingest consumer started` line per shard so
+  // `docker compose logs ingest | grep "consumer started"` reflects the
+  // actual fan-out.
+  async function spawnConsumers(client: RedisLike): Promise<MultiConsumer> {
+    const streams = SHARD_ASSIGNMENT.map((s) => shardStreamKey(STREAM, s, STREAM_SHARDS));
+    await ensureGroupsForShards(client, streams, GROUP);
+    const m = createMultiShardConsumer(client, {
+      baseStream: STREAM, group: GROUP, consumerNameBase: CONSUMER_NAME,
+      totalShards: STREAM_SHARDS, assignment: SHARD_ASSIGNMENT,
+      batchSize: BATCH_SIZE, blockMs: BLOCK_MS, schema,
+    });
+    m.start();
+    for (const h of m.handles) {
+      log.info(
+        { stream: h.stream, group: GROUP, consumerName: h.consumerName, shard: h.shard, totalShards: STREAM_SHARDS },
+        "ingest consumer started",
+      );
+    }
+    return m;
+  }
+
   let watcher: ActiveTargetWatcher | null = null;
 
+  if (SHARD_ASSIGNMENT.length === 0) {
+    throw new Error(`SHARD_ASSIGNMENT=${SHARD_ASSIGNMENT_SPEC} resolved to no shards for STREAM_SHARDS=${STREAM_SHARDS}`);
+  }
+
   if (useWatcher) {
-    log.info({ apiUrl, pollMs: ACTIVE_TARGET_POLL_MS }, "ingest starting with active-target watcher");
+    log.info(
+      { apiUrl, pollMs: ACTIVE_TARGET_POLL_MS, streamShards: STREAM_SHARDS, shards: SHARD_ASSIGNMENT },
+      "ingest starting with active-target watcher",
+    );
     watcher = createActiveTargetWatcher({
       apiBase: apiUrl!,
       token: internalToken!,
       pollMs: ACTIVE_TARGET_POLL_MS,
       fallbackUrl: redisUrl,
       onTargetChange: async (next, prev) => {
-        // Drain the previous consumer so its in-flight XREADGROUP batch
+        // Drain every per-shard runner so each in-flight XREADGROUP batch
         // finishes (capped by BLOCK_MS) before we tear the old client down.
-        if (runner && prev) {
-          try { await runner.stop(); } catch (err) {
-            log.warn({ err: String(err) }, "drain previous consumer failed");
+        if (multi && prev) {
+          try { await multi.stop(); } catch (err) {
+            log.warn({ err: String(err) }, "drain previous consumers failed");
           }
         }
-        await ensureGroup(next.client, STREAM, GROUP);
-        runner = createConsumer(next.client, {
-          stream: STREAM, group: GROUP, consumerName: CONSUMER_NAME,
-          batchSize: BATCH_SIZE, blockMs: BLOCK_MS, schema,
-        });
+        multi = await spawnConsumers(next.client);
         activeClient = next.client;
-        runner.start();
         state.ready = true;
       },
     });
     await watcher.start();
   } else if (redisUrl) {
-    log.info({ stream: STREAM, group: GROUP, consumerName: CONSUMER_NAME, source: "REDIS_URL" }, "ingest starting");
+    log.info(
+      { stream: STREAM, group: GROUP, consumerName: CONSUMER_NAME, source: "REDIS_URL", streamShards: STREAM_SHARDS, shards: SHARD_ASSIGNMENT },
+      "ingest starting",
+    );
     const client = createClientFromUrl(redisUrl);
     activeClient = client;
-    await ensureGroup(client, STREAM, GROUP);
-    runner = createConsumer(client, {
-      stream: STREAM, group: GROUP, consumerName: CONSUMER_NAME,
-      batchSize: BATCH_SIZE, blockMs: BLOCK_MS, schema,
-    });
-    runner.start();
+    multi = await spawnConsumers(client);
     state.ready = true;
   } else {
     throw new Error("ingest requires REDIS_URL (tests) or API_URL+INTERNAL_API_TOKEN (compose) to locate Redis");
   }
 
-  // Throughput log every 5s
-  let last = runner?.stats.consumed ?? 0;
+  // Throughput log every 5s — single roll-up line across all per-shard
+  // runners (Wave 5.92B aggregated stats).
+  let last = multi?.stats.consumed ?? 0;
   const tick = setInterval(() => {
-    const now = runner?.stats.consumed ?? 0;
+    const now = multi?.stats.consumed ?? 0;
     const rps = Math.round((now - last) / 5);
     last = now;
-    log.info({ consumed: now, errors: runner?.stats.errors ?? 0, rps }, "ingest progress");
+    log.info(
+      { consumed: now, errors: multi?.stats.errors ?? 0, rps, shards: SHARD_ASSIGNMENT.length },
+      "ingest progress",
+    );
   }, 5000).unref();
 
   const shutdown = async (sig: string) => {
     log.info({ sig }, "shutting down");
     clearInterval(tick);
     state.ready = false;
-    if (runner) await runner.stop();
+    if (multi) await multi.stop();
     if (watcher) await watcher.stop();
     await new Promise<void>((r) => health.close(() => r()));
     if (activeClient && !watcher) {
