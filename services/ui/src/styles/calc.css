@@ -699,6 +699,36 @@ button.drilldown-pill:focus-visible {
   border-color: rgba(91, 211, 123, 0.35);
 }
 
+/* Wave 5.96G-ui — empty-data banner above the scenario grid. Single-line
+   informational tone (NOT an error) — surfaces `performance.cells_empty`
+   plus the generator flag that fills the gap. Uses the same neutral chip
+   palette as the perf strip so it doesn't compete with real alerts. */
+.calc-panel__total-empty-banner {
+  margin: 0;
+  padding: calc(var(--grid) * 0.75) calc(var(--grid) * 1.25);
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--redis-border-primary, #2D4754);
+  border-left: 3px solid var(--redis-border-secondary, #3D5764);
+  border-radius: var(--radius, 5px);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  color: var(--redis-text-secondary, #C8D1D5);
+}
+.calc-panel__total-empty-banner > strong {
+  color: var(--redis-text-primary, #F0F4F5);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.calc-panel__total-empty-banner > code {
+  display: inline-block;
+  padding: 0 0.3125rem;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--redis-border-primary, #2D4754);
+  border-radius: 3px;
+  font-size: 0.75rem;
+  color: var(--redis-text-secondary, #C8D1D5);
+}
+
 /* 3. Scenario columns --------------------------------------------------- */
 .calc-panel__total-scenarios {
   display: grid;

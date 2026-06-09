@@ -291,10 +291,12 @@ describe("<CalcPanel /> — Total SBM card (Wave 5.96B)", () => {
     expect(screen.queryByTestId("calc-total-perf-cache-chip")).toBeNull();
   });
 
-  // Wave 5.96C — fully-skipped classes (e.g. EQUITY when no sensitivities
-  // exist for any leg) render as "(no data)" instead of "$0.00", so the
-  // empty vs. computed-zero distinction is visible.
-  it("renders fully-skipped classes as '(no data)' rather than $0.00", async () => {
+  // Wave 5.96C / 5.96G-ui — fully-skipped classes (e.g. EQUITY when no
+  // sensitivities exist for any leg) render the "class not ingested" badge
+  // instead of "$0.00", so the empty vs. computed-zero distinction is
+  // visible. Wave 5.96G-ui retitled the wording from the original
+  // "(no data)" to the more demo-friendly "class not ingested".
+  it("renders fully-skipped classes as 'class not ingested' rather than $0.00", async () => {
     mockTotalResponse(buildTotalResponse());
     render(<CalcPanel />);
     fireEvent.click(screen.getByTestId("calc-total-cta"));
@@ -303,8 +305,8 @@ describe("<CalcPanel /> — Total SBM card (Wave 5.96B)", () => {
     const highCol = screen.getByTestId("calc-total-scenario-high");
     const equity = highCol.querySelector('[data-class="EQUITY"]') as HTMLElement;
     expect(equity.className).toMatch(/calc-panel__total-class--empty/);
-    expect(within(equity).getByText("(no data)")).toBeInTheDocument();
-    // The "(no data)" treatment supplants any "$0.00" / "0.000" charge line.
+    expect(within(equity).getByText("class not ingested")).toBeInTheDocument();
+    // The badge treatment supplants any "$0.00" / "0.000" charge line.
     expect(within(equity).queryByText(/^0\.000$/)).toBeNull();
   });
 });
@@ -418,5 +420,177 @@ describe("<CalcPanel /> — Total SBM progressive UX (Wave 5.96D)", () => {
     expect(tip).toMatch(/3 legs/);
     expect(tip).toMatch(/3 correlation scenarios/);
     expect(tip).toMatch(/27 parallel Lua kernel calls/);
+  });
+});
+
+
+// Wave 5.96G-ui — "no data ingested" / "class not ingested" cell badges +
+// an above-grid banner driven by the new performance.cells_empty counter
+// and per-scenario `data_status` field shipped in 5.96G-api. The previous
+// behaviour rendered structurally-empty cells as a misleading "$0.0000".
+describe("<CalcPanel /> — empty-cell badges & banner (Wave 5.96G-ui)", () => {
+  // GIRR with one empty Vega cell across all scenarios, FX populated and
+  // EQUITY fully skipped — covers all three data_status values in a single
+  // response so each branch of the rendering switch is exercised.
+  function buildEmptyResponse(overrides: Partial<TotalSbmResponse> = {}): TotalSbmResponse {
+    const breakdown: TotalSbmResponse["breakdown"] = [
+      // GIRR Delta + Curvature populated, Vega empty (buckets exist but no
+      // Vega rows ingested) — the per-cell "no data ingested" badge case.
+      { risk_class: "GIRR", leg: "delta", skipped: false,
+        scenarios: {
+          low: { charge: 43.2, ms: 1, data_status: "populated" },
+          medium: { charge: 45.1, ms: 1, data_status: "populated" },
+          high: { charge: 46.8, ms: 1, data_status: "populated" },
+        } },
+      { risk_class: "GIRR", leg: "vega", skipped: false,
+        scenarios: {
+          low: { charge: 0, ms: 1, data_status: "empty" },
+          medium: { charge: 0, ms: 1, data_status: "empty" },
+          high: { charge: 0, ms: 1, data_status: "empty" },
+        } },
+      { risk_class: "GIRR", leg: "curvature", skipped: false,
+        scenarios: {
+          low: { charge: 8.9, ms: 1, data_status: "populated" },
+          medium: { charge: 9.2, ms: 1, data_status: "populated" },
+          high: { charge: 9.5, ms: 1, data_status: "populated" },
+        } },
+      // EQUITY fully skipped — the 503 "class not ingested" case, per-cell.
+      { risk_class: "EQUITY", leg: "delta", skipped: true,
+        scenarios: {
+          low: { charge: 0, ms: 0, data_status: "skipped" },
+          medium: { charge: 0, ms: 0, data_status: "skipped" },
+          high: { charge: 0, ms: 0, data_status: "skipped" },
+        } },
+      { risk_class: "EQUITY", leg: "vega", skipped: true,
+        scenarios: {
+          low: { charge: 0, ms: 0, data_status: "skipped" },
+          medium: { charge: 0, ms: 0, data_status: "skipped" },
+          high: { charge: 0, ms: 0, data_status: "skipped" },
+        } },
+      { risk_class: "EQUITY", leg: "curvature", skipped: true,
+        scenarios: {
+          low: { charge: 0, ms: 0, data_status: "skipped" },
+          medium: { charge: 0, ms: 0, data_status: "skipped" },
+          high: { charge: 0, ms: 0, data_status: "skipped" },
+        } },
+      // FX fully populated.
+      { risk_class: "FX", leg: "delta", skipped: false,
+        scenarios: {
+          low: { charge: 124.0, ms: 1, data_status: "populated" },
+          medium: { charge: 125.0, ms: 1, data_status: "populated" },
+          high: { charge: 126.0, ms: 1, data_status: "populated" },
+        } },
+      { risk_class: "FX", leg: "vega", skipped: false,
+        scenarios: {
+          low: { charge: 38.4, ms: 1, data_status: "populated" },
+          medium: { charge: 38.4, ms: 1, data_status: "populated" },
+          high: { charge: 38.4, ms: 1, data_status: "populated" },
+        } },
+      { risk_class: "FX", leg: "curvature", skipped: false,
+        scenarios: {
+          low: { charge: 15.7, ms: 1, data_status: "populated" },
+          medium: { charge: 15.9, ms: 1, data_status: "populated" },
+          high: { charge: 16.1, ms: 1, data_status: "populated" },
+        } },
+    ];
+    return {
+      total_sbm: 196.4,
+      winning_scenario: "high",
+      scenario_totals: { low: 191.8, medium: 194.6, high: 196.4 },
+      breakdown,
+      unsupported_classes: [],
+      performance: {
+        total_ms: 18,
+        cumulative_ms: 200,
+        parallelism_factor: 11,
+        // 6 populated + 3 empty fired = 9 ops; 9 EQUITY ops skipped.
+        redis_ops_count: 18,
+        ops_skipped: 9,
+        cells_empty: 3,
+      },
+      resolved_command_summary: "27 FT.AGGREGATE+FCALL fan-out via /calc/sbm (3 classes × 3 legs × 3 scenarios)",
+      ...overrides,
+    };
+  }
+
+  it("renders the 'no data ingested' badge + tooltip on cells with data_status='empty'", async () => {
+    mockTotalResponse(buildEmptyResponse());
+    render(<CalcPanel />);
+    fireEvent.click(screen.getByTestId("calc-total-cta"));
+    await waitFor(() => expect(screen.getByTestId("calc-total-result")).toBeInTheDocument());
+
+    // GIRR Vega is empty across all three scenarios — under the winning
+    // (high) column it must render the badge, not "$0.0000" / "0.000".
+    const highCol = screen.getByTestId("calc-total-scenario-high");
+    const girr = highCol.querySelector('[data-class="GIRR"]') as HTMLElement;
+    const vegaBadge = within(girr).getByTestId(
+      "calc-total-cell-badge-GIRR-vega-high",
+    ) as HTMLElement;
+    expect(vegaBadge).toBeInTheDocument();
+    expect(vegaBadge.textContent).toBe("no data ingested");
+    expect(vegaBadge.getAttribute("data-status")).toBe("empty");
+    // Tooltip surfaces the "structurally 0" copy from the task spec.
+    expect(vegaBadge.getAttribute("title") ?? "").toMatch(
+      /No rows of this risk_class \+ sensitivity_type were ingested/,
+    );
+    expect(vegaBadge.getAttribute("title") ?? "").toMatch(/structurally 0/);
+    // The misleading "$0.0000" / "0.000" placeholder must NOT be present
+    // alongside the badge in the same cell.
+    expect(within(girr).queryAllByText(/^0\.0000?$/).length).toBe(0);
+  });
+
+  it("renders the distinct 'class not ingested' badge for data_status='skipped' cells", async () => {
+    mockTotalResponse(buildEmptyResponse());
+    render(<CalcPanel />);
+    fireEvent.click(screen.getByTestId("calc-total-cta"));
+    await waitFor(() => expect(screen.getByTestId("calc-total-result")).toBeInTheDocument());
+
+    // EQUITY is fully skipped → renders the class-level "class not
+    // ingested" treatment (per-leg badges are suppressed by the existing
+    // allSkipped branch). The badge wording and the data-status attribute
+    // must distinguish it from the per-cell "empty" badge.
+    const highCol = screen.getByTestId("calc-total-scenario-high");
+    const equity = highCol.querySelector('[data-class="EQUITY"]') as HTMLElement;
+    expect(equity.className).toMatch(/calc-panel__total-class--empty/);
+    const skippedBadge = within(equity).getByText("class not ingested");
+    expect(skippedBadge).toBeInTheDocument();
+    expect(skippedBadge.getAttribute("data-status")).toBe("skipped");
+    // Tooltip explains the 503 no-data-or-index distinction.
+    expect(skippedBadge.getAttribute("title") ?? "").toMatch(
+      /no-data-or-index|no buckets in the index/i,
+    );
+    // And the per-cell empty wording from the GIRR.vega case must NOT
+    // appear inside the EQUITY class — the two badges are visually and
+    // semantically distinct.
+    expect(within(equity).queryByText("no data ingested")).toBeNull();
+  });
+
+  it("renders the cells_empty banner above the grid only when cells_empty > 0", async () => {
+    // Case 1 — cells_empty=3 → banner present with count + generator flag.
+    mockTotalResponse(buildEmptyResponse());
+    const { unmount } = render(<CalcPanel />);
+    fireEvent.click(screen.getByTestId("calc-total-cta"));
+    await waitFor(() => expect(screen.getByTestId("calc-total-result")).toBeInTheDocument());
+
+    const banner = screen.getByTestId("calc-total-empty-banner");
+    expect(banner).toBeInTheDocument();
+    expect(banner.textContent).toMatch(/3/);
+    expect(banner.textContent).toMatch(/no ingested data/i);
+    expect(banner.textContent).toMatch(/--sensitivity-types Delta,Vega,Curvature/);
+    // Banner sits above the breakdown grid (DOM order, not just visual).
+    const matrix = screen.getByTestId("calc-total-matrix");
+    expect(
+      banner.compareDocumentPosition(matrix) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    unmount();
+
+    // Case 2 — cells_empty omitted / 0 → banner absent. Use the original
+    // buildTotalResponse helper (no cells_empty field set) to also cover
+    // backward compat with pre-5.96G-api response shapes.
+    mockTotalResponse(buildTotalResponse());
+    render(<CalcPanel />);
+    fireEvent.click(screen.getByTestId("calc-total-cta"));
+    await waitFor(() => expect(screen.getByTestId("calc-total-result")).toBeInTheDocument());
+    expect(screen.queryByTestId("calc-total-empty-banner")).toBeNull();
   });
 });

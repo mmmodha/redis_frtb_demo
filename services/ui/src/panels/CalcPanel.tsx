@@ -748,6 +748,18 @@ const TOTAL_SBM_LEG_LABEL: Record<TotalSbmLeg, string> = {
 };
 const TOTAL_SBM_LEG_ORDER: TotalSbmLeg[] = ["delta", "vega", "curvature"];
 
+// Wave 5.96G-ui — hover tooltips for the per-cell ingestion badges. "empty"
+// means the index has buckets but zero rows for this risk_class +
+// sensitivity_type; "skipped" means the whole class has no buckets at all
+// (the 503 no-data-or-index branch on /calc/sbm).
+const CELL_BADGE_TOOLTIP: Record<"empty" | "skipped" | "populated", string> = {
+  empty:
+    "No rows of this risk_class + sensitivity_type were ingested. Charge is structurally 0.",
+  skipped:
+    "This class has no buckets in the index — typically the sensitivity_type was never ingested (Curvature is the common case). /calc/sbm returned 503 no-data-or-index for this cell.",
+  populated: "",
+};
+
 // Preserve first-seen class order from the server breakdown so the column
 // stack reads consistently across the three scenario columns.
 function groupBreakdownByClass(
@@ -916,6 +928,23 @@ function TotalSbmResultView({ result }: { result: TotalSbmResponse }) {
         </details>
       </section>
 
+      {/* Wave 5.96G-ui — single-line banner above the breakdown grid when
+          any cell came back with data_status === "empty". Tells the user
+          their charge of 0 is structural (no rows ingested) rather than a
+          real computed zero, and points at the generator flag that fills
+          the gap. Skipped (503) cells are NOT counted here. */}
+      {perf.cells_empty && perf.cells_empty > 0 ? (
+        <div
+          className="calc-panel__total-empty-banner"
+          data-testid="calc-total-empty-banner"
+          role="status"
+        >
+          <strong>{perf.cells_empty}</strong> cell{perf.cells_empty === 1 ? "" : "s"} have
+          no ingested data — generate the missing rows with{" "}
+          <code>--sensitivity-types Delta,Vega,Curvature</code> to populate them.
+        </div>
+      ) : null}
+
       {/* 3. Per-scenario subtotals — three columns, binding scenario tinted + starred */}
       <section
         className="calc-panel__total-scenarios"
@@ -969,7 +998,13 @@ function TotalSbmResultView({ result }: { result: TotalSbmResponse }) {
                       <div className="calc-panel__total-class-header">
                         <span className="calc-panel__total-class-name">{riskClass}</span>
                         {sub.allSkipped ? (
-                          <span className="calc-panel__total-class-empty">(no data)</span>
+                          <span
+                            className="calc-panel__total-class-empty"
+                            data-status="skipped"
+                            title={CELL_BADGE_TOOLTIP.skipped}
+                          >
+                            class not ingested
+                          </span>
                         ) : null}
                       </div>
                       {sub.allSkipped ? null : (
@@ -977,7 +1012,18 @@ function TotalSbmResultView({ result }: { result: TotalSbmResponse }) {
                           <dl className="calc-panel__total-class-legs">
                             {TOTAL_SBM_LEG_ORDER.map((leg) => {
                               const row = rows.find((r) => r.leg === leg);
-                              const skipped = !row || row.skipped;
+                              // Wave 5.96G-ui — resolve effective per-cell
+                              // ingestion status. Prefer cell-level
+                              // data_status; fall back to row.skipped /
+                              // missing-row for pre-5.96G-api responses.
+                              const cellStatus: "populated" | "empty" | "skipped" =
+                                !row
+                                  ? "skipped"
+                                  : (row.scenarios[scenario]?.data_status ??
+                                     (row.skipped ? "skipped" : "populated"));
+                              const isEmpty = cellStatus === "empty";
+                              const isSkipped = cellStatus === "skipped";
+                              const isNonPopulated = isEmpty || isSkipped;
                               return (
                                 <Fragment key={leg}>
                                   <dt className="calc-panel__total-class-leg-label">
@@ -985,14 +1031,25 @@ function TotalSbmResultView({ result }: { result: TotalSbmResponse }) {
                                   </dt>
                                   <dd
                                     className={
-                                      skipped
+                                      isNonPopulated
                                         ? "calc-panel__total-class-leg-value calc-panel__total-class-leg-value--empty"
                                         : "calc-panel__total-class-leg-value"
                                     }
                                   >
-                                    {skipped
-                                      ? "(no data)"
-                                      : formatCharge(row!.scenarios[scenario].charge)}
+                                    {isNonPopulated ? (
+                                      <span
+                                        className="calc-panel__total-class-leg-badge"
+                                        data-status={cellStatus}
+                                        data-testid={`calc-total-cell-badge-${riskClass}-${leg}-${scenario}`}
+                                        title={CELL_BADGE_TOOLTIP[cellStatus]}
+                                      >
+                                        {isEmpty
+                                          ? "no data ingested"
+                                          : "class not ingested"}
+                                      </span>
+                                    ) : (
+                                      formatCharge(row!.scenarios[scenario].charge)
+                                    )}
                                   </dd>
                                 </Fragment>
                               );

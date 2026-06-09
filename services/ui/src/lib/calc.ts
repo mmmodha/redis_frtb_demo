@@ -209,6 +209,11 @@ export interface TotalSbmScenarioCell {
   // (when this cell was served from a /calc/sbm cache hit). Present on
   // every non-skipped cell since misses set it equal to the fresh cell_ms.
   original_compute_ms?: number;
+  // Wave 5.96G-api — per-cell ingestion status. "populated" = real result;
+  // "empty" = buckets discovered but no rows for this sensitivity_type;
+  // "skipped" = whole class has no buckets at all (503 no-data-or-index).
+  // Optional for forward-compat with pre-5.96G-api responses.
+  data_status?: "populated" | "empty" | "skipped";
 }
 export interface TotalSbmBreakdownRow {
   risk_class: string;
@@ -230,6 +235,10 @@ export interface TotalSbmPerformance {
   original_cumulative_ms?: number;
   cache?: "hit" | "miss" | "partial";
   cache_hits?: number;
+  // Wave 5.96G-api — count of cells where every bucket scanned zero rows
+  // (data_status === "empty"). Skipped (503 no-data-or-index) cells are
+  // NOT counted here — those are tracked via `ops_skipped`.
+  cells_empty?: number;
 }
 export interface TotalSbmResponse {
   total_sbm: number;
