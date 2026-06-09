@@ -431,9 +431,13 @@ describe("POST /generator/start/stream (Wave 5.20c) — SSE progress + cancellat
     expect(plan.profile_requested).toBe("auto");
     expect((plan.shape as Record<string, unknown>).mode).toBe("standalone");
     expect((plan.shape as Record<string, unknown>).shards).toBe(1);
-    expect((plan.dials as Record<string, unknown>).workers).toBe(1);
-    expect((plan.dials as Record<string, unknown>).batch_size).toBe(500);
-    expect((plan.dials as Record<string, unknown>).pipeline_window).toBe(1);
+    // Wave 5.94 raised the `small` profile dials (workers:1→2, batch:500→2000,
+    // window:1→4) — the seed frame surfaces whatever resolveDials() emits, so
+    // this assertion pins the post-5.94 values. Independent of host CPU count
+    // (small never scales with cores; only `large` uses hostCores).
+    expect((plan.dials as Record<string, unknown>).workers).toBe(2);
+    expect((plan.dials as Record<string, unknown>).batch_size).toBe(2000);
+    expect((plan.dials as Record<string, unknown>).pipeline_window).toBe(4);
     expect(plan.bytes_per_row).toBe(2048);
     expect(plan.rows).toBe(25);
   });
