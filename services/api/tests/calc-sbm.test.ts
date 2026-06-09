@@ -1344,6 +1344,127 @@ describe("POST /calc/sbm — MVP endpoint", () => {
       expect(fr.calls.find((c) => c.command === "FCALL")).toBeUndefined();
     });
 
+    // Wave 5.96A — per-bucket K_b drilldown. The route surfaces the
+    // intermediates the closed-form K_b consumes (Σ WS², ρ·cross term) plus
+    // a copy-pasteable FT.AGGREGATE / FCALL string per bucket so the UI can
+    // render "How K_b was calculated" + "Redis · N ms" without re-deriving
+    // anything client-side. Fast path populates the full breakdown; Lua path
+    // stamps `path: "lua"` and omits the intermediates (intermediates are
+    // computed inside the kernel and not surfaced — option B).
+    describe("Wave 5.96A: per-bucket K_b drilldown", () => {
+      it("Equity Delta fast path: intermediate.{ws_squared_sum, cross_term, path} + resolved_command", async () => {
+        // ρ=0.5, sumWs=10, sumWsSq=50 → cross = 0.5·(100−50) = 25, K_b² = 75.
+        const fr = fakeRedis();
+        fr.setResponse("FT.AGGREGATE", (args: unknown[]) => {
+          if (!args.includes("APPLY")) return ftAggregateReply(["1"]);
+          return [
+            1,
+            ftAggRow("1", { sum_d_ws_equity_delta: 10, sum_d_ws_equity_delta_sq: 50, row_count: 5 }),
+          ];
+        });
+        app = await createServer({ redis: fr, schema: fastPathSchema() });
+        const res = await app.inject({
+          method: "POST",
+          url: "/calc/sbm",
+          payload: { risk_class: "Equity", sensitivity_type: "Delta" },
+        });
+        expect(res.statusCode).toBe(200);
+        const pb = res.json().per_bucket[0];
+        expect(pb.intermediate).toMatchObject({ path: "fast" });
+        expect(pb.intermediate.ws_squared_sum).toBeCloseTo(50, 9);
+        expect(pb.intermediate.cross_term).toBeCloseTo(25, 9);
+        // resolved_command renders the per-bucket FT.AGGREGATE slice — must
+        // carry the index name, the @bucket TAG predicate for THIS bucket,
+        // and the per-class APPLY pipeline.
+        expect(typeof pb.resolved_command).toBe("string");
+        expect(pb.resolved_command).toMatch(/^FT\.AGGREGATE /);
+        expect(pb.resolved_command).toContain("idx:sens");
+        expect(pb.resolved_command).toContain("@bucket:{1}");
+        expect(pb.resolved_command).toContain("APPLY");
+      });
+
+      it("Equity Vega fast path: intermediates + resolved_command for the vega leg", async () => {
+        // ρ=0.5, single bucket: sumWs=6, sumWsSq=20 → cross = 0.5·(36−20)=8.
+        const fr = fakeRedis();
+        fr.setResponse("FT.AGGREGATE", (args: unknown[]) => {
+          if (!args.includes("APPLY")) return ftAggregateReply(["1"]);
+          return [
+            1,
+            ftAggRow("1", { sum_v_ws_equity_vega: 6, sum_v_ws_equity_vega_sq: 20, row_count: 3 }),
+          ];
+        });
+        app = await createServer({ redis: fr, schema: fastPathSchema() });
+        const res = await app.inject({
+          method: "POST",
+          url: "/calc/sbm",
+          payload: { risk_class: "Equity", sensitivity_type: "Vega" },
+        });
+        expect(res.statusCode).toBe(200);
+        const pb = res.json().per_bucket[0];
+        expect(pb.intermediate).toMatchObject({ path: "fast" });
+        expect(pb.intermediate.ws_squared_sum).toBeCloseTo(20, 9);
+        expect(pb.intermediate.cross_term).toBeCloseTo(8, 9);
+        expect(pb.resolved_command).toContain("@sensitivity_type:{Vega}");
+      });
+
+      it("Equity Curvature fast path: surfaces K_b^+ / K_b^- and the winner label", async () => {
+        // Same canned aggregates as the Wave 5.83C-1 curvature test:
+        // up wins with K_b² = 14.5, down has K_b² = 4.5.
+        const fr = fakeRedis();
+        fr.setResponse("FT.AGGREGATE", (args: unknown[]) => {
+          if (!args.includes("APPLY")) return ftAggregateReply(["1"]);
+          return [
+            1,
+            ftAggRow("1", {
+              sum_u_ws_equity_cvr_up: 4, sum_u_ws_equity_cvr_up_sq: 14,
+              sum_u_ws_equity_cvr_up_neg: -1, sum_u_ws_equity_cvr_up_negsq: 1,
+              sum_n_ws_equity_cvr_down: 3, sum_n_ws_equity_cvr_down_sq: 3,
+              sum_n_ws_equity_cvr_down_neg: 0, sum_n_ws_equity_cvr_down_negsq: 0,
+              row_count: 3,
+            }),
+          ];
+        });
+        app = await createServer({ redis: fr, schema: fastPathSchema() });
+        const res = await app.inject({
+          method: "POST",
+          url: "/calc/sbm",
+          payload: { risk_class: "Equity", sensitivity_type: "Curvature" },
+        });
+        expect(res.statusCode).toBe(200);
+        const pb = res.json().per_bucket[0];
+        expect(pb.intermediate).toMatchObject({ path: "fast", curvature: { winner: "plus" } });
+        expect(pb.intermediate.curvature.k_plus).toBeCloseTo(Math.sqrt(14.5), 9);
+        expect(pb.intermediate.curvature.k_minus).toBeCloseTo(Math.sqrt(4.5), 9);
+        // K_b² (winner) = 14.5 = ΣCVR² (14) + cross_term (0.5).
+        expect(pb.intermediate.ws_squared_sum).toBeCloseTo(14, 9);
+        expect(pb.intermediate.cross_term).toBeCloseTo(0.5, 9);
+        expect(pb.resolved_command).toContain("@sensitivity_type:{Curvature}");
+      });
+
+      it("Lua path: intermediate.path='lua' with no breakdown + FCALL resolved_command", async () => {
+        process.env.CALC_FAST_PATH = "0";
+        const fr = fakeRedis();
+        fr.setResponse("FT.AGGREGATE", ftAggregateReply(["1"]));
+        fr.setResponse("FCALL", ["K_b", "3", "S_b", "3", "count", "5", "ms", "1"]);
+        app = await createServer({
+          redis: fr,
+          schema: fastPathSchema(),
+          correlations: { EQUITY: { kind: "constant", value: 0 } },
+        });
+        const res = await app.inject({
+          method: "POST",
+          url: "/calc/sbm",
+          payload: { risk_class: "Equity", sensitivity_type: "Delta" },
+        });
+        expect(res.statusCode).toBe(200);
+        const pb = res.json().per_bucket[0];
+        expect(pb.intermediate).toEqual({ path: "lua" });
+        expect(pb.intermediate.ws_squared_sum).toBeUndefined();
+        expect(pb.intermediate.cross_term).toBeUndefined();
+        expect(pb.resolved_command).toMatch(/^FCALL equity_delta 1 sens:\{EQUITY:1\}:_route EQUITY 1/);
+      });
+    });
+
     it("CALC_FAST_PATH=0 reverts to the Lua FCALL path and tags engine=fcall_lua", async () => {
       process.env.CALC_FAST_PATH = "0";
       const fr = fakeRedis();

@@ -1,4 +1,5 @@
 import { Fragment, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent } from "react";
+import { BlockMath } from "react-katex";
 import { EnterpriseCallout, PanelCard, Sparkline, TimingStrip } from "../components";
 import { SuggestCombobox } from "../components/SuggestCombobox";
 import type { ShardTiming } from "../components/TimingStrip";
@@ -1282,6 +1283,96 @@ function DrilldownValueCell({
   );
 }
 
+// Wave 5.96A — per-bucket K_b formula + Redis command block. Sits above the
+// existing tenor-vector drilldown so users see (a) HOW K_b was derived from
+// this bucket's actual ΣWS² and ρ·cross-term and (b) WHICH Redis command
+// produced it, with the round-trip ms badge. Fast-path responses render the
+// substituted closed form; Lua-path responses (engine="fcall_lua") fall back
+// to a "computed in Lua FCALL, intermediates not surfaced" line since the
+// kernel does not surface the breakdown (option B in the spec).
+function BucketKbDrilldown({
+  bucket,
+  sensitivityType,
+  bucketResult,
+}: {
+  bucket: string;
+  sensitivityType: SensitivityType;
+  bucketResult: BucketResult | undefined;
+}) {
+  if (!bucketResult) return null;
+  const { K_b, S_b, count, ms, intermediate, resolved_command } = bucketResult;
+  const fmt5 = (n: number): string => n.toFixed(5);
+  const fmtMs = (n: number): string => (Math.round(n * 1000) / 1000).toString();
+  // Component-aware symbolic formula. Delta/Vega share the constant-ρ closed
+  // form (§21.4(5)/(7)); Curvature is the §21.5(3) max of the two ψ-gated
+  // scenarios. Strings are KaTeX-compatible (\rho, \sum, \max, etc).
+  const isCurvature = sensitivityType === "Curvature";
+  const symbolic = isCurvature
+    ? "K_b = \\max\\!\\left(K_b^{+},\\;K_b^{-}\\right),\\quad K_b^{\\pm} = \\sqrt{\\sum_k \\mathrm{CVR}_k^{\\pm\\,2} + \\sum_{k\\neq l}\\rho_{kl}\\,\\mathrm{CVR}_k^{\\pm}\\,\\mathrm{CVR}_l^{\\pm}}"
+    : "K_b = \\sqrt{\\sum_k \\mathrm{WS}_k^{2} + \\sum_{k\\neq l}\\rho_{kl}\\,\\mathrm{WS}_k\\,\\mathrm{WS}_l}";
+  const path = intermediate?.path;
+  const wsSq = intermediate?.ws_squared_sum;
+  const cross = intermediate?.cross_term;
+  const haveBreakdown = path === "fast" && wsSq !== undefined && cross !== undefined;
+  const curvature = intermediate?.curvature;
+  return (
+    <div className="bucket-drilldown__kb" data-testid="bucket-drilldown-kb" data-bucket={bucket}>
+      <section className="bucket-drilldown__kb-formula" data-testid="bucket-drilldown-formula">
+        <h4 className="bucket-drilldown__kb-title">How K_b was calculated</h4>
+        <div className="bucket-drilldown__kb-symbolic" data-testid="bucket-drilldown-formula-symbolic">
+          <BlockMath math={symbolic} />
+        </div>
+        {haveBreakdown ? (
+          <>
+            {isCurvature && curvature ? (
+              <div className="bucket-drilldown__kb-curvature" data-testid="bucket-drilldown-formula-curvature">
+                <BlockMath
+                  math={
+                    `K_b^{+} = ${fmt5(curvature.k_plus)},\\quad ` +
+                    `K_b^{-} = ${fmt5(curvature.k_minus)}\\;\\Rightarrow\\;` +
+                    `\\text{winner} = K_b^{${curvature.winner === "plus" ? "+" : "-"}}`
+                  }
+                />
+              </div>
+            ) : null}
+            <div className="bucket-drilldown__kb-substituted" data-testid="bucket-drilldown-formula-substituted">
+              <BlockMath
+                math={`K_b = \\sqrt{${fmt5(wsSq!)} + ${fmt5(cross!)}} = ${fmt5(K_b)}`}
+              />
+            </div>
+            <p className="bucket-drilldown__kb-sb" data-testid="bucket-drilldown-formula-sb">
+              S_b = Σ<sub>k</sub> WS<sub>k</sub> = {fmt5(S_b)} ({count} sensitivities)
+            </p>
+          </>
+        ) : (
+          <p
+            className="bucket-drilldown__kb-lua"
+            data-testid="bucket-drilldown-formula-lua"
+          >
+            K<sub>b</sub> = {fmt5(K_b)} — computed in Lua FCALL · {fmtMs(ms)} ms · intermediate
+            values not surfaced (fast path required).
+          </p>
+        )}
+      </section>
+      <section className="bucket-drilldown__kb-command" data-testid="bucket-drilldown-command">
+        <h4 className="bucket-drilldown__kb-title">Redis · {fmtMs(ms)} ms</h4>
+        {resolved_command ? (
+          <pre
+            className="bucket-drilldown__kb-command-pre"
+            data-testid="bucket-drilldown-command-pre"
+          >
+            {resolved_command}
+          </pre>
+        ) : (
+          <p className="bucket-drilldown__kb-command-missing">
+            (resolved command not available)
+          </p>
+        )}
+      </section>
+    </div>
+  );
+}
+
 function BucketDrilldown({
   bucket,
   riskClass,
@@ -1390,6 +1481,14 @@ function BucketDrilldown({
           ✕
         </button>
       </div>
+      {/* Wave 5.96A — formula + Redis command block sits above the existing
+          tenor breakdown so the K_b math + provenance are the first thing the
+          user sees on expand. */}
+      <BucketKbDrilldown
+        bucket={bucket}
+        sensitivityType={sensitivityType}
+        bucketResult={bucketResult}
+      />
       <div aria-live="polite" data-testid="bucket-drilldown-live">
         {state.status === "loaded"
           ? `Drill-down for bucket ${bucket} expanded — ${state.rows.length} trades loaded`

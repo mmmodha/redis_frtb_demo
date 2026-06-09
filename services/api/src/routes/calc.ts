@@ -15,8 +15,12 @@ import {
 } from "../sbm/reduce.ts";
 import {
   aggregateBucketsViaIndex,
+  buildFastPathAggregateArgs,
+  buildFastPathQuery,
   FAST_PATH_ENGINE,
+  formatRedisCommand,
   LUA_PATH_ENGINE,
+  resolveLegFields,
 } from "../sbm/aggregate-via-index.ts";
 import {
   calcCacheKey,
@@ -31,6 +35,11 @@ import {
 type EngineTag = typeof FAST_PATH_ENGINE | typeof LUA_PATH_ENGINE;
 interface BucketResultWithEngine extends BucketResult {
   engine: EngineTag;
+  // Wave 5.96A — per-bucket Redis command string surfaced to the drilldown UI.
+  // Fast path: the FT.AGGREGATE the engine WOULD run for just this bucket
+  // (single-bucket slice of the per-request FT.AGGREGATE). Lua path: the
+  // FCALL with bucket / risk_class / exclude CSVs substituted in.
+  resolved_command: string;
 }
 
 // Wave 5.83E — benchmark-only query parameters. Both are off by default so
@@ -564,9 +573,31 @@ export function registerCalcRoute(
         // entries (e.g. a bucket the index sees in discovery but has zero rows
         // matching the sensitivity_type) collapse to zeroed BucketResults.
         const byBucket = new Map(fast.map((r) => [r.bucket, r]));
+        // Wave 5.96A — per-bucket resolved_command renders the single-bucket
+        // slice of the fast-path FT.AGGREGATE so the drilldown shows what the
+        // engine WOULD dispatch for THIS bucket alone. We rebuild argv with a
+        // bucketSubset of just [b] to preserve the per-class APPLY/REDUCE
+        // pipeline verbatim (same alias scheme the live query uses).
+        const legFields = resolveLegFields(opts.schema!, risk_class, leg as Leg);
+        const perTenor = (opts.schema!.risk_classes[risk_class]?.tenor?.nodes?.length ?? 0) > 0
+          && risk_class === "GIRR";
+        const excludeFilter = {
+          book: excludeCsv.book ? excludeCsv.book.split(",") : [],
+          trade_id: excludeCsv.trade_id ? excludeCsv.trade_id.split(",") : [],
+          risk_factor: excludeCsv.risk_factor ? excludeCsv.risk_factor.split(",") : [],
+        };
         results = buckets.map((b) => {
-          const r = byBucket.get(b) ?? { bucket: b, K_b: 0, S_b: 0, count: 0, ms: 0 };
-          return { ...r, engine: FAST_PATH_ENGINE };
+          const r = byBucket.get(b) ?? {
+            bucket: b, K_b: 0, S_b: 0, count: 0, ms: 0,
+            intermediate: { path: "fast" as const, ws_squared_sum: 0, cross_term: 0 },
+          };
+          const perBucketQuery = buildFastPathQuery(risk_class, legFields.sensitivityType, {
+            bucketSubset: [b],
+            exclude: excludeFilter,
+          });
+          const perBucketArgv = buildFastPathAggregateArgs(perBucketQuery, legFields, perTenor);
+          const resolved_command = formatRedisCommand("FT.AGGREGATE", perBucketArgv);
+          return { ...r, engine: FAST_PATH_ENGINE, resolved_command };
         });
       } else {
         results = await Promise.all(
@@ -589,7 +620,16 @@ export function registerCalcRoute(
             )) as unknown;
             const parsed = parseBucketReply(r) ?? { bucket: "", K_b: 0, S_b: 0, count: 0, ms: 0 };
             parsed.bucket = b;
-            return { ...parsed, engine: LUA_PATH_ENGINE };
+            // Wave 5.96A — Lua path: intermediates are computed inside the
+            // FCALL kernel and not surfaced (option B). Stamp `path: "lua"`
+            // so the UI renders the "computed in Lua FCALL, intermediates not
+            // surfaced" note instead of a broken formula block.
+            const intermediate = { path: "lua" as const };
+            const resolved_command = formatRedisCommand("FCALL", [
+              funcName, "1", routeKey, risk_class, b,
+              excludeCsv.book, excludeCsv.trade_id, excludeCsv.risk_factor,
+            ]);
+            return { ...parsed, engine: LUA_PATH_ENGINE, intermediate, resolved_command };
           })
         );
       }

@@ -207,6 +207,61 @@
 }
 .bucket-drilldown__load-more:disabled { opacity: 0.4; cursor: not-allowed; }
 
+/* Wave 5.96A — per-bucket K_b drilldown: formula + Redis command blocks.
+   Sits above the existing tenor-breakdown content; visually grouped with a
+   subtle background so the math+command pair reads as one unit. */
+.bucket-drilldown__kb {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0.5rem;
+  margin: 0.25rem 0 0.75rem;
+  padding: 0.5rem 0.625rem;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--redis-border-primary, rgba(255, 255, 255, 0.06));
+  border-radius: 4px;
+}
+.bucket-drilldown__kb-title {
+  margin: 0 0 0.25rem;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--redis-text-secondary, #8a8f99);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.bucket-drilldown__kb-symbolic,
+.bucket-drilldown__kb-substituted,
+.bucket-drilldown__kb-curvature { font-size: 0.875rem; overflow-x: auto; }
+.bucket-drilldown__kb-sb {
+  margin: 0.25rem 0 0;
+  font-size: 0.8125rem;
+  color: var(--redis-text-secondary, #8a8f99);
+}
+.bucket-drilldown__kb-lua {
+  margin: 0;
+  font-size: 0.8125rem;
+  font-style: italic;
+  color: var(--redis-text-secondary, #8a8f99);
+}
+.bucket-drilldown__kb-command-pre {
+  margin: 0;
+  padding: 0.375rem 0.5rem;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--redis-border-primary, rgba(255, 255, 255, 0.06));
+  border-radius: 3px;
+  font-size: 0.75rem;
+  line-height: 1.45;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  color: var(--redis-text-primary, #e6e7eb);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.bucket-drilldown__kb-command-missing {
+  margin: 0;
+  font-size: 0.8125rem;
+  font-style: italic;
+  color: var(--redis-text-secondary, #8a8f99);
+}
+
 /* Drill-down cell pills (trade_id / risk_factor). */
 .drilldown-pill {
   display: inline-block;

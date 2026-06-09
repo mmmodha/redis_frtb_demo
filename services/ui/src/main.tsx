@@ -13,6 +13,10 @@ import "./styles/pivot.css";
 import "./styles/ingest.css";
 import "./styles/loadgen.css";
 import "./styles/json-explorer.css";
+// Wave 5.96A — KaTeX bundled stylesheet for the per-bucket drilldown formula
+// block. Imported once at the app root so every <InlineMath />/<BlockMath />
+// usage downstream renders with the correct font metrics.
+import "katex/dist/katex.min.css";
 
 const rootEl = document.getElementById("root");
 if (!rootEl) {

@@ -53,12 +53,32 @@ export function scaleCorrelationSpec(
   };
 }
 
+// Wave 5.96A — per-bucket drilldown intermediates. Populated by the fast path
+// reducer in aggregate-via-index.ts; left undefined for the Lua FCALL path
+// (intermediates are computed inside the kernel and not surfaced). The UI
+// renders the "How K_b was calculated" panel from these fields when present
+// and a "computed in Lua FCALL, intermediates not surfaced" message otherwise.
+export type BucketPath = "fast" | "lua";
+export interface BucketCurvatureIntermediate {
+  k_plus: number;
+  k_minus: number;
+  winner: "plus" | "minus";
+}
+export interface BucketIntermediate {
+  path: BucketPath;
+  ws_squared_sum?: number;
+  cross_term?: number;
+  curvature?: BucketCurvatureIntermediate;
+}
 export interface BucketResult {
   bucket: string;
   K_b: number;
   S_b: number;
   count: number;
   ms: number;
+  // Wave 5.96A — additive. Optional so the legacy Lua path can omit it (the
+  // route then synthesises an `intermediate.path: "lua"` stub).
+  intermediate?: BucketIntermediate;
 }
 
 function gammaOf(corr: CorrelationSpec, idx: Map<string, number>, b: string, c: string): number {

@@ -8,7 +8,7 @@
 
 import type { Schema } from "@frtb/schema";
 import type { RedisLike } from "../redis-like.ts";
-import type { BucketResult } from "./reduce.ts";
+import type { BucketIntermediate, BucketResult } from "./reduce.ts";
 import { kbSquaredForDirection, squareCorrelation } from "@frtb/calc/src/curvatureCommon.ts";
 
 export type FastLeg = "delta" | "vega" | "curvature";
@@ -147,6 +147,25 @@ export function buildFastPathQuery(
 
 export { FT_AGGREGATE_TIMEOUT_MS, resolveLegFields, resolveRho, resolveQueryNodes };
 
+// Wave 5.96A — render an FT.AGGREGATE argv as a copy-pasteable command string
+// for the per-bucket drilldown's "Redis command" block. Tokens containing
+// whitespace are single-quoted; existing single quotes are escaped using the
+// shell-safe `'\''` form. The output is informational (the route does not
+// execute the rendered string), so we deliberately mirror what a developer
+// would paste into `redis-cli`.
+export function formatRedisCommand(name: string, argv: ReadonlyArray<unknown>): string {
+  const out = [name];
+  for (const a of argv) {
+    const s = String(a);
+    if (s === "" || /[\s'"]/.test(s)) {
+      out.push(`'${s.replace(/'/g, "'\\''")}'`);
+    } else {
+      out.push(s);
+    }
+  }
+  return out.join(" ");
+}
+
 // Build the FT.AGGREGATE argv after the command name. APPLY clauses derive
 // per-row squared sums (and sign-split helpers for Curvature) before GROUPBY
 // so the closed-form K_b only needs the resulting per-bucket SUMs. Field aliases
@@ -269,12 +288,20 @@ export function parseAggregateRows(reply: unknown): Map<string, Record<string, s
 // Constant-ρ K_b closed form: K_b² = ΣWS² + ρ·((ΣWS)² − ΣWS²). Mirrors the Lua
 // kernels (girr_delta.lua, equity_delta.lua, fx_delta.lua, *_vega.lua) so the
 // fast path stays byte-identical when the input aggregates match.
-function kbFromConstantRho(sumWs: number, sumWsSq: number, rho: number): number {
+// Wave 5.96A — returns ws_squared_sum (ΣWS²) and cross_term (ρ·Σ_{k≠l} WS_k·WS_l)
+// alongside K_b so the per-bucket drilldown UI can render the substituted
+// formula without re-deriving the intermediates.
+function kbFromConstantRho(
+  sumWs: number,
+  sumWsSq: number,
+  rho: number,
+): { K_b: number; ws_squared_sum: number; cross_term: number } {
   let cross = sumWs * sumWs - sumWsSq;
   if (cross < 0) cross = 0;
-  let kbSq = sumWsSq + rho * cross;
+  const cross_term = rho * cross;
+  let kbSq = sumWsSq + cross_term;
   if (kbSq < 0) kbSq = 0;
-  return Math.sqrt(kbSq);
+  return { K_b: Math.sqrt(kbSq), ws_squared_sum: sumWsSq, cross_term };
 }
 
 // Pull the four sign-split aggregates per indexed field for the Curvature leg
@@ -286,15 +313,21 @@ function kbCurvatureForDirection(
   prefix: "u" | "n",
   rhoCurv: number,
   perTenor: boolean,
-): { K_b: number; S_b: number } {
+): { K_b: number; S_b: number; ws_squared_sum: number; cross_term: number } {
   if (perTenor) {
     // Per-tenor classes (GIRR): K_b² operates on the per-tenor SUMs across rows
     // (mirroring girr_curvature.lua), so use the ψ-aware kernel from the shared
     // curvature oracle directly. The sign-split aggregates are unused.
+    // Wave 5.96A — also surface ΣCVR² and the residual cross term so the UI
+    // formula block can render the same closed-form pieces the kernel sees.
     const cvr = fields.map((f) => Number(row[`sum_${prefix}_${f}`] ?? 0));
     const kbSq = Math.max(0, kbSquaredForDirection(cvr, rhoCurv));
     const S_b = cvr.reduce((a, b) => a + b, 0);
-    return { K_b: Math.sqrt(kbSq), S_b };
+    const ws_squared_sum = cvr.reduce((acc, x) => acc + x * x, 0);
+    // K_b² = ΣCVR² + cross_term → cross_term = K_b² − ΣCVR² (already ψ-gated
+    // and scaled by ρ_curv inside kbSquaredForDirection).
+    const cross_term = kbSq - ws_squared_sum;
+    return { K_b: Math.sqrt(kbSq), S_b, ws_squared_sum, cross_term };
   }
   // Scalar classes (Equity / FX): each row is its own factor k. ψ gates on
   // (row_k, row_l); the sign-split decomposition lets us recover the gated
@@ -310,8 +343,9 @@ function kbCurvatureForDirection(
   const totalCross = S * S - SQ;
   const negCross = N * N - SQN;
   const gatedCross = totalCross - negCross;
-  const kbSq = Math.max(0, SQ + rhoCurv * gatedCross);
-  return { K_b: Math.sqrt(kbSq), S_b: S };
+  const cross_term = rhoCurv * gatedCross;
+  const kbSq = Math.max(0, SQ + cross_term);
+  return { K_b: Math.sqrt(kbSq), S_b: S, ws_squared_sum: SQ, cross_term };
 }
 
 // Per-bucket reducer: pulls the right aggregates from a single GROUPBY row and
@@ -335,7 +369,13 @@ function bucketResultFromRow(
       const wsK = list.map((f) => Number(row[`sum_d_${f}`] ?? 0));
       const sumWs = wsK.reduce((a, b) => a + b, 0);
       const sumWsSq = wsK.reduce((acc, x) => acc + x * x, 0);
-      return { bucket, K_b: kbFromConstantRho(sumWs, sumWsSq, rho), S_b: sumWs, count, ms };
+      const r = kbFromConstantRho(sumWs, sumWsSq, rho);
+      const intermediate: BucketIntermediate = {
+        path: "fast",
+        ws_squared_sum: r.ws_squared_sum,
+        cross_term: r.cross_term,
+      };
+      return { bucket, K_b: r.K_b, S_b: sumWs, count, ms, intermediate };
     }
     // Per-row sum_ws_sq matches the *_vega.lua and equity/fx_delta.lua shape.
     const prefix = leg === "delta" ? "d" : "v";
@@ -345,14 +385,30 @@ function bucketResultFromRow(
       sumWs += Number(row[`sum_${prefix}_${f}`] ?? 0);
       sumWsSq += Number(row[`sum_${prefix}_${f}_sq`] ?? 0);
     }
-    return { bucket, K_b: kbFromConstantRho(sumWs, sumWsSq, rho), S_b: sumWs, count, ms };
+    const r = kbFromConstantRho(sumWs, sumWsSq, rho);
+    const intermediate: BucketIntermediate = {
+      path: "fast",
+      ws_squared_sum: r.ws_squared_sum,
+      cross_term: r.cross_term,
+    };
+    return { bucket, K_b: r.K_b, S_b: sumWs, count, ms, intermediate };
   }
   // Curvature — pick the worse of K_b^+ / K_b^- per §21.5(3); S_b is the signed
   // Σ_k CVR_k of the winning direction (consumed by reduceCurvatureCharge).
   const up = kbCurvatureForDirection(row, fields.cvrUp ?? [], "u", rho, perTenor);
   const down = kbCurvatureForDirection(row, fields.cvrDown ?? [], "n", rho, perTenor);
-  if (down.K_b > up.K_b) return { bucket, K_b: down.K_b, S_b: down.S_b, count, ms };
-  return { bucket, K_b: up.K_b, S_b: up.S_b, count, ms };
+  // Wave 5.96A — surface both raw K_b^± and the winner label, plus the winning
+  // direction's ΣCVR² / cross term so the UI formula block can show the picked
+  // scenario substituted (mirrors the §21.5(3) max selection).
+  const winnerIsDown = down.K_b > up.K_b;
+  const winner = winnerIsDown ? down : up;
+  const intermediate: BucketIntermediate = {
+    path: "fast",
+    ws_squared_sum: winner.ws_squared_sum,
+    cross_term: winner.cross_term,
+    curvature: { k_plus: up.K_b, k_minus: down.K_b, winner: winnerIsDown ? "minus" : "plus" },
+  };
+  return { bucket, K_b: winner.K_b, S_b: winner.S_b, count, ms, intermediate };
 }
 
 export async function aggregateBucketsViaIndex(opts: AggregateBucketsOpts): Promise<BucketResult[]> {

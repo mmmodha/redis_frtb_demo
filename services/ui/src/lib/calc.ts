@@ -33,12 +33,31 @@ export interface CalcSbmRequest {
   };
 }
 
+// Wave 5.96A — per-bucket drilldown intermediates. Populated by the FT.AGGREGATE
+// fast path so the UI can render the "How K_b was calculated" formula block
+// with substituted numbers; absent (or `path: "lua"`) on the legacy FCALL path,
+// where the intermediates are computed inside the kernel and not surfaced.
+export type BucketPath = "fast" | "lua";
+export interface BucketCurvatureIntermediate {
+  k_plus: number;
+  k_minus: number;
+  winner: "plus" | "minus";
+}
+export interface BucketIntermediate {
+  path: BucketPath;
+  ws_squared_sum?: number;
+  cross_term?: number;
+  curvature?: BucketCurvatureIntermediate;
+}
 export interface BucketResult {
   bucket: string;
   K_b: number;
   S_b: number;
   count: number;
   ms: number;
+  // Wave 5.96A — both optional for forward-compat with older /calc/sbm responses.
+  intermediate?: BucketIntermediate;
+  resolved_command?: string;
 }
 
 export interface ShardBreakdownEntry {

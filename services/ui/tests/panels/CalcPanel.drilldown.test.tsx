@@ -358,4 +358,109 @@ describe("CalcPanel Wave 5.18 polish + drill-down", () => {
     // CalcPanel headline charge survives.
     expect(screen.getByTestId("calc-charge")).toBeInTheDocument();
   });
+
+  // Wave 5.96A — per-bucket K_b drilldown: formula block (with substituted
+  // numbers) + Redis command block. Fast-path responses render the closed
+  // form pieces from `intermediate.{ws_squared_sum, cross_term}`; Lua-path
+  // responses (intermediate.path === "lua") render a "not surfaced" message.
+  describe("Wave 5.96A: K_b formula + Redis command block", () => {
+    it("Fast path renders symbolic + substituted formula and the resolved FT.AGGREGATE", async () => {
+      fetchRouter({
+        calc: () =>
+          new Response(JSON.stringify({
+            ...calcResponse,
+            per_bucket: [{
+              bucket: "USD", K_b: 8.66025, S_b: 10, count: 5, ms: 3.2,
+              intermediate: { path: "fast", ws_squared_sum: 50, cross_term: 25 },
+              resolved_command: "FT.AGGREGATE idx:sens '@risk_class:{GIRR} @sensitivity_type:{Delta} @bucket:{USD}' APPLY '...' GROUPBY 1 @bucket",
+            }],
+          }), { headers: { "content-type": "application/json" } }),
+      });
+      render(<CalcPanel />);
+      await runCalc(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
+      fireEvent.click(
+        within(screen.getByTestId("bucket-chart"))
+          .getAllByTestId("bucket-chart-row")
+          .find((r) => r.getAttribute("data-bucket") === "USD")!,
+      );
+      await waitFor(() => expect(screen.getByTestId("bucket-drilldown-kb")).toBeInTheDocument());
+      // Formula block surfaces the substituted numbers (50, 25, K_b).
+      const sub = screen.getByTestId("bucket-drilldown-formula-substituted").textContent ?? "";
+      expect(sub).toContain("50.00000");
+      expect(sub).toContain("25.00000");
+      expect(sub).toContain("8.66025");
+      // S_b line: 10 (5 sensitivities).
+      const sb = screen.getByTestId("bucket-drilldown-formula-sb").textContent ?? "";
+      expect(sb).toContain("10.00000");
+      expect(sb).toContain("5 sensitivities");
+      // Redis command block + the FT.AGGREGATE string + the ms badge.
+      const cmdHeading = screen.getByTestId("bucket-drilldown-command").textContent ?? "";
+      expect(cmdHeading).toContain("3.2 ms");
+      expect(screen.getByTestId("bucket-drilldown-command-pre").textContent)
+        .toMatch(/^FT\.AGGREGATE/);
+    });
+
+    it("Curvature fast path: surfaces K_b^+ and K_b^- with the winner label", async () => {
+      fetchRouter({
+        calc: () =>
+          new Response(JSON.stringify({
+            ...calcResponse,
+            per_bucket: [{
+              bucket: "USD", K_b: Math.sqrt(14.5), S_b: 4, count: 3, ms: 4.1,
+              intermediate: {
+                path: "fast", ws_squared_sum: 14, cross_term: 0.5,
+                curvature: { k_plus: Math.sqrt(14.5), k_minus: Math.sqrt(4.5), winner: "plus" },
+              },
+              resolved_command: "FT.AGGREGATE idx:sens '@risk_class:{GIRR} @sensitivity_type:{Curvature} @bucket:{USD}' APPLY '...'",
+            }],
+          }), { headers: { "content-type": "application/json" } }),
+      });
+      render(<CalcPanel />);
+      fireEvent.change(screen.getByLabelText(/^sensitivity$/i), { target: { value: "Curvature" } });
+      await runCalc(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
+      fireEvent.click(
+        within(screen.getByTestId("bucket-chart"))
+          .getAllByTestId("bucket-chart-row")
+          .find((r) => r.getAttribute("data-bucket") === "USD")!,
+      );
+      await waitFor(() => expect(screen.getByTestId("bucket-drilldown-formula-curvature")).toBeInTheDocument());
+      const curv = screen.getByTestId("bucket-drilldown-formula-curvature").textContent ?? "";
+      // KaTeX collapses whitespace inside the rendered math — assert on the
+      // numeric tokens we substituted, not on the surrounding LaTeX commands.
+      expect(curv).toContain(Math.sqrt(14.5).toFixed(5));
+      expect(curv).toContain(Math.sqrt(4.5).toFixed(5));
+      expect(curv).toMatch(/winner/);
+    });
+
+    it("Lua path: shows 'computed in Lua FCALL, intermediates not surfaced'", async () => {
+      fetchRouter({
+        calc: () =>
+          new Response(JSON.stringify({
+            ...calcResponse,
+            engine: "fcall_lua",
+            per_bucket: [{
+              bucket: "USD", K_b: 3, S_b: 3, count: 5, ms: 1.0,
+              intermediate: { path: "lua" },
+              resolved_command: "FCALL sbm_delta_bucket 1 sens:{GIRR:USD}:_route GIRR USD",
+            }],
+          }), { headers: { "content-type": "application/json" } }),
+      });
+      render(<CalcPanel />);
+      await runCalc(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
+      fireEvent.click(
+        within(screen.getByTestId("bucket-chart"))
+          .getAllByTestId("bucket-chart-row")
+          .find((r) => r.getAttribute("data-bucket") === "USD")!,
+      );
+      await waitFor(() => expect(screen.getByTestId("bucket-drilldown-formula-lua")).toBeInTheDocument());
+      const lua = screen.getByTestId("bucket-drilldown-formula-lua").textContent ?? "";
+      expect(lua).toMatch(/computed in Lua FCALL/);
+      expect(lua).toMatch(/not surfaced/);
+      // No substituted block on the Lua path (no intermediates surfaced).
+      expect(screen.queryByTestId("bucket-drilldown-formula-substituted")).toBeNull();
+      // Command block still renders the FCALL string.
+      expect(screen.getByTestId("bucket-drilldown-command-pre").textContent)
+        .toMatch(/^FCALL sbm_delta_bucket/);
+    });
+  });
 });
