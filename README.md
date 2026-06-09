@@ -126,6 +126,26 @@ scripts/run-local.sh logs generator -f                  # follow progress
 Anything after `--` is forwarded to `tsx services/generator/src/cli.ts`
 (e.g. `--rows`, `--rate`, `--seed`, `--stream`).
 
+### Canonical 200k baseline (Wave 5.84)
+
+The gated live test [`services/api/tests/calc-live-200k.test.ts`](services/api/tests/calc-live-200k.test.ts)
+pins `/calc/sbm` charge + per-bucket K_b anchors against a fixed balanced-thirds
+200k corpus. Reproduce it with:
+
+```bash
+docker compose run --rm generator --rows 200000 --classes GIRR,EQUITY,FX
+```
+
+Class distribution is balanced thirds — **GIRR 66667 / EQUITY 66667 / FX 66666**
+(generator splits `--rows` evenly across the requested `--classes` list, then
+splits each class evenly across Delta / Vega / Curvature). The captured
+charge + bucket sweeps for the current pins live in
+[`docs/recordings/wave-5.84-corpus/`](docs/recordings/wave-5.84-corpus/)
+(captured 2026-06-08); these replaced the legacy skewed ~60/30/10 anchors
+under `docs/recordings/wave-5.83K/`. Re-anchor against new corpus only when
+the generator's class / leg split itself changes — anchors are corpus-derived,
+not hand-picked.
+
 ## Testing & TDD
 
 Every production module is written test-first. The root `npm test` runs
