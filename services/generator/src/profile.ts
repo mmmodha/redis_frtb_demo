@@ -4,15 +4,23 @@
 // merge on top via `resolveDials` so manual always wins (DoD #4).
 //
 // Profile table (matches the task note's informational table):
-//   small  : standalone OR 1 master shard      → workers=1, batch=500,  window=1, streamShards=1
+//   small  : standalone OR 1 master shard      → workers=2, batch=2000, window=4, streamShards=1
 //   medium : 2..3 master shards                → workers=2, batch=1500, window=2, streamShards=shards
 //   large  : 4+  master shards                 → workers=min(shards,cpus), batch=2000, window=2, streamShards=min(shards,STREAM_SHARDS_CAP)
+//
+// Wave 5.94 raised the `small` throughput dials (was workers=1/batch=500/window=1)
+// after dropping the bit-equivalence-with-pre-5.84 contract. The pre-5.84B XADD
+// sequence is still locked in by the workers.test.ts canary via explicit
+// batchSize/stride args, independent of the profile. Manual overrides via
+// `--workers/--batch-size/--pipeline-window` still reproduce the original
+// sequence (manual always wins — DoD #4).
 //
 // Wave 5.92A — `streamShards` is the new hash-tag stream-router dial. It
 // fans XADDs across N hash-tag-partitioned input streams so the producer
 // stops bottlenecking on a single Redis shard at high concurrency. Default
-// for `small` is 1 (bit-equivalent to pre-5.92); medium/large match the
-// probed master-shard count up to STREAM_SHARDS_CAP (per the task spec).
+// for `small` is 1 (single-shard targets must not produce sharded streams —
+// would break the slot-affinity contract); medium/large match the probed
+// master-shard count up to STREAM_SHARDS_CAP (per the task spec).
 
 import { BYTES_PER_ROW, type ClusterShape } from "./probe.ts";
 import type { StreamShardsConfig } from "@frtb/stream-router";
@@ -49,11 +57,11 @@ export function pickProfile(shape: ClusterShape): ProfileName {
 // Emit the concrete dials for a given profile + shape + host CPU count.
 // `large` caps workers at `min(shards, hostCores)` per the task spec.
 // Wave 5.92A — `streamShards` follows the same shape-driven shape: small=1
-// (legacy single-stream), medium=shards (one shard-per-master so XADDs
-// land slot-local), large=min(shards, STREAM_SHARDS_CAP) (bounded fan-out).
+// (single-shard target), medium=shards (one shard-per-master so XADDs land
+// slot-local), large=min(shards, STREAM_SHARDS_CAP) (bounded fan-out).
 export function profileDials(name: ProfileName, shape: ClusterShape, hostCores: number): ProfileDials {
   switch (name) {
-    case "small":  return { workers: 1, batchSize: 500,  pipelineWindow: 1, streamShards: 1 };
+    case "small":  return { workers: 2, batchSize: 2000, pipelineWindow: 4, streamShards: 1 };
     case "medium": return {
       workers: 2, batchSize: 1500, pipelineWindow: 2,
       streamShards: Math.max(1, Math.min(shape.shards, STREAM_SHARDS_CAP)),

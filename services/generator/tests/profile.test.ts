@@ -36,10 +36,22 @@ describe("Wave 5.84C — pickProfile (auto-select from cluster shape)", () => {
 });
 
 describe("Wave 5.84C — profileDials (concrete dial values)", () => {
-  it("small profile: workers=1 batch=500 window=1 streamShards=1", () => {
+  it("small profile: workers=2 batch=2000 window=4 streamShards=1 (Wave 5.94 dial-raise)", () => {
     expect(profileDials("small", shape("standalone", 1), 8)).toEqual({
-      workers: 1, batchSize: 500, pipelineWindow: 1, streamShards: 1,
+      workers: 2, batchSize: 2000, pipelineWindow: 4, streamShards: 1,
     });
+  });
+  it("profile shape: small < medium < large on throughput dials (Wave 5.94)", () => {
+    const s = profileDials("small", shape("standalone", 1), 8);
+    const m = profileDials("medium", shape("cluster", 3), 8);
+    const l = profileDials("large", shape("cluster", 6), 8);
+    // workers monotonic non-decreasing
+    expect(s.workers).toBeLessThanOrEqual(m.workers);
+    expect(m.workers).toBeLessThanOrEqual(l.workers);
+    // batchSize monotonic non-decreasing
+    expect(s.batchSize).toBeLessThanOrEqual(l.batchSize);
+    // small keeps streamShards=1 (single-shard slot-affinity contract)
+    expect(s.streamShards).toBe(1);
   });
   it("medium profile: workers=2 batch=1500 window=2 streamShards=shards", () => {
     expect(profileDials("medium", shape("cluster", 3), 8)).toEqual({
