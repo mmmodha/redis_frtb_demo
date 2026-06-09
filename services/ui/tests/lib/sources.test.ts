@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import {
   deleteSource,
   FRTB_BINDING_KEYS,
@@ -9,10 +9,12 @@ import {
   uploadSource,
   type ColumnMapping,
 } from "../../src/lib/sources";
+import { installFakeXHR, type FakeXHR } from "../helpers/fake-xhr";
 
 const originalFetch = globalThis.fetch;
 afterEach(() => {
   globalThis.fetch = originalFetch;
+  vi.unstubAllGlobals();
 });
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -53,26 +55,34 @@ describe("sources api client", () => {
     expect(await listSources()).toEqual([]);
   });
 
-  it("uploadSource POSTs multipart/form-data with field name 'file' to /sources/upload", async () => {
-    let captured: { url: string; method?: string; body?: BodyInit | null } | null = null;
-    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      captured = { url: typeof input === "string" ? input : input.toString(), method: init?.method, body: init?.body ?? null };
-      return jsonResponse(
-        { id: "src-2", name: "girr.csv", format: "csv", origin: "upload", status: "uploaded", created_at: "t", updated_at: "t" },
-        201,
-      );
-    }) as typeof fetch;
+  it("uploadSource POSTs multipart/form-data with field name 'file' to /sources/upload via XHR", async () => {
+    const harness = installFakeXHR();
     const file = new File(["a,b\n1,2"], "girr.csv", { type: "text/csv" });
-    const out = await uploadSource(file);
-    expect(captured).not.toBeNull();
-    expect(captured!.url).toMatch(/\/sources\/upload$/);
-    expect(captured!.method).toBe("POST");
-    expect(captured!.body).toBeInstanceOf(FormData);
-    const fd = captured!.body as FormData;
-    const sent = fd.get("file");
+    const p = uploadSource(file);
+    const xhr = await harness.waitForSend();
+    expect(xhr.url).toMatch(/\/sources\/upload$/);
+    expect(xhr.method).toBe("POST");
+    expect(xhr.sentBody).toBeInstanceOf(FormData);
+    const sent = (xhr.sentBody as FormData).get("file");
     expect(sent).toBeInstanceOf(File);
     expect((sent as File).name).toBe("girr.csv");
+    xhr.complete(201, JSON.stringify({ id: "src-2", name: "girr.csv", format: "csv", origin: "upload", status: "uploaded", created_at: "t", updated_at: "t" }));
+    const out = await p;
     expect(out.id).toBe("src-2");
+  });
+
+  it("uploadSource invokes onProgress and respects an AbortSignal", async () => {
+    const harness = installFakeXHR();
+    const file = new File(["abc"], "g.csv", { type: "text/csv" });
+    const seen: Array<[number, number]> = [];
+    const ctl = new AbortController();
+    const p = uploadSource(file, { signal: ctl.signal, onProgress: (l, t) => seen.push([l, t]) });
+    const xhr: FakeXHR = await harness.waitForSend();
+    xhr.emitProgress(2, 10);
+    xhr.emitProgress(7, 10);
+    expect(seen).toEqual([[2, 10], [7, 10]]);
+    ctl.abort();
+    await expect(p).rejects.toMatchObject({ name: "AbortError" });
   });
 
   it("deleteSource DELETEs /sources/:id and resolves on 204", async () => {

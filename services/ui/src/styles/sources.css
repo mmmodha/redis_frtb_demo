@@ -22,6 +22,26 @@
 .sources-dropzone__input { position: absolute; left: -9999px; width: 1px; height: 1px; opacity: 0; }
 .sources-panel__action { color: var(--redis-text-secondary); margin: var(--grid) 0 0; font-size: 0.875rem; }
 .sources-panel__error { color: var(--redis-hyper); }
+
+/* Wave 5.91 — in-flight upload rows (live above the registered-sources list). */
+.sources-uploads { list-style: none; padding: 0; margin: var(--grid) 0 0; display: grid; gap: var(--grid); }
+.sources-upload-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: calc(var(--grid) * 2);
+  align-items: center;
+  padding: var(--grid) calc(var(--grid) * 1.5);
+  background: var(--redis-bg-tertiary);
+  border: 1px solid var(--redis-border-secondary);
+  border-radius: var(--radius);
+}
+.sources-upload-row__main { display: grid; gap: 4px; min-width: 0; }
+.sources-upload-row__name { font-size: 0.9375rem; font-weight: 600; color: var(--redis-text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sources-upload-row__meta { display: flex; gap: var(--grid); align-items: center; flex-wrap: wrap; color: var(--redis-text-secondary); font-size: 0.75rem; }
+.sources-upload-row__error { color: var(--redis-hyper); }
+.sources-upload-row__progress { width: 100%; height: 6px; }
+.sources-upload-row__pct { font-size: 0.75rem; color: var(--redis-text-secondary); min-width: 3ch; text-align: right; }
+.sources-upload-row__actions { display: flex; gap: var(--grid); }
 .sources-panel__callouts { display: grid; gap: var(--grid); }
 
 .source-list { list-style: none; padding: 0; margin: 0; display: grid; gap: var(--grid); }

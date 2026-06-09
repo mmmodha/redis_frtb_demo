@@ -3,6 +3,7 @@ import { AppShell } from "./components/AppShell";
 import { GeneratorRunProvider } from "./context/GeneratorRunContext";
 import { PivotBurstProvider } from "./context/PivotBurstContext";
 import { PivotHistoryProvider } from "./context/PivotHistoryContext";
+import { UploadsProvider } from "./context/UploadsContext";
 import { Connections } from "./routes/Connections";
 import { Sources } from "./routes/Sources";
 import { Ingest } from "./routes/Ingest";
@@ -17,19 +18,21 @@ export function App() {
     <PivotBurstProvider>
       <GeneratorRunProvider>
         <PivotHistoryProvider>
-          <AppShell>
-            <Routes>
-              <Route path="/" element={<Navigate to="/observability" replace />} />
-              <Route path="/connections" element={<Connections />} />
-              <Route path="/sources" element={<Sources />} />
-              <Route path="/ingest" element={<Ingest />} />
-              <Route path="/pivot" element={<Pivot />} />
-              <Route path="/calc" element={<Calc />} />
-              <Route path="/observability" element={<Observability />} />
-              <Route path="/loadgen" element={<Loadgen />} />
-              <Route path="/explorer" element={<Explorer />} />
-            </Routes>
-          </AppShell>
+          <UploadsProvider>
+            <AppShell>
+              <Routes>
+                <Route path="/" element={<Navigate to="/observability" replace />} />
+                <Route path="/connections" element={<Connections />} />
+                <Route path="/sources" element={<Sources />} />
+                <Route path="/ingest" element={<Ingest />} />
+                <Route path="/pivot" element={<Pivot />} />
+                <Route path="/calc" element={<Calc />} />
+                <Route path="/observability" element={<Observability />} />
+                <Route path="/loadgen" element={<Loadgen />} />
+                <Route path="/explorer" element={<Explorer />} />
+              </Routes>
+            </AppShell>
+          </UploadsProvider>
         </PivotHistoryProvider>
       </GeneratorRunProvider>
     </PivotBurstProvider>

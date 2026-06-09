@@ -82,12 +82,61 @@ export async function listSources(): Promise<SourceRecord[]> {
   return [];
 }
 
-export async function uploadSource(file: File): Promise<SourceRecord> {
-  const fd = new FormData();
-  fd.append("file", file, file.name);
-  const res = await fetch(`${apiBase()}/sources/upload`, { method: "POST", body: fd });
-  if (!res.ok) throw await asError(res, `api /sources/upload ${res.status}`);
-  return (await res.json()) as SourceRecord;
+// Wave 5.91 — XHR-based upload so we can surface determinate upload progress
+// to the UploadsProvider. The public Promise<SourceRecord> contract is
+// preserved; existing call sites that omit `opts` still work.
+export interface UploadSourceOptions {
+  onProgress?: (bytesUploaded: number, bytesTotal: number) => void;
+  signal?: AbortSignal;
+}
+
+export function uploadSource(file: File, opts: UploadSourceOptions = {}): Promise<SourceRecord> {
+  return new Promise<SourceRecord>((resolve, reject) => {
+    const fd = new FormData();
+    fd.append("file", file, file.name);
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${apiBase()}/sources/upload`);
+
+    const onSignalAbort = (): void => { try { xhr.abort(); } catch { /* noop */ } };
+    if (opts.signal) {
+      if (opts.signal.aborted) {
+        reject(new DOMException("Aborted", "AbortError"));
+        return;
+      }
+      opts.signal.addEventListener("abort", onSignalAbort, { once: true });
+    }
+    const cleanup = (): void => { opts.signal?.removeEventListener("abort", onSignalAbort); };
+
+    if (opts.onProgress) {
+      xhr.upload.onprogress = (ev: ProgressEvent): void => {
+        const total = ev.lengthComputable && ev.total > 0 ? ev.total : file.size;
+        opts.onProgress?.(ev.loaded, total);
+      };
+    }
+
+    xhr.onload = (): void => {
+      cleanup();
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          resolve(JSON.parse(xhr.responseText) as SourceRecord);
+        } catch (e) {
+          reject(new Error(`api /sources/upload parse failed: ${(e as Error).message}`));
+        }
+      } else {
+        reject(new Error(`api /sources/upload ${xhr.status}`));
+      }
+    };
+    xhr.onerror = (): void => {
+      cleanup();
+      reject(new Error(`api /sources/upload network error`));
+    };
+    xhr.onabort = (): void => {
+      cleanup();
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+
+    xhr.send(fd);
+  });
 }
 
 export async function deleteSource(id: string): Promise<void> {

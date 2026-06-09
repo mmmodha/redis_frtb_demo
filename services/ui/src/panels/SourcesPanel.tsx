@@ -7,12 +7,12 @@ import {
   ingestSource,
   listSources,
   saveMapping,
-  uploadSource,
   type ColumnMapping,
   type InferredColumn,
   type SourceRecord,
 } from "../lib/sources";
 import { EmptyTargetError } from "../lib/empty-target";
+import { useUploads, type UploadEntry } from "../context/UploadsContext";
 import { MappingWizard } from "./SourcesPanel/MappingWizard";
 
 const READY_TO_INGEST = new Set(["mapped", "ingested", "error"]);
@@ -42,6 +42,8 @@ export function SourcesPanel() {
   const [dragOver, setDragOver] = useState(false);
   const [lastMessage, setLastMessage] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const { entries: uploads, startUpload, cancel: cancelUpload, dismiss: dismissUpload } = useUploads();
+  const refreshedForRef = useRef<Set<string>>(new Set());
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -65,22 +67,27 @@ export function SourcesPanel() {
 
   useEffect(() => { void refresh(); }, [refresh]);
 
-  async function handleFiles(files: FileList | File[] | null | undefined): Promise<void> {
+  // Wave 5.91 — re-fetch the sources list when any upload completes so the
+  // new server-side row appears, even if the upload finished while the panel
+  // was unmounted. Tracked via a ref so each id triggers exactly one refresh.
+  useEffect(() => {
+    const newlyDone = uploads.filter(
+      (e) => e.status === "succeeded" && e.source_id && !refreshedForRef.current.has(e.id),
+    );
+    if (newlyDone.length === 0) return;
+    for (const e of newlyDone) refreshedForRef.current.add(e.id);
+    void refresh();
+  }, [uploads, refresh]);
+
+  function handleFiles(files: FileList | File[] | null | undefined): void {
     if (!files) return;
     const list = Array.from(files);
     if (list.length === 0) return;
-    setBusyId("upload");
     setLastMessage(null);
-    try {
-      for (const f of list) await uploadSource(f);
-      setLastMessage(`Uploaded ${list.length} file${list.length === 1 ? "" : "s"}`);
-      await refresh();
-    } catch (e) {
-      setLastMessage(`Upload failed: ${(e as Error).message}`);
-    } finally {
-      setBusyId(null);
-    }
+    for (const f of list) startUpload(f);
   }
+
+  const inflightCount = uploads.filter((e) => e.status === "uploading" || e.status === "queued").length;
 
   async function openMapping(src: SourceRecord): Promise<void> {
     setBusyId(src.id);
@@ -146,7 +153,7 @@ export function SourcesPanel() {
   const onDrop = (e: React.DragEvent<HTMLDivElement>): void => {
     e.preventDefault();
     setDragOver(false);
-    void handleFiles(e.dataTransfer?.files);
+    handleFiles(e.dataTransfer?.files);
   };
 
   return (
@@ -172,12 +179,12 @@ export function SourcesPanel() {
           onClick={() => fileInputRef.current?.click()}
           onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") fileInputRef.current?.click(); }}
           className={`sources-dropzone${dragOver ? " is-over" : ""}`}
-          data-busy={busyId === "upload" ? "yes" : "no"}
+          data-busy={inflightCount > 0 ? "yes" : "no"}
         >
           <div className="sources-dropzone__title">Drop CSV / JSONL / Parquet here</div>
           <div className="sources-dropzone__hint">
             or <span className="sources-dropzone__link">browse files</span>
-            {busyId === "upload" ? " · uploading…" : ""}
+            {inflightCount > 0 ? ` · ${inflightCount} uploading…` : ""}
           </div>
           <input
             ref={fileInputRef}
@@ -185,11 +192,18 @@ export function SourcesPanel() {
             multiple
             accept=".csv,.jsonl,.ndjson,.parquet,text/csv,application/json"
             className="sources-dropzone__input"
-            onChange={(e) => { void handleFiles(e.target.files); e.target.value = ""; }}
+            onChange={(e) => { handleFiles(e.target.files); e.target.value = ""; }}
             aria-hidden="true"
             tabIndex={-1}
           />
         </div>
+        {uploads.length > 0 ? (
+          <ul className="sources-uploads" data-testid="uploads-list" aria-live="polite">
+            {uploads.map((u) => (
+              <UploadRow key={u.id} entry={u} onCancel={cancelUpload} onDismiss={dismissUpload} />
+            ))}
+          </ul>
+        ) : null}
         {lastMessage ? <p className="sources-panel__action" role="status">{lastMessage}</p> : null}
       </PanelCard>
 
@@ -319,6 +333,53 @@ export function SourcesPanel() {
         </EnterpriseCallout>
       </div>
     </div>
+  );
+}
+
+interface UploadRowProps {
+  entry: UploadEntry;
+  onCancel: (id: string) => void;
+  onDismiss: (id: string) => void;
+}
+
+function UploadRow({ entry, onCancel, onDismiss }: UploadRowProps): JSX.Element {
+  const isInflight = entry.status === "uploading" || entry.status === "queued";
+  const total = entry.size_bytes > 0 ? entry.size_bytes : undefined;
+  const pct = total && total > 0 ? Math.min(100, Math.round((entry.bytes_uploaded / total) * 100)) : 0;
+  return (
+    <li className="sources-upload-row" data-testid={`upload-row-${entry.id}`} data-status={entry.status}>
+      <div className="sources-upload-row__main">
+        <div className="sources-upload-row__name mono">{entry.name}</div>
+        <div className="sources-upload-row__meta">
+          <span className="sources-upload-row__bytes">
+            {fmtBytes(entry.bytes_uploaded)} / {fmtBytes(entry.size_bytes)}
+          </span>
+          <span data-testid="upload-status-pill" data-status={entry.status} className="status-pill">
+            {entry.status}
+          </span>
+          {entry.error ? <span className="sources-upload-row__error">{entry.error}</span> : null}
+        </div>
+        <progress
+          className="sources-upload-row__progress"
+          data-testid={`upload-progress-${entry.id}`}
+          aria-label={`Uploading ${entry.name}`}
+          max={total ?? 1}
+          value={total ? entry.bytes_uploaded : 0}
+        />
+      </div>
+      <div className="sources-upload-row__actions">
+        {isInflight ? (
+          <button type="button" className="btn" onClick={() => onCancel(entry.id)}>
+            Cancel
+          </button>
+        ) : (
+          <button type="button" className="btn" onClick={() => onDismiss(entry.id)}>
+            Dismiss
+          </button>
+        )}
+      </div>
+      <span className="sources-upload-row__pct" aria-hidden="true">{pct}%</span>
+    </li>
   );
 }
 

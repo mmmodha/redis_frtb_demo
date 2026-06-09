@@ -2,6 +2,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { SourcesPanel } from "../../src/panels/SourcesPanel";
+import { UploadsProvider } from "../../src/context/UploadsContext";
+import { installFakeXHR } from "../helpers/fake-xhr";
 
 vi.mock("../../src/components/PanelCard", () => ({
   PanelCard: ({ title, children, actions }: { title: string; children: React.ReactNode; actions?: React.ReactNode }) => (
@@ -44,7 +46,9 @@ function makeSource(over: Partial<Record<string, unknown>> = {}) {
 function renderPanel() {
   return render(
     <MemoryRouter>
-      <SourcesPanel />
+      <UploadsProvider>
+        <SourcesPanel />
+      </UploadsProvider>
     </MemoryRouter>,
   );
 }
@@ -171,24 +175,93 @@ describe("SourcesPanel", () => {
     });
   });
 
-  it("drag-drop onto the dropzone POSTs the file to /sources/upload", async () => {
-    let uploaded = false;
-    fetchMock.mockImplementation(async (input: RequestInfo, init?: RequestInit) => {
-      const url = String(input);
-      const method = init?.method ?? "GET";
-      if (url.endsWith("/sources") && method === "GET") return jsonResponse([]);
-      if (/\/sources\/upload$/.test(url) && method === "POST") {
-        uploaded = true;
-        expect(init?.body).toBeInstanceOf(FormData);
-        return jsonResponse(makeSource({ id: "src-9", name: "drop.csv" }), 201);
-      }
-      return jsonResponse({});
-    });
+  it("drag-drop onto the dropzone POSTs the file to /sources/upload (via XHR)", async () => {
+    const harness = installFakeXHR();
+    fetchMock.mockImplementation(async () => jsonResponse([]));
     renderPanel();
     const dz = await waitFor(() => screen.getByTestId("sources-dropzone"));
     const file = new File(["a,b\n1,2"], "drop.csv", { type: "text/csv" });
     const dt = { files: [file], items: [{ kind: "file", type: "text/csv", getAsFile: () => file }], types: ["Files"] } as unknown as DataTransfer;
     fireEvent.drop(dz, { dataTransfer: dt });
-    await waitFor(() => expect(uploaded).toBe(true));
+    const xhr = await harness.waitForSend();
+    expect(xhr.url).toMatch(/\/sources\/upload$/);
+    expect(xhr.method).toBe("POST");
+    expect(xhr.sentBody).toBeInstanceOf(FormData);
+    const sent = (xhr.sentBody as FormData).get("file");
+    expect(sent).toBeInstanceOf(File);
+    expect((sent as File).name).toBe("drop.csv");
+    xhr.complete(201, JSON.stringify(makeSource({ id: "src-9", name: "drop.csv" })));
+  });
+
+  it("drag-drop shows an in-flight upload row with a progress bar and Cancel button", async () => {
+    const harness = installFakeXHR();
+    fetchMock.mockImplementation(async () => jsonResponse([]));
+    renderPanel();
+    const dz = await waitFor(() => screen.getByTestId("sources-dropzone"));
+    const file = new File(["abcdefghij"], "slow.csv", { type: "text/csv" });
+    const dt = { files: [file], items: [{ kind: "file", type: "text/csv", getAsFile: () => file }], types: ["Files"] } as unknown as DataTransfer;
+    fireEvent.drop(dz, { dataTransfer: dt });
+    const xhr = await harness.waitForSend();
+    // The row should appear immediately with status=uploading.
+    const list = await waitFor(() => screen.getByTestId("uploads-list"));
+    expect(within(list).getByText(/slow\.csv/)).toBeInTheDocument();
+    // Emit progress and confirm the <progress> element reflects it.
+    xhr.emitProgress(5, 10);
+    await waitFor(() => {
+      const bars = list.querySelectorAll("progress");
+      expect(bars[0]!.value).toBeGreaterThan(0);
+    });
+    // Cancel button is wired to xhr.abort().
+    const cancelBtn = within(list).getByRole("button", { name: /cancel/i });
+    fireEvent.click(cancelBtn);
+    await waitFor(() => {
+      expect(within(list).getByTestId("upload-status-pill")).toHaveAttribute("data-status", "aborted");
+    });
+  });
+
+  it("in-flight upload survives unmount → remount of SourcesPanel (cross-panel survival)", async () => {
+    const harness = installFakeXHR();
+    fetchMock.mockImplementation(async () => jsonResponse([]));
+    // Provider lives ABOVE the panel — the panel can unmount/remount and the
+    // upload state remains alive.
+    const Panel = () => (
+      <MemoryRouter>
+        <SourcesPanel />
+      </MemoryRouter>
+    );
+    const { rerender } = render(
+      <UploadsProvider>
+        <Panel />
+      </UploadsProvider>,
+    );
+    const dz = await waitFor(() => screen.getByTestId("sources-dropzone"));
+    const file = new File(["xxxxxxxxxx"], "survive.csv", { type: "text/csv" });
+    const dt = { files: [file], items: [{ kind: "file", type: "text/csv", getAsFile: () => file }], types: ["Files"] } as unknown as DataTransfer;
+    fireEvent.drop(dz, { dataTransfer: dt });
+    const xhr = await harness.waitForSend();
+    xhr.emitProgress(3, 10);
+    await waitFor(() => expect(screen.getByText(/survive\.csv/)).toBeInTheDocument());
+
+    // Swap the panel for a stand-in (simulates navigating to /calc).
+    rerender(
+      <UploadsProvider>
+        <div data-testid="other-panel">other panel</div>
+      </UploadsProvider>,
+    );
+    expect(screen.queryByTestId("sources-dropzone")).toBeNull();
+
+    // More progress while panel is unmounted.
+    xhr.emitProgress(7, 10);
+
+    // Remount — the row must still be visible at its current progress (>0).
+    rerender(
+      <UploadsProvider>
+        <Panel />
+      </UploadsProvider>,
+    );
+    const list = await waitFor(() => screen.getByTestId("uploads-list"));
+    expect(within(list).getByText(/survive\.csv/)).toBeInTheDocument();
+    const bar = list.querySelector("progress")!;
+    expect(bar.value).toBeGreaterThan(0);
   });
 });
