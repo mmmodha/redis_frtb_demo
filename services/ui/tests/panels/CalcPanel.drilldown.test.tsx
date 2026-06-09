@@ -463,4 +463,197 @@ describe("CalcPanel Wave 5.18 polish + drill-down", () => {
         .toMatch(/^FCALL sbm_delta_bucket/);
     });
   });
+
+  // Wave 5.96A.1 — per-component breakdown tables (WS_k², cross-term pairs,
+  // CVR_k^± for curvature). Tables sit beneath the existing K_b formula block
+  // and are gated on intermediate.path === "fast" (Lua-routed buckets hide
+  // them — see Wave 5.96A option B).
+  describe("Wave 5.96A.1: per-component breakdown tables", () => {
+    function calcResponseWithComponents(extra: Record<string, unknown>) {
+      return {
+        ...calcResponse,
+        per_bucket: [{
+          bucket: "USD", K_b: 8.66025, S_b: 10, count: 5, ms: 3.2,
+          intermediate: {
+            path: "fast", ws_squared_sum: 50, cross_term: 25,
+            ws_components: [
+              { k: "3M", ws: 3, ws_squared: 9 },
+              { k: "6M", ws: 4, ws_squared: 16 },
+              { k: "1Y", ws: 5, ws_squared: 25 },
+            ],
+            cross_components: [
+              { k: "1Y", l: "6M", rho: 0.5, ws_k: 5, ws_l: 4, contrib: 10 },
+              { k: "6M", l: "1Y", rho: 0.5, ws_k: 4, ws_l: 5, contrib: 10 },
+              { k: "3M", l: "1Y", rho: 0.5, ws_k: 3, ws_l: 5, contrib: 7.5 },
+            ],
+            cross_components_truncated: false,
+            cross_components_total_count: 3,
+            ...extra,
+          },
+          resolved_command: "FT.AGGREGATE idx:sens ... APPLY ...",
+        }],
+      };
+    }
+
+    it("Delta fast path renders WS table with one row per component and totals", async () => {
+      fetchRouter({
+        calc: () =>
+          new Response(JSON.stringify(calcResponseWithComponents({})), {
+            headers: { "content-type": "application/json" },
+          }),
+      });
+      render(<CalcPanel />);
+      await runCalc(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
+      fireEvent.click(
+        within(screen.getByTestId("bucket-chart"))
+          .getAllByTestId("bucket-chart-row")
+          .find((r) => r.getAttribute("data-bucket") === "USD")!,
+      );
+      await waitFor(() => expect(screen.getByTestId("bucket-drilldown-ws-breakdown")).toBeInTheDocument());
+      const rows = screen.getAllByTestId("bucket-drilldown-ws-row");
+      expect(rows).toHaveLength(3);
+      const total = screen.getByTestId("bucket-drilldown-ws-total").textContent ?? "";
+      expect(total).toContain("50.00000");
+    });
+
+    it("Delta fast path renders cross-term table with rows + total", async () => {
+      fetchRouter({
+        calc: () =>
+          new Response(JSON.stringify(calcResponseWithComponents({})), {
+            headers: { "content-type": "application/json" },
+          }),
+      });
+      render(<CalcPanel />);
+      await runCalc(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
+      fireEvent.click(
+        within(screen.getByTestId("bucket-chart"))
+          .getAllByTestId("bucket-chart-row")
+          .find((r) => r.getAttribute("data-bucket") === "USD")!,
+      );
+      await waitFor(() => expect(screen.getByTestId("bucket-drilldown-cross-breakdown")).toBeInTheDocument());
+      const rows = screen.getAllByTestId("bucket-drilldown-cross-row");
+      expect(rows).toHaveLength(3);
+      const total = screen.getByTestId("bucket-drilldown-cross-total").textContent ?? "";
+      expect(total).toContain("25.00000");
+      // No "Show all" button when not truncated.
+      expect(screen.queryByTestId("bucket-drilldown-cross-show-all")).toBeNull();
+    });
+
+    it("Show all triggers bucket-cross-detail fetch and swaps rows", async () => {
+      const fullList = Array.from({ length: 20 }, (_, i) => ({
+        k: `RF${i}`, l: `RF${i + 1}`, rho: 0.5, ws_k: i, ws_l: i + 1, contrib: 0.5 * i * (i + 1),
+      }));
+      const detailHandler = vi.fn(() =>
+        new Response(JSON.stringify({ bucket: "USD", cross_components: fullList }), {
+          headers: { "content-type": "application/json" },
+        }),
+      );
+      globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes("/bucket-cross-detail")) return detailHandler();
+        if (url.includes("/calc/sbm")) {
+          return new Response(JSON.stringify(calcResponseWithComponents({
+            cross_components: Array.from({ length: 10 }, (_, i) => ({
+              k: `RF${i}`, l: `RF${i + 1}`, rho: 0.5, ws_k: i, ws_l: i + 1, contrib: 1.0 - i * 0.1,
+            })),
+            cross_components_truncated: true,
+            cross_components_total_count: 20,
+          })), { headers: { "content-type": "application/json" } });
+        }
+        if (url.includes("/pivot")) {
+          return new Response(JSON.stringify({ rows: [], total: 0, limit: 20, offset: 0, ms: 1 }), {
+            headers: { "content-type": "application/json" },
+          });
+        }
+        return new Response("not found", { status: 404 });
+      }) as typeof fetch;
+      render(<CalcPanel />);
+      await runCalc(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
+      fireEvent.click(
+        within(screen.getByTestId("bucket-chart"))
+          .getAllByTestId("bucket-chart-row")
+          .find((r) => r.getAttribute("data-bucket") === "USD")!,
+      );
+      await waitFor(() => expect(screen.getByTestId("bucket-drilldown-cross-breakdown")).toBeInTheDocument());
+      // Initially top-10 shown.
+      expect(screen.getAllByTestId("bucket-drilldown-cross-row")).toHaveLength(10);
+      const showAll = screen.getByTestId("bucket-drilldown-cross-show-all");
+      expect(showAll.textContent).toMatch(/Show all 20/);
+      fireEvent.click(showAll);
+      // After fetch resolves, full 20 rows render and button toggles.
+      await waitFor(() => expect(screen.getAllByTestId("bucket-drilldown-cross-row")).toHaveLength(20));
+      expect(detailHandler).toHaveBeenCalledTimes(1);
+      expect(screen.getByTestId("bucket-drilldown-cross-show-all").textContent).toMatch(/Show top 10/);
+      // Toggle back collapses to top-10.
+      fireEvent.click(screen.getByTestId("bucket-drilldown-cross-show-all"));
+      expect(screen.getAllByTestId("bucket-drilldown-cross-row")).toHaveLength(10);
+    });
+
+    it("Curvature buckets render CVR_k^± table instead of WS/cross tables", async () => {
+      fetchRouter({
+        calc: () =>
+          new Response(JSON.stringify({
+            ...calcResponse,
+            per_bucket: [{
+              bucket: "USD", K_b: Math.sqrt(14.5), S_b: 4, count: 3, ms: 4.1,
+              intermediate: {
+                path: "fast", ws_squared_sum: 14, cross_term: 0.5,
+                curvature: {
+                  k_plus: Math.sqrt(14.5), k_minus: Math.sqrt(4.5), winner: "plus",
+                  cvr_components: [
+                    { k: "3M", cvr_up: 2, cvr_down: 1 },
+                    { k: "6M", cvr_up: 3, cvr_down: 1 },
+                    { k: "1Y", cvr_up: -1, cvr_down: 1 },
+                  ],
+                },
+              },
+              resolved_command: "FT.AGGREGATE idx:sens ... APPLY ...",
+            }],
+          }), { headers: { "content-type": "application/json" } }),
+      });
+      render(<CalcPanel />);
+      fireEvent.change(screen.getByLabelText(/^sensitivity$/i), { target: { value: "Curvature" } });
+      await runCalc(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
+      fireEvent.click(
+        within(screen.getByTestId("bucket-chart"))
+          .getAllByTestId("bucket-chart-row")
+          .find((r) => r.getAttribute("data-bucket") === "USD")!,
+      );
+      await waitFor(() => expect(screen.getByTestId("bucket-drilldown-cvr-breakdown")).toBeInTheDocument());
+      const rows = screen.getAllByTestId("bucket-drilldown-cvr-row");
+      expect(rows).toHaveLength(3);
+      // WS and cross tables are not rendered on curvature buckets.
+      expect(screen.queryByTestId("bucket-drilldown-ws-breakdown")).toBeNull();
+      expect(screen.queryByTestId("bucket-drilldown-cross-breakdown")).toBeNull();
+      // Totals row mentions the winner direction.
+      const total = screen.getByTestId("bucket-drilldown-cvr-total").textContent ?? "";
+      expect(total).toMatch(/winner/);
+    });
+
+    it("Lua path hides component tables (intermediate.path === 'lua')", async () => {
+      fetchRouter({
+        calc: () =>
+          new Response(JSON.stringify({
+            ...calcResponse,
+            engine: "fcall_lua",
+            per_bucket: [{
+              bucket: "USD", K_b: 3, S_b: 3, count: 5, ms: 1.0,
+              intermediate: { path: "lua" },
+              resolved_command: "FCALL sbm_delta_bucket 1 sens:{GIRR:USD}:_route GIRR USD",
+            }],
+          }), { headers: { "content-type": "application/json" } }),
+      });
+      render(<CalcPanel />);
+      await runCalc(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
+      fireEvent.click(
+        within(screen.getByTestId("bucket-chart"))
+          .getAllByTestId("bucket-chart-row")
+          .find((r) => r.getAttribute("data-bucket") === "USD")!,
+      );
+      await waitFor(() => expect(screen.getByTestId("bucket-drilldown-formula-lua")).toBeInTheDocument());
+      expect(screen.queryByTestId("bucket-drilldown-ws-breakdown")).toBeNull();
+      expect(screen.queryByTestId("bucket-drilldown-cross-breakdown")).toBeNull();
+      expect(screen.queryByTestId("bucket-drilldown-cvr-breakdown")).toBeNull();
+    });
+  });
 });

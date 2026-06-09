@@ -38,16 +38,47 @@ export interface CalcSbmRequest {
 // with substituted numbers; absent (or `path: "lua"`) on the legacy FCALL path,
 // where the intermediates are computed inside the kernel and not surfaced.
 export type BucketPath = "fast" | "lua";
+// Wave 5.96A.1 — per-component breakdown so the drilldown UI can render the
+// individual WS_k / WS_k² + dominant pairwise contribs that summed into
+// ws_squared_sum and cross_term.
+export interface WsComponent {
+  k: string;
+  ws: number;
+  ws_squared: number;
+}
+export interface CrossComponent {
+  k: string;
+  l: string;
+  rho: number;
+  ws_k: number;
+  ws_l: number;
+  contrib: number;
+}
+export interface CvrComponent {
+  k: string;
+  cvr_up: number;
+  cvr_down: number;
+}
 export interface BucketCurvatureIntermediate {
   k_plus: number;
   k_minus: number;
   winner: "plus" | "minus";
+  // Wave 5.96A.1 — per-risk-factor CVR pairs whose signed sums precede the
+  // §21.5(3) max selection.
+  cvr_components?: CvrComponent[];
 }
 export interface BucketIntermediate {
   path: BucketPath;
   ws_squared_sum?: number;
   cross_term?: number;
   curvature?: BucketCurvatureIntermediate;
+  // Wave 5.96A.1 — additive per-component arrays. Present on the fast path
+  // with the top-10 cross_components by |contrib| and a truncation flag so
+  // the UI can fetch the full list via /calc/sbm/bucket-cross-detail.
+  ws_components?: WsComponent[];
+  cross_components?: CrossComponent[];
+  cross_components_truncated?: boolean;
+  cross_components_total_count?: number;
 }
 export interface BucketResult {
   bucket: string;
@@ -130,4 +161,28 @@ export async function postCalcSbm(body: CalcSbmRequest): Promise<CalcSbmResponse
     throw await buildApiError(res, `api /calc/sbm ${res.status}`);
   }
   return (await res.json()) as CalcSbmResponse;
+}
+
+// Wave 5.96A.1 — full cross-component listing for a single bucket. The
+// /calc/sbm response caps cross_components at the top-10 by |contrib|; the
+// drilldown's "Show all" toggle calls this to fetch the complete pair list.
+export interface BucketCrossDetailRequest extends CalcSbmRequest {
+  bucket: string;
+}
+export interface BucketCrossDetailResponse {
+  bucket: string;
+  cross_components: CrossComponent[];
+}
+export async function postBucketCrossDetail(
+  body: BucketCrossDetailRequest,
+): Promise<BucketCrossDetailResponse> {
+  const res = await fetch(`${apiBase()}/calc/sbm/bucket-cross-detail`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    throw await buildApiError(res, `api /calc/sbm/bucket-cross-detail ${res.status}`);
+  }
+  return (await res.json()) as BucketCrossDetailResponse;
 }

@@ -567,6 +567,11 @@ export function registerCalcRoute(
               risk_factor: excludeCsv.risk_factor ? excludeCsv.risk_factor.split(",") : [],
             },
           },
+          // Wave 5.96A.1 — surface ws_components + top-10 cross_components +
+          // (curvature) cvr_components on every per-bucket intermediate so the
+          // drilldown UI can render the component-level breakdown without an
+          // extra round-trip on the common case.
+          components: { crossTopN: 10 },
         });
         // Match the legacy bucket order (input `buckets` from discovery) so the
         // dispatched_keys[i]/results[i] correspondence holds. Missing fast-path
@@ -737,4 +742,101 @@ export function registerCalcRoute(
     if (!noCache) storeCalcCache(cacheKey, body);
     return { ...body, cache: "miss" as const };
   });
+
+  // Wave 5.96A.1 — full per-bucket cross-component listing. The /calc/sbm
+  // response carries the top-10 pairs by |contrib| on each bucket; this
+  // endpoint reuses the same fast-path reducer for a SINGLE bucket with the
+  // top-N cap removed so the UI's "Show all" toggle gets the complete list.
+  // Mirrors /calc/sbm validation rules (uppercase risk_class, leg allow-list,
+  // exclude predicates) and refuses non-fast-path requests since Lua kernels
+  // don't surface component-level data (Wave 5.96A option B).
+  app.post<{ Body: CalcBody & { bucket?: string } }>(
+    "/calc/sbm/bucket-cross-detail",
+    async (req, reply) => {
+      const risk_class_raw = req.body?.risk_class;
+      const legRaw = req.body?.sensitivity_type;
+      const bucketRaw = req.body?.bucket;
+      if (!risk_class_raw || !legRaw || !bucketRaw) {
+        reply.code(400);
+        return { error: "risk_class, sensitivity_type and bucket are required" };
+      }
+      const leg = String(legRaw).toLowerCase();
+      if (!ALLOWED_LEG.has(leg)) {
+        reply.code(400);
+        return { error: `sensitivity_type must be one of: Delta, Vega, Curvature (got ${legRaw})` };
+      }
+      if (typeof bucketRaw !== "string" || bucketRaw.length === 0) {
+        reply.code(400);
+        return { error: "bucket must be a non-empty string" };
+      }
+      const risk_class = String(risk_class_raw).toUpperCase();
+      const bucket = bucketRaw.toUpperCase();
+
+      // Mirror /calc/sbm exclude validation so the per-bucket slice respects
+      // the same kernel-side row-exclusion predicates.
+      const excludeRaw = req.body?.exclude;
+      const excludeArr: Record<ExcludeKey, string[]> = { book: [], trade_id: [], risk_factor: [] };
+      if (excludeRaw !== undefined && excludeRaw !== null) {
+        if (typeof excludeRaw !== "object" || Array.isArray(excludeRaw)) {
+          reply.code(400);
+          return { error: "exclude must be an object with optional book/trade_id/risk_factor arrays" };
+        }
+        for (const key of EXCLUDE_KEYS) {
+          const list = (excludeRaw as Record<string, unknown>)[key];
+          if (list === undefined || list === null) continue;
+          if (!Array.isArray(list)) {
+            reply.code(400);
+            return { error: `exclude.${key} must be an array of non-empty strings` };
+          }
+          if (list.length > MAX_EXCLUDE_LIST) {
+            reply.code(413);
+            return { error: `exclude.${key} exceeds maximum of ${MAX_EXCLUDE_LIST} entries` };
+          }
+          const seen = new Set<string>();
+          for (const v of list) {
+            if (typeof v !== "string" || v.length === 0) {
+              reply.code(400);
+              return { error: `exclude.${key} must be an array of non-empty strings` };
+            }
+            if (v.includes(",")) {
+              reply.code(400);
+              return { error: `exclude.${key} values may not contain commas` };
+            }
+            seen.add(v);
+          }
+          excludeArr[key] = Array.from(seen);
+        }
+      }
+
+      if (!opts.schema) {
+        reply.code(503);
+        return { error: "fast-path schema unavailable", hint: "bucket-cross-detail requires CALC_FAST_PATH" };
+      }
+      const redis = getRedis();
+      const target_label = getActiveTarget().label;
+      try {
+        const results = await aggregateBucketsViaIndex({
+          redis,
+          schema: opts.schema,
+          riskClass: risk_class,
+          leg: leg as Leg,
+          filters: { bucketSubset: [bucket], exclude: excludeArr },
+          components: { crossTopN: null },
+        });
+        const hit = results.find((r) => r.bucket === bucket);
+        if (!hit) {
+          return { bucket, cross_components: [] };
+        }
+        const cross = hit.intermediate?.cross_components ?? [];
+        return { bucket, cross_components: cross };
+      } catch (err) {
+        const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
+        if (translated) {
+          reply.code(translated.status);
+          return translated.body;
+        }
+        throw err;
+      }
+    },
+  );
 }

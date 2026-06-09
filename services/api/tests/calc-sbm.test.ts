@@ -1702,6 +1702,287 @@ describe("POST /calc/sbm — MVP endpoint", () => {
       expect(Math.abs(body.per_bucket[0].S_b - winner.S_b)).toBeLessThanOrEqual(1e-9);
     });
 
+    // Wave 5.96A.1 — per-bucket K_b component breakdown: ws_components,
+    // cross_components (top 10 + truncated flag), cvr_components for curvature,
+    // plus the bucket-cross-detail endpoint for the full pair list.
+    describe("Wave 5.96A.1: per-component breakdown", () => {
+      // Per-RF FT.AGGREGATE reply shape: rows of (bucket, risk_factor, sums).
+      function perRfRow(bucket: string, rf: string, kv: Record<string, number | string>): unknown[] {
+        const row: unknown[] = ["bucket", bucket, "risk_factor", rf];
+        for (const [k, v] of Object.entries(kv)) row.push(k, String(v));
+        return row;
+      }
+      // FT.AGGREGATE dispatch helper that routes between discovery, main fast-
+      // path, and per-RF components aggregate via args inspection.
+      function routeFtAggregate(replies: {
+        discovery: (args: unknown[]) => unknown;
+        main: (args: unknown[]) => unknown;
+        perRf: (args: unknown[]) => unknown;
+      }) {
+        return (args: unknown[]) => {
+          if (!args.includes("APPLY")) return replies.discovery(args);
+          if (args.includes("@risk_factor")) return replies.perRf(args);
+          return replies.main(args);
+        };
+      }
+
+      it("GIRR Delta perTenor: ws_components match per-tenor sums; Σ ws_squared = ws_squared_sum", async () => {
+        const fr = fakeRedis();
+        fr.setResponse("FT.AGGREGATE", routeFtAggregate({
+          discovery: () => ftAggregateReply(["USD"]),
+          main: () => [1, ftAggRow("USD", {
+            sum_d_ws_girr_delta_3M: 3,
+            sum_d_ws_girr_delta_6M: 4,
+            sum_d_ws_girr_delta_1Y: 0,
+            row_count: 7,
+          })],
+          perRf: () => [0],  // unused for GIRR perTenor
+        }));
+        app = await createServer({ redis: fr, schema: fastPathSchema() });
+        const res = await app.inject({
+          method: "POST",
+          url: "/calc/sbm",
+          payload: { risk_class: "GIRR", sensitivity_type: "Delta" },
+        });
+        expect(res.statusCode).toBe(200);
+        const pb = res.json().per_bucket[0];
+        const ws = pb.intermediate.ws_components;
+        expect(Array.isArray(ws)).toBe(true);
+        // Component count matches tenor count from schema (3M, 6M, 1Y).
+        expect(ws.length).toBe(3);
+        const sumWsSq = ws.reduce((acc: number, c: { ws_squared: number }) => acc + c.ws_squared, 0);
+        expect(Math.abs(sumWsSq - pb.intermediate.ws_squared_sum)).toBeLessThanOrEqual(1e-9);
+      });
+
+      it("Equity Delta scalar: per-RF aggregate populates ws_components with Σ ws_squared = ws_squared_sum", async () => {
+        // 3 RFs in bucket "1" with WS sums [2, 3, -1] and squared sums [4, 9, 1].
+        // ws_squared_sum (main aggregate) = 4 + 9 + 1 = 14.
+        // sumWs (main) = 2 + 3 - 1 = 4 → cross_term = 0.5·(16-14) = 1; K_b² = 15.
+        const fr = fakeRedis();
+        fr.setResponse("FT.AGGREGATE", routeFtAggregate({
+          discovery: () => ftAggregateReply(["1"]),
+          main: () => [1, ftAggRow("1", {
+            sum_d_ws_equity_delta: 4,
+            sum_d_ws_equity_delta_sq: 14,
+            row_count: 3,
+          })],
+          perRf: () => [
+            3,
+            perRfRow("1", "AAPL", { sum_d_ws_equity_delta: 2, sum_d_ws_equity_delta_sq: 4 }),
+            perRfRow("1", "GOOG", { sum_d_ws_equity_delta: 3, sum_d_ws_equity_delta_sq: 9 }),
+            perRfRow("1", "MSFT", { sum_d_ws_equity_delta: -1, sum_d_ws_equity_delta_sq: 1 }),
+          ],
+        }));
+        app = await createServer({ redis: fr, schema: fastPathSchema() });
+        const res = await app.inject({
+          method: "POST",
+          url: "/calc/sbm",
+          payload: { risk_class: "Equity", sensitivity_type: "Delta" },
+        });
+        expect(res.statusCode).toBe(200);
+        const pb = res.json().per_bucket[0];
+        const ws = pb.intermediate.ws_components;
+        expect(ws.length).toBe(3);
+        const sumWsSq = ws.reduce((acc: number, c: { ws_squared: number }) => acc + c.ws_squared, 0);
+        expect(Math.abs(sumWsSq - pb.intermediate.ws_squared_sum)).toBeLessThanOrEqual(1e-9);
+        const keys = ws.map((c: { k: string }) => c.k).sort();
+        expect(keys).toEqual(["AAPL", "GOOG", "MSFT"]);
+      });
+
+      it("Equity Vega scalar: ws_components populated via per-RF aggregate", async () => {
+        const fr = fakeRedis();
+        fr.setResponse("FT.AGGREGATE", routeFtAggregate({
+          discovery: () => ftAggregateReply(["1"]),
+          main: () => [1, ftAggRow("1", {
+            sum_v_ws_equity_vega: 6, sum_v_ws_equity_vega_sq: 20, row_count: 3,
+          })],
+          perRf: () => [
+            2,
+            perRfRow("1", "AAPL", { sum_v_ws_equity_vega: 4, sum_v_ws_equity_vega_sq: 16 }),
+            perRfRow("1", "MSFT", { sum_v_ws_equity_vega: 2, sum_v_ws_equity_vega_sq: 4 }),
+          ],
+        }));
+        app = await createServer({ redis: fr, schema: fastPathSchema() });
+        const res = await app.inject({
+          method: "POST", url: "/calc/sbm",
+          payload: { risk_class: "Equity", sensitivity_type: "Vega" },
+        });
+        expect(res.statusCode).toBe(200);
+        const pb = res.json().per_bucket[0];
+        const ws = pb.intermediate.ws_components;
+        expect(ws.length).toBe(2);
+        const sumWsSq = ws.reduce((acc: number, c: { ws_squared: number }) => acc + c.ws_squared, 0);
+        expect(Math.abs(sumWsSq - pb.intermediate.ws_squared_sum)).toBeLessThanOrEqual(1e-9);
+      });
+
+      it("cross_components sorted by descending |contrib| with length ≤ 10 and truncated flag set when > 10", async () => {
+        // 12 RFs with monotonically increasing WS so |contrib| ordering is
+        // predictable. With WS_i = i+1 for i=0..11 (so [1,2,3,4,5,6,7,8,9,10,11,12])
+        // and ρ=0.5, the biggest contribs are 0.5·11·12 (and 0.5·12·11) = 66.
+        const N = 12;
+        const ws = Array.from({ length: N }, (_, i) => i + 1);
+        const sumWs = ws.reduce((a, b) => a + b, 0);
+        const sumWsSq = ws.reduce((a, b) => a + b * b, 0);
+        const fr = fakeRedis();
+        fr.setResponse("FT.AGGREGATE", routeFtAggregate({
+          discovery: () => ftAggregateReply(["1"]),
+          main: () => [1, ftAggRow("1", {
+            sum_d_ws_equity_delta: sumWs, sum_d_ws_equity_delta_sq: sumWsSq, row_count: N,
+          })],
+          perRf: () => {
+            const rows: unknown[] = [N];
+            for (let i = 0; i < N; i++) {
+              rows.push(perRfRow("1", `RF${String(i).padStart(2, "0")}`, {
+                sum_d_ws_equity_delta: ws[i]!,
+                sum_d_ws_equity_delta_sq: ws[i]! * ws[i]!,
+              }));
+            }
+            return rows;
+          },
+        }));
+        app = await createServer({ redis: fr, schema: fastPathSchema() });
+        const res = await app.inject({
+          method: "POST", url: "/calc/sbm",
+          payload: { risk_class: "Equity", sensitivity_type: "Delta" },
+        });
+        expect(res.statusCode).toBe(200);
+        const pb = res.json().per_bucket[0];
+        const cc = pb.intermediate.cross_components;
+        expect(cc.length).toBe(10);
+        expect(pb.intermediate.cross_components_truncated).toBe(true);
+        expect(pb.intermediate.cross_components_total_count).toBe(N * (N - 1));
+        // Sorted descending by |contrib|.
+        for (let i = 1; i < cc.length; i++) {
+          expect(Math.abs(cc[i - 1].contrib)).toBeGreaterThanOrEqual(Math.abs(cc[i].contrib));
+        }
+        // Top pair must be RF10/RF11 (or its mirror) with contrib = 0.5·11·12 = 66.
+        expect(Math.abs(cc[0].contrib)).toBeCloseTo(0.5 * 11 * 12, 9);
+      });
+
+      it("cross_components_truncated is false when total pair count ≤ 10", async () => {
+        // 3 RFs → 6 ordered pairs ≤ 10 → not truncated.
+        const fr = fakeRedis();
+        fr.setResponse("FT.AGGREGATE", routeFtAggregate({
+          discovery: () => ftAggregateReply(["1"]),
+          main: () => [1, ftAggRow("1", {
+            sum_d_ws_equity_delta: 4, sum_d_ws_equity_delta_sq: 14, row_count: 3,
+          })],
+          perRf: () => [
+            3,
+            perRfRow("1", "AAPL", { sum_d_ws_equity_delta: 2, sum_d_ws_equity_delta_sq: 4 }),
+            perRfRow("1", "GOOG", { sum_d_ws_equity_delta: 3, sum_d_ws_equity_delta_sq: 9 }),
+            perRfRow("1", "MSFT", { sum_d_ws_equity_delta: -1, sum_d_ws_equity_delta_sq: 1 }),
+          ],
+        }));
+        app = await createServer({ redis: fr, schema: fastPathSchema() });
+        const res = await app.inject({
+          method: "POST", url: "/calc/sbm",
+          payload: { risk_class: "Equity", sensitivity_type: "Delta" },
+        });
+        expect(res.statusCode).toBe(200);
+        const pb = res.json().per_bucket[0];
+        expect(pb.intermediate.cross_components.length).toBe(6);
+        expect(pb.intermediate.cross_components_truncated).toBe(false);
+        expect(pb.intermediate.cross_components_total_count).toBe(6);
+      });
+
+      it("Curvature Equity scalar: cvr_components populated via per-RF aggregate", async () => {
+        const fr = fakeRedis();
+        fr.setResponse("FT.AGGREGATE", routeFtAggregate({
+          discovery: () => ftAggregateReply(["1"]),
+          main: () => [1, ftAggRow("1", {
+            sum_u_ws_equity_cvr_up: 4, sum_u_ws_equity_cvr_up_sq: 14,
+            sum_u_ws_equity_cvr_up_neg: -1, sum_u_ws_equity_cvr_up_negsq: 1,
+            sum_n_ws_equity_cvr_down: 3, sum_n_ws_equity_cvr_down_sq: 3,
+            sum_n_ws_equity_cvr_down_neg: 0, sum_n_ws_equity_cvr_down_negsq: 0,
+            row_count: 3,
+          })],
+          perRf: () => [
+            3,
+            perRfRow("1", "AAPL", {
+              sum_u_ws_equity_cvr_up: 2, sum_u_ws_equity_cvr_up_sq: 4,
+              sum_n_ws_equity_cvr_down: 1, sum_n_ws_equity_cvr_down_sq: 1,
+            }),
+            perRfRow("1", "GOOG", {
+              sum_u_ws_equity_cvr_up: 3, sum_u_ws_equity_cvr_up_sq: 9,
+              sum_n_ws_equity_cvr_down: 1, sum_n_ws_equity_cvr_down_sq: 1,
+            }),
+            perRfRow("1", "MSFT", {
+              sum_u_ws_equity_cvr_up: -1, sum_u_ws_equity_cvr_up_sq: 1,
+              sum_n_ws_equity_cvr_down: 1, sum_n_ws_equity_cvr_down_sq: 1,
+            }),
+          ],
+        }));
+        app = await createServer({ redis: fr, schema: fastPathSchema() });
+        const res = await app.inject({
+          method: "POST", url: "/calc/sbm",
+          payload: { risk_class: "Equity", sensitivity_type: "Curvature" },
+        });
+        expect(res.statusCode).toBe(200);
+        const pb = res.json().per_bucket[0];
+        const cvr = pb.intermediate.curvature.cvr_components;
+        expect(Array.isArray(cvr)).toBe(true);
+        expect(cvr.length).toBe(3);
+        // Σ cvr_up = 4 (matches the main-aggregate K_b^+ precursor).
+        const sumUp = cvr.reduce((a: number, c: { cvr_up: number }) => a + c.cvr_up, 0);
+        const sumDown = cvr.reduce((a: number, c: { cvr_down: number }) => a + c.cvr_down, 0);
+        expect(Math.abs(sumUp - 4)).toBeLessThanOrEqual(1e-9);
+        expect(Math.abs(sumDown - 3)).toBeLessThanOrEqual(1e-9);
+      });
+
+      it("POST /calc/sbm/bucket-cross-detail returns all cross_components for the requested bucket", async () => {
+        const N = 5;
+        const ws = [1, 2, 3, 4, 5];
+        const sumWs = ws.reduce((a, b) => a + b, 0);
+        const sumWsSq = ws.reduce((a, b) => a + b * b, 0);
+        const fr = fakeRedis();
+        fr.setResponse("FT.AGGREGATE", routeFtAggregate({
+          discovery: () => ftAggregateReply(["1"]),
+          main: () => [1, ftAggRow("1", {
+            sum_d_ws_equity_delta: sumWs, sum_d_ws_equity_delta_sq: sumWsSq, row_count: N,
+          })],
+          perRf: () => {
+            const rows: unknown[] = [N];
+            for (let i = 0; i < N; i++) {
+              rows.push(perRfRow("1", `RF${i}`, {
+                sum_d_ws_equity_delta: ws[i]!,
+                sum_d_ws_equity_delta_sq: ws[i]! * ws[i]!,
+              }));
+            }
+            return rows;
+          },
+        }));
+        app = await createServer({ redis: fr, schema: fastPathSchema() });
+        const res = await app.inject({
+          method: "POST",
+          url: "/calc/sbm/bucket-cross-detail",
+          payload: { risk_class: "Equity", sensitivity_type: "Delta", bucket: "1" },
+        });
+        expect(res.statusCode).toBe(200);
+        const body = res.json();
+        expect(body.bucket).toBe("1");
+        // N=5 → 20 ordered pairs returned in full (no truncation).
+        expect(body.cross_components.length).toBe(N * (N - 1));
+        // Sorted descending by |contrib|.
+        for (let i = 1; i < body.cross_components.length; i++) {
+          expect(Math.abs(body.cross_components[i - 1].contrib))
+            .toBeGreaterThanOrEqual(Math.abs(body.cross_components[i].contrib));
+        }
+      });
+
+      it("POST /calc/sbm/bucket-cross-detail rejects missing bucket", async () => {
+        const fr = fakeRedis();
+        fr.setResponse("FT.AGGREGATE", () => ftAggregateReply([]));
+        app = await createServer({ redis: fr, schema: fastPathSchema() });
+        const res = await app.inject({
+          method: "POST",
+          url: "/calc/sbm/bucket-cross-detail",
+          payload: { risk_class: "Equity", sensitivity_type: "Delta" },
+        });
+        expect(res.statusCode).toBe(400);
+      });
+    });
+
     it("commands.fcall.dispatched_keys still mirrors the per-bucket key shape on the fast path", async () => {
       // Stability gate: the UI commands panel keys off this list. Fast path
       // didn't actually issue the FCALLs, but the keys describe what the

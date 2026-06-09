@@ -59,16 +59,47 @@ export function scaleCorrelationSpec(
 // renders the "How K_b was calculated" panel from these fields when present
 // and a "computed in Lua FCALL, intermediates not surfaced" message otherwise.
 export type BucketPath = "fast" | "lua";
+// Wave 5.96A.1 — per-component breakdown so the drilldown UI can show the
+// individual WS_k / WS_k² that summed into ws_squared_sum and the dominant
+// pairwise rho·WS_k·WS_l contributions that summed into cross_term.
+export interface WsComponent {
+  k: string;
+  ws: number;
+  ws_squared: number;
+}
+export interface CrossComponent {
+  k: string;
+  l: string;
+  rho: number;
+  ws_k: number;
+  ws_l: number;
+  contrib: number;
+}
+export interface CvrComponent {
+  k: string;
+  cvr_up: number;
+  cvr_down: number;
+}
 export interface BucketCurvatureIntermediate {
   k_plus: number;
   k_minus: number;
   winner: "plus" | "minus";
+  // Wave 5.96A.1 — per-risk-factor CVR pairs whose signed sums precede the
+  // §21.5(3) max selection. Σ cvr_up over components matches the K_b^+
+  // precursor; same for cvr_down / K_b^-.
+  cvr_components?: CvrComponent[];
 }
 export interface BucketIntermediate {
   path: BucketPath;
   ws_squared_sum?: number;
   cross_term?: number;
   curvature?: BucketCurvatureIntermediate;
+  // Wave 5.96A.1 — additive per-component arrays. Present on the fast path
+  // only when the route asks for them; absent on the Lua path.
+  ws_components?: WsComponent[];
+  cross_components?: CrossComponent[];
+  cross_components_truncated?: boolean;
+  cross_components_total_count?: number;
 }
 export interface BucketResult {
   bucket: string;

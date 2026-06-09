@@ -4,6 +4,7 @@ import { EnterpriseCallout, PanelCard, Sparkline, TimingStrip } from "../compone
 import { SuggestCombobox } from "../components/SuggestCombobox";
 import type { ShardTiming } from "../components/TimingStrip";
 import {
+  postBucketCrossDetail,
   postCalcSbm,
   type BucketResult,
   type CalcCacheState,
@@ -11,7 +12,10 @@ import {
   type CalcEngine,
   type CalcSbmResponse,
   type CorrelationRegime,
+  type CrossComponent,
+  type CvrComponent,
   type SensitivityType,
+  type WsComponent,
 } from "../lib/calc";
 import { EmptyTargetError } from "../lib/empty-target";
 import { formatCharge } from "../lib/format";
@@ -1292,10 +1296,12 @@ function DrilldownValueCell({
 // kernel does not surface the breakdown (option B in the spec).
 function BucketKbDrilldown({
   bucket,
+  riskClass,
   sensitivityType,
   bucketResult,
 }: {
   bucket: string;
+  riskClass: RiskClass;
   sensitivityType: SensitivityType;
   bucketResult: BucketResult | undefined;
 }) {
@@ -1369,7 +1375,288 @@ function BucketKbDrilldown({
           </p>
         )}
       </section>
+      {/* Wave 5.96A.1 — collapsible per-component breakdowns. Delta/Vega
+          buckets render the WS_k² + cross-term tables; Curvature buckets
+          render the CVR_k^± tables. All sections are collapsed by default
+          via the native <details> disclosure. */}
+      {haveBreakdown && !isCurvature && intermediate?.ws_components ? (
+        <WsComponentsBreakdown
+          components={intermediate.ws_components}
+          total={wsSq!}
+        />
+      ) : null}
+      {haveBreakdown && !isCurvature && intermediate?.cross_components ? (
+        <CrossComponentsBreakdown
+          components={intermediate.cross_components}
+          truncated={intermediate.cross_components_truncated ?? false}
+          totalCount={
+            intermediate.cross_components_total_count ?? intermediate.cross_components.length
+          }
+          crossTerm={cross!}
+          bucket={bucket}
+          riskClass={riskClass}
+          sensitivityType={sensitivityType}
+        />
+      ) : null}
+      {haveBreakdown && isCurvature && curvature?.cvr_components ? (
+        <CvrComponentsBreakdown
+          components={curvature.cvr_components}
+          kPlus={curvature.k_plus}
+          kMinus={curvature.k_minus}
+          winner={curvature.winner}
+        />
+      ) : null}
     </div>
+  );
+}
+
+// Wave 5.96A.1 — natural tenor sort. Reuses GIRR_TENORS so 3M < 6M < 1Y, with
+// non-matching component keys falling back to lexicographic order.
+function componentSort<T extends { k: string }>(a: T, b: T): number {
+  const ia = GIRR_TENORS.indexOf(a.k);
+  const ib = GIRR_TENORS.indexOf(b.k);
+  if (ia !== -1 && ib !== -1) return ia - ib;
+  if (ia !== -1) return -1;
+  if (ib !== -1) return 1;
+  return a.k < b.k ? -1 : a.k > b.k ? 1 : 0;
+}
+
+function WsComponentsBreakdown({
+  components,
+  total,
+}: {
+  components: WsComponent[];
+  total: number;
+}) {
+  const fmt5 = (n: number): string => n.toFixed(5);
+  const sorted = [...components].sort(componentSort);
+  return (
+    <details
+      className="bucket-drilldown__ws-breakdown"
+      data-testid="bucket-drilldown-ws-breakdown"
+    >
+      <summary className="bucket-drilldown__breakdown-summary">
+        Σ WS<sub>k</sub>² breakdown ({sorted.length} components)
+      </summary>
+      <div className="bucket-drilldown__breakdown-scroll">
+        <table
+          className="bucket-drilldown__breakdown-table"
+          data-testid="bucket-drilldown-ws-table"
+        >
+          <thead>
+            <tr>
+              <th scope="col">k</th>
+              <th scope="col">WS<sub>k</sub></th>
+              <th scope="col">WS<sub>k</sub>²</th>
+            </tr>
+          </thead>
+          <tbody>
+            {sorted.map((c) => (
+              <tr key={c.k} data-testid="bucket-drilldown-ws-row" data-k={c.k}>
+                <td>{c.k}</td>
+                <td>{fmt5(c.ws)}</td>
+                <td>{fmt5(c.ws_squared)}</td>
+              </tr>
+            ))}
+          </tbody>
+          <tfoot>
+            <tr data-testid="bucket-drilldown-ws-total">
+              <td>Total</td>
+              <td></td>
+              <td>{fmt5(total)}</td>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+    </details>
+  );
+}
+
+function CrossComponentsBreakdown({
+  components,
+  truncated,
+  totalCount,
+  crossTerm,
+  bucket,
+  riskClass,
+  sensitivityType,
+}: {
+  components: CrossComponent[];
+  truncated: boolean;
+  totalCount: number;
+  crossTerm: number;
+  bucket: string;
+  riskClass: RiskClass;
+  sensitivityType: SensitivityType;
+}) {
+  const fmt5 = (n: number): string => n.toFixed(5);
+  const [showingAll, setShowingAll] = useState(false);
+  const [fullList, setFullList] = useState<CrossComponent[] | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function onToggle() {
+    if (showingAll) {
+      setShowingAll(false);
+      return;
+    }
+    if (fullList) {
+      setShowingAll(true);
+      return;
+    }
+    setLoading(true);
+    setError(null);
+    try {
+      const resp = await postBucketCrossDetail({
+        risk_class: riskClass,
+        sensitivity_type: sensitivityType,
+        bucket,
+      });
+      setFullList(resp.cross_components);
+      setShowingAll(true);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const rows = showingAll && fullList ? fullList : components;
+  return (
+    <details
+      className="bucket-drilldown__cross-breakdown"
+      data-testid="bucket-drilldown-cross-breakdown"
+    >
+      <summary className="bucket-drilldown__breakdown-summary">
+        Cross-term breakdown ({truncated ? `top ${components.length} of ${totalCount}` : `${components.length} pairs`})
+      </summary>
+      <div className="bucket-drilldown__breakdown-scroll">
+        <table
+          className="bucket-drilldown__breakdown-table"
+          data-testid="bucket-drilldown-cross-table"
+        >
+          <thead>
+            <tr>
+              <th scope="col">k</th>
+              <th scope="col">l</th>
+              <th scope="col">ρ<sub>kl</sub></th>
+              <th scope="col">WS<sub>k</sub></th>
+              <th scope="col">WS<sub>l</sub></th>
+              <th scope="col">contrib</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((c, i) => (
+              <tr key={`${c.k}|${c.l}|${i}`} data-testid="bucket-drilldown-cross-row" data-k={c.k} data-l={c.l}>
+                <td>{c.k}</td>
+                <td>{c.l}</td>
+                <td>{fmt5(c.rho)}</td>
+                <td>{fmt5(c.ws_k)}</td>
+                <td>{fmt5(c.ws_l)}</td>
+                <td>{fmt5(c.contrib)}</td>
+              </tr>
+            ))}
+          </tbody>
+          <tfoot>
+            <tr data-testid="bucket-drilldown-cross-total">
+              <td colSpan={5}>
+                {truncated && !showingAll
+                  ? `Showing top ${components.length} of ${totalCount} by |contrib|. Total cross_term (all pairs):`
+                  : "Total cross_term:"}
+              </td>
+              <td>{fmt5(crossTerm)}</td>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+      {truncated ? (
+        <div className="bucket-drilldown__breakdown-actions">
+          <button
+            type="button"
+            onClick={onToggle}
+            disabled={loading}
+            data-testid="bucket-drilldown-cross-show-all"
+          >
+            {loading
+              ? "Loading…"
+              : showingAll
+              ? "Show top 10"
+              : `Show all ${totalCount}`}
+          </button>
+          {error ? (
+            <span
+              className="bucket-drilldown__breakdown-error"
+              data-testid="bucket-drilldown-cross-error"
+            >
+              {error}
+            </span>
+          ) : null}
+        </div>
+      ) : null}
+    </details>
+  );
+}
+
+function CvrComponentsBreakdown({
+  components,
+  kPlus,
+  kMinus,
+  winner,
+}: {
+  components: CvrComponent[];
+  kPlus: number;
+  kMinus: number;
+  winner: "plus" | "minus";
+}) {
+  const fmt5 = (n: number): string => n.toFixed(5);
+  const sorted = [...components].sort(componentSort);
+  const sumUp = sorted.reduce((acc, c) => acc + c.cvr_up, 0);
+  const sumDown = sorted.reduce((acc, c) => acc + c.cvr_down, 0);
+  return (
+    <details
+      className="bucket-drilldown__cvr-breakdown"
+      data-testid="bucket-drilldown-cvr-breakdown"
+    >
+      <summary className="bucket-drilldown__breakdown-summary">
+        CVR<sub>k</sub><sup>±</sup> breakdown ({sorted.length} components)
+      </summary>
+      <div className="bucket-drilldown__breakdown-scroll">
+        <table
+          className="bucket-drilldown__breakdown-table"
+          data-testid="bucket-drilldown-cvr-table"
+        >
+          <thead>
+            <tr>
+              <th scope="col">k</th>
+              <th scope="col">CVR<sub>k</sub><sup>+</sup></th>
+              <th scope="col">CVR<sub>k</sub><sup>−</sup></th>
+            </tr>
+          </thead>
+          <tbody>
+            {sorted.map((c) => (
+              <tr key={c.k} data-testid="bucket-drilldown-cvr-row" data-k={c.k}>
+                <td>{c.k}</td>
+                <td>{fmt5(c.cvr_up)}</td>
+                <td>{fmt5(c.cvr_down)}</td>
+              </tr>
+            ))}
+          </tbody>
+          <tfoot>
+            <tr data-testid="bucket-drilldown-cvr-total">
+              <td>
+                Σ (winner: K<sub>b</sub><sup>{winner === "plus" ? "+" : "−"}</sup>)
+              </td>
+              <td>
+                {fmt5(sumUp)} → K<sub>b</sub><sup>+</sup>={fmt5(kPlus)}
+              </td>
+              <td>
+                {fmt5(sumDown)} → K<sub>b</sub><sup>−</sup>={fmt5(kMinus)}
+              </td>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+    </details>
   );
 }
 
@@ -1486,6 +1773,7 @@ function BucketDrilldown({
           user sees on expand. */}
       <BucketKbDrilldown
         bucket={bucket}
+        riskClass={riskClass}
         sensitivityType={sensitivityType}
         bucketResult={bucketResult}
       />
