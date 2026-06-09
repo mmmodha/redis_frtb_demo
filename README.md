@@ -55,32 +55,25 @@ Auto Tiering, scale pivot moment).
 
 ### Boot the application stack
 
-First, populate `.env.local` with your Redis Enterprise URL — copy the
-template and fill in the real credentials (`.env.local` is gitignored):
-
-```bash
-cp .env.example .env.local
-# edit .env.local — at minimum set REDIS_URL
-```
-
-Then bring the stack up. Each Redis-touching service has `env_file: .env.local`
-declared in `docker-compose.yml`, so Compose loads it automatically — **no
-`--env-file` flag required**:
+A fresh clone needs no environment editing. Bring the stack up and configure
+Redis through the UI:
 
 ```bash
 docker compose up -d --wait
-docker compose ps
+# then open http://localhost:3000 → Connections → Add connection
 ```
 
 All seven services come up healthy. The UI is on <http://localhost:3000>, the api on
 <http://localhost:8080>. On first boot the UI shows
-*"No active connection — add a Redis Cloud connection to begin"*.
+*"No active connection — add a Redis Cloud connection to begin"*; open the
+**Connections** panel, enter your RS cluster host / port / TLS / ACL credentials,
+**Test**, then **Set active**. Every backend service that needs Redis pulls the
+active target from the api router; nothing is hard-coded.
 
-### Add a Redis target
-
-Open the UI → **Connections** panel → **Add connection** → enter your RS cluster
-host, port, TLS / ACL credentials → **Test** → **Set active**. Every backend service
-that needs Redis pulls the active target from the api router; nothing is hard-coded.
+`.env.local` is gitignored and optional — `scripts/run-local.sh` auto-creates a
+minimal one with generated secrets on first run. See
+**Advanced: environment overrides** below if you need custom ports, custom
+secrets, or want to pre-seed `REDIS_URL`.
 
 ### Fault-isolation smoke tests
 
@@ -107,9 +100,13 @@ scripts/run-local.sh doctor             # diagnostics
 scripts/run-local.sh stop               # stop all (services + any running one-shot tools)
 ```
 
-Runtime state (PIDs, logs, env snapshot) lives under `./.run/`. Runs as the
-invoking user; no sudo, no systemd, no `/var/lib` paths. To reset cleanly:
-`scripts/run-local.sh stop && rm -rf .run/`.
+`start` needs no prior setup on a fresh clone: it auto-creates `.env.local`
+with generated `CONN_STORE_KEY` + `INTERNAL_API_TOKEN` secrets (no
+`REDIS_URL`, since the UI Connections panel is the primary configuration path)
+and then boots the six services. Runtime state (PIDs, logs, env snapshot)
+lives under `./.run/`. Runs as the invoking user; no sudo, no systemd, no
+`/var/lib` paths. To reset cleanly:
+`scripts/run-local.sh stop && rm -rf .run/ .env.local`.
 
 ### Synthetic data: the `generator` one-shot tool
 
@@ -146,6 +143,27 @@ charge + bucket sweeps for the current pins live in
 under `docs/recordings/wave-5.83K/`. Re-anchor against new corpus only when
 the generator's class / leg split itself changes — anchors are corpus-derived,
 not hand-picked.
+
+## Advanced: environment overrides
+
+`.env.local` is optional. Use it when you need to:
+
+- **Pre-seed a Redis target** — set `REDIS_URL=...` and the api auto-seeds a
+  `live-standalone` / `live-cluster` Connection profile in the UI on boot.
+  Without it, add the connection through the UI Connections panel.
+- **Rotate secrets by hand** — `CONN_STORE_KEY` (32-byte hex; encrypts the
+  Connections store) and `INTERNAL_API_TOKEN` (16-byte hex; api↔source/loadgen
+  internal bearer). `scripts/run-local.sh start` generates these on first
+  run; override here for CI / shared dev boxes. `doctor` warns if
+  `CONN_STORE_KEY` is still the literal `dev-only-change-in-prod` default.
+- **Remap service ports / hosts** — `API_PORT`, `UI_PORT`, etc. (full list in
+  the Wave 5.79 block of `.env.example`).
+- **Tweak Redis client behaviour** — `REDIS_TLS`, `REDIS_CLUSTER`,
+  `REDIS_READY_TIMEOUT_MS`, `ALLOWED_ORIGINS`.
+
+See `.env.example` for the full annotated list. Copy individual entries into
+`.env.local` only as needed; missing values fall back to the documented
+defaults.
 
 ## Testing & TDD
 

@@ -70,6 +70,19 @@ async function main(): Promise<void> {
   // below both pick up the persisted choice. Wave 5.16y — also thread the
   // stored username/password so getActiveRedisClient() authenticates.
   const activeRaw = store.getActiveRaw();
+  // Wave 5.97B — surface a one-shot operator-facing prompt when the boot
+  // finds no active Redis profile (and REDIS_URL was not pre-seeded). The UI
+  // Connections panel is the primary configuration path; emit the link once
+  // at startup so a fresh-clone operator knows where to go. Fastify's logger
+  // isn't constructed yet at this point in main(); use the same console.*
+  // pattern as the surrounding boot-status lines.
+  if (!activeRaw && !process.env.REDIS_URL) {
+    console.log(
+      "👉 No active Redis connection configured.\n"
+      + "   Open http://localhost:3000/connections to add one.\n"
+      + "   (You can also pre-seed REDIS_URL in .env.local; see .env.example.)"
+    );
+  }
   if (activeRaw) {
     setActiveTarget(
       {
