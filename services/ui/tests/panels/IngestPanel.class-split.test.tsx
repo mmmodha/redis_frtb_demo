@@ -102,9 +102,9 @@ describe("<IngestPanel /> — per-class targets (Wave 5.47d)", () => {
     const card = await waitFor(() => generatorCard());
     openAdvanced(card);
     const splitGroup = within(card).getByTestId("generator-class-split");
-    // Wave 5.52 — defaults (200 rows · 60/30/10 mix) drop {120, 60, 20} into
+    // Wave 5.87a — defaults (200 rows · 34/33/33 mix) drop {68, 66, 66} into
     // the per-class inputs so the reveal mirrors the simple-mode submit body.
-    const expected = { GIRR: "120", Equity: "60", FX: "20" } as const;
+    const expected = { GIRR: "68", Equity: "66", FX: "66" } as const;
     for (const c of ["GIRR", "Equity", "FX"] as const) {
       const input = within(splitGroup).getByLabelText(c) as HTMLInputElement;
       expect(input).toBeInTheDocument();

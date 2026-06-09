@@ -142,8 +142,8 @@ describe("<IngestPanel /> synthetic generator (Wave 5.20a)", () => {
       (c) => /\/generator\/start\/stream$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",
     )!;
     const body = JSON.parse((posted[1] as RequestInit).body as string);
-    // Wave 5.52 — defaults (200 rows · 60/30/10 mix) auto-derive a full body.
-    expect(body.class_split).toEqual({ GIRR: 120, Equity: 60, FX: 20 });
+    // Wave 5.87a — defaults (200 rows · 34/33/33 balanced-thirds mix) auto-derive a full body.
+    expect(body.class_split).toEqual({ GIRR: 68, Equity: 66, FX: 66 });
     expect(body.sensitivity_types).toEqual(["Delta", "Vega"]);
     expect(body.trade_pool_size).toBe(50);
     expect(body.factor_pool_size).toBe(8);

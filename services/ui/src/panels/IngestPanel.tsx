@@ -63,7 +63,11 @@ const QUICK_PICK_ROWS = [
   { label: "200k", value: 200_000 },
   { label: "2M", value: 2_000_000 },
 ] as const;
-const DEFAULT_MIX_PCT: Record<(typeof GENERATOR_CLASSES)[number], number> = { GIRR: 60, Equity: 30, FX: 10 };
+// Wave 5.87a — balanced-thirds default. Mirrors the canonical 200k baseline
+// (README "Canonical 200k baseline (Wave 5.84)") used to pin
+// calc-live-200k.test.ts charge anchors — the legacy 60/30/10 default
+// produced a skewed corpus that drifted those pins on UI-driven 200k runs.
+const DEFAULT_MIX_PCT: Record<(typeof GENERATOR_CLASSES)[number], number> = { GIRR: 34, Equity: 33, FX: 33 };
 const CANONICAL_DEMO_SEED = 0xCAFEBABE;
 const CANONICAL_DEMO_MIX: Record<(typeof GENERATOR_CLASSES)[number], number> = { GIRR: 100, Equity: 0, FX: 0 };
 const CANONICAL_DEMO_ROWS = 200;

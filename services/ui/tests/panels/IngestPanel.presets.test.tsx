@@ -118,7 +118,7 @@ describe("<IngestPanel /> — Realistic profile presets (Wave 5.49)", () => {
     renderPanel();
     const card = await waitFor(() => generatorCard());
     openAdvanced(card);
-    // rows=200, mix=60/30/10 ⇒ trade_pool=max(50,floor(200/20))=50, factor_pool=max(8,floor(200/200))=8.
+    // rows=200, mix=34/33/33 ⇒ trade_pool=max(50,floor(200/20))=50, factor_pool=max(8,floor(200/200))=8.
     const trade = within(card).getByLabelText(/trade pool size/i) as HTMLInputElement;
     const factor = within(card).getByLabelText(/risk factor pool size/i) as HTMLInputElement;
     expect(trade.value).toBe("50");

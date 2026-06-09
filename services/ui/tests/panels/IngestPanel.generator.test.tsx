@@ -97,7 +97,7 @@ describe("<IngestPanel /> — synthetic generator card (Wave 5.17b / 5.52)", () 
     vi.restoreAllMocks();
   });
 
-  it("renders simple-mode defaults (200 rows + 60/30/10 mix) and advanced legacy fields after opening Advanced", async () => {
+  it("renders simple-mode defaults (200 rows + 34/33/33 mix) and advanced legacy fields after opening Advanced", async () => {
     baselineFetch(fetchMock);
     renderPanel();
     const card = await waitFor(() => generatorCard());
@@ -106,9 +106,9 @@ describe("<IngestPanel /> — synthetic generator card (Wave 5.17b / 5.52)", () 
     // Wave 5.52 — simple-mode: Total rows + Class mix percent inputs.
     const totalRows = within(card).getByLabelText(/^total rows$/i) as HTMLInputElement;
     expect(totalRows.value).toBe("200");
-    expect((within(card).getByLabelText("GIRR") as HTMLInputElement).value).toBe("60");
-    expect((within(card).getByLabelText("Equity") as HTMLInputElement).value).toBe("30");
-    expect((within(card).getByLabelText("FX") as HTMLInputElement).value).toBe("10");
+    expect((within(card).getByLabelText("GIRR") as HTMLInputElement).value).toBe("34");
+    expect((within(card).getByLabelText("Equity") as HTMLInputElement).value).toBe("33");
+    expect((within(card).getByLabelText("FX") as HTMLInputElement).value).toBe("33");
 
     // Opening Advanced reveals the legacy controls pre-populated with derived values.
     openAdvanced(card);
@@ -141,7 +141,7 @@ describe("<IngestPanel /> — synthetic generator card (Wave 5.17b / 5.52)", () 
       (c) => /\/generator\/start\/stream$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",
     )!;
     const body = JSON.parse((posted[1] as RequestInit).body as string);
-    expect(body.class_split).toEqual({ GIRR: 120, Equity: 60, FX: 20 });
+    expect(body.class_split).toEqual({ GIRR: 68, Equity: 66, FX: 66 });
     expect(body.sensitivity_types).toEqual(["Delta", "Vega"]);
     expect(body.trade_pool_size).toBe(50);
     expect(body.factor_pool_size).toBe(8);

@@ -91,14 +91,14 @@ describe("<IngestPanel /> — Wave 5.52 simple-mode generator", () => {
     vi.restoreAllMocks();
   });
 
-  it("renders Total rows (200) and Class mix (60/30/10) as the only visible controls; advanced is collapsed", async () => {
+  it("renders Total rows (200) and Class mix (34/33/33) as the only visible controls; advanced is collapsed", async () => {
     baselineFetch(fetchMock);
     renderPanel();
     const card = await waitFor(() => generatorCard());
     expect((within(card).getByLabelText(/^total rows$/i) as HTMLInputElement).value).toBe("200");
-    expect((within(card).getByLabelText("GIRR") as HTMLInputElement).value).toBe("60");
-    expect((within(card).getByLabelText("Equity") as HTMLInputElement).value).toBe("30");
-    expect((within(card).getByLabelText("FX") as HTMLInputElement).value).toBe("10");
+    expect((within(card).getByLabelText("GIRR") as HTMLInputElement).value).toBe("34");
+    expect((within(card).getByLabelText("Equity") as HTMLInputElement).value).toBe("33");
+    expect((within(card).getByLabelText("FX") as HTMLInputElement).value).toBe("33");
     // Advanced disclosure is collapsed (no preset dropdown visible).
     expect(within(card).queryByTestId("generator-preset")).toBeNull();
     expect(within(card).getByTestId("generator-advanced-toggle")).toHaveAttribute("aria-expanded", "false");
@@ -131,7 +131,12 @@ describe("<IngestPanel /> — Wave 5.52 simple-mode generator", () => {
       expect(posted).toBeDefined();
     });
     const body = postedBody(fetchMock);
-    expect(body.class_split).toEqual({ GIRR: 120, Equity: 60, FX: 20 });
+    // Wave 5.87a — balanced-thirds default ({GIRR:34, Equity:33, FX:33})
+    // integrates to ~equal contributions per class (rounding remainder lands
+    // on the last non-zero class via deriveClassSplit).
+    expect(body.class_split).toEqual({ GIRR: 68, Equity: 66, FX: 66 });
+    const counts = Object.values(body.class_split as Record<string, number>);
+    expect(Math.max(...counts) - Math.min(...counts)).toBeLessThanOrEqual(2);
     expect(body.sensitivity_types).toEqual(["Delta", "Vega"]);
     // rows=200 ⇒ max(50, min(10000, floor(200/20))) = 50
     expect(body.trade_pool_size).toBe(50);
@@ -147,10 +152,10 @@ describe("<IngestPanel /> — Wave 5.52 simple-mode generator", () => {
     renderPanel();
     const card = await waitFor(() => generatorCard());
     fireEvent.change(within(card).getByLabelText("FX"), { target: { value: "20" } });
-    // Mix is now 60 + 30 + 20 = 110.
+    // Mix is now 34 + 33 + 20 = 87.
     const pill = within(card).getByTestId("generator-mix-pill");
     expect(pill.textContent).toMatch(/sum to 100/i);
-    expect(pill.textContent).toMatch(/currently 110/);
+    expect(pill.textContent).toMatch(/currently 87/);
     expect((within(card).getByTestId("generator-generate-btn") as HTMLButtonElement).disabled).toBe(true);
   });
 
@@ -227,11 +232,11 @@ describe("<IngestPanel /> — Wave 5.52 simple-mode generator", () => {
     expect((within(card).getByLabelText(/trade pool size/i) as HTMLInputElement).value).toBe("1000");
     // Factor pool 20000/200 = 100 (clamped within [8, 256]).
     expect((within(card).getByLabelText(/risk factor pool size/i) as HTMLInputElement).value).toBe("100");
-    // Per-class split mirrors the 60/30/10 mix for 20000 rows.
+    // Per-class split mirrors the 34/33/33 mix for 20000 rows.
     const splitGroup = within(card).getByTestId("generator-class-split");
-    expect((within(splitGroup).getByLabelText("GIRR") as HTMLInputElement).value).toBe("12000");
-    expect((within(splitGroup).getByLabelText("Equity") as HTMLInputElement).value).toBe("6000");
-    expect((within(splitGroup).getByLabelText("FX") as HTMLInputElement).value).toBe("2000");
+    expect((within(splitGroup).getByLabelText("GIRR") as HTMLInputElement).value).toBe("6800");
+    expect((within(splitGroup).getByLabelText("Equity") as HTMLInputElement).value).toBe("6600");
+    expect((within(splitGroup).getByLabelText("FX") as HTMLInputElement).value).toBe("6600");
     // Stop conditions: rows=20000, memory_pct=75, elapsed=600.
     const stop = within(card).getByTestId("generator-stop-when");
     expect((within(stop).getByLabelText(/Stop after rows/i) as HTMLInputElement).value).toBe("20000");
