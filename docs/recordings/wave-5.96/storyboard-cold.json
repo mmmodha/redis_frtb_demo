@@ -1,0 +1,255 @@
+{
+  "total_sbm": 196570.21,
+  "winning_scenario": "high",
+  "scenario_totals": {
+    "low": 148885.89,
+    "medium": 171439.45,
+    "high": 196570.21
+  },
+  "breakdown": [
+    {
+      "risk_class": "GIRR",
+      "leg": "delta",
+      "skipped": false,
+      "scenarios": {
+        "low": {
+          "charge": 29777.178,
+          "ms": 5236.753963,
+          "original_compute_ms": 5236.753963,
+          "data_status": "populated"
+        },
+        "medium": {
+          "charge": 34287.89,
+          "ms": 5236.753963,
+          "original_compute_ms": 5236.753963,
+          "data_status": "populated"
+        },
+        "high": {
+          "charge": 39314.042,
+          "ms": 5236.753963,
+          "original_compute_ms": 5236.753963,
+          "data_status": "populated"
+        }
+      }
+    },
+    {
+      "risk_class": "GIRR",
+      "leg": "vega",
+      "skipped": false,
+      "scenarios": {
+        "low": {
+          "charge": 14888.589,
+          "ms": 5236.753963,
+          "original_compute_ms": 5236.753963,
+          "data_status": "populated"
+        },
+        "medium": {
+          "charge": 17143.945,
+          "ms": 5236.753963,
+          "original_compute_ms": 5236.753963,
+          "data_status": "populated"
+        },
+        "high": {
+          "charge": 19657.021,
+          "ms": 5236.753963,
+          "original_compute_ms": 5236.753963,
+          "data_status": "populated"
+        }
+      }
+    },
+    {
+      "risk_class": "GIRR",
+      "leg": "curvature",
+      "skipped": false,
+      "scenarios": {
+        "low": {
+          "charge": 4962.863,
+          "ms": 5236.753963,
+          "original_compute_ms": 5236.753963,
+          "data_status": "populated"
+        },
+        "medium": {
+          "charge": 5714.648333,
+          "ms": 5236.753963,
+          "original_compute_ms": 5236.753963,
+          "data_status": "populated"
+        },
+        "high": {
+          "charge": 6552.340333,
+          "ms": 5236.753963,
+          "original_compute_ms": 5236.753963,
+          "data_status": "populated"
+        }
+      }
+    },
+    {
+      "risk_class": "EQUITY",
+      "leg": "delta",
+      "skipped": false,
+      "scenarios": {
+        "low": {
+          "charge": 29777.178,
+          "ms": 5236.753963,
+          "original_compute_ms": 5236.753963,
+          "data_status": "populated"
+        },
+        "medium": {
+          "charge": 34287.89,
+          "ms": 5236.753963,
+          "original_compute_ms": 5236.753963,
+          "data_status": "populated"
+        },
+        "high": {
+          "charge": 39314.042,
+          "ms": 5236.753963,
+          "original_compute_ms": 5236.753963,
+          "data_status": "populated"
+        }
+      }
+    },
+    {
+      "risk_class": "EQUITY",
+      "leg": "vega",
+      "skipped": false,
+      "scenarios": {
+        "low": {
+          "charge": 14888.589,
+          "ms": 5236.753963,
+          "original_compute_ms": 5236.753963,
+          "data_status": "populated"
+        },
+        "medium": {
+          "charge": 17143.945,
+          "ms": 5236.753963,
+          "original_compute_ms": 5236.753963,
+          "data_status": "populated"
+        },
+        "high": {
+          "charge": 19657.021,
+          "ms": 5236.753963,
+          "original_compute_ms": 5236.753963,
+          "data_status": "populated"
+        }
+      }
+    },
+    {
+      "risk_class": "EQUITY",
+      "leg": "curvature",
+      "skipped": false,
+      "scenarios": {
+        "low": {
+          "charge": 4962.863,
+          "ms": 5236.753963,
+          "original_compute_ms": 5236.753963,
+          "data_status": "populated"
+        },
+        "medium": {
+          "charge": 5714.648333,
+          "ms": 5236.753963,
+          "original_compute_ms": 5236.753963,
+          "data_status": "populated"
+        },
+        "high": {
+          "charge": 6552.340333,
+          "ms": 5236.753963,
+          "original_compute_ms": 5236.753963,
+          "data_status": "populated"
+        }
+      }
+    },
+    {
+      "risk_class": "FX",
+      "leg": "delta",
+      "skipped": false,
+      "scenarios": {
+        "low": {
+          "charge": 29777.178,
+          "ms": 5236.753963,
+          "original_compute_ms": 5236.753963,
+          "data_status": "populated"
+        },
+        "medium": {
+          "charge": 34287.89,
+          "ms": 5236.753963,
+          "original_compute_ms": 5236.753963,
+          "data_status": "populated"
+        },
+        "high": {
+          "charge": 39314.042,
+          "ms": 5236.753963,
+          "original_compute_ms": 5236.753963,
+          "data_status": "populated"
+        }
+      }
+    },
+    {
+      "risk_class": "FX",
+      "leg": "vega",
+      "skipped": false,
+      "scenarios": {
+        "low": {
+          "charge": 14888.589,
+          "ms": 5236.753963,
+          "original_compute_ms": 5236.753963,
+          "data_status": "populated"
+        },
+        "medium": {
+          "charge": 17143.945,
+          "ms": 5236.753963,
+          "original_compute_ms": 5236.753963,
+          "data_status": "populated"
+        },
+        "high": {
+          "charge": 19657.021,
+          "ms": 5236.753963,
+          "original_compute_ms": 5236.753963,
+          "data_status": "populated"
+        }
+      }
+    },
+    {
+      "risk_class": "FX",
+      "leg": "curvature",
+      "skipped": false,
+      "scenarios": {
+        "low": {
+          "charge": 4962.863,
+          "ms": 5236.753963,
+          "original_compute_ms": 5236.753963,
+          "data_status": "populated"
+        },
+        "medium": {
+          "charge": 5714.648333,
+          "ms": 5236.753963,
+          "original_compute_ms": 5236.753963,
+          "data_status": "populated"
+        },
+        "high": {
+          "charge": 6552.340333,
+          "ms": 5236.753963,
+          "original_compute_ms": 5236.753963,
+          "data_status": "populated"
+        }
+      }
+    }
+  ],
+  "unsupported_classes": [
+    "csr_non_sec",
+    "csr_sec_non_ctp",
+    "csr_sec_ctp",
+    "commodity"
+  ],
+  "performance": {
+    "total_ms": 6433.466,
+    "cumulative_ms": 141395.459,
+    "original_cumulative_ms": 141392.357,
+    "parallelism_factor": 21.978,
+    "original_parallelism_factor": 21.978,
+    "redis_ops_count": 27,
+    "ops_skipped": 0,
+    "cells_empty": 0,
+    "cache": "miss",
+    "cache_hits": 0
+  },
+  "resolved_command_summary": "POST /calc/sbm/total — 27-cell matrix (3 classes × 3 legs × 3 regimes), cache=miss"
+}
