@@ -9,6 +9,10 @@ export type SensitivityRow = {
   [field: string]: unknown;
 };
 
+export interface StreamProducerFlowControl {
+  afterBatch(streamKey: string, batchSize: number): Promise<void>;
+}
+
 export interface StreamProducerOptions {
   stream: string;
   batchSize?: number;
@@ -25,6 +29,19 @@ export interface StreamProducerOptions {
   // pipelineWindow is the GLOBAL cap across all in-flight pipeline.exec()
   // calls, not per-stream.
   router?: StreamRouter;
+  // Wave 5.92C — when set, every XADD includes `MAXLEN ~ <streamMaxLen>` so
+  // Redis approximately caps the stream length and protects holding shards
+  // from OOM when consumers fall behind. Default undefined keeps the XADD
+  // command sequence bit-identical to pre-5.92C (the canary tests rely on
+  // the undefined default). The generator CLI / source ingest layer set
+  // this from the `--stream-maxlen` flag / `STREAM_MAXLEN` env (default
+  // 2_000_000).
+  streamMaxLen?: number;
+  // Wave 5.92C — optional producer-side credit gate. After each successful
+  // XADD batch the producer calls `flowControl.afterBatch(streamKey, n)`;
+  // the gate may sleep when XLEN exceeds a threshold so the producer pauses
+  // generation until consumers drain.
+  flowControl?: StreamProducerFlowControl;
 }
 
 export const MAX_PIPELINE_WINDOW = 8;
@@ -64,6 +81,14 @@ export function createStreamProducer(
   // buffer; pipelineWindow remains a GLOBAL cap across all in-flight
   // dispatches (not per-stream).
   const router = opts.router;
+  // Wave 5.92C — pre-compute the optional MAXLEN ~ N arg-prefix once so the
+  // hot loop is a spread, not a per-row branch. Undefined streamMaxLen
+  // collapses to an empty array, preserving the pre-5.92C XADD command
+  // sequence (canary in workers.test.ts).
+  const maxLenArgs: readonly string[] = opts.streamMaxLen !== undefined
+    ? ["MAXLEN", "~", String(opts.streamMaxLen)]
+    : [];
+  const flowControl = opts.flowControl;
   const buffers = new Map<string, SensitivityRow[]>();
   const stats = {
     rowsSent: 0,
@@ -98,7 +123,10 @@ export function createStreamProducer(
     const pipeline = client.pipeline();
     for (const row of batch) {
       const fields = serializeRow(row);
-      pipeline.xadd(streamKey, "*", ...fields);
+      // Wave 5.92C — `MAXLEN ~ N` (if configured) goes between the stream
+      // key and the id placeholder so the producer's command sequence is
+      // a clean `XADD <key> [MAXLEN ~ <N>] * <fields...>`.
+      pipeline.xadd(streamKey, ...maxLenArgs, "*", ...fields);
     }
     // Window=1 keeps the pre-5.84A flushBuffer code path exactly: dispatch
     // and immediately await this batch's exec before returning. This is the
@@ -114,6 +142,10 @@ export function createStreamProducer(
         }
       }
       stats.rowsSent += batch.length;
+      // Wave 5.92C — credit gate runs AFTER the dispatch lands so the
+      // post-batch XLEN reflects this batch's writes. Awaiting here serializes
+      // the next dispatchBatch behind any pause loop (producer-side pause).
+      if (flowControl) await flowControl.afterBatch(streamKey, batch.length);
       return;
     }
     // Window>1 — keep up to `pipelineWindow` pipeline.exec() calls in flight.
@@ -127,6 +159,7 @@ export function createStreamProducer(
           }
         }
         stats.rowsSent += batch.length;
+        if (flowControl) await flowControl.afterBatch(streamKey, batch.length);
       } catch (e) {
         if (!firstError) firstError = e;
         throw e;

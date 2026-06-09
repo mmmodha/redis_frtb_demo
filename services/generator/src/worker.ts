@@ -22,10 +22,12 @@ import type { Redis, Cluster } from "ioredis";
 import { Cluster as ClusterCtor } from "ioredis";
 import { createRedisClient } from "@frtb/redis-client";
 import { loadSchema } from "@frtb/schema";
+import pino from "pino";
 import { createRowGenerator } from "./row-generator.ts";
 import { createStreamProducer } from "./producer.ts";
 import { runGenerationInline } from "./coordinator.ts";
 import { createStreamRouter, type StreamShardsConfig } from "@frtb/stream-router";
+import { createStreamFlowControl } from "./flow-control.ts";
 
 export interface WorkerInitData {
   schemaPath: string;
@@ -39,6 +41,8 @@ export interface WorkerInitData {
   // path bit-identical. Threaded through `workerData` because routers
   // aren't serialisable across worker_threads.postMessage boundaries.
   streamShards: StreamShardsConfig;
+  // Wave 5.92C — approximate XADD MAXLEN cap. 0 means opt out.
+  streamMaxLen: number;
   /** Per-worker seed already includes the `:w${idx}` suffix; the row-generator
    * appends `:aux` for the aux RNG so isolation is preserved. */
   seed: string;
@@ -93,11 +97,19 @@ async function main(): Promise<void> {
   });
   const client = createClient(data.redisUrl);
   const router = createStreamRouter(data.stream, data.streamShards);
+  // Wave 5.92C — per-worker pino logger (worker_threads can't share the
+  // parent's pino instance) + per-worker flow-control gate. The gate polls
+  // XLEN on the worker's local client so backpressure is observed per-shard
+  // (each worker writes to a deterministic subset of streams via its router).
+  const log = pino({ level: process.env.LOG_LEVEL ?? "info" }).child({ worker: data.workerIdx });
+  const flowControl = createStreamFlowControl(client, {}, log);
   const producer = createStreamProducer(client, {
     stream: data.stream,
     batchSize: data.batchSize,
     pipelineWindow: data.pipelineWindow,
     router,
+    streamMaxLen: data.streamMaxLen > 0 ? data.streamMaxLen : undefined,
+    flowControl,
   });
 
   const progressEvery = data.progressBatchSize ?? 1000;

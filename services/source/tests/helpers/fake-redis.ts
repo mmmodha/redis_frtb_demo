@@ -4,6 +4,9 @@
 export interface FakeStreamEntry {
   stream: string;
   fields: Record<string, string>;
+  // Wave 5.92C — captured XADD trim args (MAXLEN/MINID) when production
+  // ingest opts in; absent when XADD was called without a trim modifier.
+  trim?: { mode: string; approx: boolean; count: string };
 }
 
 export interface FakeRedis {
@@ -99,14 +102,36 @@ export function makeFakeRedis(): FakeRedis {
         return ["0", keys];
       }
       if (cmd === "XADD") {
-        const [stream, , ...fields] = args as [string, string, ...string[]];
+        // Wave 5.92C — accept the optional `MAXLEN ~|= N` trim modifier that
+        // production ingest now always emits. Layout:
+        //   XADD <key> [NOMKSTREAM] [MAXLEN|MINID ~|= N] <id|*> field val ...
+        // Recorded fields are post-modifier so existing assertions remain
+        // accurate; the MAXLEN args themselves are captured in `trim` so
+        // tests can verify they were sent.
+        let i = 0;
+        const stream = args[i++] as string;
+        if (typeof args[i] === "string" && (args[i] as string).toUpperCase() === "NOMKSTREAM") i++;
+        let trim: { mode: string; approx: boolean; count: string } | undefined;
+        if (typeof args[i] === "string") {
+          const tok = (args[i] as string).toUpperCase();
+          if (tok === "MAXLEN" || tok === "MINID") {
+            i++;
+            const next = args[i];
+            const approx = next === "~" || next === "=";
+            if (approx) i++;
+            const count = String(args[i++]);
+            trim = { mode: tok, approx: next === "~", count };
+          }
+        }
+        // Skip the id (or "*"); remainder is field/value pairs.
+        i++;
         const fmap: Record<string, string> = {};
-        for (let i = 0; i < fields.length; i += 2) {
-          const k = fields[i];
-          const v = fields[i + 1];
+        for (; i < args.length; i += 2) {
+          const k = args[i];
+          const v = args[i + 1];
           if (typeof k === "string" && typeof v === "string") fmap[k] = v;
         }
-        streams.push({ stream, fields: fmap });
+        streams.push({ stream, fields: fmap, ...(trim ? { trim } : {}) });
         return `${Date.now()}-${streams.length}`;
       }
       throw new Error(`fakeRedis: unsupported command ${cmd}`);

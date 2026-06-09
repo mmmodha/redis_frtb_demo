@@ -27,6 +27,11 @@ import {
   parseStreamShardsFlag,
   type StreamShardsConfig,
 } from "@frtb/stream-router";
+import { createStreamFlowControl } from "./flow-control.js";
+
+// Wave 5.92C — default approximate MAXLEN per stream (~2 GB at ~1 KB/entry).
+// Tune per cluster via --stream-maxlen / STREAM_MAXLEN env. Pass 0 to disable.
+const DEFAULT_STREAM_MAXLEN = 2_000_000;
 
 const log = pino({ level: process.env.LOG_LEVEL ?? "info" });
 
@@ -65,6 +70,9 @@ interface CliOptions {
   // 1 keeps the pre-5.92 single-stream code path bit-identical. Manual
   // wins over the profile-resolved dial (DoD #4).
   streamShards?: string;
+  // Wave 5.92C — approximate MAXLEN cap appended as `MAXLEN ~ N` on every
+  // XADD. Default 2_000_000 (~2 GB at ~1 KB/entry). `0` disables the cap.
+  streamMaxlen?: string;
   dryRun?: boolean;
   force?: boolean;
 }
@@ -99,6 +107,10 @@ async function main(): Promise<void> {
     .option(
       "--stream-shards <n>",
       "hash-tag stream-shard fan-out: positive integer or \"per-bucket\" (default 1 = bit-identical to pre-5.92)",
+    )
+    .option(
+      "--stream-maxlen <n>",
+      `approximate MAXLEN cap per stream (XADD ... MAXLEN ~ N). 0 disables. Default ${DEFAULT_STREAM_MAXLEN} (or STREAM_MAXLEN env)`,
     )
     .option("--dry-run", "probe target, print plan, exit 0 without writing any rows")
     .option("--force", "bypass the memory-cap refuse-or-go gate");
@@ -150,6 +162,11 @@ async function main(): Promise<void> {
   const batchSize = dials.batchSize;
   const pipelineWindow = dials.pipelineWindow;
   const streamShards: StreamShardsConfig = dials.streamShards;
+  // Wave 5.92C — resolve approximate MAXLEN cap: --stream-maxlen > STREAM_MAXLEN
+  // env > default 2_000_000. `0` opts out (no MAXLEN args on XADD). Threaded
+  // through every producer (inline + worker) so the holding shards are
+  // protected from OOM if consumers fall behind.
+  const streamMaxLen = resolveStreamMaxLen(opts.streamMaxlen);
   const gate = refuseOrGo(shape, totalRows);
   printPlan({ shape, dials, hostCores, rows: totalRows, profileRequested: opts.profile, gate });
 
@@ -179,7 +196,15 @@ async function main(): Promise<void> {
     const client = createClient(redisUrl);
     const generator = createRowGenerator(schema, { seed: baseSeed });
     const router = streamShards === 1 ? undefined : createStreamRouter(opts.stream, streamShards);
-    const producer = createStreamProducer(client, { stream: opts.stream, batchSize, pipelineWindow, router });
+    // Wave 5.92C — flow control polls XLEN via the same client; when streamMaxLen
+    // is opted out (0) we still attach the gate so consumer-slowdown protection
+    // works independently of the trim cap.
+    const flowControl = createStreamFlowControl(client, {}, log);
+    const producer = createStreamProducer(client, {
+      stream: opts.stream, batchSize, pipelineWindow, router,
+      streamMaxLen: streamMaxLen > 0 ? streamMaxLen : undefined,
+      flowControl,
+    });
     try {
       await runGenerationInline({
         totalRows, classes, offset: 0, stride: 1,
@@ -206,8 +231,21 @@ async function main(): Promise<void> {
   await runWithWorkers({
     schemaPath, redisUrl, stream: opts.stream, batchSize, pipelineWindow,
     baseSeed, totalRows, classes, totalWorkers: cappedWorkers, rate, start,
-    streamShards,
+    streamShards, streamMaxLen,
   });
+}
+
+// Wave 5.92C — resolve approximate MAXLEN cap: explicit --stream-maxlen >
+// STREAM_MAXLEN env > DEFAULT_STREAM_MAXLEN. `0` or negative disables the
+// cap so XADD command sequence stays bit-identical to pre-5.92C (used for
+// the canary harness / opt-out). Garbage env values fall back to default
+// rather than silently disabling — a typo must not OOM the host.
+function resolveStreamMaxLen(explicit: string | undefined): number {
+  const raw = explicit ?? process.env.STREAM_MAXLEN;
+  if (raw === undefined || raw === "") return DEFAULT_STREAM_MAXLEN;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return DEFAULT_STREAM_MAXLEN;
+  return Math.floor(n);
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────────
@@ -237,6 +275,8 @@ interface RunWithWorkersOpts {
   // (workers build their own router locally — routers are not serialisable
   // across postMessage).
   streamShards: StreamShardsConfig;
+  // Wave 5.92C — approximate XADD MAXLEN cap. 0 means opt out (no cap).
+  streamMaxLen: number;
 }
 
 async function runWithWorkers(opts: RunWithWorkersOpts): Promise<void> {
@@ -275,6 +315,7 @@ async function runWithWorkers(opts: RunWithWorkersOpts): Promise<void> {
       batchSize: opts.batchSize,
       pipelineWindow: opts.pipelineWindow,
       streamShards: opts.streamShards,
+      streamMaxLen: opts.streamMaxLen,
       seed: `${opts.baseSeed}:w${w}`,
       totalRows: opts.totalRows,
       workerIdx: w,

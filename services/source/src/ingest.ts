@@ -20,6 +20,11 @@ import {
 
 export const INBOUND_STREAM = "sensitivities:in";
 
+// Wave 5.92C — default approximate MAXLEN for source-ingest XADDs (~2 GB
+// at ~1 KB/entry). Tunable via STREAM_MAXLEN env. The producer-side cap
+// protects holding shards from OOM when downstream ingest falls behind.
+export const DEFAULT_STREAM_MAXLEN = 2_000_000;
+
 export interface IngestArgs {
   redis: RedisLike;
   path: string;
@@ -32,6 +37,10 @@ export interface IngestArgs {
   // SOURCE_STREAM_SHARDS from the env; if that is also unset it defaults to
   // 1, preserving the pre-5.92 single-stream XADD path bit-identically.
   streamShards?: StreamShardsConfig;
+  // Wave 5.92C — approximate MAXLEN cap appended as `MAXLEN ~ N` on every
+  // XADD. Resolves arg > STREAM_MAXLEN env > DEFAULT_STREAM_MAXLEN. Pass
+  // `0` to disable the cap entirely (tests / opt-out).
+  streamMaxLen?: number;
 }
 
 export interface IngestStats {
@@ -49,6 +58,13 @@ export async function ingestFile(args: IngestArgs): Promise<IngestStats> {
   const shards: StreamShardsConfig = args.streamShards
     ?? parseStreamShardsFlag(process.env.SOURCE_STREAM_SHARDS);
   const router = shards === 1 ? null : createStreamRouter(INBOUND_STREAM, shards);
+  // Wave 5.92C — resolve MAXLEN cap: explicit arg > STREAM_MAXLEN env >
+  // DEFAULT_STREAM_MAXLEN. `0` disables the cap so the XADD command stays
+  // byte-identical to pre-5.92C (tests that drive a strict stub-Redis can
+  // opt out). The MAXLEN prefix is pre-computed once so the per-row XADD
+  // call is a plain spread.
+  const maxLen = resolveStreamMaxLen(args.streamMaxLen);
+  const maxLenArgs: readonly string[] = maxLen > 0 ? ["MAXLEN", "~", String(maxLen)] : [];
   let n = 0;
 
   for (const row of rows) {
@@ -57,7 +73,7 @@ export async function ingestFile(args: IngestArgs): Promise<IngestStats> {
     const streamKey = router ? router.route(hashTag) : INBOUND_STREAM;
     const xargs: string[] = ["_hash_tag", hashTag];
     for (const [k, v] of Object.entries(fields)) xargs.push(k, v);
-    await args.redis.call("XADD", streamKey, "*", ...xargs);
+    await args.redis.call("XADD", streamKey, ...maxLenArgs, "*", ...xargs);
     n += 1;
     if (args.onProgress && n % progressEvery === 0) args.onProgress(n);
   }
@@ -84,6 +100,20 @@ function applyMapping(
     if (value !== undefined) out[binding] = value;
   }
   return out;
+}
+
+// Wave 5.92C — resolve the MAXLEN ~ N cap from explicit arg > STREAM_MAXLEN
+// env > DEFAULT_STREAM_MAXLEN. `0` (env or arg) disables the cap; any other
+// non-finite / negative value also disables it so a typo can't OOM the host.
+function resolveStreamMaxLen(explicit: number | undefined): number {
+  if (explicit !== undefined) {
+    return Number.isFinite(explicit) && explicit >= 0 ? Math.floor(explicit) : DEFAULT_STREAM_MAXLEN;
+  }
+  const raw = process.env.STREAM_MAXLEN;
+  if (raw === undefined || raw === "") return DEFAULT_STREAM_MAXLEN;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return DEFAULT_STREAM_MAXLEN;
+  return Math.floor(n);
 }
 
 function resolveField(row: Record<string, string>, field: MappedField): string | undefined {

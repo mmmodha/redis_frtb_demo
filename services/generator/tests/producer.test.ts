@@ -331,3 +331,88 @@ describe("Wave 5.92A — stream-router fan-out", () => {
     expect(p.rowsSent).toBe(400);
   });
 });
+
+
+// Wave 5.92C — MAXLEN cap + flow-control delegate. The streamMaxLen option
+// MUST inject `MAXLEN ~ N` between the stream key and the `*` id placeholder
+// on every XADD; the flowControl delegate MUST be called once per dispatched
+// batch with the actual stream key + batch size.
+describe("Wave 5.92C — XADD MAXLEN + flow-control hook", () => {
+  it("undefined streamMaxLen leaves the XADD command sequence bit-identical to pre-5.92C", async () => {
+    const a = stubPipelineClient();
+    const b = stubPipelineClient();
+    const pa = createStreamProducer(a as never, { stream: "s", batchSize: 50 });
+    const pb = createStreamProducer(b as never, { stream: "s", batchSize: 50, streamMaxLen: undefined });
+    for (let i = 0; i < 75; i++) {
+      await pa.add(makeRow(i));
+      await pb.add(makeRow(i));
+    }
+    await pa.flush();
+    await pb.flush();
+    expect(b.execCalls).toEqual(a.execCalls);
+    // First XADD arg-tuple after the stream key is "*" (the id placeholder)
+    // when no MAXLEN cap is set — no trim modifier sneaked in.
+    expect(a.execCalls[0]![0]![1]).toBe("*");
+  });
+
+  it("streamMaxLen=N injects `MAXLEN ~ N` between stream key and `*` on every XADD", async () => {
+    const c = stubPipelineClient();
+    const p = createStreamProducer(c as never, { stream: "s", batchSize: 10, streamMaxLen: 250_000 });
+    for (let i = 0; i < 25; i++) await p.add(makeRow(i));
+    await p.flush();
+    let totalXadds = 0;
+    for (const batch of c.execCalls) {
+      for (const args of batch) {
+        expect(args[0]).toBe("s");
+        expect(args[1]).toBe("MAXLEN");
+        expect(args[2]).toBe("~");
+        expect(args[3]).toBe("250000");
+        expect(args[4]).toBe("*");
+        totalXadds++;
+      }
+    }
+    expect(totalXadds).toBe(25);
+  });
+
+  it("flowControl.afterBatch is called once per dispatched batch with the routed stream key", async () => {
+    const c = stubPipelineClient();
+    const router = createStreamRouter("sensitivities:in", 4);
+    const calls: Array<{ key: string; n: number }> = [];
+    const flowControl = {
+      async afterBatch(key: string, n: number) { calls.push({ key, n }); },
+    };
+    const p = createStreamProducer(c as never, {
+      stream: "sensitivities:in", batchSize: 25, router, flowControl,
+    });
+    // Wide hash-tag spread so every shard accumulates rows.
+    for (let i = 0; i < 200; i++) await p.add(makeRowWithTag(i, `GIRR:B${i % 16}`));
+    await p.flush();
+    // One callback per dispatched batch — every flush emits one batch per
+    // per-stream buffer that reaches batchSize OR is drained by flush().
+    expect(calls.length).toBe(c.execCalls.length);
+    expect(calls.length).toBeGreaterThan(0);
+    const totalRows = calls.reduce((s, x) => s + x.n, 0);
+    expect(totalRows).toBe(200);
+    // Every reported key matches one of the router's shard keys.
+    const shardKeys = new Set(router.shardKeys()!);
+    for (const { key } of calls) expect(shardKeys.has(key)).toBe(true);
+  });
+
+  it("MAXLEN cap + router together: every XADD across all streams carries `MAXLEN ~ N`", async () => {
+    const c = stubPipelineClient();
+    const router = createStreamRouter("sensitivities:in", 4);
+    const p = createStreamProducer(c as never, {
+      stream: "sensitivities:in", batchSize: 25, router, streamMaxLen: 1_000_000,
+    });
+    for (let i = 0; i < 200; i++) await p.add(makeRowWithTag(i, `GIRR:B${i % 16}`));
+    await p.flush();
+    for (const batch of c.execCalls) {
+      for (const args of batch) {
+        expect(args[1]).toBe("MAXLEN");
+        expect(args[2]).toBe("~");
+        expect(args[3]).toBe("1000000");
+        expect(args[4]).toBe("*");
+      }
+    }
+  });
+});

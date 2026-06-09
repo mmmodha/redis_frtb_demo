@@ -178,3 +178,73 @@ describe("ingestFile — progress callback", () => {
     expect(events[events.length - 1]).toBe(6);
   });
 });
+
+
+// Wave 5.92C — every XADD emitted by the source ingest MUST carry the
+// `MAXLEN ~ N` trim modifier so the holding stream is bounded.
+describe("ingestFile — Wave 5.92C MAXLEN cap", () => {
+  it("default streamMaxLen (2_000_000) is appended as `MAXLEN ~ 2000000` on every XADD", async () => {
+    const redis = makeFakeRedis();
+    await ingestFile({
+      redis,
+      path: resolve(FIXTURES, "girr-small.csv"),
+      format: "csv",
+      mapping: { fields: { risk_class: { from: "risk_class" }, bucket: { from: "bucket" } } },
+    });
+    expect(redis.streams.length).toBeGreaterThan(0);
+    for (const entry of redis.streams) {
+      expect(entry.trim).toBeDefined();
+      expect(entry.trim!.mode).toBe("MAXLEN");
+      expect(entry.trim!.approx).toBe(true);
+      expect(entry.trim!.count).toBe("2000000");
+    }
+  });
+
+  it("explicit streamMaxLen arg overrides the env default", async () => {
+    const redis = makeFakeRedis();
+    await ingestFile({
+      redis,
+      path: resolve(FIXTURES, "girr-small.csv"),
+      format: "csv",
+      mapping: { fields: { risk_class: { from: "risk_class" }, bucket: { from: "bucket" } } },
+      streamMaxLen: 500_000,
+    });
+    for (const entry of redis.streams) {
+      expect(entry.trim?.count).toBe("500000");
+    }
+  });
+
+  it("streamMaxLen=0 disables the cap (no MAXLEN args on XADD)", async () => {
+    const redis = makeFakeRedis();
+    await ingestFile({
+      redis,
+      path: resolve(FIXTURES, "girr-small.csv"),
+      format: "csv",
+      mapping: { fields: { risk_class: { from: "risk_class" }, bucket: { from: "bucket" } } },
+      streamMaxLen: 0,
+    });
+    for (const entry of redis.streams) {
+      expect(entry.trim).toBeUndefined();
+    }
+  });
+
+  it("STREAM_MAXLEN env is honoured when arg is unset", async () => {
+    const prev = process.env.STREAM_MAXLEN;
+    process.env.STREAM_MAXLEN = "750000";
+    try {
+      const redis = makeFakeRedis();
+      await ingestFile({
+        redis,
+        path: resolve(FIXTURES, "girr-small.csv"),
+        format: "csv",
+        mapping: { fields: { risk_class: { from: "risk_class" }, bucket: { from: "bucket" } } },
+      });
+      for (const entry of redis.streams) {
+        expect(entry.trim?.count).toBe("750000");
+      }
+    } finally {
+      if (prev === undefined) delete process.env.STREAM_MAXLEN;
+      else process.env.STREAM_MAXLEN = prev;
+    }
+  });
+});
