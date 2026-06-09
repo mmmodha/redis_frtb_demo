@@ -2004,3 +2004,95 @@ describe("POST /calc/sbm — MVP endpoint", () => {
     });
   });
 });
+
+// Wave 5.96F — truthful timing on cache hits. The cached body's `total_ms`
+// holds the cold-compute cost; replaying it on every warm retry made Redis
+// caching look slow (the UI surfaced "Computed in 21 s" alongside cache:hit).
+// computeSbmCharge now overwrites `total_ms` with the freshly-measured hit
+// elapsed and preserves the cold value as `original_compute_ms` so the
+// headline chip can render "Computed in 21.05 s (cached, served in 12 ms)".
+describe("POST /calc/sbm — Wave 5.96F truthful cache-hit timing", () => {
+  let app: Awaited<ReturnType<typeof createServer>>;
+  beforeEach(() => {
+    __resetCalcCacheForTests();
+  });
+  afterEach(async () => {
+    if (app) await app.close();
+  });
+
+  it("cold call records cache:miss with no original_compute_ms; warm call records cache:hit with fresh total_ms and preserved original_compute_ms", async () => {
+    // Synthetic 50 ms latency on the Redis ops so the cold response has a
+    // realistically slow `total_ms` (≥50 ms). The warm retry must come in
+    // far faster because no FT.AGGREGATE / FCALL is dispatched — only the
+    // in-process cache lookup runs.
+    const fr = fakeRedis();
+    fr.setResponse("FT.AGGREGATE", async () => {
+      await new Promise((r) => setTimeout(r, 50));
+      return ftAggregateReply(["USD-IRS"]);
+    });
+    fr.setResponse("FCALL", async () => {
+      await new Promise((r) => setTimeout(r, 50));
+      return ["K_b", "3", "S_b", "3", "count", "100", "ms", "5"];
+    });
+    app = await createServer({
+      redis: fr,
+      correlations: { GIRR: { kind: "constant", value: 0 } },
+    });
+
+    const cold = await app.inject({
+      method: "POST",
+      url: "/calc/sbm",
+      payload: { risk_class: "GIRR", sensitivity_type: "Delta" },
+    });
+    expect(cold.statusCode).toBe(200);
+    const coldBody = cold.json();
+    expect(coldBody.cache).toBe("miss");
+    expect(coldBody.original_compute_ms).toBeUndefined();
+    expect(coldBody.total_ms).toBeGreaterThanOrEqual(50);
+    const coldTotalMs = Number(coldBody.total_ms);
+
+    // Warm retry hits the cache; total_ms must reflect the fresh lookup
+    // (well under any plausible cold-compute cost) while original_compute_ms
+    // exactly preserves the cold-compute value.
+    const warm = await app.inject({
+      method: "POST",
+      url: "/calc/sbm",
+      payload: { risk_class: "GIRR", sensitivity_type: "Delta" },
+    });
+    expect(warm.statusCode).toBe(200);
+    const warmBody = warm.json();
+    expect(warmBody.cache).toBe("hit");
+    expect(warmBody.original_compute_ms).toBe(coldTotalMs);
+    expect(warmBody.total_ms).toBeLessThan(200);
+    expect(warmBody.total_ms).toBeLessThan(coldTotalMs);
+    expect(warmBody.fanout_ms).toBe(0);
+    expect(warmBody.original_fanout_ms).toBe(coldBody.fanout_ms);
+    // The charge itself is unchanged on warm replay — only the timing
+    // metadata is freshly measured.
+    expect(warmBody.charge).toBe(coldBody.charge);
+  });
+
+  it("?nocache=1 skips the cache and never reports cache:hit", async () => {
+    const fr = fakeRedis();
+    fr.setResponse("FT.AGGREGATE", ftAggregateReply(["USD-IRS"]));
+    fr.setResponse("FCALL", ["K_b", "3", "S_b", "3", "count", "100", "ms", "1"]);
+    app = await createServer({
+      redis: fr,
+      correlations: { GIRR: { kind: "constant", value: 0 } },
+    });
+    const r1 = await app.inject({
+      method: "POST",
+      url: "/calc/sbm?nocache=1",
+      payload: { risk_class: "GIRR", sensitivity_type: "Delta" },
+    });
+    const r2 = await app.inject({
+      method: "POST",
+      url: "/calc/sbm?nocache=1",
+      payload: { risk_class: "GIRR", sensitivity_type: "Delta" },
+    });
+    expect(r1.json().cache).toBe("miss");
+    expect(r2.json().cache).toBe("miss");
+    expect(r1.json().original_compute_ms).toBeUndefined();
+    expect(r2.json().original_compute_ms).toBeUndefined();
+  });
+});

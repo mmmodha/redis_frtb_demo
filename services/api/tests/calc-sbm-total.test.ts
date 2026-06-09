@@ -144,6 +144,89 @@ describe("POST /calc/sbm/total — Wave 5.96B orchestrator", () => {
     expect(res.json().error).toMatch(/exclude\.book/);
   });
 
+  // Wave 5.96F — truthful per-cell timing on cache hits. The orchestrator
+  // previously stored each inner cell's `b.total_ms` as the displayed
+  // per-cell ms; on a cache hit that replayed the cold-compute cost (often
+  // 100×–1000× larger than the wall-clock elapsed of the warm fan-out),
+  // breaking the math invariant max(cell_ms) ≤ wall_clock_ms and inflating
+  // the parallelism factor into the millions. The fix is to use the
+  // orchestrator's own freshly-measured `cell_ms` for the breakdown and
+  // expose the stored cold cost as `original_compute_ms`.
+  it("warm retry: per-cell ms ≤ wall_clock, parallelism_factor sane, original_compute_ms preserved", async () => {
+    const fr = delayedFakeRedis(5, ["USD-IRS"]);
+    app = await createServer({
+      redis: fr,
+      correlations: {
+        GIRR: { kind: "constant", value: 0 },
+        EQUITY: { kind: "constant", value: 0 },
+        FX: { kind: "constant", value: 0 },
+      },
+    });
+    // Cold run: every cell is computed and cached. cumulative_ms / total_ms
+    // should both be in the realistic millisecond range for the fan-out.
+    const cold = await app.inject({
+      method: "POST",
+      url: "/calc/sbm/total",
+      payload: {},
+    });
+    expect(cold.statusCode).toBe(200);
+    const coldBody = cold.json();
+    expect(coldBody.performance.cache).toBe("miss");
+    // Wall-clock invariant: no per-cell ms may exceed the wall-clock.
+    for (const row of coldBody.breakdown) {
+      for (const s of ["low", "medium", "high"]) {
+        expect(row.scenarios[s].ms).toBeLessThanOrEqual(coldBody.performance.total_ms + 1);
+      }
+    }
+    const coldCumulative = coldBody.performance.cumulative_ms;
+    expect(coldCumulative).toBeGreaterThan(0);
+
+    // Warm retry: every cell is a cache hit. The freshly-measured
+    // per-cell ms must be far less than the cold-compute cost, and the
+    // wall-clock invariant must still hold. `original_cumulative_ms`
+    // preserves the cold reference; `parallelism_factor` lands in a sane
+    // (e.g. <100×) range, NOT millions.
+    const warm = await app.inject({
+      method: "POST",
+      url: "/calc/sbm/total",
+      payload: {},
+    });
+    expect(warm.statusCode).toBe(200);
+    const warmBody = warm.json();
+    expect(warmBody.performance.cache).toBe("hit");
+    expect(warmBody.performance.cache_hits).toBe(warmBody.performance.redis_ops_count);
+    // Wall-clock invariant on the warm retry — this was the bug.
+    let maxCellMs = 0;
+    for (const row of warmBody.breakdown) {
+      for (const s of ["low", "medium", "high"]) {
+        const cellMs = row.scenarios[s].ms;
+        expect(cellMs).toBeLessThanOrEqual(warmBody.performance.total_ms + 1);
+        if (cellMs > maxCellMs) maxCellMs = cellMs;
+        // On a non-skipped cell the original_compute_ms field must echo
+        // the cold-compute cost. We only assert it's defined and at least
+        // as large as the freshly-measured warm ms — the cold run's per-
+        // cell ms exact value can't be deterministically mirrored back
+        // through the shared cache, but it MUST be greater than the
+        // warm-lookup elapsed.
+        if (!row.skipped) {
+          expect(typeof row.scenarios[s].original_compute_ms).toBe("number");
+          expect(row.scenarios[s].original_compute_ms).toBeGreaterThanOrEqual(cellMs);
+        }
+      }
+    }
+    // cumulative_ms is now the sum of fresh cell_ms values, so the
+    // wall-clock invariant generalises: cumulative_ms / wall_clock ≤
+    // number of cells. parallelism_factor lands in a sane bound, NOT the
+    // millions reported pre-fix.
+    expect(warmBody.performance.cumulative_ms).toBeGreaterThanOrEqual(0);
+    expect(warmBody.performance.parallelism_factor).toBeLessThan(100);
+    expect(warmBody.performance.parallelism_factor).toBeGreaterThanOrEqual(0);
+    // original_cumulative_ms preserves the cold reference (sum of inner
+    // cold-compute costs). It must roughly match the cold cumulative.
+    expect(typeof warmBody.performance.original_cumulative_ms).toBe("number");
+    expect(warmBody.performance.original_cumulative_ms).toBeGreaterThanOrEqual(coldCumulative * 0.5);
+  });
+
   it("a 503 no-data-or-index cell is recorded as skipped with charge 0", async () => {
     const fr = fakeRedis();
     // Discovery returns empty → triggers the precondition probe.

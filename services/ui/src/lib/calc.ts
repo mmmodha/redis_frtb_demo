@@ -149,6 +149,12 @@ export interface CalcSbmResponse {
   engine?: CalcEngine;
   cache?: CalcCacheState;
   cached_at_iso?: string;
+  // Wave 5.96F — on cache hits, `total_ms` / `fanout_ms` are the freshly
+  // measured hit elapsed (expected <100 ms); these fields preserve the cold-
+  // compute cost from when the cache entry was first written so the chip can
+  // render "Computed in 21.05 s (cached, served in 12 ms)". Absent on misses.
+  original_compute_ms?: number;
+  original_fanout_ms?: number;
 }
 
 export async function postCalcSbm(body: CalcSbmRequest): Promise<CalcSbmResponse> {
@@ -199,6 +205,10 @@ export type TotalSbmLeg = "delta" | "vega" | "curvature";
 export interface TotalSbmScenarioCell {
   charge: number;
   ms: number;
+  // Wave 5.96F — cold-compute cost preserved from the cached inner body
+  // (when this cell was served from a /calc/sbm cache hit). Present on
+  // every non-skipped cell since misses set it equal to the fresh cell_ms.
+  original_compute_ms?: number;
 }
 export interface TotalSbmBreakdownRow {
   risk_class: string;
@@ -212,6 +222,14 @@ export interface TotalSbmPerformance {
   parallelism_factor: number;
   redis_ops_count: number;
   ops_skipped: number;
+  // Wave 5.96F — sum of inner cold-compute costs (preserved through cache
+  // hits). `cumulative_ms` is now the sum of freshly-measured cell_ms;
+  // `original_cumulative_ms` retains the cold reference. `cache` is
+  // populated when any cell participated in caching: "hit" = all cells were
+  // cache hits, "miss" = none, "partial" = mixed.
+  original_cumulative_ms?: number;
+  cache?: "hit" | "miss" | "partial";
+  cache_hits?: number;
 }
 export interface TotalSbmResponse {
   total_sbm: number;

@@ -327,14 +327,25 @@ async function computeSbmCharge(
   if (!noCache) {
     const hit = lookupCalcCache(cacheKey);
     if (hit) {
-      return {
-        ok: true,
-        body: {
-          ...(hit.value as Record<string, unknown>),
-          cache: "hit" as const,
-          cached_at_iso: hit.cachedAtIso,
-        },
+      // Wave 5.96F — truthful cache-hit timing. The cached body carries the
+      // cold-compute cost in `total_ms` / `fanout_ms`; replaying those would
+      // make Redis caching look slow. Preserve them as `original_*` and
+      // overwrite the headline timing fields with the freshly-measured hit
+      // elapsed (lookup is in-process, expected <1 ms).
+      const hitMs = Number(process.hrtime.bigint() - t0) / 1e6;
+      const cached = hit.value as Record<string, unknown>;
+      const originalTotalMs = Number(cached.total_ms);
+      const originalFanoutMs = Number(cached.fanout_ms);
+      const body: Record<string, unknown> = {
+        ...cached,
+        total_ms: Math.round(hitMs * 1000) / 1000,
+        fanout_ms: 0,
+        cache: "hit" as const,
+        cached_at_iso: hit.cachedAtIso,
       };
+      if (Number.isFinite(originalTotalMs)) body.original_compute_ms = originalTotalMs;
+      if (Number.isFinite(originalFanoutMs)) body.original_fanout_ms = originalFanoutMs;
+      return { ok: true, body };
     }
   }
 
@@ -877,25 +888,62 @@ export function registerCalcRoute(
       //   breakdown[]               → one entry per (class, leg) with scenarios sub-map
       //   scenario_totals[scenario] → Σ_class (Δ + V + Crv) for that scenario
       //   total_sbm                 → max over scenarios
+      //
+      // Wave 5.96F — per-cell `ms` is the orchestrator's own `cell_ms`
+      // measurement (fresh on every request, including cache hits), NOT the
+      // inner `b.total_ms` (which on a cache hit replays the cold-compute
+      // cost). The stale inner value is preserved as `original_compute_ms`
+      // so cached cells can still show "this cell was a cache hit, original
+      // cold cost was X s" tooltips. cumulative_ms / parallelism_factor are
+      // derived from the fresh cell_ms so the wall-clock invariant
+      // max(cell_ms) ≤ wall_clock_ms always holds.
       type CellInfo = {
         charge: number;
         ms: number;
+        original_compute_ms?: number;
+        cache?: "hit" | "miss";
         skipped: boolean;
       };
       const cellByKey = new Map<string, CellInfo>();
       let cumulative_ms = 0;
+      let original_cumulative_ms = 0;
       let opsFired = 0;
+      let cacheHits = 0;
       const opsSkippedSet = new Set<string>();
       for (const c of cells) {
         const key = `${c.plan.risk_class}|${c.plan.leg}|${c.plan.regime}`;
+        const cellMsRounded = Math.round(c.cell_ms * 1000) / 1000;
         if (!c.outcome.ok) {
-          cellByKey.set(key, { charge: 0, ms: Math.round(c.cell_ms * 1000) / 1000, skipped: true });
+          cellByKey.set(key, { charge: 0, ms: cellMsRounded, skipped: true });
           opsSkippedSet.add(`${c.plan.risk_class}|${c.plan.leg}`);
         } else {
-          const b = c.outcome.body as { charge?: number; total_ms?: number };
-          const ms = Math.round((Number(b.total_ms) || c.cell_ms) * 1000) / 1000;
-          cellByKey.set(key, { charge: Number(b.charge) || 0, ms, skipped: false });
-          cumulative_ms += Number(b.total_ms) || 0;
+          const b = c.outcome.body as {
+            charge?: number;
+            total_ms?: number;
+            original_compute_ms?: number;
+            cache?: "hit" | "miss";
+          };
+          // On a cache hit the inner body's `total_ms` is already the fresh
+          // hit elapsed (overwritten in computeSbmCharge) and the stored
+          // cold-compute cost is in `original_compute_ms`. On a miss the
+          // inner `total_ms` IS the cold-compute cost, so it doubles as the
+          // "original" value (no separate field is present).
+          const innerOriginal = Number(b.original_compute_ms);
+          const innerTotal = Number(b.total_ms);
+          const originalComputeMs = Number.isFinite(innerOriginal)
+            ? innerOriginal
+            : Number.isFinite(innerTotal) ? innerTotal : 0;
+          const info: CellInfo = {
+            charge: Number(b.charge) || 0,
+            ms: cellMsRounded,
+            original_compute_ms: Math.round(originalComputeMs * 1000) / 1000,
+            cache: b.cache,
+            skipped: false,
+          };
+          cellByKey.set(key, info);
+          cumulative_ms += c.cell_ms;
+          original_cumulative_ms += originalComputeMs;
+          if (b.cache === "hit") cacheHits += 1;
           opsFired += 1;
         }
       }
@@ -906,14 +954,24 @@ export function registerCalcRoute(
           const cellSkipped = scenarios.every(
             (s) => cellByKey.get(`${cls}|${lg}|${s}`)?.skipped !== false,
           );
-          const scenarioBlock: Record<CorrelationRegime, { charge: number; ms: number }> = {
+          const scenarioBlock: Record<
+            CorrelationRegime,
+            { charge: number; ms: number; original_compute_ms?: number }
+          > = {
             low: { charge: 0, ms: 0 },
             medium: { charge: 0, ms: 0 },
             high: { charge: 0, ms: 0 },
           };
           for (const s of scenarios) {
             const info = cellByKey.get(`${cls}|${lg}|${s}`)!;
-            scenarioBlock[s] = { charge: info.charge, ms: info.ms };
+            const cell: { charge: number; ms: number; original_compute_ms?: number } = {
+              charge: info.charge,
+              ms: info.ms,
+            };
+            if (info.original_compute_ms !== undefined) {
+              cell.original_compute_ms = info.original_compute_ms;
+            }
+            scenarioBlock[s] = cell;
             scenario_totals[s] += info.charge;
           }
           return {
@@ -934,10 +992,20 @@ export function registerCalcRoute(
         }
       }
 
+      // Wave 5.96F — parallelism_factor is now (fresh cumulative cell_ms) /
+      // wall_clock. Since each cell_ms ≤ wall_clock and at most `plan.length`
+      // cells contribute, this lands in the realistic 1–N range (e.g. 5–30×
+      // on real fan-outs), never the millions we saw when stale stored
+      // total_ms values were summed.
       const parallelism_factor = wallClockMs > 0
         ? Math.round((cumulative_ms / wallClockMs) * 1000) / 1000
         : 0;
       const ops_skipped = opsSkippedSet.size * scenarios.length;
+      const orchestratorCache: "hit" | "miss" | "partial" | undefined =
+        opsFired === 0 ? undefined
+          : cacheHits === opsFired ? "hit"
+          : cacheHits === 0 ? "miss"
+          : "partial";
 
       return {
         total_sbm,
@@ -952,9 +1020,11 @@ export function registerCalcRoute(
         performance: {
           total_ms: Math.round(wallClockMs * 1000) / 1000,
           cumulative_ms: Math.round(cumulative_ms * 1000) / 1000,
+          original_cumulative_ms: Math.round(original_cumulative_ms * 1000) / 1000,
           parallelism_factor,
           redis_ops_count: opsFired,
           ops_skipped,
+          ...(orchestratorCache ? { cache: orchestratorCache, cache_hits: cacheHits } : {}),
         },
         resolved_command_summary: `${plan.length} FT.AGGREGATE+FCALL fan-out via /calc/sbm (${classes.length} classes × ${legs.length} legs × ${scenarios.length} scenarios)`,
       };

@@ -309,6 +309,44 @@ describe("<CalcPanel />", () => {
     });
   });
 
+  // Wave 5.96F — single-calc wallclock badge. On cache misses the chip is
+  // unchanged ("Computed in <total_ms> ms (<fanout_ms> ms of Redis fan-out)").
+  // On cache hits it headlines the cold-compute cost (preserved as
+  // `original_compute_ms`) and then surfaces the freshly-measured
+  // served-in time so users can read "Computed in 21.05 s (cached,
+  // served in 12 ms)".
+  describe("Wave 5.96F: wallclock-badge cache-hit wording", () => {
+    it("cache miss leaves the chip text unchanged", async () => {
+      mockCalcResponse({ ...baseResponse, total_ms: 1500.4, fanout_ms: 14.6, cache: "miss" });
+      render(<CalcPanel />);
+      fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
+      const badge = await screen.findByTestId("wallclock-badge");
+      expect(badge.textContent).toMatch(/Computed in 1500\.4 ms \(14\.6 ms of Redis fan-out\)/);
+      expect(badge.getAttribute("data-cache")).toBeNull();
+    });
+
+    it("cache hit headlines cold compute and surfaces served-in time", async () => {
+      mockCalcResponse({
+        ...baseResponse,
+        total_ms: 12,
+        fanout_ms: 0,
+        cache: "hit",
+        original_compute_ms: 21051.134,
+        original_fanout_ms: 14.6,
+      });
+      render(<CalcPanel />);
+      fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
+      const badge = await screen.findByTestId("wallclock-badge");
+      // Both numbers appear: "21.05 s" (cold) and "12 ms" (served).
+      expect(badge.textContent).toMatch(/21\.05 s/);
+      expect(badge.textContent).toMatch(/cached, served in 12 ms/);
+      expect(badge.getAttribute("data-cache")).toBe("hit");
+      // Tooltip distinguishes original cold compute from served-in time.
+      expect(badge.getAttribute("title") ?? "").toMatch(/Original cold compute/);
+      expect(badge.getAttribute("title") ?? "").toMatch(/served from the response cache/);
+    });
+  });
+
   // Wave 5.16n: standalone Redis has a single shard with sub-ms FCALL, so
   // per-bucket timing is noise — suppress the panel entirely in that case.
   it("Wave 5.16n: suppresses the per-bucket timing panel on standalone (single shard / all zero ms)", async () => {
