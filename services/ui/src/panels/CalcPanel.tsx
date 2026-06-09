@@ -6,6 +6,7 @@ import type { ShardTiming } from "../components/TimingStrip";
 import {
   postBucketCrossDetail,
   postCalcSbm,
+  postCalcSbmTotal,
   type BucketResult,
   type CalcCacheState,
   type CalcCommands,
@@ -15,6 +16,7 @@ import {
   type CrossComponent,
   type CvrComponent,
   type SensitivityType,
+  type TotalSbmResponse,
   type WsComponent,
 } from "../lib/calc";
 import { EmptyTargetError } from "../lib/empty-target";
@@ -315,6 +317,14 @@ export function CalcPanel() {
   // details stay open regardless.
   const [advancedManuallyOpened, setAdvancedManuallyOpened] = useState<boolean>(false);
 
+  // Wave 5.96B — Total SBM orchestrator state. Independent of the per-cell
+  // form so a Total run doesn't disturb the active risk_class / sensitivity
+  // / scenario picks. bucket_subset + exclude are shared because the same
+  // filters apply uniformly across every cell of the 27-cell matrix.
+  const [totalLoading, setTotalLoading] = useState(false);
+  const [totalResult, setTotalResult] = useState<TotalSbmResponse | null>(null);
+  const [totalError, setTotalError] = useState<string | null>(null);
+
   useEffect(() => {
     try {
       window.localStorage.setItem(
@@ -398,6 +408,37 @@ export function CalcPanel() {
       }
     } finally {
       setLoading(false);
+    }
+  }
+
+  // Wave 5.96B — Total SBM orchestrator handler. Fires a single
+  // /calc/sbm/total request that fans out the 27-cell matrix server-side;
+  // bucket_subset + exclude carry the same "don't send the default" rule
+  // as onCalculate so the body stays byte-minimal on the default path.
+  async function onCalculateTotal() {
+    setTotalLoading(true);
+    setTotalError(null);
+    try {
+      const excludeBody: Record<string, string[]> = {};
+      if (excludeBooks.size > 0) excludeBody.book = Array.from(excludeBooks);
+      if (excludeTrades.size > 0) excludeBody.trade_id = Array.from(excludeTrades);
+      if (excludeFactors.size > 0) excludeBody.risk_factor = Array.from(excludeFactors);
+      const sendExclude = Object.keys(excludeBody).length > 0;
+      const sendSubset =
+        result !== null &&
+        bucketSubset !== null &&
+        bucketSubset.size < result.per_bucket.length;
+      const subsetArr = sendSubset ? Array.from(bucketSubset!) : undefined;
+      const r = await postCalcSbmTotal({
+        ...(subsetArr ? { bucket_subset: subsetArr } : {}),
+        ...(sendExclude ? { exclude: excludeBody } : {}),
+      });
+      setTotalResult(r);
+    } catch (e) {
+      setTotalResult(null);
+      setTotalError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setTotalLoading(false);
     }
   }
 
@@ -549,6 +590,137 @@ export function CalcPanel() {
           showRedisCommands={showRedisCommands}
         />
       ) : null}
+
+      <TotalSbmCard
+        loading={totalLoading}
+        result={totalResult}
+        error={totalError}
+        onCalculate={onCalculateTotal}
+      />
+    </div>
+  );
+}
+
+// Wave 5.96B — Total SBM card. Fans out the §21.4(8) max-over-scenarios
+// risk charge across the 27-cell (class × leg × scenario) matrix server-side
+// and surfaces parallelism evidence so the demo can show "Redis-fast" with
+// concrete numbers (wall-clock vs cumulative ms, parallelism factor).
+function TotalSbmCard({
+  loading,
+  result,
+  error,
+  onCalculate,
+}: {
+  loading: boolean;
+  result: TotalSbmResponse | null;
+  error: string | null;
+  onCalculate: () => void;
+}) {
+  return (
+    <PanelCard title="Total SBM (all classes × legs × scenarios)">
+      <p className="calc-panel__lead">
+        Computes the full §21.4(8) risk charge — Σ over classes of (Δ + V + Crv), max over
+        Low/Med/High regimes — by fanning out 27 cells to Redis in parallel.
+      </p>
+      <div className="calc-panel__cta-row">
+        <button
+          type="button"
+          className="calc-panel__cta"
+          onClick={onCalculate}
+          disabled={loading}
+          data-testid="calc-total-cta"
+        >
+          {loading ? "Computing 27 cells…" : "Calculate Total SBM"}
+        </button>
+      </div>
+      {error ? (
+        <div role="alert" className="calc-panel__error">
+          {error}
+        </div>
+      ) : null}
+      {result ? <TotalSbmResultView result={result} /> : null}
+    </PanelCard>
+  );
+}
+
+function TotalSbmResultView({ result }: { result: TotalSbmResponse }) {
+  const perf = result.performance;
+  const totalCells = perf.redis_ops_count + perf.ops_skipped;
+  return (
+    <div className="calc-panel__total-result" data-testid="calc-total-result">
+      <div className="calc-panel__total-headline">
+        <span className="calc-panel__total-headline-label">Total SBM charge</span>
+        <strong data-testid="calc-total-charge">{formatCharge(result.total_sbm)}</strong>
+        <span className="calc-panel__total-headline-meta">
+          winning scenario: <code>{result.winning_scenario}</code>
+        </span>
+      </div>
+      <div className="calc-panel__total-performance" data-testid="calc-total-performance">
+        <span>
+          wall-clock <strong>{perf.total_ms.toFixed(1)} ms</strong>
+        </span>
+        <span>
+          cumulative <strong>{perf.cumulative_ms.toFixed(1)} ms</strong>
+        </span>
+        <span>
+          parallelism ×<strong data-testid="calc-total-parallelism">
+            {perf.parallelism_factor.toFixed(2)}
+          </strong>
+        </span>
+        <span>
+          {perf.redis_ops_count}/{totalCells} cells
+          {perf.ops_skipped > 0 ? ` (${perf.ops_skipped} skipped)` : ""}
+        </span>
+      </div>
+      <div className="calc-panel__total-scenarios">
+        {(["low", "medium", "high"] as CorrelationRegime[]).map((s) => (
+          <div
+            key={s}
+            className={`calc-panel__total-scenario${
+              s === result.winning_scenario ? " calc-panel__total-scenario--winner" : ""
+            }`}
+          >
+            <span className="calc-panel__total-scenario-name">{s}</span>
+            <strong>{formatCharge(result.scenario_totals[s])}</strong>
+          </div>
+        ))}
+      </div>
+      <details className="calc-panel__total-breakdown">
+        <summary>Breakdown (class × leg × scenario)</summary>
+        <table className="calc-panel__total-table" data-testid="calc-total-matrix">
+          <thead>
+            <tr>
+              <th>Class</th>
+              <th>Leg</th>
+              <th>Low</th>
+              <th>Medium</th>
+              <th>High</th>
+            </tr>
+          </thead>
+          <tbody>
+            {result.breakdown.map((row) => (
+              <tr
+                key={`${row.risk_class}-${row.leg}`}
+                className={row.skipped ? "calc-panel__total-row--skipped" : undefined}
+              >
+                <td>{row.risk_class}</td>
+                <td>{row.leg}</td>
+                <td>{formatCharge(row.scenarios.low.charge)}</td>
+                <td>{formatCharge(row.scenarios.medium.charge)}</td>
+                <td>{formatCharge(row.scenarios.high.charge)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </details>
+      {result.unsupported_classes.length > 0 ? (
+        <p className="calc-panel__total-footnote">
+          Unsupported classes (omitted): <code>{result.unsupported_classes.join(", ")}</code>
+        </p>
+      ) : null}
+      <p className="calc-panel__total-footnote">
+        <code>{result.resolved_command_summary}</code>
+      </p>
     </div>
   );
 }

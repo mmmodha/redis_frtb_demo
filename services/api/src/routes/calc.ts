@@ -74,6 +74,28 @@ interface CalcBody {
 
 const ALLOWED_REGIME = new Set<CorrelationRegime>(["low", "medium", "high"]);
 
+// Wave 5.96B — Total SBM orchestrator body. Shares the same bucket_subset +
+// exclude shape as the per-cell /calc/sbm route so a caller that already
+// filters one cell can lift the same payload onto /calc/sbm/total to filter
+// across the entire 27-cell matrix.
+interface TotalSbmBody {
+  bucket_subset?: string[];
+  exclude?: { book?: string[]; trade_id?: string[]; risk_factor?: string[] };
+}
+
+// Wave 5.96B — supported asset classes for the Total SBM orchestrator.
+// Mirrors the keys of FUNC_BY_RISK_CLASS (UPPERCASE for parity with the
+// canonical storage shape Wave 5.15l established). Unsupported classes are
+// surfaced verbatim on the response so the UI can render them as greyed-out
+// rows in the breakdown matrix.
+const TOTAL_SBM_CLASSES: string[] = ["GIRR", "EQUITY", "FX"];
+const TOTAL_SBM_UNSUPPORTED_CLASSES: string[] = [
+  "csr_non_sec",
+  "csr_sec_non_ctp",
+  "csr_sec_ctp",
+  "commodity",
+];
+
 // Wave 5.31a: TAG-token escape for the discovery query string. Duplicates the
 // helper in routes/pivot.ts — kept inline rather than factored into a shared
 // module because it's three lines and the extraction cost outweighs the reuse.
@@ -241,6 +263,308 @@ function resolveQueryNodes(client: RedisLike): RedisLike[] {
   return [client];
 }
 
+// Wave 5.96B — minimal logger surface used by the compute helper (subset of
+// FastifyBaseLogger). Lets the helper warn on discovery failures without
+// pulling the full Fastify type into the function signature.
+interface LogLike {
+  warn: (obj: unknown, msg?: string) => void;
+}
+
+interface ComputeSbmInput {
+  risk_class: string; // already UPPERCASE
+  leg: Leg;
+  bucket_subset: string[]; // already validated + deduped + uppercased
+  regime: CorrelationRegime;
+  excludeCsv: Record<ExcludeKey, string>;
+  forcePath: "lua" | "fast" | null;
+  noCache: boolean;
+}
+
+interface ComputeSbmCtx {
+  redis: RedisLike;
+  schema?: Schema;
+  correlations: Record<string, CorrelationSpec>;
+  log: LogLike;
+}
+
+type ComputeSbmOutcome =
+  | { ok: true; body: Record<string, unknown> }
+  | { ok: false; statusCode: number; body: Record<string, unknown> };
+
+// Wave 5.96B — extracted core compute for a single (risk_class, leg, regime)
+// triplet. Reuses the same discovery + fanout + reduce pipeline the /calc/sbm
+// route has carried since Wave 5.7, so the new /calc/sbm/total orchestrator
+// fans out without HTTP self-recursion and without duplicating Lua/fast-path
+// branching logic.
+async function computeSbmCharge(
+  input: ComputeSbmInput,
+  ctx: ComputeSbmCtx,
+): Promise<ComputeSbmOutcome> {
+  const { risk_class, leg, bucket_subset, regime, excludeCsv, forcePath, noCache } = input;
+  const { redis, schema, correlations, log } = ctx;
+  const funcName = funcNameFor(risk_class, leg);
+  const corr: CorrelationSpec = correlations[risk_class] ?? { kind: "constant", value: 0 };
+  const regimeFactor = CORRELATION_REGIME_FACTOR[regime];
+  // CRITICAL — Curvature scaling order (§21.5(5) + §21.6): scale γ FIRST,
+  // then square. Because reduceCurvatureCharge calls squareCorrelationSpec
+  // on whatever we pass in, feeding it the scaled spec yields
+  //   (γ × factor)²  =  γ² × factor²
+  // which is the correct Basel interpretation.
+  const scaledCorr = scaleCorrelationSpec(corr, regimeFactor, 1.0);
+  const target_label = getActiveTarget().label;
+  const t0 = process.hrtime.bigint();
+
+  // Wave 5.83C-2 — short-TTL response cache lookup.
+  const cacheBody = {
+    risk_class,
+    sensitivity_type: leg,
+    bucket_subset: [...bucket_subset].sort(),
+    correlation_regime: regime,
+    exclude: excludeCsv,
+  };
+  const dataVersion = await getDataVersion(redis);
+  const cacheKey = calcCacheKey({ ...cacheBody, force_path: forcePath }, dataVersion);
+  if (!noCache) {
+    const hit = lookupCalcCache(cacheKey);
+    if (hit) {
+      return {
+        ok: true,
+        body: {
+          ...(hit.value as Record<string, unknown>),
+          cache: "hit" as const,
+          cached_at_iso: hit.cachedAtIso,
+        },
+      };
+    }
+  }
+
+  const discoveryQuery = bucket_subset.length > 0
+    ? `@risk_class:{${risk_class}} @bucket:{${bucket_subset.map(escapeTag).join("|")}}`
+    : `@risk_class:{${risk_class}}`;
+
+  // 1) Discover buckets present for this risk_class — per-master fan-out.
+  const queryNodes = resolveQueryNodes(redis);
+  const bucketSet = new Set<string>();
+  let discoveryError: string | null = null;
+  try {
+    for (const node of queryNodes) {
+      const aggReply = await node.call(
+        "FT.AGGREGATE",
+        "idx:sens",
+        discoveryQuery,
+        "GROUPBY",
+        "1",
+        "@bucket",
+        "LIMIT",
+        "0",
+        "10000",
+        "DIALECT",
+        "2",
+        "TIMEOUT",
+        "30000",
+      );
+      for (const b of parseBucketsFromAggregate(aggReply)) bucketSet.add(b);
+    }
+  } catch (err) {
+    const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
+    if (translated) {
+      return { ok: false, statusCode: translated.status, body: translated.body };
+    }
+    const errMsg = err instanceof Error ? err.message : String(err);
+    discoveryError = errMsg;
+    log.warn({
+      evt: "calc-discovery-failed",
+      err: errMsg,
+      query: discoveryQuery,
+      risk_class,
+      target_label,
+    });
+  }
+  const buckets = Array.from(bucketSet);
+
+  // 1a) Precondition probe via FT.INFO num_docs.
+  let numDocs: number | null = null;
+  if (buckets.length === 0 || discoveryError) {
+    let probed = 0;
+    try {
+      const infoReply = await redis.call("FT.INFO", "idx:sens");
+      probed = parseFtInfoNumDocs(infoReply);
+    } catch {
+      probed = 0;
+    }
+    numDocs = probed;
+    if (buckets.length === 0 && numDocs === 0) {
+      return {
+        ok: false,
+        statusCode: 503,
+        body: {
+          error: "no-data-or-index",
+          risk_class,
+          measure: leg,
+          hint: "ensure idx:sens exists on all masters and stream has been ingested",
+        },
+      };
+    }
+  }
+
+  if (discoveryError && numDocs !== null && numDocs > 0) {
+    return {
+      ok: false,
+      statusCode: 502,
+      body: {
+        error: "discovery-failed",
+        reason: discoveryError,
+        hint: "FT.AGGREGATE on idx:sens failed — see api warn log",
+      },
+    };
+  }
+
+  // 2) Per-bucket K_b/S_b via fast path or Lua FCALL.
+  const useFastPath = forcePath === "fast"
+    ? schema !== undefined
+    : forcePath === "lua"
+    ? false
+    : fastPathEnabled(schema);
+  const fanoutStart = process.hrtime.bigint();
+  const dispatchedKeys = buckets.map((b) => `sens:{${risk_class}:${b}}:_route`);
+  let results: BucketResultWithEngine[];
+  try {
+    if (useFastPath) {
+      const fast = await aggregateBucketsViaIndex({
+        redis,
+        schema: schema!,
+        riskClass: risk_class,
+        leg,
+        filters: {
+          bucketSubset: bucket_subset,
+          exclude: {
+            book: excludeCsv.book ? excludeCsv.book.split(",") : [],
+            trade_id: excludeCsv.trade_id ? excludeCsv.trade_id.split(",") : [],
+            risk_factor: excludeCsv.risk_factor ? excludeCsv.risk_factor.split(",") : [],
+          },
+        },
+        components: { crossTopN: 10 },
+      });
+      const byBucket = new Map(fast.map((r) => [r.bucket, r]));
+      const legFields = resolveLegFields(schema!, risk_class, leg);
+      const perTenor = (schema!.risk_classes[risk_class]?.tenor?.nodes?.length ?? 0) > 0
+        && risk_class === "GIRR";
+      const excludeFilter = {
+        book: excludeCsv.book ? excludeCsv.book.split(",") : [],
+        trade_id: excludeCsv.trade_id ? excludeCsv.trade_id.split(",") : [],
+        risk_factor: excludeCsv.risk_factor ? excludeCsv.risk_factor.split(",") : [],
+      };
+      results = buckets.map((b) => {
+        const r = byBucket.get(b) ?? {
+          bucket: b, K_b: 0, S_b: 0, count: 0, ms: 0,
+          intermediate: { path: "fast" as const, ws_squared_sum: 0, cross_term: 0 },
+        };
+        const perBucketQuery = buildFastPathQuery(risk_class, legFields.sensitivityType, {
+          bucketSubset: [b],
+          exclude: excludeFilter,
+        });
+        const perBucketArgv = buildFastPathAggregateArgs(perBucketQuery, legFields, perTenor);
+        const resolved_command = formatRedisCommand("FT.AGGREGATE", perBucketArgv);
+        return { ...r, engine: FAST_PATH_ENGINE, resolved_command };
+      });
+    } else {
+      results = await Promise.all(
+        buckets.map(async (b, i): Promise<BucketResultWithEngine> => {
+          const routeKey = dispatchedKeys[i]!;
+          const r = (await redis.call(
+            "FCALL",
+            funcName,
+            "1",
+            routeKey,
+            risk_class,
+            b,
+            excludeCsv.book,
+            excludeCsv.trade_id,
+            excludeCsv.risk_factor,
+          )) as unknown;
+          const parsed = parseBucketReply(r) ?? { bucket: "", K_b: 0, S_b: 0, count: 0, ms: 0 };
+          parsed.bucket = b;
+          const intermediate = { path: "lua" as const };
+          const resolved_command = formatRedisCommand("FCALL", [
+            funcName, "1", routeKey, risk_class, b,
+            excludeCsv.book, excludeCsv.trade_id, excludeCsv.risk_factor,
+          ]);
+          return { ...parsed, engine: LUA_PATH_ENGINE, intermediate, resolved_command };
+        }),
+      );
+    }
+  } catch (err) {
+    const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
+    if (translated) {
+      return { ok: false, statusCode: translated.status, body: translated.body };
+    }
+    throw err;
+  }
+  const fanoutMs = Number(process.hrtime.bigint() - fanoutStart) / 1e6;
+
+  // 3) Reduce per-bucket K_b/S_b → risk-class charge.
+  let charge: number;
+  let curvatureBranch: "positive_interior" | "fallback_clipped_s" | undefined;
+  if (leg === "curvature") {
+    const out = reduceCurvatureCharge(results, scaledCorr);
+    charge = out.charge;
+    curvatureBranch = out.usedFallback ? "fallback_clipped_s" : "positive_interior";
+  } else {
+    charge = reduceRiskClassCharge(results, scaledCorr);
+  }
+  const total_ms = Number(process.hrtime.bigint() - t0) / 1e6;
+
+  const regimeNote =
+    regime === "high"
+      ? "γ × 1.25, each ρ_bc capped at 1.0"
+      : regime === "low"
+      ? "γ × 0.75"
+      : "γ × 1.0 (no-op)";
+  const commands = {
+    discovery: {
+      command: "FT.AGGREGATE" as const,
+      index: "idx:sens",
+      query: discoveryQuery,
+      groupby: ["@bucket"],
+      reducers: ["COUNT 0 AS n"],
+    },
+    fcall: {
+      command: "FCALL" as const,
+      function: funcName,
+      library: "frtb",
+      arg_template: `FCALL ${funcName} 1 sens:{${risk_class}:<bucket>}:_route ${risk_class} <bucket> <exclude_book_csv> <exclude_trade_csv> <exclude_factor_csv>`,
+      dispatched_keys: dispatchedKeys,
+    },
+    regime: {
+      name: regime,
+      factor: regimeFactor,
+      cap: 1.0,
+      note: regimeNote,
+    },
+  };
+
+  const note = results.length === 0 && buckets.length === 0
+    ? bucket_subset.length > 0
+      ? `No buckets in subset [${bucket_subset.join(",")}] have data for risk_class ${risk_class} on '${target_label}'.`
+      : `No sensitivities on '${target_label}' — ingest data to run calculations.`
+    : undefined;
+
+  const body: Record<string, unknown> = {
+    charge,
+    per_bucket: results,
+    total_ms: Math.round(total_ms * 1000) / 1000,
+    shard_breakdown: results.map((r) => ({ shard: r.bucket, buckets: [r.bucket], ms: r.ms })),
+    fanout_ms: Math.round(fanoutMs * 1000) / 1000,
+    correlation_regime: regime,
+    engine: useFastPath ? FAST_PATH_ENGINE : LUA_PATH_ENGINE,
+    commands,
+    ...(curvatureBranch !== undefined ? { curvature_branch: curvatureBranch } : {}),
+    ...(note ? { ok: true, note } : {}),
+  };
+  if (!noCache) storeCalcCache(cacheKey, body);
+  return { ok: true, body: { ...body, cache: "miss" as const } };
+}
+
 /**
  * Registers `POST /calc/sbm`.
  *
@@ -373,375 +697,269 @@ export function registerCalcRoute(
         excludeCsv[key] = Array.from(seen).join(",");
       }
     }
-    const regimeFactor = CORRELATION_REGIME_FACTOR[regime];
-    // CRITICAL — Curvature scaling order (§21.5(5) + §21.6): scale γ FIRST,
-    // then square. Because reduceCurvatureCharge calls squareCorrelationSpec
-    // on whatever we pass in, feeding it the scaled spec yields
-    //   (γ × factor)²  =  γ² × factor²
-    // which is the correct Basel interpretation. Scaling γ_curv directly
-    // (i.e. γ² × factor) would be wrong by a factor of `factor`.
-    const scaledCorr = scaleCorrelationSpec(corr, regimeFactor, 1.0);
-
-    // Wave 5.16t — resolve the active redis client once per request so a
-    // mid-flight target switch is picked up by the very next call.
-    const redis = getRedis();
-    const target_label = getActiveTarget().label;
-
-    const t0 = process.hrtime.bigint();
-
-    // Wave 5.83C-2 — short-TTL response cache lookup. Key combines the
-    // normalised request body (post-validation, post-uppercase, post-dedup)
-    // with a data-version stamp INCR'd on every /admin/flush. A hit returns
-    // the cached body verbatim with cache:"hit" + cached_at_iso markers;
-    // miss falls through to the FT.AGGREGATE + FCALL fan-out below.
-    const cacheBody = {
-      risk_class,
-      sensitivity_type: leg,
-      bucket_subset: [...bucket_subset].sort(),
-      correlation_regime: regime,
-      exclude: excludeCsv,
-    };
-    // Wave 5.83E — `?nocache=1` and `?force_path=lua|fast` are benchmark-only
-    // query knobs. nocache=1 skips both lookup and store so every call forces
-    // a cold fan-out. force_path participates in the cache key so the two
-    // engines don't collide when the cache IS used.
-    const noCache = req.query?.nocache === "1";
-    const forcePathRaw = req.query?.force_path;
-    const forcePath: "lua" | "fast" | null =
-      forcePathRaw === "lua" || forcePathRaw === "fast" ? forcePathRaw : null;
-    const dataVersion = await getDataVersion(redis);
-    const cacheKey = calcCacheKey({ ...cacheBody, force_path: forcePath }, dataVersion);
-    if (!noCache) {
-      const hit = lookupCalcCache(cacheKey);
-      if (hit) {
-        return {
-          ...(hit.value as Record<string, unknown>),
-          cache: "hit" as const,
-          cached_at_iso: hit.cachedAtIso,
-        };
-      }
-    }
-
-    // Wave 5.31a: build the discovery query string ONCE so the FT.AGGREGATE
-    // call and the observability `commands.discovery.query` mirror agree by
-    // construction. When a subset is supplied, push the @bucket TAG predicate
-    // alongside @risk_class so the index returns only the requested slice.
-    const discoveryQuery = bucket_subset.length > 0
-      ? `@risk_class:{${risk_class}} @bucket:{${bucket_subset.map(escapeTag).join("|")}}`
-      : `@risk_class:{${risk_class}}`;
-
-    // 1) Discover buckets present for this risk_class — per-master fan-out.
-    //    ioredis Cluster's coordinator does NOT aggregate FT.SEARCH / FT.AGGREGATE
-    //    replies the way it aggregates FT.INFO: a single .call() lands on one
-    //    slot owner and returns only that shard's view of the cluster-wide
-    //    idx:sens. So we query every master and union the bucket sets in TS.
-    //    In standalone mode resolveQueryNodes returns [client] and this is a
-    //    single call exactly as before.
-    const queryNodes = resolveQueryNodes(redis);
-    const bucketSet = new Set<string>();
-    // Wave 5.41: explicit TIMEOUT on the discovery FT.AGGREGATE so a slow
-    // cluster surfaces as a captured error (and a 502 below) rather than
-    // hanging the request behind the implicit module default. The `catch`
-    // captures the error in `discoveryError` so the FT.AGGREGATE failure
-    // isn't silently swallowed into a misleading charge=0 result.
-    let discoveryError: string | null = null;
-    try {
-      for (const node of queryNodes) {
-        const aggReply = await node.call(
-          "FT.AGGREGATE",
-          "idx:sens",
-          discoveryQuery,
-          "GROUPBY",
-          "1",
-          "@bucket",
-          "LIMIT",
-          "0",
-          "10000",
-          "DIALECT",
-          "2",
-          "TIMEOUT",
-          "30000"
-        );
-        for (const b of parseBucketsFromAggregate(aggReply)) bucketSet.add(b);
-      }
-    } catch (err) {
-      const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
-      if (translated) {
-        reply.code(translated.status);
-        return translated.body;
-      }
-      const errMsg = err instanceof Error ? err.message : String(err);
-      discoveryError = errMsg;
-      app.log.warn({
-        evt: "calc-discovery-failed",
-        err: errMsg,
-        query: discoveryQuery,
+    // Wave 5.96B — delegate to the shared compute helper so /calc/sbm/total
+    // can fan out the same logic in-process across (class, leg, scenario)
+    // cells without HTTP self-recursion.
+    const outcome = await computeSbmCharge(
+      {
         risk_class,
-        target_label,
-      });
-    }
-    const buckets = Array.from(bucketSet);
-
-    // 1a) Precondition probe: an empty bucket list could mean either no data
-    //     for this risk_class or — the Wave 5.7 failure mode — the index is
-    //     missing on some shards. FT.INFO IS cluster-aggregated by ioredis
-    //     Cluster (it sums num_docs across masters), so a single call gives
-    //     the cluster-wide populated total without a per-shard fan-out. If
-    //     num_docs is zero (or FT.INFO errors because no index exists),
-    //     surface a 503 so callers don't mistake "no data" for a genuine
-    //     sbm_charge=0.
-    //
-    // Wave 5.41: numDocs is now lifted out of the empty-buckets branch so
-    // the new 502 "discovery-failed" path below shares the same probe.
-    let numDocs: number | null = null;
-    if (buckets.length === 0 || discoveryError) {
-      let probed = 0;
-      try {
-        const infoReply = await redis.call("FT.INFO", "idx:sens");
-        probed = parseFtInfoNumDocs(infoReply);
-      } catch {
-        probed = 0;
-      }
-      numDocs = probed;
-      if (buckets.length === 0 && numDocs === 0) {
-        reply.code(503);
-        return {
-          error: "no-data-or-index",
-          risk_class,
-          measure: leg,
-          hint: "ensure idx:sens exists on all masters and stream has been ingested",
-        };
-      }
-    }
-
-    // Wave 5.41: FT.AGGREGATE failed BUT idx:sens has data → surface the
-    // upstream failure as 502 so the caller sees the underlying reason
-    // instead of a misleading "No sensitivities" 200 with charge=0.
-    if (discoveryError && numDocs !== null && numDocs > 0) {
-      reply.code(502);
-      return {
-        error: "discovery-failed",
-        reason: discoveryError,
-        hint: "FT.AGGREGATE on idx:sens failed — see api warn log",
-      };
-    }
-
-    // 2) Per-bucket K_b/S_b. Two execution paths share the same downstream
-    //    reducer shape:
-    //      • Wave 5.83C-1 fast path (default when opts.schema is present and
-    //        CALC_FAST_PATH !== "0"): a single FT.AGGREGATE returns the per-
-    //        bucket pre-weighted aggregates and TS computes K_b in-process via
-    //        the constant-ρ closed form (Delta/Vega) or the §21.5(3) ψ-gated
-    //        closed form (Curvature). Stamps engine="ft_aggregate" per bucket.
-    //      • Legacy Lua path: one FCALL per bucket, runs slot-local on the
-    //        owning shard because the routing key carries the
-    //        {risk_class:bucket} hash-tag. Stamps engine="fcall_lua".
-    //    `dispatchedKeys` is built off `buckets` regardless of path so the
-    //    Wave 5.16m observability `commands.fcall.dispatched_keys` stays the
-    //    same shape on both modes (the fast path didn't actually issue the
-    //    FCALLs — the keys describe what the legacy path WOULD have dispatched
-    //    for the same input).
-    // Wave 5.83E — force_path overrides the CALC_FAST_PATH env at the request
-    // level. Still requires opts.schema to be present (the fast path needs the
-    // schema to resolve per-tenor weighted field names).
-    const useFastPath = forcePath === "fast"
-      ? opts.schema !== undefined
-      : forcePath === "lua"
-      ? false
-      : fastPathEnabled(opts.schema);
-    const fanoutStart = process.hrtime.bigint();
-    const dispatchedKeys = buckets.map((b) => `sens:{${risk_class}:${b}}:_route`);
-    let results: BucketResultWithEngine[];
-    try {
-      if (useFastPath) {
-        const fast = await aggregateBucketsViaIndex({
-          redis,
-          schema: opts.schema!,
-          riskClass: risk_class,
-          leg: leg as Leg,
-          filters: {
-            bucketSubset: bucket_subset,
-            exclude: {
-              book: excludeCsv.book ? excludeCsv.book.split(",") : [],
-              trade_id: excludeCsv.trade_id ? excludeCsv.trade_id.split(",") : [],
-              risk_factor: excludeCsv.risk_factor ? excludeCsv.risk_factor.split(",") : [],
-            },
-          },
-          // Wave 5.96A.1 — surface ws_components + top-10 cross_components +
-          // (curvature) cvr_components on every per-bucket intermediate so the
-          // drilldown UI can render the component-level breakdown without an
-          // extra round-trip on the common case.
-          components: { crossTopN: 10 },
-        });
-        // Match the legacy bucket order (input `buckets` from discovery) so the
-        // dispatched_keys[i]/results[i] correspondence holds. Missing fast-path
-        // entries (e.g. a bucket the index sees in discovery but has zero rows
-        // matching the sensitivity_type) collapse to zeroed BucketResults.
-        const byBucket = new Map(fast.map((r) => [r.bucket, r]));
-        // Wave 5.96A — per-bucket resolved_command renders the single-bucket
-        // slice of the fast-path FT.AGGREGATE so the drilldown shows what the
-        // engine WOULD dispatch for THIS bucket alone. We rebuild argv with a
-        // bucketSubset of just [b] to preserve the per-class APPLY/REDUCE
-        // pipeline verbatim (same alias scheme the live query uses).
-        const legFields = resolveLegFields(opts.schema!, risk_class, leg as Leg);
-        const perTenor = (opts.schema!.risk_classes[risk_class]?.tenor?.nodes?.length ?? 0) > 0
-          && risk_class === "GIRR";
-        const excludeFilter = {
-          book: excludeCsv.book ? excludeCsv.book.split(",") : [],
-          trade_id: excludeCsv.trade_id ? excludeCsv.trade_id.split(",") : [],
-          risk_factor: excludeCsv.risk_factor ? excludeCsv.risk_factor.split(",") : [],
-        };
-        results = buckets.map((b) => {
-          const r = byBucket.get(b) ?? {
-            bucket: b, K_b: 0, S_b: 0, count: 0, ms: 0,
-            intermediate: { path: "fast" as const, ws_squared_sum: 0, cross_term: 0 },
-          };
-          const perBucketQuery = buildFastPathQuery(risk_class, legFields.sensitivityType, {
-            bucketSubset: [b],
-            exclude: excludeFilter,
-          });
-          const perBucketArgv = buildFastPathAggregateArgs(perBucketQuery, legFields, perTenor);
-          const resolved_command = formatRedisCommand("FT.AGGREGATE", perBucketArgv);
-          return { ...r, engine: FAST_PATH_ENGINE, resolved_command };
-        });
-      } else {
-        results = await Promise.all(
-          buckets.map(async (b, i): Promise<BucketResultWithEngine> => {
-            const routeKey = dispatchedKeys[i]!;
-            // Wave 5.31c: positional args 3/4/5 are the exclude CSVs. Empty
-            // strings are passed through unconditionally so the FCALL arity is
-            // stable — the kernel's `_frtb_parse_csv_set` returns nil for "" and
-            // takes the short-circuit "no exclusion" path.
-            const r = (await redis.call(
-              "FCALL",
-              funcName,
-              "1",
-              routeKey,
-              risk_class,
-              b,
-              excludeCsv.book,
-              excludeCsv.trade_id,
-              excludeCsv.risk_factor
-            )) as unknown;
-            const parsed = parseBucketReply(r) ?? { bucket: "", K_b: 0, S_b: 0, count: 0, ms: 0 };
-            parsed.bucket = b;
-            // Wave 5.96A — Lua path: intermediates are computed inside the
-            // FCALL kernel and not surfaced (option B). Stamp `path: "lua"`
-            // so the UI renders the "computed in Lua FCALL, intermediates not
-            // surfaced" note instead of a broken formula block.
-            const intermediate = { path: "lua" as const };
-            const resolved_command = formatRedisCommand("FCALL", [
-              funcName, "1", routeKey, risk_class, b,
-              excludeCsv.book, excludeCsv.trade_id, excludeCsv.risk_factor,
-            ]);
-            return { ...parsed, engine: LUA_PATH_ENGINE, intermediate, resolved_command };
-          })
-        );
-      }
-    } catch (err) {
-      const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
-      if (translated) {
-        reply.code(translated.status);
-        return translated.body;
-      }
-      throw err;
-    }
-    const fanoutMs = Number(process.hrtime.bigint() - fanoutStart) / 1e6;
-
-    // 3) Reduce per-bucket K_b/S_b → risk-class charge. Curvature follows the
-    //    §21.5(5)/(5)(b) shape (γ² + ψ-gated cross terms); Delta/Vega use the
-    //    §21.4(5)/(7) shape. We pass `scaledCorr` — the §21.6 regime-scaled γ
-    //    spec — into BOTH paths so the cross-bucket term reflects the chosen
-    //    correlation regime. For Curvature, reduceCurvatureCharge squares the
-    //    spec internally; feeding it the already-scaled γ yields (γ·f)² which
-    //    is the correct interpretation (scale FIRST, then square).
-    let charge: number;
-    let curvatureBranch: "positive_interior" | "fallback_clipped_s" | undefined;
-    if (leg === "curvature") {
-      const out = reduceCurvatureCharge(results, scaledCorr);
-      charge = out.charge;
-      curvatureBranch = out.usedFallback ? "fallback_clipped_s" : "positive_interior";
-    } else {
-      charge = reduceRiskClassCharge(results, scaledCorr);
-    }
-    const total_ms = Number(process.hrtime.bigint() - t0) / 1e6;
-
-    // Wave 5.16m / 5.31b: observability — surface the exact Redis commands the
-    // route dispatched (FT.AGGREGATE for discovery, FCALL per bucket for
-    // fan-out) plus the §21.6 regime applied to γ_bc so the UI can render the
-    // full provenance verbatim for the demo. Read-only mirror; no extra work.
-    const regimeNote =
-      regime === "high"
-        ? "γ × 1.25, each ρ_bc capped at 1.0"
-        : regime === "low"
-        ? "γ × 0.75"
-        : "γ × 1.0 (no-op)";
-    const commands = {
-      discovery: {
-        command: "FT.AGGREGATE" as const,
-        index: "idx:sens",
-        // Wave 5.31a: mirror the actual query string we just dispatched so the
-        // observability panel reflects subset narrowing verbatim.
-        query: discoveryQuery,
-        groupby: ["@bucket"],
-        reducers: ["COUNT 0 AS n"],
+        leg: leg as Leg,
+        bucket_subset,
+        regime,
+        excludeCsv,
+        forcePath: req.query?.force_path === "lua" || req.query?.force_path === "fast"
+          ? (req.query.force_path as "lua" | "fast")
+          : null,
+        noCache: req.query?.nocache === "1",
       },
-      fcall: {
-        command: "FCALL" as const,
-        function: funcName,
-        library: "frtb",
-        // Wave 5.31c: arg_template surfaces the three exclude CSV positionals
-        // so the UI commands panel makes the kernel-side predicate push-down
-        // visible to demo audiences — the pushdown is invisible without it.
-        arg_template: `FCALL ${funcName} 1 sens:{${risk_class}:<bucket>}:_route ${risk_class} <bucket> <exclude_book_csv> <exclude_trade_csv> <exclude_factor_csv>`,
-        dispatched_keys: dispatchedKeys,
+      {
+        redis: getRedis(),
+        schema: opts.schema,
+        correlations: opts.correlations,
+        log: app.log,
       },
-      regime: {
-        name: regime,
-        factor: regimeFactor,
-        cap: 1.0,
-        note: regimeNote,
-      },
-    };
-
-    // Wave 5.16t / 5.31a — empty-result hint. Two distinct empty cases land
-    // here (the num_docs===0 case already 503'd above):
-    //   • subset-driven empty: caller asked for buckets that don't exist for
-    //     this risk_class → return a 200 with a subset-aware note rather than
-    //     silently rendering charge=0.
-    //   • no-subset empty: index is populated for other risk classes but this
-    //     one has no rows → existing "ingest data" prompt.
-    const note = results.length === 0 && buckets.length === 0
-      ? bucket_subset.length > 0
-        ? `No buckets in subset [${bucket_subset.join(",")}] have data for risk_class ${risk_class} on '${target_label}'.`
-        : `No sensitivities on '${target_label}' — ingest data to run calculations.`
-      : undefined;
-
-    const body = {
-      charge,
-      per_bucket: results,
-      total_ms: Math.round(total_ms * 1000) / 1000,
-      shard_breakdown: results.map((r) => ({ shard: r.bucket, buckets: [r.bucket], ms: r.ms })),
-      // diagnostic — useful for the demo "look how parallel we are" callout
-      fanout_ms: Math.round(fanoutMs * 1000) / 1000,
-      // Wave 5.31b: echo the regime that was actually applied so the UI badge
-      // shows what was computed, not what the user thought they requested.
-      correlation_regime: regime,
-      // Wave 5.83C-1 — top-level engine field for the UI badge. All per-bucket
-      // entries share the same engine within a single request, so a single
-      // field is sufficient (and cheaper for the UI than scanning per_bucket).
-      engine: useFastPath ? FAST_PATH_ENGINE : LUA_PATH_ENGINE,
-      commands,
-      ...(curvatureBranch !== undefined ? { curvature_branch: curvatureBranch } : {}),
-      ...(note ? { ok: true, note } : {}),
-    };
-    // Wave 5.83C-2 — cache the successful response body so repeat requests
-    // with the same canonicalised inputs short-circuit above. The cache:"miss"
-    // marker on the wire mirrors the cache:"hit" marker added on lookup.
-    // Wave 5.83E — `?nocache=1` skips store too so subsequent calls stay cold.
-    if (!noCache) storeCalcCache(cacheKey, body);
-    return { ...body, cache: "miss" as const };
+    );
+    if (!outcome.ok) {
+      reply.code(outcome.statusCode);
+      return outcome.body;
+    }
+    return outcome.body;
   });
+
+  // Wave 5.96B — Total SBM orchestrator. Fans out computeSbmCharge over the
+  // 27-cell (class × leg × scenario) matrix in parallel via Promise.all,
+  // collapses per-scenario via Σ_class (Δ + V + Crv), then takes max over
+  // low/medium/high to produce the final §21.4(8) risk charge. Surfaces a
+  // breakdown matrix plus parallelism evidence (cumulative vs wall-clock ms)
+  // so the UI can render the "Redis-fast" callout with concrete numbers.
+  app.post<{ Body: TotalSbmBody; Querystring: CalcQuery }>(
+    "/calc/sbm/total",
+    async (req, reply) => {
+      // Validation mirrors /calc/sbm so the orchestrator rejects the same
+      // malformed payloads at entry. bucket_subset / exclude apply uniformly
+      // to every cell — a single subset narrows discovery across the matrix.
+      const subsetRaw = req.body?.bucket_subset;
+      let bucket_subset: string[] = [];
+      if (subsetRaw !== undefined && subsetRaw !== null) {
+        if (!Array.isArray(subsetRaw)) {
+          reply.code(400);
+          return { error: "bucket_subset must be an array of non-empty strings" };
+        }
+        for (const v of subsetRaw) {
+          if (typeof v !== "string" || v.length === 0) {
+            reply.code(400);
+            return { error: "bucket_subset must be an array of non-empty strings" };
+          }
+        }
+        if (subsetRaw.length > MAX_BUCKET_SUBSET) {
+          reply.code(400);
+          return { error: `bucket_subset exceeds maximum of ${MAX_BUCKET_SUBSET} entries` };
+        }
+        const seen = new Set<string>();
+        for (const v of subsetRaw) {
+          const u = v.toUpperCase();
+          if (!seen.has(u)) seen.add(u);
+        }
+        bucket_subset = Array.from(seen);
+      }
+
+      const excludeRaw = req.body?.exclude;
+      const excludeCsv: Record<ExcludeKey, string> = { book: "", trade_id: "", risk_factor: "" };
+      if (excludeRaw !== undefined && excludeRaw !== null) {
+        if (typeof excludeRaw !== "object" || Array.isArray(excludeRaw)) {
+          reply.code(400);
+          return { error: "exclude must be an object with optional book/trade_id/risk_factor arrays" };
+        }
+        for (const key of EXCLUDE_KEYS) {
+          const list = (excludeRaw as Record<string, unknown>)[key];
+          if (list === undefined || list === null) continue;
+          if (!Array.isArray(list)) {
+            reply.code(400);
+            return { error: `exclude.${key} must be an array of non-empty strings` };
+          }
+          if (list.length > MAX_EXCLUDE_LIST) {
+            reply.code(413);
+            return { error: `exclude.${key} exceeds maximum of ${MAX_EXCLUDE_LIST} entries` };
+          }
+          const seen = new Set<string>();
+          for (const v of list) {
+            if (typeof v !== "string" || v.length === 0) {
+              reply.code(400);
+              return { error: `exclude.${key} must be an array of non-empty strings` };
+            }
+            if (v.includes(",")) {
+              reply.code(400);
+              return { error: `exclude.${key} values may not contain commas` };
+            }
+            seen.add(v);
+          }
+          excludeCsv[key] = Array.from(seen).join(",");
+        }
+      }
+
+      const forcePath: "lua" | "fast" | null =
+        req.query?.force_path === "lua" || req.query?.force_path === "fast"
+          ? (req.query.force_path as "lua" | "fast")
+          : null;
+      const noCache = req.query?.nocache === "1";
+
+      const redis = getRedis();
+      const ctx: ComputeSbmCtx = {
+        redis,
+        schema: opts.schema,
+        correlations: opts.correlations,
+        log: app.log,
+      };
+
+      // Wave 5.96B — orchestration matrix: only the three supported asset
+      // classes ship Redis Functions today (csr_*/commodity are out of scope
+      // per the locked spec). Legs and scenarios are the full §21.4(7)/(8)
+      // crosses. Fanout is the cartesian product → 3·3·3 = 27 cells.
+      const classes: string[] = TOTAL_SBM_CLASSES;
+      const legs: Leg[] = ["delta", "vega", "curvature"];
+      const scenarios: CorrelationRegime[] = ["low", "medium", "high"];
+
+      const wallStart = process.hrtime.bigint();
+      type CellPlan = { risk_class: string; leg: Leg; regime: CorrelationRegime };
+      const plan: CellPlan[] = [];
+      for (const rc of classes) for (const l of legs) for (const s of scenarios) {
+        plan.push({ risk_class: rc, leg: l, regime: s });
+      }
+
+      // The proof-of-parallelism is here: Promise.all dispatches every cell
+      // without awaiting between them so per-cell Redis round-trips overlap
+      // on the cluster (or in-process fake) rather than serialising on the
+      // event loop. The cumulative_ms / wall_clock_ms ratio reflects this.
+      const cellPromises = plan.map(async (p) => {
+        const cellStart = process.hrtime.bigint();
+        const outcome = await computeSbmCharge(
+          {
+            risk_class: p.risk_class,
+            leg: p.leg,
+            bucket_subset,
+            regime: p.regime,
+            excludeCsv,
+            forcePath,
+            noCache,
+          },
+          ctx,
+        );
+        const cell_ms = Number(process.hrtime.bigint() - cellStart) / 1e6;
+        return { plan: p, outcome, cell_ms };
+      });
+      const cells = await Promise.all(cellPromises);
+      const wallClockMs = Number(process.hrtime.bigint() - wallStart) / 1e6;
+
+      // Surface a fatal infrastructure failure (cluster-loading / connection
+      // refused) verbatim — those translate to 5xx in computeSbmCharge and
+      // mean the whole request is unanswerable, not just one cell. A 503
+      // "no-data-or-index" however is a legitimate per-cell skip (the class
+      // simply has no sensitivities ingested) and contributes 0 to the
+      // breakdown.
+      for (const c of cells) {
+        if (!c.outcome.ok) {
+          const status = c.outcome.statusCode;
+          const body = c.outcome.body as { error?: string };
+          const isPerCellSkip = status === 503 && body.error === "no-data-or-index";
+          if (!isPerCellSkip) {
+            reply.code(status);
+            return {
+              ...body,
+              risk_class: c.plan.risk_class,
+              sensitivity_type: c.plan.leg,
+              correlation_regime: c.plan.regime,
+            };
+          }
+        }
+      }
+
+      // Wave 5.96B — collapse the 27-cell grid:
+      //   breakdown[]               → one entry per (class, leg) with scenarios sub-map
+      //   scenario_totals[scenario] → Σ_class (Δ + V + Crv) for that scenario
+      //   total_sbm                 → max over scenarios
+      type CellInfo = {
+        charge: number;
+        ms: number;
+        skipped: boolean;
+      };
+      const cellByKey = new Map<string, CellInfo>();
+      let cumulative_ms = 0;
+      let opsFired = 0;
+      const opsSkippedSet = new Set<string>();
+      for (const c of cells) {
+        const key = `${c.plan.risk_class}|${c.plan.leg}|${c.plan.regime}`;
+        if (!c.outcome.ok) {
+          cellByKey.set(key, { charge: 0, ms: Math.round(c.cell_ms * 1000) / 1000, skipped: true });
+          opsSkippedSet.add(`${c.plan.risk_class}|${c.plan.leg}`);
+        } else {
+          const b = c.outcome.body as { charge?: number; total_ms?: number };
+          const ms = Math.round((Number(b.total_ms) || c.cell_ms) * 1000) / 1000;
+          cellByKey.set(key, { charge: Number(b.charge) || 0, ms, skipped: false });
+          cumulative_ms += Number(b.total_ms) || 0;
+          opsFired += 1;
+        }
+      }
+
+      const scenario_totals: Record<CorrelationRegime, number> = { low: 0, medium: 0, high: 0 };
+      const breakdown = classes.flatMap((cls) =>
+        legs.map((lg) => {
+          const cellSkipped = scenarios.every(
+            (s) => cellByKey.get(`${cls}|${lg}|${s}`)?.skipped !== false,
+          );
+          const scenarioBlock: Record<CorrelationRegime, { charge: number; ms: number }> = {
+            low: { charge: 0, ms: 0 },
+            medium: { charge: 0, ms: 0 },
+            high: { charge: 0, ms: 0 },
+          };
+          for (const s of scenarios) {
+            const info = cellByKey.get(`${cls}|${lg}|${s}`)!;
+            scenarioBlock[s] = { charge: info.charge, ms: info.ms };
+            scenario_totals[s] += info.charge;
+          }
+          return {
+            risk_class: cls,
+            leg: lg,
+            skipped: cellSkipped,
+            scenarios: scenarioBlock,
+          };
+        }),
+      );
+
+      let winning_scenario: CorrelationRegime = "medium";
+      let total_sbm = scenario_totals.medium;
+      for (const s of scenarios) {
+        if (scenario_totals[s] > total_sbm) {
+          total_sbm = scenario_totals[s];
+          winning_scenario = s;
+        }
+      }
+
+      const parallelism_factor = wallClockMs > 0
+        ? Math.round((cumulative_ms / wallClockMs) * 1000) / 1000
+        : 0;
+      const ops_skipped = opsSkippedSet.size * scenarios.length;
+
+      return {
+        total_sbm,
+        winning_scenario,
+        scenario_totals: {
+          low: Math.round(scenario_totals.low * 1e6) / 1e6,
+          medium: Math.round(scenario_totals.medium * 1e6) / 1e6,
+          high: Math.round(scenario_totals.high * 1e6) / 1e6,
+        },
+        breakdown,
+        unsupported_classes: TOTAL_SBM_UNSUPPORTED_CLASSES,
+        performance: {
+          total_ms: Math.round(wallClockMs * 1000) / 1000,
+          cumulative_ms: Math.round(cumulative_ms * 1000) / 1000,
+          parallelism_factor,
+          redis_ops_count: opsFired,
+          ops_skipped,
+        },
+        resolved_command_summary: `${plan.length} FT.AGGREGATE+FCALL fan-out via /calc/sbm (${classes.length} classes × ${legs.length} legs × ${scenarios.length} scenarios)`,
+      };
+    },
+  );
 
   // Wave 5.96A.1 — full per-bucket cross-component listing. The /calc/sbm
   // response carries the top-10 pairs by |contrib| on each bucket; this

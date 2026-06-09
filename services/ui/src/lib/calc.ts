@@ -186,3 +186,50 @@ export async function postBucketCrossDetail(
   }
   return (await res.json()) as BucketCrossDetailResponse;
 }
+
+// Wave 5.96B — Total SBM orchestrator client. Fans out the 27-cell
+// (class × leg × scenario) matrix server-side and returns the §21.4(8)
+// max-over-scenarios risk charge plus per-cell evidence and parallelism
+// metrics for the "Redis-fast" badge.
+export interface TotalSbmRequest {
+  bucket_subset?: string[];
+  exclude?: { book?: string[]; trade_id?: string[]; risk_factor?: string[] };
+}
+export type TotalSbmLeg = "delta" | "vega" | "curvature";
+export interface TotalSbmScenarioCell {
+  charge: number;
+  ms: number;
+}
+export interface TotalSbmBreakdownRow {
+  risk_class: string;
+  leg: TotalSbmLeg;
+  skipped: boolean;
+  scenarios: Record<CorrelationRegime, TotalSbmScenarioCell>;
+}
+export interface TotalSbmPerformance {
+  total_ms: number;
+  cumulative_ms: number;
+  parallelism_factor: number;
+  redis_ops_count: number;
+  ops_skipped: number;
+}
+export interface TotalSbmResponse {
+  total_sbm: number;
+  winning_scenario: CorrelationRegime;
+  scenario_totals: Record<CorrelationRegime, number>;
+  breakdown: TotalSbmBreakdownRow[];
+  unsupported_classes: string[];
+  performance: TotalSbmPerformance;
+  resolved_command_summary: string;
+}
+export async function postCalcSbmTotal(body: TotalSbmRequest): Promise<TotalSbmResponse> {
+  const res = await fetch(`${apiBase()}/calc/sbm/total`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    throw await buildApiError(res, `api /calc/sbm/total ${res.status}`);
+  }
+  return (await res.json()) as TotalSbmResponse;
+}
