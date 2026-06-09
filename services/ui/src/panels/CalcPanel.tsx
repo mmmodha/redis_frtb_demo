@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent } from "react";
 import { BlockMath, InlineMath } from "react-katex";
-import { EnterpriseCallout, PanelCard, Sparkline, TimingStrip } from "../components";
+import { CommandPreview, EnterpriseCallout, PanelCard, Sparkline, TimingStrip } from "../components";
 import { SuggestCombobox } from "../components/SuggestCombobox";
 import type { ShardTiming } from "../components/TimingStrip";
 import {
@@ -1958,12 +1958,11 @@ function BucketKbDrilldown({
       <section className="bucket-drilldown__kb-command" data-testid="bucket-drilldown-command">
         <h4 className="bucket-drilldown__kb-title">Redis · {fmtMs(ms)} ms</h4>
         {resolved_command ? (
-          <pre
-            className="bucket-drilldown__kb-command-pre"
-            data-testid="bucket-drilldown-command-pre"
-          >
-            {resolved_command}
-          </pre>
+          <CommandPreview
+            command={resolved_command}
+            preTestId="bucket-drilldown-command-pre"
+            preClassName="bucket-drilldown__kb-command-pre"
+          />
         ) : (
           <p className="bucket-drilldown__kb-command-missing">
             (resolved command not available)
@@ -2647,9 +2646,7 @@ function CommandsPanel({
     >
       <div aria-live="polite" data-testid="redis-commands">
         <h3 style={{ margin: "0 0 0.5rem", fontSize: "0.9375rem" }}>Discovery (FT.AGGREGATE)</h3>
-        <pre style={codeStyle}>
-          <code data-testid="discovery-command">{discoveryOneLiner}</code>
-        </pre>
+        <CommandPreview command={discoveryOneLiner} codeTestId="discovery-command" />
         <p style={captionStyle}>
           Counts how many sensitivities exist per bucket so we know which shards to fan out to.
         </p>
@@ -2661,9 +2658,7 @@ function CommandsPanel({
           Function: <strong data-testid="fcall-function">{f.function}</strong> · Library:{" "}
           <strong data-testid="fcall-library">{f.library}</strong>
         </p>
-        <pre style={codeStyle}>
-          <code data-testid="fcall-command">{f.arg_template}</code>
-        </pre>
+        <CommandPreview command={f.arg_template} codeTestId="fcall-command" />
         <p style={captionStyle}>
           Runs the SBM K_b reduction inside Redis, slot-local per bucket via the hash-tagged
           routing key.

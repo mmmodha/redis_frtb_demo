@@ -11,3 +11,5 @@ export { Sparkline } from "./Sparkline";
 export type { SparklineProps } from "./Sparkline";
 export { MetricHistoryModal } from "./MetricHistoryModal";
 export type { MetricHistoryModalProps } from "./MetricHistoryModal";
+export { CommandPreview } from "./CommandPreview";
+export type { CommandPreviewProps } from "./CommandPreview";
