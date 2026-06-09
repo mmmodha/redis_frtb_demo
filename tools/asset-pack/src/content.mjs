@@ -2,14 +2,14 @@
 // Kept as code-as-content so the bundle is reproducible from a clean checkout
 // even before the demo dry-run captures real screenshots.
 
-export const NEXT_STEPS_MD = `# Next Steps — HSBC FRTB-SA on Redis Enterprise
+export const NEXT_STEPS_MD = `# Next Steps — Tier-1 bank FRTB-SA on Redis Enterprise
 
 After today's demo, the recommended path to value.
 
 ## 1. Two-week scoped POC
 
 - Pick one risk class (suggested: GIRR Delta) and one desk.
-- HSBC supplies one day of real sensitivities (anonymised if needed) plus the desk's incumbent SBM oracle output.
+- The bank supplies one day of real sensitivities (anonymised if needed) plus the desk's incumbent SBM oracle output.
 - Redis SA + Professional Services co-builds the schema YAML and the Function library binding.
 - Acceptance: live calc reproduces the incumbent oracle to within 0.01% over the sample, sub-2-second wall-clock.
 
@@ -17,7 +17,7 @@ After today's demo, the recommended path to value.
 
 - **K8s Operator** (preferred for GKE / EKS / OpenShift) — official Operator + BDB CRDs, GitOps-native.
 - **Ansible roles** for VM-based (on-prem VMware, bare metal). Same product, same modules.
-- All installs run **inside HSBC's perimeter**. No data egress. No SaaS dependency.
+- All installs run **inside the bank's perimeter**. No data egress. No SaaS dependency.
 
 ## 3. Procurement contacts
 
@@ -42,7 +42,7 @@ After today's demo, the recommended path to value.
 Total realistic timeline from POC kick-off to production cut-over: **14–18 weeks**.
 `;
 
-export const EXEC_SUMMARY_MD = `# Executive Summary — Redis Enterprise for HSBC FRTB-SA
+export const EXEC_SUMMARY_MD = `# Executive Summary — Redis Enterprise for Tier-1 bank FRTB-SA
 
 ## The pain
 FRTB-SA goes live in January. Your incumbent stack (Oracle + Spark + JVM risk engines) was built for end-of-day batch. The desk wants live recalc on 450M sensitivities across ~110 dimensions with tenor arrays. The current architecture cannot deliver the latency, the shape, or the cost envelope at that scale.
@@ -55,7 +55,7 @@ FRTB-SA goes live in January. Your incumbent stack (Oracle + Spark + JVM risk en
 - **In-database SBM math** via Redis Functions — \`FCALL\` per bucket on the owning shard, slot-local, map-reduce.
 - **Auto Tiering** (RAM + NVMe in one logical DB) for the 450M scale story. Enterprise-exclusive.
 - **Active-Active CRDTs** for local-write latency in London, Hong Kong, New York.
-- **Deployed inside HSBC's perimeter** — your VPCs, your on-prem, your controls.
+- **Deployed inside the bank's perimeter** — your VPCs, your on-prem, your controls.
 
 ## What today's demo proved
 - Live ingest of 10M synthetic sensitivities into a 3-shard cluster.
@@ -73,13 +73,13 @@ FRTB-SA goes live in January. Your incumbent stack (Oracle + Spark + JVM risk en
 - 24×7 support from the team that builds the product.
 
 ## The ask
-Two-week scoped POC on one risk class with HSBC's own data. Acceptance: live SBM charge reproduces your incumbent oracle to within 0.01%, sub-2-second wall-clock. The path from POC to production is 14–18 weeks via the K8s Operator.
+Two-week scoped POC on one risk class with the bank's own data. Acceptance: live SBM charge reproduces your incumbent oracle to within 0.01%, sub-2-second wall-clock. The path from POC to production is 14–18 weeks via the K8s Operator.
 `;
 
 export const TECHNICAL_BRIEF_MD = `# Technical Brief — FRTB-SA Architecture on Redis Enterprise
 
 ## Architecture summary
-- **State + search + compute consolidated in one product.** Redis Enterprise Software (RS) cluster runs inside HSBC's perimeter. The application sits in front of RS via the Fastify \`api\` service. There is no separate search store, no separate compute layer for the per-bucket SBM math.
+- **State + search + compute consolidated in one product.** Redis Enterprise Software (RS) cluster runs inside the bank's perimeter. The application sits in front of RS via the Fastify \`api\` service. There is no separate search store, no separate compute layer for the per-bucket SBM math.
 - **Microservices, fault-isolated.** \`ui\`, \`api\`, \`generator\`, \`ingest\`, \`source\`, \`calc\`, \`loadgen\`. Each restarts independently. \`docker compose up\` is the dev loop.
 - **All UI traffic goes through the api.** Browsers never speak Redis directly.
 
@@ -108,7 +108,7 @@ export const TECHNICAL_BRIEF_MD = `# Technical Brief — FRTB-SA Architecture on
 - **Sources:** \`synthetic\` (generator) and \`file\` (browser upload < 2 GB or server path / S3 reference for 450M-row files). \`source\` infers columns and presents a mapping wizard.
 
 ## Security posture
-- TLS in transit (mTLS available), encryption at rest with HSBC's KMS (BYOK), audit logs to HSBC's SIEM, support for fully air-gapped installs, RBAC + ACL per database.
+- TLS in transit (mTLS available), encryption at rest with the bank's KMS (BYOK), audit logs to the bank's SIEM, support for fully air-gapped installs, RBAC + ACL per database.
 
 ## What's in the asset pack
 - This brief, the executive summary, the talking-points cheat-sheet, the competitive-positioning doc, the sizing worksheet, the Reveal.js deck (PDF), and screenshots of every demo step.

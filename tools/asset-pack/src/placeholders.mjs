@@ -10,7 +10,7 @@ export const PNG_1x1 = Buffer.from(
 
 // Minimal valid single-page PDF, ~480 bytes, declares "FRTB-SA Deck —
 // placeholder". Replaced by the real Reveal.js export from task 4.4 before
-// the HSBC handoff.
+// the Tier-1 bank handoff.
 export function makePlaceholderPdf(title = 'FRTB-SA Deck — placeholder (replaced by 4.4 dry-run)') {
   const text = title;
   const body = [

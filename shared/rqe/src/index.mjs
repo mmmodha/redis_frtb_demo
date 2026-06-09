@@ -25,7 +25,7 @@ export const IDX_PREFIX = "sens:";
 // Schema, in declaration order. Add fields here by appending; the FT.CREATE
 // command is built from this array so additions are mechanical.
 //
-// Wave 5.17a — added `risk_factor` (HSBC tag dimension; pool of 16 per
+// Wave 5.17a — added `risk_factor` (Tier-1 bank tag dimension; pool of 16 per
 // class). `trade_id` was already indexed and stays indexed.
 // Wave 5.83A — added `trader` (per-row attribution) and `_calibration`
 // (low-cardinality ingest tag) as static TAGs; per-class per-tenor
