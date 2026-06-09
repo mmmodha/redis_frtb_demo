@@ -124,7 +124,8 @@ scripts/run-local.sh logs generator -f                  # follow progress
 ```
 
 Anything after `--` is forwarded to `tsx services/generator/src/cli.ts`
-(e.g. `--rows`, `--rate`, `--seed`, `--stream`).
+(e.g. `--rows`, `--rate`, `--seed`, `--stream`, `--sensitivity-types Delta,Vega,Curvature`
+— default omits Curvature).
 
 ### Canonical 200k baseline (Wave 5.84)
 

@@ -73,12 +73,46 @@ interface CliOptions {
   // Wave 5.92C — approximate MAXLEN cap appended as `MAXLEN ~ N` on every
   // XADD. Default 2_000_000 (~2 GB at ~1 KB/entry). `0` disables the cap.
   streamMaxlen?: string;
+  // Wave 5.96G-gen — CSV of sensitivity types to emit. Accepts Delta, Vega,
+  // Curvature (case-insensitive). Default ["Delta","Vega"] preserves pre-5.96G
+  // behaviour for every existing smoke / unit test that relied on the
+  // row-generator default.
+  sensitivityTypes?: string;
   dryRun?: boolean;
   force?: boolean;
 }
 
 // Wave 5.84C — accepted --profile values.
 const PROFILE_NAMES = new Set<string>(["auto", "small", "medium", "large"]);
+
+// Wave 5.96G-gen — canonical sensitivity-type names. The row-generator's
+// DEFAULT_SENSITIVITY_TYPES is ["Delta","Vega"]; Curvature is opt-in (shape A
+// per docs/demo/curvature-scope.md §3a).
+const VALID_SENSITIVITY_TYPES = ["Delta", "Vega", "Curvature"] as const;
+
+// Wave 5.96G-gen — parse `--sensitivity-types Delta,vega,CURVATURE` into the
+// canonical-cased array `["Delta","Vega","Curvature"]`. Case-insensitive
+// accept, canonical-cased storage. Rejects empty tokens and any value outside
+// the three valid names. Returns the row-generator default when the flag is
+// omitted.
+function parseSensitivityTypes(csv: string | undefined): readonly string[] {
+  if (csv === undefined) return ["Delta", "Vega"];
+  const tokens = csv.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+  if (tokens.length === 0) {
+    throw new Error(`--sensitivity-types must list at least one of: ${VALID_SENSITIVITY_TYPES.join(", ")}`);
+  }
+  const canonical: string[] = [];
+  for (const tok of tokens) {
+    const match = VALID_SENSITIVITY_TYPES.find((v) => v.toLowerCase() === tok.toLowerCase());
+    if (!match) {
+      throw new Error(
+        `--sensitivity-types: invalid value "${tok}". Allowed: ${VALID_SENSITIVITY_TYPES.join(", ")}`,
+      );
+    }
+    if (!canonical.includes(match)) canonical.push(match);
+  }
+  return canonical;
+}
 
 async function main(): Promise<void> {
   const program = new Command();
@@ -112,6 +146,10 @@ async function main(): Promise<void> {
       "--stream-maxlen <n>",
       `approximate MAXLEN cap per stream (XADD ... MAXLEN ~ N). 0 disables. Default ${DEFAULT_STREAM_MAXLEN} (or STREAM_MAXLEN env)`,
     )
+    .option(
+      "--sensitivity-types <csv>",
+      `comma list of sensitivity types to emit (case-insensitive). Allowed: ${VALID_SENSITIVITY_TYPES.join(", ")}. Default: Delta,Vega`,
+    )
     .option("--dry-run", "probe target, print plan, exit 0 without writing any rows")
     .option("--force", "bypass the memory-cap refuse-or-go gate");
 
@@ -129,6 +167,9 @@ async function main(): Promise<void> {
   if (!PROFILE_NAMES.has(opts.profile)) {
     throw new Error(`--profile must be one of auto|small|medium|large (got: ${opts.profile})`);
   }
+  // Wave 5.96G-gen — resolve sensitivity types before any Redis connection so
+  // an invalid flag fails fast (DoD #3).
+  const sensitivityTypes = parseSensitivityTypes(opts.sensitivityTypes);
 
   const schema = loadSchema(schemaPath);
   const classes = pickRiskClasses(schema, opts.classes);
@@ -194,7 +235,7 @@ async function main(): Promise<void> {
     // streamShards !== 1; the N=1 / per-bucket=false branch leaves producer
     // construction byte-for-byte identical to pre-5.92 (no router arg).
     const client = createClient(redisUrl);
-    const generator = createRowGenerator(schema, { seed: baseSeed });
+    const generator = createRowGenerator(schema, { seed: baseSeed, sensitivityTypes });
     const router = streamShards === 1 ? undefined : createStreamRouter(opts.stream, streamShards);
     // Wave 5.92C — flow control polls XLEN via the same client; when streamMaxLen
     // is opted out (0) we still attach the gate so consumer-slowdown protection
@@ -231,7 +272,7 @@ async function main(): Promise<void> {
   await runWithWorkers({
     schemaPath, redisUrl, stream: opts.stream, batchSize, pipelineWindow,
     baseSeed, totalRows, classes, totalWorkers: cappedWorkers, rate, start,
-    streamShards, streamMaxLen,
+    streamShards, streamMaxLen, sensitivityTypes,
   });
 }
 
@@ -277,6 +318,8 @@ interface RunWithWorkersOpts {
   streamShards: StreamShardsConfig;
   // Wave 5.92C — approximate XADD MAXLEN cap. 0 means opt out (no cap).
   streamMaxLen: number;
+  // Wave 5.96G-gen — canonical-cased sensitivity types to emit per row.
+  sensitivityTypes: readonly string[];
 }
 
 async function runWithWorkers(opts: RunWithWorkersOpts): Promise<void> {
@@ -318,6 +361,7 @@ async function runWithWorkers(opts: RunWithWorkersOpts): Promise<void> {
       pipelineWindow: opts.pipelineWindow,
       streamShards: opts.streamShards,
       streamMaxLen: opts.streamMaxLen,
+      sensitivityTypes: [...opts.sensitivityTypes],
       seed: `${opts.baseSeed}:w${w}`,
       totalRows: opts.totalRows,
       workerIdx: w,

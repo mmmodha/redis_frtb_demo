@@ -254,6 +254,94 @@ describe("generator CLI", () => {
     }
   });
 
+  // Wave 5.96G-gen — --sensitivity-types CLI flag plumbed through to
+  // createRowGenerator. Default omitted → Delta+Vega only (preserves every
+  // pre-5.96G smoke/unit assertion); explicit Curvature opts in to shape-A
+  // emission; invalid value fails fast before any Redis connection.
+  it.skipIf(!redisAvailable)("default --sensitivity-types (omitted) → only Delta + Vega in the Stream", async () => {
+    const res = spawnSync(
+      process.execPath,
+      [tsx, cli, "--rows", "200", "--classes", "fx", "--seed", "10", "--batch-size", "100"],
+      {
+        env: { ...process.env, SCHEMA_FILE: multiClass, REDIS_URL: `redis://127.0.0.1:${PORT}`, REDIS_CLUSTER: "false", STREAM_KEY: "sensitivities:in" },
+        encoding: "utf8",
+        timeout: 30_000,
+      }
+    );
+    expect(res.status, `stdout:\n${res.stdout}\nstderr:\n${res.stderr}`).toBe(0);
+    const items = await redis.xrange("sensitivities:in", "-", "+", "COUNT", 200);
+    const seen = new Set<string>();
+    for (const [, fields] of items) {
+      const map = Object.fromEntries(
+        Array.from({ length: fields.length / 2 }, (_, i) => [fields[i * 2], fields[i * 2 + 1]])
+      );
+      const payload = JSON.parse(map.payload as string);
+      seen.add(payload.sensitivity_type as string);
+    }
+    expect(seen).toEqual(new Set(["Delta", "Vega"]));
+  });
+
+  it.skipIf(!redisAvailable)("--sensitivity-types Curvature → only Curvature rows emitted (case-insensitive accept)", async () => {
+    const res = spawnSync(
+      process.execPath,
+      [tsx, cli, "--rows", "200", "--classes", "fx", "--seed", "11", "--batch-size", "100", "--sensitivity-types", "curvature"],
+      {
+        env: { ...process.env, SCHEMA_FILE: multiClass, REDIS_URL: `redis://127.0.0.1:${PORT}`, REDIS_CLUSTER: "false", STREAM_KEY: "sensitivities:in" },
+        encoding: "utf8",
+        timeout: 30_000,
+      }
+    );
+    expect(res.status, `stdout:\n${res.stdout}\nstderr:\n${res.stderr}`).toBe(0);
+    const items = await redis.xrange("sensitivities:in", "-", "+", "COUNT", 200);
+    const seen = new Set<string>();
+    for (const [, fields] of items) {
+      const map = Object.fromEntries(
+        Array.from({ length: fields.length / 2 }, (_, i) => [fields[i * 2], fields[i * 2 + 1]])
+      );
+      const payload = JSON.parse(map.payload as string);
+      seen.add(payload.sensitivity_type as string);
+    }
+    expect(seen).toEqual(new Set(["Curvature"]));
+  });
+
+  it.skipIf(!redisAvailable)("--sensitivity-types Delta,Vega,Curvature → all three present in the Stream", async () => {
+    const res = spawnSync(
+      process.execPath,
+      [tsx, cli, "--rows", "600", "--classes", "fx", "--seed", "12", "--batch-size", "200", "--sensitivity-types", "Delta,Vega,Curvature"],
+      {
+        env: { ...process.env, SCHEMA_FILE: multiClass, REDIS_URL: `redis://127.0.0.1:${PORT}`, REDIS_CLUSTER: "false", STREAM_KEY: "sensitivities:in" },
+        encoding: "utf8",
+        timeout: 30_000,
+      }
+    );
+    expect(res.status, `stdout:\n${res.stdout}\nstderr:\n${res.stderr}`).toBe(0);
+    const items = await redis.xrange("sensitivities:in", "-", "+", "COUNT", 600);
+    const seen = new Set<string>();
+    for (const [, fields] of items) {
+      const map = Object.fromEntries(
+        Array.from({ length: fields.length / 2 }, (_, i) => [fields[i * 2], fields[i * 2 + 1]])
+      );
+      const payload = JSON.parse(map.payload as string);
+      seen.add(payload.sensitivity_type as string);
+    }
+    expect(seen).toEqual(new Set(["Delta", "Vega", "Curvature"]));
+  });
+
+  it("--sensitivity-types Bogus exits non-zero with a clear error before any Redis connection", () => {
+    const res = spawnSync(
+      process.execPath,
+      [tsx, cli, "--rows", "10", "--classes", "fx", "--sensitivity-types", "Bogus"],
+      {
+        env: { ...process.env, SCHEMA_FILE: multiClass, REDIS_URL: "redis://127.0.0.1:1", REDIS_CLUSTER: "false", STREAM_KEY: "sensitivities:in" },
+        encoding: "utf8",
+        timeout: 30_000,
+      }
+    );
+    expect(res.status, `stdout:\n${res.stdout}\nstderr:\n${res.stderr}`).not.toBe(0);
+    expect(res.stdout + res.stderr).toMatch(/sensitivity-types/i);
+    expect(res.stdout + res.stderr).toMatch(/Bogus/);
+  });
+
   it.skipIf(!redisAvailable)("re-running with a different SCHEMA_FILE produces rows in the new shape (proves schema swap)", async () => {
     const swap = resolve(here, "fixtures/swap-schema.yaml");
     spawnSync(
