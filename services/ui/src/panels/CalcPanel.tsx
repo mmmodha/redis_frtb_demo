@@ -663,7 +663,7 @@ function TotalSbmCard({
     <PanelCard title="Total SBM (all classes × legs × scenarios)">
       <p className="calc-panel__lead">
         Computes the full §21.4(8) risk charge — Σ over classes of (Δ + V + Crv), max over
-        Low/Med/High regimes — by fanning out 27 cells to Redis in parallel.
+        Low/Med/High regimes.
       </p>
       <div className="calc-panel__cta-row">
         <button
