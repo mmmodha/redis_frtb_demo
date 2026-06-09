@@ -1,4 +1,4 @@
-// Wave 5.83K — Live 200k canonical anchor gate.
+// Wave 5.84 — Live 200k canonical anchor gate (balanced-thirds baseline).
 //
 // Asserts the running api (default http://localhost:8080) returns the
 // pinned 6-variant {GIRR,EQUITY,FX} × {Delta,Vega} charges against the
@@ -12,9 +12,13 @@
 // stays hermetic and CI green; mirrors the RUN_CANONICAL_E2E pattern at
 // calc-differential.test.ts:1003.
 //
-// Anchors captured 2026-06-08 via /tmp/sweep.sh + /tmp/buckets.sh against
-// the live cluster post-restart; raw artefacts saved under
-// docs/recordings/wave-5.83K/parity-sweep-resweep.json and buckets.json.
+// Anchors captured 2026-06-08 against the balanced-thirds 200k corpus
+// produced by the documented baseline command
+//   `docker compose run --rm generator --rows 200000 --classes GIRR,EQUITY,FX`
+// using `force_path=lua&nocache=1` (lua is authoritative). This replaces the
+// 5.83K skewed ~60/30/10-mix anchors with the README-default balanced-thirds
+// baseline. Raw artefacts saved under
+// docs/recordings/wave-5.84-corpus/parity-sweep.json and buckets.json.
 
 import { describe, it, expect } from "vitest";
 
@@ -25,12 +29,12 @@ const API_BASE = process.env.API_BASE_URL ?? "http://localhost:8080";
 // demo grand_total_l2 = 9558.91465449378 anchor). Fast path is asserted
 // to match lua, not the anchor — both are checked separately below.
 const CHARGE_ANCHORS: Record<string, number> = {
-  "GIRR/Delta":  4.52615658787703,
-  "GIRR/Vega":   397.347778663417,
-  "EQUITY/Delta": 50.84214743981691,
-  "EQUITY/Vega":  155.8102750611618,
-  "FX/Delta":    3.8692587532347296,
-  "FX/Vega":     48.763847537792195,
+  "GIRR/Delta":  3.811340239425009,
+  "GIRR/Vega":   417.54285447783707,
+  "EQUITY/Delta": 53.923588149883244,
+  "EQUITY/Vega":  144.1291586750418,
+  "FX/Delta":    10.544877039929958,
+  "FX/Vega":     105.24610997565287,
 };
 
 // Per-bucket K_b anchors for one multi-bucket case per class. FX is the
@@ -39,45 +43,45 @@ const CHARGE_ANCHORS: Record<string, number> = {
 // bucket so the assertion is order-independent.
 const BUCKET_ANCHORS: Record<string, Array<{ bucket: string; K_b: number }>> = {
   "GIRR/Delta": [
-    { bucket: "AUD", K_b: 0.6879599971758967 },
-    { bucket: "CAD", K_b: 2.1701823919539374 },
-    { bucket: "CHF", K_b: 1.2109852929953453 },
-    { bucket: "EUR", K_b: 1.6150314329859767 },
-    { bucket: "GBP", K_b: 1.427513434647651 },
-    { bucket: "JPY", K_b: 3.6184536312811617 },
-    { bucket: "NOK", K_b: 0.7423976786747216 },
-    { bucket: "NZD", K_b: 0.8854635028362513 },
-    { bucket: "OTHER", K_b: 0.6199073369638458 },
-    { bucket: "SEK", K_b: 1.0335813079106366 },
-    { bucket: "USD", K_b: 2.2083767210841923 },
+    { bucket: "AUD", K_b: 1.2483315273269 },
+    { bucket: "CAD", K_b: 0.7432919467352 },
+    { bucket: "CHF", K_b: 0.71675143938197 },
+    { bucket: "EUR", K_b: 1.6705994147098 },
+    { bucket: "GBP", K_b: 2.1145252918025 },
+    { bucket: "JPY", K_b: 1.2202537871691 },
+    { bucket: "NOK", K_b: 1.1024068935635 },
+    { bucket: "NZD", K_b: 0.41955099444901 },
+    { bucket: "OTHER", K_b: 0.63156640556764 },
+    { bucket: "SEK", K_b: 0.98618406758706 },
+    { bucket: "USD", K_b: 2.543956246941 },
   ],
   "EQUITY/Delta": [
-    { bucket: "1", K_b: 23.408651313371305 },
-    { bucket: "10", K_b: 11.18840512941858 },
-    { bucket: "11", K_b: 22.44441515653727 },
-    { bucket: "12", K_b: 5.739960422386936 },
-    { bucket: "13", K_b: 3.5921221457934864 },
-    { bucket: "2", K_b: 25.423518968584975 },
-    { bucket: "3", K_b: 14.470146172808157 },
-    { bucket: "4", K_b: 10.643901419122596 },
-    { bucket: "5", K_b: 10.244236738282245 },
-    { bucket: "6", K_b: 11.458494593611329 },
-    { bucket: "7", K_b: 9.0160770430049 },
-    { bucket: "8", K_b: 11.31956968917105 },
-    { bucket: "9", K_b: 12.3600974725121 },
+    { bucket: "1", K_b: 24.659035912133 },
+    { bucket: "10", K_b: 11.967515235451 },
+    { bucket: "11", K_b: 23.385704432196 },
+    { bucket: "12", K_b: 4.1771065930341 },
+    { bucket: "13", K_b: 3.682661492105 },
+    { bucket: "2", K_b: 26.906337642632 },
+    { bucket: "3", K_b: 10.646873076704 },
+    { bucket: "4", K_b: 11.824915569245 },
+    { bucket: "5", K_b: 9.9714153529453 },
+    { bucket: "6", K_b: 12.511543485222 },
+    { bucket: "7", K_b: 9.4396400700559 },
+    { bucket: "8", K_b: 13.110775500029 },
+    { bucket: "9", K_b: 12.590169512281 },
   ],
   "FX/Delta": [
-    { bucket: "AUDUSD", K_b: 1.5787215667083236 },
-    { bucket: "EURGBP", K_b: 0.9655317614677417 },
-    { bucket: "EURJPY", K_b: 0.9271289626249414 },
-    { bucket: "EURUSD", K_b: 2.3650576034485926 },
-    { bucket: "GBPJPY", K_b: 0.7491612307814653 },
-    { bucket: "GBPUSD", K_b: 1.690595668733361 },
-    { bucket: "NZDUSD", K_b: 1.2699185845130598 },
-    { bucket: "OTHER", K_b: 1.6196077460818732 },
-    { bucket: "USDCAD", K_b: 1.0711535948592994 },
-    { bucket: "USDCHF", K_b: 1.3610275429823024 },
-    { bucket: "USDJPY", K_b: 2.771549978999158 },
+    { bucket: "AUDUSD", K_b: 2.1078877767337 },
+    { bucket: "EURGBP", K_b: 1.7789155500805 },
+    { bucket: "EURJPY", K_b: 1.8145451403806 },
+    { bucket: "EURUSD", K_b: 7.0947891583691 },
+    { bucket: "GBPJPY", K_b: 1.4149307724476 },
+    { bucket: "GBPUSD", K_b: 3.0422198694824 },
+    { bucket: "NZDUSD", K_b: 1.356256095578 },
+    { bucket: "OTHER", K_b: 1.7567598342988 },
+    { bucket: "USDCAD", K_b: 2.1042023879802 },
+    { bucket: "USDCHF", K_b: 1.9739137217685 },
+    { bucket: "USDJPY", K_b: 3.0649477423005 },
   ],
 };
 
