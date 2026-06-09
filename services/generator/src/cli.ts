@@ -296,9 +296,11 @@ async function runWithWorkers(opts: RunWithWorkersOpts): Promise<void> {
   }, 1000);
   progressTimer.unref?.();
 
-  // Resolve worker.ts via this module's URL — tsx executes .ts directly in
-  // the worker via the same loader as the parent.
-  const workerEntry = resolve(dirname(fileURLToPath(import.meta.url)), "worker.ts");
+  // Resolve worker entry via this module's URL. We point at a tiny `.mjs`
+  // shim that calls tsx's `register()` API before dynamic-importing the
+  // TypeScript worker — `--import tsx` alone does NOT register the loader
+  // inside worker threads (auto-register is gated by `isMainThread`).
+  const workerEntry = resolve(dirname(fileURLToPath(import.meta.url)), "worker-entry.mjs");
   const workerPromises: Promise<{ idx: number; rowsSent: number; byClass: Record<string, number>; cancelled: boolean }>[] = [];
   let firstError: Error | null = null;
   // Graceful cancel on SIGINT/SIGTERM — flip the shared flag so all workers
@@ -327,7 +329,6 @@ async function runWithWorkers(opts: RunWithWorkersOpts): Promise<void> {
     };
     const worker = new Worker(workerEntry, {
       workerData: init,
-      execArgv: ["--import", "tsx"],
     });
     workerPromises.push(new Promise((resolveP, rejectP) => {
       worker.on("message", (msg: WorkerMessage) => {

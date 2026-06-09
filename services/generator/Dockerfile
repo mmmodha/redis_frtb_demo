@@ -1,30 +1,8 @@
 # syntax=docker/dockerfile:1.7
-# Multi-stage build for the @frtb/generator service.
-# Stage 1 installs workspace deps (production-only) plus a globally-installed
-# tsx, since @frtb/schema and @frtb/redis-client export .ts entrypoints that
-# node cannot load directly and we don't want a TS build step here.
-# Stage 2 carries a slim node:20-alpine runtime that invokes tsx by path.
-
-FROM node:20-alpine AS builder
-WORKDIR /app
-
-# Workspace install — needs root manifests + generator manifest + the
-# workspace source for @frtb/schema and @frtb/redis-client (runtime deps
-# resolved via the workspace: protocol).
-COPY package.json package-lock.json ./
-COPY services/generator/package.json ./services/generator/package.json
-COPY shared/schema ./shared/schema
-COPY shared/redis-client ./shared/redis-client
-COPY shared/stream-router ./shared/stream-router
-# Runtime deps only (drops typescript/vitest/@types). tsx is installed
-# globally with the same pinned version used elsewhere so the CLI loader
-# can resolve .ts files without a TS build step in this service.
-RUN --mount=type=cache,target=/root/.npm,sharing=locked \
-    npm ci --workspace=@frtb/generator --include-workspace-root \
-    --omit=dev --no-audit --no-fund
-RUN --mount=type=cache,target=/root/.npm,sharing=locked \
-    npm install -g --no-audit --no-fund tsx@4.19.2
-
+# Dockerfile for the @frtb/generator service.
+# Single-stage runtime that mirrors services/api/Dockerfile: workspace install
+# with --omit=dev keeps the runtime tsx (and its hoisted peers) inside
+# /app/node_modules where node and Worker threads alike can resolve it.
 FROM node:20-alpine AS runtime
 WORKDIR /app
 
@@ -41,17 +19,20 @@ LABEL org.opencontainers.image.title="@frtb/generator" \
 # no HTTP server — the healthcheck is disabled in docker-compose.yml).
 RUN apk add --no-cache curl
 
-# Copy the entire global node_modules tree so tsx's hoisted runtime deps
-# (esbuild, get-tsconfig, …) are available alongside the tsx package itself.
-# The /usr/local/bin/tsx symlink is intentionally NOT copied: Docker
-# dereferences it into a plain file, which makes node resolve esbuild from
-# /usr/local/bin/ and fail. We invoke tsx via its real path instead.
-COPY --from=builder /usr/local/lib/node_modules /usr/local/lib/node_modules
-COPY --from=builder /app/node_modules ./node_modules
-COPY --from=builder /app/shared/schema ./shared/schema
-COPY --from=builder /app/shared/redis-client ./shared/redis-client
-COPY --from=builder /app/shared/stream-router ./shared/stream-router
+# Workspace install: copy root + workspace manifests, plus the source of every
+# workspace package the generator consumes at runtime (@frtb/schema,
+# @frtb/redis-client, @frtb/stream-router). Building from the monorepo root
+# lets npm resolve the workspace: protocol.
+COPY package.json package-lock.json ./
 COPY services/generator/package.json ./services/generator/package.json
+COPY shared/schema ./shared/schema
+COPY shared/redis-client ./shared/redis-client
+COPY shared/stream-router ./shared/stream-router
+# Wave 2: prod-only install with BuildKit npm cache. tsx is now a runtime
+# dep so --omit=dev keeps it while shedding typescript/vitest/@types/*.
+RUN --mount=type=cache,target=/root/.npm,sharing=locked \
+    npm ci --workspace=@frtb/generator --include-workspace-root --omit=dev --no-audit --no-fund
+
 COPY services/generator/tsconfig.json ./services/generator/tsconfig.json
 COPY services/generator/src ./services/generator/src
 # Schema YAMLs are loaded at runtime via SCHEMA_FILE (set in docker-compose.yml
@@ -69,4 +50,4 @@ WORKDIR /app/services/generator
 # replacing the whole command (which previously made docker try to exec `--rows`
 # directly). Default `docker compose up generator` still runs the entrypoint
 # with no extra args — commander uses its built-in defaults.
-ENTRYPOINT ["node", "/usr/local/lib/node_modules/tsx/dist/cli.mjs", "src/cli.ts"]
+ENTRYPOINT ["npx", "tsx", "src/cli.ts"]
