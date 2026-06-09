@@ -74,9 +74,9 @@ interface CliOptions {
   // XADD. Default 2_000_000 (~2 GB at ~1 KB/entry). `0` disables the cap.
   streamMaxlen?: string;
   // Wave 5.96G-gen — CSV of sensitivity types to emit. Accepts Delta, Vega,
-  // Curvature (case-insensitive). Default ["Delta","Vega"] preserves pre-5.96G
-  // behaviour for every existing smoke / unit test that relied on the
-  // row-generator default.
+  // Curvature (case-insensitive). Wave 5.96J flipped the CLI default to
+  // ["Delta","Vega","Curvature"] so any default operator regen populates all 9
+  // Total SBM grid cells; the row-generator library default remains Delta+Vega.
   sensitivityTypes?: string;
   dryRun?: boolean;
   force?: boolean;
@@ -93,10 +93,10 @@ const VALID_SENSITIVITY_TYPES = ["Delta", "Vega", "Curvature"] as const;
 // Wave 5.96G-gen — parse `--sensitivity-types Delta,vega,CURVATURE` into the
 // canonical-cased array `["Delta","Vega","Curvature"]`. Case-insensitive
 // accept, canonical-cased storage. Rejects empty tokens and any value outside
-// the three valid names. Returns the row-generator default when the flag is
-// omitted.
+// the three valid names. Wave 5.96J — when the flag is omitted, returns all
+// three types so a default regen fills every Total SBM grid cell.
 function parseSensitivityTypes(csv: string | undefined): readonly string[] {
-  if (csv === undefined) return ["Delta", "Vega"];
+  if (csv === undefined) return ["Delta", "Vega", "Curvature"];
   const tokens = csv.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
   if (tokens.length === 0) {
     throw new Error(`--sensitivity-types must list at least one of: ${VALID_SENSITIVITY_TYPES.join(", ")}`);
@@ -148,7 +148,7 @@ async function main(): Promise<void> {
     )
     .option(
       "--sensitivity-types <csv>",
-      `comma list of sensitivity types to emit (case-insensitive). Allowed: ${VALID_SENSITIVITY_TYPES.join(", ")}. Default: Delta,Vega`,
+      `comma list of sensitivity types to emit (case-insensitive). Allowed: ${VALID_SENSITIVITY_TYPES.join(", ")}. Default: Delta,Vega,Curvature`,
     )
     .option("--dry-run", "probe target, print plan, exit 0 without writing any rows")
     .option("--force", "bypass the memory-cap refuse-or-go gate");

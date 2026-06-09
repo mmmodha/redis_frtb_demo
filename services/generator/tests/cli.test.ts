@@ -255,10 +255,11 @@ describe("generator CLI", () => {
   });
 
   // Wave 5.96G-gen — --sensitivity-types CLI flag plumbed through to
-  // createRowGenerator. Default omitted → Delta+Vega only (preserves every
-  // pre-5.96G smoke/unit assertion); explicit Curvature opts in to shape-A
-  // emission; invalid value fails fast before any Redis connection.
-  it.skipIf(!redisAvailable)("default --sensitivity-types (omitted) → only Delta + Vega in the Stream", async () => {
+  // createRowGenerator. Wave 5.96J flipped the CLI default to all three types
+  // so a default regen populates every Total SBM grid cell; explicit subsets
+  // still narrow the emission; invalid value fails fast before any Redis
+  // connection.
+  it.skipIf(!redisAvailable)("default --sensitivity-types (omitted) → all three (Delta, Vega, Curvature) in the Stream", async () => {
     const res = spawnSync(
       process.execPath,
       [tsx, cli, "--rows", "200", "--classes", "fx", "--seed", "10", "--batch-size", "100"],
@@ -278,7 +279,7 @@ describe("generator CLI", () => {
       const payload = JSON.parse(map.payload as string);
       seen.add(payload.sensitivity_type as string);
     }
-    expect(seen).toEqual(new Set(["Delta", "Vega"]));
+    expect(seen).toEqual(new Set(["Delta", "Vega", "Curvature"]));
   });
 
   it.skipIf(!redisAvailable)("--sensitivity-types Curvature → only Curvature rows emitted (case-insensitive accept)", async () => {
@@ -344,9 +345,12 @@ describe("generator CLI", () => {
 
   it.skipIf(!redisAvailable)("re-running with a different SCHEMA_FILE produces rows in the new shape (proves schema swap)", async () => {
     const swap = resolve(here, "fixtures/swap-schema.yaml");
+    // Wave 5.96J — pin Delta,Vega so this test asserts the scalar `{ spot }`
+    // schema-swap shape it was written for, unaffected by the flipped CLI
+    // default that now also emits Curvature `{ cvr_up, cvr_down }` rows.
     spawnSync(
       process.execPath,
-      [tsx, cli, "--rows", "20", "--classes", "fx", "--seed", "4"],
+      [tsx, cli, "--rows", "20", "--classes", "fx", "--seed", "4", "--sensitivity-types", "Delta,Vega"],
       {
         env: { ...process.env, SCHEMA_FILE: swap, REDIS_URL: `redis://127.0.0.1:${PORT}`, REDIS_CLUSTER: "false", STREAM_KEY: "sensitivities:in" },
         encoding: "utf8",
