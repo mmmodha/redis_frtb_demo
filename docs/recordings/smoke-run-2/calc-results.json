@@ -1,8 +1,0 @@
-[
-  {"risk_class":"GIRR","sensitivity_type":"Delta","timing":{"http":500,"time_total_s":0.110290},"body":"{\"statusCode\":500,\"error\":\"Internal Server Error\",\"message\":\"SEARCH_INDEX_NOT_FOUND Index not found: idx:sens\"}"},
-  {"risk_class":"GIRR","sensitivity_type":"Vega","timing":{"http":500,"time_total_s":0.097423},"body":"{\"statusCode\":500,\"error\":\"Internal Server Error\",\"message\":\"SEARCH_INDEX_NOT_FOUND Index not found: idx:sens\"}"},
-  {"risk_class":"Equity","sensitivity_type":"Delta","timing":{"http":500,"time_total_s":0.099767},"body":"{\"statusCode\":500,\"error\":\"Internal Server Error\",\"message\":\"SEARCH_INDEX_NOT_FOUND Index not found: idx:sens\"}"},
-  {"risk_class":"Equity","sensitivity_type":"Vega","timing":{"http":500,"time_total_s":0.097879},"body":"{\"statusCode\":500,\"error\":\"Internal Server Error\",\"message\":\"SEARCH_INDEX_NOT_FOUND Index not found: idx:sens\"}"},
-  {"risk_class":"FX","sensitivity_type":"Delta","timing":{"http":500,"time_total_s":0.103868},"body":"{\"statusCode\":500,\"error\":\"Internal Server Error\",\"message\":\"SEARCH_INDEX_NOT_FOUND Index not found: idx:sens\"}"},
-  {"risk_class":"FX","sensitivity_type":"Vega","timing":{"http":500,"time_total_s":0.100035},"body":"{\"statusCode\":500,\"error\":\"Internal Server Error\",\"message\":\"SEARCH_INDEX_NOT_FOUND Index not found: idx:sens\"}"}
-]

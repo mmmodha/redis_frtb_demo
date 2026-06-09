@@ -1,6 +1,7 @@
 import { monotonicFactory } from "ulid";
 import seedrandom from "seedrandom";
 import type { Dimension, Schema, RiskClassConfig } from "@frtb/schema";
+import { buildHashTag } from "@frtb/stream-router";
 
 export type SensitivityRow = {
   risk_class: string;
@@ -192,7 +193,7 @@ export function createRowGenerator(
       const row: SensitivityRow = {
         risk_class: riskClass,
         bucket,
-        _hash_tag: `${riskClass}:${bucket}`,
+        _hash_tag: buildHashTag(riskClass, bucket),
         _id: ulid(),
       };
       const ops = plan.ops;

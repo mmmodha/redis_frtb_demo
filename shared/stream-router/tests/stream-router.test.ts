@@ -6,7 +6,15 @@
 //   • per-bucket mode emits one stream per distinct hash-tag.
 
 import { describe, it, expect } from "vitest";
-import { createStreamRouter, hashFnv1a32, parseStreamShardsFlag } from "../src/index.ts";
+import { buildHashTag, createStreamRouter, hashFnv1a32, parseStreamShardsFlag } from "../src/index.ts";
+
+describe("buildHashTag", () => {
+  it("joins risk_class and bucket with a colon (canonical `{rc}:{bkt}` wire format)", () => {
+    expect(buildHashTag("GIRR", "USD")).toBe("GIRR:USD");
+    expect(buildHashTag("EQ", "12")).toBe("EQ:12");
+    expect(buildHashTag("", "")).toBe(":");
+  });
+});
 
 describe("createStreamRouter — N=1 (legacy single-stream path)", () => {
   it("returns the literal base stream regardless of hash-tag (bit-equivalence)", () => {

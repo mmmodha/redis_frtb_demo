@@ -1,1 +1,0 @@
-{"invoked": false, "concurrency_target": 200, "duration_s_target": 60, "measured_p99_ms": null, "reason": "AC1 prerequisite not met — all 6 calc variants returned HTTP 200 but charge=0 (200-zero class). No AC1-passing variant to load-test."}

@@ -1,2 +1,0 @@
-[{"shardId":"2","role":"master","opsPerSec":11,"slotCount":8192,"usedMemoryBytes":751819216,"netInBytes":424385489,"netOutBytes":447323991},{"shardId":"3","role":"master","opsPerSec":11,"slotCount":8192,"usedMemoryBytes":751819216,"netInBytes":424385489,"netOutBytes":447323991}]
-HTTP:200 TIME:0.403461

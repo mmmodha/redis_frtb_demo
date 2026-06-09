@@ -1,8 +1,0 @@
-[
-  {"risk_class":"GIRR","sensitivity_type":"Delta","timing":{"http":500,"time_total_s":0.957134},"body":"{\"statusCode\":500,\"error\":\"Internal Server Error\",\"message\":\"Reached the max retries per request limit (which is 3). Refer to \\"maxRetriesPerRequest\\" option for details.\"}"},
-  {"risk_class":"GIRR","sensitivity_type":"Vega","timing":{"http":500,"time_total_s":8.013663},"body":"{\"statusCode\":500,\"error\":\"Internal Server Error\",\"message\":\"Reached the max retries per request limit (which is 3). Refer to \\"maxRetriesPerRequest\\" option for details.\"}"},
-  {"risk_class":"Equity","sensitivity_type":"Delta","timing":{"http":500,"time_total_s":7.984417},"body":"{\"statusCode\":500,\"error\":\"Internal Server Error\",\"message\":\"Reached the max retries per request limit (which is 3). Refer to \\"maxRetriesPerRequest\\" option for details.\"}"},
-  {"risk_class":"Equity","sensitivity_type":"Vega","timing":{"http":500,"time_total_s":7.994085},"body":"{\"statusCode\":500,\"error\":\"Internal Server Error\",\"message\":\"Reached the max retries per request limit (which is 3). Refer to \\"maxRetriesPerRequest\\" option for details.\"}"},
-  {"risk_class":"FX","sensitivity_type":"Delta","timing":{"http":500,"time_total_s":7.992896},"body":"{\"statusCode\":500,\"error\":\"Internal Server Error\",\"message\":\"Reached the max retries per request limit (which is 3). Refer to \\"maxRetriesPerRequest\\" option for details.\"}"},
-  {"risk_class":"FX","sensitivity_type":"Vega","timing":{"http":500,"time_total_s":7.974899},"body":"{\"statusCode\":500,\"error\":\"Internal Server Error\",\"message\":\"Reached the max retries per request limit (which is 3). Refer to \\"maxRetriesPerRequest\\" option for details.\"}"}
-]

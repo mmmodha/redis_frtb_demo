@@ -1,7 +1,0 @@
-{
-  "xlen_stream_post_ingest": 300000,
-  "ft_num_docs_post_ingest": 126136,
-  "ft_hash_indexing_failures": 0,
-  "ingest_consumed": 300000,
-  "density_pct": 42.05
-}

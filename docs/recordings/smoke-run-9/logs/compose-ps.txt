@@ -1,7 +1,0 @@
-NAME                           IMAGE                        COMMAND                  SERVICE   CREATED          STATUS                    PORTS
-frtb-sbm-redis-pov-api-1       frtb-sbm-redis-pov-api       "docker-entrypoint.s…"   api       29 seconds ago   Up 28 seconds (healthy)   0.0.0.0:8080->8080/tcp, [::]:8080->8080/tcp
-frtb-sbm-redis-pov-calc-1      frtb-sbm-redis-pov-calc      "docker-entrypoint.s…"   calc      29 seconds ago   Up 22 seconds (healthy)   8084/tcp
-frtb-sbm-redis-pov-ingest-1    frtb-sbm-redis-pov-ingest    "docker-entrypoint.s…"   ingest    29 seconds ago   Up 22 seconds (healthy)   8083/tcp
-frtb-sbm-redis-pov-loadgen-1   frtb-sbm-redis-pov-loadgen   "docker-entrypoint.s…"   loadgen   29 seconds ago   Up 22 seconds (healthy)   8085/tcp
-frtb-sbm-redis-pov-source-1    frtb-sbm-redis-pov-source    "docker-entrypoint.s…"   source    29 seconds ago   Up 22 seconds (healthy)   8082/tcp
-frtb-sbm-redis-pov-ui-1        frtb-sbm-redis-pov-ui        "/docker-entrypoint.…"   ui        29 seconds ago   Up 22 seconds (healthy)   0.0.0.0:3000->3000/tcp, [::]:3000->3000/tcp

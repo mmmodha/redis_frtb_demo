@@ -19,6 +19,14 @@
 
 export type StreamShardsConfig = number | "per-bucket";
 
+// Canonical `_hash_tag` constructor. Centralised so the wire format
+// (`{risk_class}:{bucket}`) is defined exactly once — generator and source
+// producers both call this when stamping rows / building the routing key,
+// keeping them in lock-step if the format ever evolves.
+export function buildHashTag(riskClass: string, bucket: string): string {
+  return `${riskClass}:${bucket}`;
+}
+
 export interface StreamRouter {
   /** Resolve a row's `_hash_tag` to the target stream key. */
   route(hashTag: string): string;

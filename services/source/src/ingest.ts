@@ -13,6 +13,7 @@ import { sampleJsonl } from "./readers/jsonl.ts";
 import type { ColumnMapping, MappedField } from "./infer/mapping.ts";
 import type { RedisLike } from "./store.ts";
 import {
+  buildHashTag,
   createStreamRouter,
   parseStreamShardsFlag,
   type StreamShardsConfig,
@@ -69,7 +70,7 @@ export async function ingestFile(args: IngestArgs): Promise<IngestStats> {
 
   for (const row of rows) {
     const fields = applyMapping(row, args.mapping);
-    const hashTag = `${fields.risk_class ?? ""}:${fields.bucket ?? ""}`;
+    const hashTag = buildHashTag(fields.risk_class ?? "", fields.bucket ?? "");
     const streamKey = router ? router.route(hashTag) : INBOUND_STREAM;
     const xargs: string[] = ["_hash_tag", hashTag];
     for (const [k, v] of Object.entries(fields)) xargs.push(k, v);
