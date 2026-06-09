@@ -1,0 +1,12 @@
+{"risk_class":"GIRR","bucket":"USD-IRS","sensitivity_type":"Delta","tenor":"3M","risk_value":12500.0,"weight":0.017,"trade_id":"T-1001","trader":"alice","book":"RATES-NY"}
+{"risk_class":"GIRR","bucket":"USD-IRS","sensitivity_type":"Delta","tenor":"1Y","risk_value":-8400.0,"weight":0.016,"trade_id":"T-1001","trader":"alice","book":"RATES-NY"}
+{"risk_class":"GIRR","bucket":"EUR-IRS","sensitivity_type":"Delta","tenor":"5Y","risk_value":22000.0,"weight":0.011,"trade_id":"T-1002","trader":"bob","book":"RATES-LDN"}
+{"risk_class":"GIRR","bucket":"EUR-IRS","sensitivity_type":"Vega","tenor":"5Y","risk_value":1750.0,"weight":1.0,"trade_id":"T-1003"}
+{"risk_class":"EQUITY","bucket":"1","sensitivity_type":"Delta","tenor":"","risk_value":45000.0,"weight":0.55,"trade_id":"T-2001","trader":"carol","book":"EQ-NY"}
+{"risk_class":"EQUITY","bucket":"1","sensitivity_type":"Curvature","tenor":"","risk_value":3200.0,"weight":0.55,"trade_id":"T-2001","trader":"carol","book":"EQ-NY"}
+{"risk_class":"EQUITY","bucket":"5","sensitivity_type":"Delta","tenor":"","risk_value":-17500.0,"weight":0.30,"trade_id":"T-2002"}
+{"risk_class":"EQUITY","bucket":"5","sensitivity_type":"Curvature","tenor":"","risk_value":-2100.0,"weight":0.30,"trade_id":"T-2002"}
+{"risk_class":"FX","bucket":"USD/EUR","sensitivity_type":"Delta","tenor":"","risk_value":68000.0,"weight":0.075,"trade_id":"T-3001","trader":"dan","book":"FX-LDN"}
+{"risk_class":"FX","bucket":"USD/EUR","sensitivity_type":"Vega","tenor":"","risk_value":4200.0,"weight":0.075,"trade_id":"T-3001","trader":"dan","book":"FX-LDN"}
+{"risk_class":"FX","bucket":"USD/GBP","sensitivity_type":"Delta","tenor":"","risk_value":-25000.0,"weight":0.075,"trade_id":"T-3002"}
+{"risk_class":"FX","bucket":"USD/GBP","sensitivity_type":"Vega","tenor":"","risk_value":1850.0,"weight":0.075,"trade_id":"T-3002"}
