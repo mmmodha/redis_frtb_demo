@@ -848,15 +848,27 @@ function TotalSbmResultView({ result }: { result: TotalSbmResponse }) {
   const originalCumulativeMs = typeof perf.original_cumulative_ms === "number"
     ? perf.original_cumulative_ms
     : perf.cumulative_ms;
+  // Wave 5.96L — the "Σ if serial" chip displays the cold serial equivalent
+  // (sum of per-cell compute time). On cache hits `cumulative_ms` collapses
+  // to the warm cache-only path (~tens of ms) and destroys the parallelism
+  // story, so we show `original_cumulative_ms` instead — the preserved cold
+  // reference is what makes the contrast with wall-clock visceral.
+  const serialEquivalentMs = perfCache === "hit" || perfCache === "partial"
+    ? originalCumulativeMs
+    : perf.cumulative_ms;
+  const serialChipTooltip =
+    `Sum of per-cell compute time across ${perf.redis_ops_count} cells. ` +
+    `If we ran the cells one after another instead of in parallel, this is how long the user would wait. ` +
+    `The wall-clock chip shows the actual wait time.`;
   const perfTooltip = perfCache === "hit" || perfCache === "partial"
     ? `Served from cache ${perfCache === "hit" ? "(all cells)" : `(${perf.cache_hits ?? 0}/${perf.redis_ops_count} cells)`}. ` +
       `Wall-clock this request: ${perf.total_ms.toFixed(1)} ms. ` +
       `Fresh per-cell cumulative: ${perf.cumulative_ms.toFixed(1)} ms. ` +
-      `Original cold compute (preserved): ${originalCumulativeMs.toFixed(1)} ms across ${perf.redis_ops_count} cells. ` +
-      `Parallelism factor = cumulative / wall-clock = ${perf.parallelism_factor.toFixed(2)}×.`
-    : `Cumulative compute time across ${perf.redis_ops_count} cells: ${perf.cumulative_ms.toFixed(1)} ms. ` +
+      `Σ if serial (original cold compute, preserved): ${originalCumulativeMs.toFixed(1)} ms across ${perf.redis_ops_count} cells. ` +
+      `Parallelism factor = Σ if serial / wall-clock = ${perf.parallelism_factor.toFixed(2)}×.`
+    : `Σ if serial (sum of per-cell compute across ${perf.redis_ops_count} cells): ${perf.cumulative_ms.toFixed(1)} ms. ` +
       `Wall-clock elapsed: ${perf.total_ms.toFixed(1)} ms. ` +
-      `Parallelism factor = cumulative / wall-clock = ${perf.parallelism_factor.toFixed(2)}×.`;
+      `Parallelism factor = Σ if serial / wall-clock = ${perf.parallelism_factor.toFixed(2)}×.`;
 
   return (
     <div className="calc-panel__total-result" data-testid="calc-total-result">
@@ -1089,8 +1101,12 @@ function TotalSbmResultView({ result }: { result: TotalSbmResponse }) {
         <span className="calc-panel__total-perf-chip" data-chip="wall">
           wall-clock <strong>{perf.total_ms.toFixed(1)} ms</strong>
         </span>
-        <span className="calc-panel__total-perf-chip" data-chip="cumulative">
-          cumulative <strong>{perf.cumulative_ms.toFixed(1)} ms</strong>
+        <span
+          className="calc-panel__total-perf-chip"
+          data-chip="cumulative"
+          title={serialChipTooltip}
+        >
+          {"\u03A3"} if serial · <strong>{formatComputeMs(serialEquivalentMs)}</strong>
         </span>
         <span className="calc-panel__total-perf-chip" data-chip="parallel">
           ×<strong data-testid="calc-total-parallelism">

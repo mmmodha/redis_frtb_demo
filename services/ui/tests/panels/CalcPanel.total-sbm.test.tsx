@@ -91,11 +91,13 @@ describe("<CalcPanel /> — Total SBM card (Wave 5.96B)", () => {
 
     const perf = screen.getByTestId("calc-total-performance");
     expect(perf.textContent).toMatch(/wall-clock/);
-    expect(perf.textContent).toMatch(/cumulative/);
+    // Wave 5.96L — the cumulative chip is now labelled "Σ if serial" to make
+    // the cold serial equivalent vs wall-clock contrast obvious at a glance.
+    expect(perf.textContent).toMatch(/\u03A3 if serial/);
     expect(perf.textContent).toMatch(/27\/27 cells/);
     expect(perf.textContent).toMatch(/parallel speedup/);
-    // The tooltip surfaces the full cumulative / wall-clock derivation.
-    expect(perf.getAttribute("title") ?? "").toMatch(/Parallelism factor = cumulative \/ wall-clock/);
+    // The tooltip surfaces the full Σ if serial / wall-clock derivation.
+    expect(perf.getAttribute("title") ?? "").toMatch(/Parallelism factor = \u03A3 if serial \/ wall-clock/);
 
     expect(screen.getByText(/27 FT\.AGGREGATE\+FCALL fan-out/)).toBeInTheDocument();
 
@@ -247,7 +249,43 @@ describe("<CalcPanel /> — Total SBM card (Wave 5.96B)", () => {
     // the full story.
     const perf = screen.getByTestId("calc-total-performance");
     expect(perf.getAttribute("title") ?? "").toMatch(/Served from cache/);
-    expect(perf.getAttribute("title") ?? "").toMatch(/Original cold compute/);
+    expect(perf.getAttribute("title") ?? "").toMatch(/original cold compute/i);
+  });
+
+  // Wave 5.96L — on a cache-hit run the "Σ if serial" chip must surface
+  // the preserved cold cumulative (original_cumulative_ms), NOT the warm
+  // cumulative_ms which collapses to the cache-only path and destroys the
+  // parallelism story. The chip carries the cold value via formatComputeMs.
+  it("renders the 'Σ if serial' chip with original_cumulative_ms (not cumulative_ms) on a cache hit", async () => {
+    mockTotalResponse(buildTotalResponse({
+      performance: {
+        total_ms: 1.722,
+        cumulative_ms: 40.178,
+        original_cumulative_ms: 142834.172,
+        parallelism_factor: 23.337,
+        redis_ops_count: 27,
+        ops_skipped: 0,
+        cache: "hit",
+        cache_hits: 27,
+      },
+    }));
+    render(<CalcPanel />);
+    fireEvent.click(screen.getByTestId("calc-total-cta"));
+    await waitFor(() => expect(screen.getByTestId("calc-total-result")).toBeInTheDocument());
+
+    // Locate the cumulative chip by its preserved data-chip selector.
+    const perf = screen.getByTestId("calc-total-performance");
+    const serialChip = perf.querySelector('[data-chip="cumulative"]') as HTMLElement;
+    expect(serialChip).toBeTruthy();
+    expect(serialChip.textContent).toMatch(/\u03A3 if serial/);
+    // Cold value (142834 ms) formatted as "142.83 s" via formatComputeMs.
+    expect(serialChip.textContent).toMatch(/142\.83 s/);
+    // Must NOT echo the warm cumulative (40 ms) — that would defeat the chip.
+    expect(serialChip.textContent).not.toMatch(/40 ms/);
+    // Chip-level tooltip explains the contrast in plain English.
+    const chipTitle = serialChip.getAttribute("title") ?? "";
+    expect(chipTitle).toMatch(/Sum of per-cell compute time/);
+    expect(chipTitle).toMatch(/wall-clock chip shows the actual wait time/);
   });
 
   // Wave 5.96F — partial cache participation (some cells hit, some missed)

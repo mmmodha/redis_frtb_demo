@@ -888,6 +888,14 @@ button.drilldown-pill:focus-visible {
   color: var(--redis-text-primary, #F0F4F5);
   font-weight: 600;
 }
+/* Wave 5.96L — the wall-clock vs Σ if serial contrast is the visual climax
+   of the strip. Bump value weight/size on both so the (e.g.) 1.7 ms vs
+   134.25 s gap reads at a glance. */
+.calc-panel__total-perf-chip[data-chip="wall"] > strong,
+.calc-panel__total-perf-chip[data-chip="cumulative"] > strong {
+  font-weight: 700;
+  font-size: 0.9375rem;
+}
 .calc-panel__total-perf-chip[data-chip="parallel"] {
   background: rgba(91, 211, 123, 0.10);
   border-color: rgba(91, 211, 123, 0.45);
