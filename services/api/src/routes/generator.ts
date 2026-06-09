@@ -10,12 +10,18 @@ import { availableParallelism } from "node:os";
 import type { FastifyInstance } from "fastify";
 import type { Schema } from "@frtb/schema";
 import {
-  createRowGenerator,
-  createStreamProducer,
-  createStreamFlowControl,
   DEFAULT_FLOW_CONTROL,
   type FlowControlOptions,
 } from "@frtb/generator";
+// Wave 5.95C — producer construction + per-row XADD loop live in the
+// shared helper so the JSON and SSE routes can't drift on MAXLEN /
+// flow-control / stop-condition wiring (5.92C-fix had to patch both copies).
+import {
+  runGeneratorLoop,
+  type StopReason,
+  type StopWhen,
+  type ClassPicker,
+} from "../lib/run-generator.ts";
 // Wave 5.84C — cluster-adaptive profile module + parsers. Plumbed through
 // the api so the seed SSE frame includes the resolved plan (shape + dials)
 // for the UI to surface alongside the run.
@@ -44,8 +50,6 @@ import {
 } from "@frtb/stream-router";
 import type { RedisLike } from "../redis-like.ts";
 import { getActiveTarget } from "../active-target.ts";
-import { getBootstrapStatus } from "../bootstrap-status.ts";
-import { translateRedisError } from "../redis-errors.ts";
 import { corsHeadersForRequest } from "../cors-headers.ts";
 
 // Wave 5.84B — `workers` field plumbed through the api so the UI can surface
@@ -130,14 +134,10 @@ interface GeneratorStartBody {
 // Wave 5.84C — accepted profile values for body validation.
 const PROFILE_NAMES = new Set<string>(["auto", "small", "medium", "large"]);
 
-// Wave 5.47c — resolved stop_when after validation; same shape as the input
-// stop_when but with each field guaranteed to be a valid positive number.
-interface StopWhen {
-  rows?: number;
-  memory_pct?: number;
-  elapsed_seconds?: number;
-}
-export type StopReason = "rows" | "memory" | "elapsed" | "cancelled" | "error";
+// Wave 5.95C — `StopWhen` / `StopReason` now live with the shared
+// run-loop helper (the only consumer of the per-row logic). `StopReason`
+// is re-exported here for backward compat with any downstream import.
+export type { StopReason };
 
 export interface GeneratorRoutesOpts {
   streamName?: string;
@@ -211,9 +211,8 @@ type PipelineClient = {
 // i-th row. Round-robin keeps the existing modulo behaviour (O(1) per pick,
 // no allocation). The Bresenham-style interleaver expands a class_split map
 // so progress events show a consistent mix instead of "all GIRR then all FX".
-interface ClassPicker {
-  pick(i: number): string;
-}
+// Wave 5.95C — `ClassPicker` interface is shared with the run-loop helper
+// (imported above) so the picker handed to `runGeneratorLoop` typechecks.
 function roundRobinPicker(resolvedClasses: string[]): ClassPicker {
   return { pick: (i) => resolvedClasses[i % resolvedClasses.length]! };
 }
@@ -577,40 +576,9 @@ function parseGeneratorRequest(
   };
 }
 
-// Wave 5.47c — parse Redis "INFO memory" text into the numeric fields used
-// by the memory_pct stop condition. Returns 0 for missing keys so callers
-// can fall back to other denominators.
-function parseInfoMemory(text: string): {
-  used_memory: number;
-  used_memory_rss: number;
-  total_system_memory: number;
-  maxmemory: number;
-} {
-  const get = (key: string): number => {
-    const m = new RegExp(`^${key}:(\\d+)`, "m").exec(text);
-    return m ? Number(m[1]) : 0;
-  };
-  return {
-    used_memory: get("used_memory"),
-    used_memory_rss: get("used_memory_rss"),
-    total_system_memory: get("total_system_memory"),
-    maxmemory: get("maxmemory"),
-  };
-}
-
-// Wave 5.47c — current memory pct from a parsed INFO memory snapshot.
-// Prefers used_memory / maxmemory when maxmemory > 0; otherwise falls back
-// to used_memory_rss / total_system_memory. Returns null when neither
-// denominator is available (so the stop check can no-op gracefully).
-function memoryPct(info: ReturnType<typeof parseInfoMemory>): number | null {
-  if (info.maxmemory > 0 && info.used_memory > 0) {
-    return (info.used_memory / info.maxmemory) * 100;
-  }
-  if (info.total_system_memory > 0 && info.used_memory_rss > 0) {
-    return (info.used_memory_rss / info.total_system_memory) * 100;
-  }
-  return null;
-}
+// Wave 5.95C — `parseInfoMemory` + `memoryPct` (used only inside the
+// per-row stop-condition loop) now live in `lib/run-generator.ts` next
+// to the loop body that consumes them.
 
 // Wave 5.84C — light-weight probe used by the api streaming route to build
 // the same `plan` payload the CLI logs. Goes through the narrow `RedisLike`
@@ -682,106 +650,49 @@ export function registerGeneratorRoutes(
     const { rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker, stopWhen, batchSize, pipelineWindow, workers, streamShards, streamMaxLen, flowControlOptions } = parsed;
 
     const run_id = ulid();
-    const t0 = process.hrtime.bigint();
-    const startedAtMs = Date.now();
 
     // Wave 5.16t — resolve active redis per-request so the generator writes
     // to the currently-active profile's stream.
     const redis = getRedis();
     const target_label = getActiveTarget().label;
 
-    const generator = createRowGenerator(schema, {
-      seed: body.seed,
-      sensitivityTypes: sensitivity_types,
-      tradePoolSize: tradePool,
-      factorPoolSize: factorPool,
-    });
     // Wave 5.92A — construct the router only when stream_shards is provided
     // AND != 1; the default (no field, or stream_shards=1) goes through the
     // legacy single-stream code path bit-identically.
     const router = streamShards !== undefined && streamShards !== 1
       ? createStreamRouter(streamName, streamShards)
       : undefined;
-    // Wave 5.92C-fix — build the producer-side XLEN credit gate only when
-    // the caller asks for it (default is no gate, parity with pre-fix
-    // behaviour on this route).
-    const flowControl = flowControlOptions
-      ? createStreamFlowControl(redis as unknown as Parameters<typeof createStreamFlowControl>[0], flowControlOptions, app.log)
-      : undefined;
-    // Wave 5.92C-fix — status-line log when the approximate MAXLEN cap is
-    // in effect on XADD (parity with the CLI's --stream-maxlen plumbing).
-    if (streamMaxLen !== undefined) {
-      app.log.info({ evt: "generator-start", run_id, stream_maxlen: streamMaxLen }, `MAXLEN ~ ${streamMaxLen} in effect on XADD`);
-    }
-    const producer = createStreamProducer(
-      redis as unknown as Parameters<typeof createStreamProducer>[0],
-      { stream: streamName, batchSize, pipelineWindow, router, streamMaxLen, flowControl },
-    );
 
-    // Wave 5.47c — track which condition halts the loop. Defaults to "rows"
-    // for backward compat (the historical behaviour).
-    let stopReason: StopReason = "rows";
-    let lastMemPollBatchCount = 0;
-    let lastMemPollAtMs = startedAtMs;
-
-    try {
-      for (let i = 0; i < rows; i++) {
-        // Wave 5.47c — check active stop conditions BEFORE adding the next
-        // row so the terminal frame reflects "stopped at N rows".
-        if (stopWhen.elapsed_seconds !== undefined
-          && (Date.now() - startedAtMs) / 1000 >= stopWhen.elapsed_seconds) {
-          stopReason = "elapsed";
-          break;
-        }
-        if (stopWhen.memory_pct !== undefined) {
-          const dueByBatches = producer.batchCount - lastMemPollBatchCount >= 25;
-          const dueByTime = Date.now() - lastMemPollAtMs >= 1000;
-          if (dueByBatches && dueByTime) {
-            lastMemPollBatchCount = producer.batchCount;
-            lastMemPollAtMs = Date.now();
-            try {
-              const text = await redis.info("memory");
-              const pct = memoryPct(parseInfoMemory(text));
-              if (pct !== null && pct >= stopWhen.memory_pct) {
-                stopReason = "memory";
-                break;
-              }
-            } catch { /* tolerate transient INFO failure; next poll retries */ }
-          }
-        }
-        const riskClass = picker.pick(i);
-        const row = generator.generate(riskClass);
-        await producer.add(row);
+    // Wave 5.95C — producer setup + per-row XADD loop + stop-condition
+    // checks live in the shared helper so the JSON and SSE routes can't
+    // drift on MAXLEN / flow-control / stop wiring (5.92C-fix had to
+    // touch both copies). The helper never throws; producer/redis errors
+    // surface via `result.error`.
+    const result = await runGeneratorLoop({
+      redis, log: app.log, evt: "generator-start", run_id, target_label,
+      schema, seed: body.seed, sensitivity_types, tradePool, factorPool,
+      streamName, batchSize, pipelineWindow, router, streamMaxLen, flowControlOptions,
+      rows, picker, stopWhen,
+    });
+    if (result.error) {
+      if (result.error.translated) {
+        reply.code(result.error.translated.status);
+        return result.error.translated.body;
       }
-      await producer.flush();
-      await producer.close();
-    } catch (err) {
-      try { await producer.close(); } catch { /* swallow flush-on-close error */ }
-      const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
-      if (translated) {
-        const msg = err instanceof Error ? err.message : String(err);
-        app.log.warn({ evt: "generator-start", run_id, err: msg });
-        reply.code(translated.status);
-        return translated.body;
-      }
-      const msg = err instanceof Error ? err.message : String(err);
-      app.log.warn({ evt: "generator-start", run_id, err: msg });
       reply.code(502);
-      return { error: `redis unreachable: ${msg}` };
+      return { error: `redis unreachable: ${result.error.message}` };
     }
 
-    const ms = Number(process.hrtime.bigint() - t0) / 1e6;
-    const rows_queued = producer.rowsSent;
-    app.log.info({ evt: "generator-start", run_id, rows_queued, classes: resolvedClasses, ms });
+    app.log.info({ evt: "generator-start", run_id, rows_queued: result.rows_queued, classes: resolvedClasses, ms: result.ms });
 
     return {
       ok: true,
       run_id,
-      rows_queued,
+      rows_queued: result.rows_queued,
       classes: resolvedClasses,
       sensitivity_types,
-      ms: Math.round(ms * 1000) / 1000,
-      stop_reason: stopReason,
+      ms: Math.round(result.ms * 1000) / 1000,
+      stop_reason: result.stop_reason,
       // Wave 5.84B — echo the resolved worker count so the UI can surface it
       // alongside the run summary (DoD #7). The non-streaming /generator/start
       // path always runs in the request handler (single-thread); the
@@ -799,88 +710,12 @@ export function registerGeneratorRoutes(
   const progressIntervalMs = opts.sseProgressIntervalMs ?? 200;
   const terminalGraceMs = opts.terminalGraceMs ?? 30_000;
 
-  // Detached generator loop. Mutates `state` in place; resolves when the run
-  // reaches a terminal status (done/cancelled/error). Never throws.
-  const runGenerator = async (
-    state: ActiveRun,
-    t0: bigint,
-    rows: number,
-    picker: ClassPicker,
-    generator: ReturnType<typeof createRowGenerator>,
-    producer: ReturnType<typeof createStreamProducer>,
-    target_label: string,
-    stopWhen: StopWhen,
-    redis: RedisLike,
-  ): Promise<void> => {
-    const tick = (): void => {
-      state.rows_done = producer.rowsSent;
-      const elapsed = Number(process.hrtime.bigint() - t0) / 1e6;
-      state.elapsed_ms = Math.round(elapsed);
-      state.rows_per_sec = elapsed > 0 ? Math.round((state.rows_done / elapsed) * 1000) : 0;
-    };
-    // Wave 5.47c — stop-condition bookkeeping. `loopReason` records which
-    // active stop condition broke the loop; default is "rows" (ran to count).
-    let loopReason: StopReason = "rows";
-    const startedAtMs = Date.now();
-    let lastMemPollBatchCount = 0;
-    let lastMemPollAtMs = startedAtMs;
-    try {
-      for (let i = 0; i < rows; i++) {
-        if (state.cancelFlag.cancelled) break;
-        // Wave 5.47c — check active stop conditions before each row so the
-        // terminal frame surfaces stop_reason at the row count when tripped.
-        if (stopWhen.elapsed_seconds !== undefined
-          && (Date.now() - startedAtMs) / 1000 >= stopWhen.elapsed_seconds) {
-          loopReason = "elapsed";
-          break;
-        }
-        if (stopWhen.memory_pct !== undefined) {
-          const dueByBatches = producer.batchCount - lastMemPollBatchCount >= 25;
-          const dueByTime = Date.now() - lastMemPollAtMs >= 1000;
-          if (dueByBatches && dueByTime) {
-            lastMemPollBatchCount = producer.batchCount;
-            lastMemPollAtMs = Date.now();
-            try {
-              const text = await redis.info("memory");
-              const pct = memoryPct(parseInfoMemory(text));
-              if (pct !== null && pct >= stopWhen.memory_pct) {
-                loopReason = "memory";
-                break;
-              }
-            } catch { /* tolerate transient INFO failure; next poll retries */ }
-          }
-        }
-        const riskClass = picker.pick(i);
-        const row = generator.generate(riskClass);
-        await producer.add(row);
-        tick();
-      }
-      await producer.flush();
-      await producer.close();
-      tick();
-    } catch (err) {
-      try { await producer.close(); } catch { /* swallow flush-on-close error */ }
-      const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
-      const msg = err instanceof Error ? err.message : String(err);
-      app.log.warn({ evt: "generator-stream", run_id: state.run_id, err: msg });
-      const errBody = translated
-        ? translated.body
-        : { error: `redis unreachable: ${msg}` };
-      state.error = (errBody as { error?: string }).error ?? "redis error";
-      tick();
-    }
-    if (state.error) {
-      state.status = "error";
-      state.stop_reason = "error";
-    } else if (state.cancelFlag.cancelled) {
-      state.status = "cancelled";
-      state.stop_reason = "cancelled";
-    } else {
-      state.status = "done";
-      state.stop_reason = loopReason;
-    }
-    state.terminal_at_ms = Date.now();
-  };
+  // Wave 5.95C — the per-row loop body that mutates this run's `state`
+  // now lives in `runGeneratorLoop` (lib/run-generator.ts) shared with
+  // the JSON route. The SSE caller wires `onTick` to update the same
+  // `state` fields and `cancelFlag` to the same flag /generator/cancel
+  // flips, so the terminal-frame transition + grace-eviction below
+  // continues to be the only SSE-specific orchestration.
 
   app.post<{ Body: GeneratorStartBody }>("/generator/start/stream", async (req, reply) => {
     if (!schema) {
@@ -898,7 +733,6 @@ export function registerGeneratorRoutes(
     const { rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker, stopWhen, batchSize, pipelineWindow, workers, profile, streamShards, streamMaxLen, flowControlOptions } = parsed;
 
     const run_id = ulid();
-    const t0 = process.hrtime.bigint();
     const redis = getRedis();
     const target_label = getActiveTarget().label;
 
@@ -1006,12 +840,6 @@ export function registerGeneratorRoutes(
     };
     interval = setInterval(emitProgress, progressIntervalMs);
 
-    const generator = createRowGenerator(schema, {
-      seed: body.seed,
-      sensitivityTypes: sensitivity_types,
-      tradePoolSize: tradePool,
-      factorPoolSize: factorPool,
-    });
     // Wave 5.92A — use the resolved dial (profile or manual override) to
     // build the router; pre-5.92 behaviour (N=1) skips router construction
     // entirely so the streaming-route XADDs stay byte-for-byte identical
@@ -1019,24 +847,52 @@ export function registerGeneratorRoutes(
     const sseRouter = dials.streamShards !== 1
       ? createStreamRouter(streamName, dials.streamShards)
       : undefined;
-    // Wave 5.92C-fix — same gate construction as the non-streaming route;
-    // off by default for parity with pre-fix behaviour. The bench harness
-    // (5.92D) supplies `flow_control` explicitly when it wants the gate.
-    const sseFlowControl = flowControlOptions
-      ? createStreamFlowControl(redis as unknown as Parameters<typeof createStreamFlowControl>[0], flowControlOptions, app.log)
-      : undefined;
-    if (streamMaxLen !== undefined) {
-      app.log.info({ evt: "generator-stream", run_id, stream_maxlen: streamMaxLen }, `MAXLEN ~ ${streamMaxLen} in effect on XADD`);
-    }
-    const producer = createStreamProducer(
-      redis as unknown as Parameters<typeof createStreamProducer>[0],
-      { stream: streamName, batchSize: 200, router: sseRouter, streamMaxLen, flowControl: sseFlowControl },
-    );
 
-    // Detached run — handle terminal frame + grace-eviction here so the
-    // route handler can return immediately after writing the seed frame.
-    void runGenerator(state, t0, rows, picker, generator, producer, target_label, stopWhen, redis)
-      .then(() => {
+    // Wave 5.95C — call the shared run-loop helper. The SSE route
+    // keeps its historical `batchSize: 200` + omitted `pipelineWindow`
+    // (parity with pre-5.95C XADD command sequence). `onTick` mutates
+    // the per-run `state` so the SSE progress timer reads it; the
+    // shared `cancelFlag` is the one /generator/cancel flips.
+    void runGeneratorLoop({
+      redis, log: app.log, evt: "generator-stream", run_id, target_label,
+      schema, seed: body.seed, sensitivity_types, tradePool, factorPool,
+      streamName, batchSize: 200, router: sseRouter, streamMaxLen, flowControlOptions,
+      rows, picker, stopWhen,
+      cancelFlag: state.cancelFlag,
+      onTick: (rowsSent, elapsedNs) => {
+        state.rows_done = rowsSent;
+        const elapsed = Number(elapsedNs) / 1e6;
+        state.elapsed_ms = Math.round(elapsed);
+        state.rows_per_sec = elapsed > 0 ? Math.round((rowsSent / elapsed) * 1000) : 0;
+      },
+    })
+      .then((result) => {
+        // Translate the helper's result into the in-place `state`
+        // mutations the original inline runGenerator made, preserving
+        // the cancelled / error / done precedence (cancel-first, then
+        // error, then the loop's resolved stop_reason). Sync rows_done
+        // from the helper's final producer.rowsSent so the terminal
+        // frame reflects rows that XADDed during flush() (the original
+        // inline runGenerator did this via a final tick() in catch).
+        state.rows_done = result.rows_queued;
+        if (result.error) {
+          const errBody = result.error.translated
+            ? result.error.translated.body
+            : { error: `redis unreachable: ${result.error.message}` };
+          state.error = (errBody as { error?: string }).error ?? "redis error";
+        }
+        if (state.error) {
+          state.status = "error";
+          state.stop_reason = "error";
+        } else if (state.cancelFlag.cancelled) {
+          state.status = "cancelled";
+          state.stop_reason = "cancelled";
+        } else {
+          state.status = "done";
+          state.stop_reason = result.stop_reason;
+        }
+        state.terminal_at_ms = Date.now();
+
         if (interval) { clearInterval(interval); interval = null; }
         const msPrecise = Math.round(state.elapsed_ms * 1000) / 1000;
         const cancelled = state.status === "cancelled";
@@ -1068,9 +924,9 @@ export function registerGeneratorRoutes(
         setTimeout(() => { activeRuns.delete(run_id); }, terminalGraceMs).unref?.();
       })
       .catch((err: unknown) => {
-        // Defensive: runGenerator catches all producer errors internally, so
-        // this should never fire. Log + force-evict so a stuck entry can't
-        // linger in `activeRuns`.
+        // Defensive: runGeneratorLoop catches all producer errors
+        // internally, so this should never fire. Log + force-evict so
+        // a stuck entry can't linger in `activeRuns`.
         const msg = err instanceof Error ? err.message : String(err);
         app.log.error({ evt: "generator-stream", run_id, err: msg, stage: "detached" });
         state.status = "error";
