@@ -6,11 +6,29 @@
 // small-batch top-up path (≤2000 rows/call).
 
 import { ulid } from "ulid";
+import { availableParallelism } from "node:os";
 import type { FastifyInstance } from "fastify";
 import type { Schema } from "@frtb/schema";
 import {
   createRowGenerator,
   createStreamProducer,
+} from "@frtb/generator";
+// Wave 5.84C — cluster-adaptive profile module + parsers. Plumbed through
+// the api so the seed SSE frame includes the resolved plan (shape + dials)
+// for the UI to surface alongside the run.
+import {
+  parseClusterInfo,
+  parseInfoMemory as parseInfoMemoryProbe,
+  parseMaxclients,
+  fallbackShape,
+  BYTES_PER_ROW,
+  pickProfile,
+  resolveDials,
+  refuseOrGo,
+  estimateDurationSec,
+  type ClusterShape,
+  type ProfileName,
+  type ResolvedDials,
 } from "@frtb/generator";
 import type { RedisLike } from "../redis-like.ts";
 import { getActiveTarget } from "../active-target.ts";
@@ -62,7 +80,16 @@ interface GeneratorStartBody {
   // with its own ioredis client + RowGenerator + StreamProducer; coordinator
   // merges per-worker postMessage progress into a single SSE counter.
   workers?: number;
+  // Wave 5.84C — cluster-adaptive profile. `auto` (default) probes the
+  // target and picks dials by shard count + host cores; explicit
+  // small/medium/large overrides autodetect. Manual workers/batch_size/
+  // pipeline_window in this same body still override the profile's dials
+  // (manual always wins — DoD #4). Invalid values are rejected with 400.
+  profile?: "auto" | "small" | "medium" | "large";
 }
+
+// Wave 5.84C — accepted profile values for body validation.
+const PROFILE_NAMES = new Set<string>(["auto", "small", "medium", "large"]);
 
 // Wave 5.47c — resolved stop_when after validation; same shape as the input
 // stop_when but with each field guaranteed to be a valid positive number.
@@ -196,6 +223,10 @@ interface ParsedGeneratorRequest {
   pipelineWindow: number;
   // Wave 5.84B — resolved worker count (always populated; defaults to 1).
   workers: number;
+  // Wave 5.84C — explicit profile name from the request (auto|small|
+  // medium|large). The seed-frame plan uses this together with the probed
+  // shape to compute the resolved dials.
+  profile: "auto" | ProfileName;
 }
 interface ParsedGeneratorError {
   ok: false;
@@ -412,13 +443,22 @@ function parseGeneratorRequest(
     workers = w;
   }
 
+  // Wave 5.84C — validate optional profile name (auto|small|medium|large).
+  let profile: "auto" | ProfileName = "auto";
+  if (body.profile !== undefined) {
+    if (typeof body.profile !== "string" || !PROFILE_NAMES.has(body.profile)) {
+      return { ok: false, status: 400, error: "profile must be one of auto|small|medium|large" };
+    }
+    profile = body.profile;
+  }
+
   const picker: ClassPicker = classSplitResolved
     ? sequencePicker(interleavedSequence(classSplitResolved))
     : roundRobinPicker(resolvedClasses);
 
   return {
     ok: true, rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker, stopWhen,
-    batchSize, pipelineWindow, workers,
+    batchSize, pipelineWindow, workers, profile,
   };
 }
 
@@ -455,6 +495,51 @@ function memoryPct(info: ReturnType<typeof parseInfoMemory>): number | null {
     return (info.used_memory_rss / info.total_system_memory) * 100;
   }
   return null;
+}
+
+// Wave 5.84C — light-weight probe used by the api streaming route to build
+// the same `plan` payload the CLI logs. Goes through the narrow `RedisLike`
+// surface so a `FakeRedis` (or a redis without CLUSTER/CONFIG perms) just
+// falls back to the conservative `small` shape instead of erroring. The
+// only commands attempted are: CLUSTER INFO, INFO memory, CONFIG GET
+// maxclients — each guarded individually so partial info is still used.
+async function probeForApi(redis: RedisLike): Promise<ClusterShape> {
+  const shape: ClusterShape = { ...fallbackShape() };
+  // CLUSTER INFO → shard count + cluster mode. A non-cluster server replies
+  // with an error or "cluster_enabled:0"; either path keeps shape.mode as
+  // "standalone" and shards=1.
+  try {
+    const ci = await redis.call("CLUSTER", "INFO");
+    if (typeof ci === "string") {
+      const parsed = parseClusterInfo(ci);
+      if (parsed.enabled) {
+        shape.mode = "cluster";
+        if (parsed.size > 0) shape.shards = parsed.size;
+      }
+    }
+  } catch { /* non-cluster or no perms — keep standalone defaults */ }
+  // INFO memory → used + maxmemory bytes for the refuse-or-go gate.
+  try {
+    const text = await redis.info("memory");
+    if (typeof text === "string") {
+      const mem = parseInfoMemoryProbe(text);
+      shape.usedMemoryBytes = mem.used_memory;
+      shape.maxmemoryBytes = mem.maxmemory;
+    }
+  } catch { /* INFO denied — leave 0; gate becomes a no-op */ }
+  // CONFIG GET maxclients → reported as a [name, value] reply.
+  try {
+    const reply = await redis.call("CONFIG", "GET", "maxclients");
+    const mc = parseMaxclients(reply);
+    if (mc > 0) shape.maxclients = mc;
+  } catch { /* leave conservative default */ }
+  // Mark the shape non-fallback once we collected at least one signal so the
+  // UI can distinguish "probe ran, here's what we saw" from "probe failed,
+  // using small". An empty-everything return still reads as a fallback.
+  if (shape.shards > 1 || shape.maxmemoryBytes > 0 || shape.maxclients !== fallbackShape().maxclients) {
+    shape.fallback = false;
+  }
+  return shape;
 }
 
 export function registerGeneratorRoutes(
@@ -678,12 +763,44 @@ export function registerGeneratorRoutes(
       reply.code(parsed.status);
       return { error: parsed.error };
     }
-    const { rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker, stopWhen, batchSize, pipelineWindow, workers } = parsed;
+    const { rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker, stopWhen, batchSize, pipelineWindow, workers, profile } = parsed;
 
     const run_id = ulid();
     const t0 = process.hrtime.bigint();
     const redis = getRedis();
     const target_label = getActiveTarget().label;
+
+    // Wave 5.84C — probe the active redis to surface the resolved plan
+    // (shape + dials) in the seed SSE frame. Manual workers/batch/window
+    // from the request body override the profile's dials (DoD #4); the
+    // route already applies those overrides via `parseGeneratorRequest`, so
+    // we just thread the body values into `resolveDials` to compute the
+    // overrides bitmap consistently with the CLI plan block.
+    const shape = await probeForApi(redis);
+    const profileName: ProfileName = profile === "auto" ? pickProfile(shape) : profile;
+    const dials: ResolvedDials = resolveDials(profileName, shape, availableParallelism(), {
+      workers: body.workers,
+      batchSize: body.batch_size,
+      pipelineWindow: body.pipeline_window,
+    });
+    const gate = refuseOrGo(shape, rows);
+    const plan = {
+      profile: dials.profile,
+      profile_requested: profile,
+      shape: {
+        mode: shape.mode, shards: shape.shards, maxclients: shape.maxclients,
+        maxmemory_bytes: shape.maxmemoryBytes, used_memory_bytes: shape.usedMemoryBytes,
+        fallback: !!shape.fallback,
+      },
+      host_cores: availableParallelism(),
+      dials: { workers: dials.workers, batch_size: dials.batchSize, pipeline_window: dials.pipelineWindow },
+      overrides: dials.overrides,
+      rows,
+      bytes_per_row: BYTES_PER_ROW,
+      estimated_bytes: gate.estimatedBytes,
+      memory_gate: { allowed: gate.allowed, threshold_bytes: gate.thresholdBytes },
+      estimated_duration_sec: Math.round(estimateDurationSec(rows, dials.workers) * 100) / 100,
+    };
 
     const state: ActiveRun = {
       run_id,
@@ -733,8 +850,9 @@ export function registerGeneratorRoutes(
     // Seed frame so the client has the run_id even when generation completes
     // before the first interval tick (small synthetic batches). Wave 5.84B
     // adds `workers` so the UI can surface "running with N workers" from the
-    // very first frame (DoD #7).
-    writeFrame({ run_id, rows_done: 0, rows_total: rows, elapsed_ms: 0, rows_per_sec: 0, workers });
+    // very first frame (DoD #7). Wave 5.84C adds `plan` (shape + dials) so
+    // the UI can show the resolved profile alongside the run from frame 0.
+    writeFrame({ run_id, rows_done: 0, rows_total: rows, elapsed_ms: 0, rows_per_sec: 0, workers, plan });
 
     const emitProgress = (): void => {
       if (!clientConnected) return;

@@ -294,6 +294,79 @@ describe("POST /generator/start/stream (Wave 5.20c) — SSE progress + cancellat
     expect(fr.xadds).toHaveLength(50);
   });
 
+  // Wave 5.84C — seed SSE frame carries the resolved `plan` (shape +
+  // dials) so the UI can show the chosen profile from frame 0. The fake
+  // redis has no CLUSTER INFO / CONFIG GET responses set → the probe
+  // catches each and falls back; pickProfile returns `small`.
+  it("seed frame includes a plan object with the resolved profile + dials (Wave 5.84C)", async () => {
+    const schema = loadFixtureSchema();
+    const fr = pipelineFakeRedis();
+    app = await createServer({ redis: fr, schema });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/generator/start/stream",
+      payload: { rows: 25 },
+      headers: { accept: "text/event-stream" },
+      payloadAsStream: true,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = await collectStream(res.stream() as unknown as NodeJS.ReadableStream);
+    const frames = parseSseFrames(body);
+    const seed = frames[0]!;
+    expect(seed.plan).toBeDefined();
+    const plan = seed.plan as Record<string, unknown>;
+    expect(plan.profile).toBe("small");
+    expect(plan.profile_requested).toBe("auto");
+    expect((plan.shape as Record<string, unknown>).mode).toBe("standalone");
+    expect((plan.shape as Record<string, unknown>).shards).toBe(1);
+    expect((plan.dials as Record<string, unknown>).workers).toBe(1);
+    expect((plan.dials as Record<string, unknown>).batch_size).toBe(500);
+    expect((plan.dials as Record<string, unknown>).pipeline_window).toBe(1);
+    expect(plan.bytes_per_row).toBe(2048);
+    expect(plan.rows).toBe(25);
+  });
+
+  // Wave 5.84C — explicit profile in the body overrides auto-pick; manual
+  // batch_size in the same body overrides the profile's dial (DoD #4).
+  it("explicit profile=medium + manual batch_size overrides the dial (Wave 5.84C)", async () => {
+    const schema = loadFixtureSchema();
+    const fr = pipelineFakeRedis();
+    app = await createServer({ redis: fr, schema });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/generator/start/stream",
+      payload: { rows: 10, profile: "medium", batch_size: 333 },
+      headers: { accept: "text/event-stream" },
+      payloadAsStream: true,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = await collectStream(res.stream() as unknown as NodeJS.ReadableStream);
+    const seed = parseSseFrames(body)[0]!;
+    const plan = seed.plan as Record<string, unknown>;
+    expect(plan.profile).toBe("medium");
+    expect(plan.profile_requested).toBe("medium");
+    const dials = plan.dials as Record<string, unknown>;
+    expect(dials.batch_size).toBe(333);
+    expect(dials.pipeline_window).toBe(2);
+    expect((plan.overrides as Record<string, unknown>).batchSize).toBe(true);
+  });
+
+  // Wave 5.84C — invalid profile value → 400.
+  it("rejects an unknown profile with 400 (Wave 5.84C)", async () => {
+    const schema = loadFixtureSchema();
+    const fr = pipelineFakeRedis();
+    app = await createServer({ redis: fr, schema });
+    const res = await app.inject({
+      method: "POST",
+      url: "/generator/start/stream",
+      payload: { rows: 10, profile: "xlarge" },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toMatch(/profile must be one of/i);
+  });
+
   // Wave 5.21c — regression: the previous implementation listened on
   // `req.raw` for `close`/`error`, which Fastify fires as soon as the
   // inbound JSON body finishes parsing. That flipped `cancelFlag` before

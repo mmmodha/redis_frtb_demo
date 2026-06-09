@@ -5,6 +5,7 @@ import { createRedisClient } from "@frtb/redis-client";
 import pino from "pino";
 import { loadSchema } from "@frtb/schema";
 import { Worker } from "node:worker_threads";
+import { availableParallelism } from "node:os";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRowGenerator } from "./row-generator.js";
@@ -12,6 +13,15 @@ import { createStreamProducer } from "./producer.js";
 import { pickRiskClasses } from "./mix.js";
 import { runGenerationInline } from "./coordinator.js";
 import type { WorkerInitData, WorkerMessage } from "./worker.js";
+import { probeCluster, fallbackShape, BYTES_PER_ROW, type ClusterShape } from "./probe.js";
+import {
+  pickProfile,
+  resolveDials,
+  refuseOrGo,
+  estimateDurationSec,
+  type ProfileName,
+  type ResolvedDials,
+} from "./profile.js";
 
 const log = pino({ level: process.env.LOG_LEVEL ?? "info" });
 
@@ -39,7 +49,18 @@ interface CliOptions {
   // Wave 5.84B — worker_threads shard-out. Default 1 is bit-identical to
   // pre-5.84B (skips the worker spawn entirely; runs the inline coordinator).
   workers: string;
+  // Wave 5.84C — cluster-adaptive profile. `auto` probes the target and
+  // picks small/medium/large based on shard count + host CPUs. Explicit
+  // small/medium/large overrides autodetect; manual --workers /
+  // --batch-size / --pipeline-window override the profile's dial values
+  // (manual always wins — DoD #4).
+  profile: string;
+  dryRun?: boolean;
+  force?: boolean;
 }
+
+// Wave 5.84C — accepted --profile values.
+const PROFILE_NAMES = new Set<string>(["auto", "small", "medium", "large"]);
 
 async function main(): Promise<void> {
   const program = new Command();
@@ -59,7 +80,14 @@ async function main(): Promise<void> {
       "--workers <n>",
       `worker_threads to shard the row loop across (1..${MAX_WORKERS_HARD_CAP}, default 1 = bit-identical to pre-5.84B)`,
       "1",
-    );
+    )
+    .option(
+      "--profile <name>",
+      "cluster-adaptive profile (auto|small|medium|large, default auto) — auto probes the target and picks dials based on shard count",
+      "auto",
+    )
+    .option("--dry-run", "probe target, print plan, exit 0 without writing any rows")
+    .option("--force", "bypass the memory-cap refuse-or-go gate");
 
   program.parse(process.argv);
   const opts = program.opts<CliOptions>();
@@ -72,17 +100,53 @@ async function main(): Promise<void> {
   if (!redisUrl) {
     throw new Error("redis URL missing: pass --redis-url or set REDIS_URL");
   }
+  if (!PROFILE_NAMES.has(opts.profile)) {
+    throw new Error(`--profile must be one of auto|small|medium|large (got: ${opts.profile})`);
+  }
 
   const schema = loadSchema(schemaPath);
   const classes = pickRiskClasses(schema, opts.classes);
   const totalRows = Number(opts.rows);
-  const batchSize = Number(opts.batchSize);
-  const pipelineWindow = Number(opts.pipelineWindow);
   const rate = opts.rate ? Number(opts.rate) : undefined;
-  const requestedWorkers = Math.max(1, Math.min(MAX_WORKERS_HARD_CAP, Math.floor(Number(opts.workers))));
   const baseSeed = opts.seed ?? "0";
 
-  log.info({ totalRows, classes, schemaPath, stream: opts.stream, workers: requestedWorkers }, "generator starting");
+  // Wave 5.84C — probe the target once, resolve the profile + dials, and
+  // print the plan. Manual --workers/--batch-size/--pipeline-window flags
+  // override the profile's dials (manual always wins). Probe failure falls
+  // back to a conservative `small` profile with a warn log (DoD #7).
+  const workersExplicit = program.getOptionValueSource("workers") === "cli";
+  const batchExplicit = program.getOptionValueSource("batchSize") === "cli";
+  const pipelineExplicit = program.getOptionValueSource("pipelineWindow") === "cli";
+  const hostCores = Math.max(1, availableParallelism());
+  const shape = await probeForCli(redisUrl);
+  const profileName: ProfileName = opts.profile === "auto" ? pickProfile(shape) : (opts.profile as ProfileName);
+  const dials = resolveDials(profileName, shape, hostCores, {
+    workers: workersExplicit ? Math.max(1, Math.min(MAX_WORKERS_HARD_CAP, Math.floor(Number(opts.workers)))) : undefined,
+    batchSize: batchExplicit ? Number(opts.batchSize) : undefined,
+    pipelineWindow: pipelineExplicit ? Number(opts.pipelineWindow) : undefined,
+  });
+  // Clamp profile-resolved workers to the hard cap; manual values already
+  // clamped above so the explicit operator choice is preserved end-to-end.
+  const requestedWorkers = Math.max(1, Math.min(MAX_WORKERS_HARD_CAP, dials.workers));
+  const batchSize = dials.batchSize;
+  const pipelineWindow = dials.pipelineWindow;
+  const gate = refuseOrGo(shape, totalRows);
+  printPlan({ shape, dials, hostCores, rows: totalRows, profileRequested: opts.profile, gate });
+
+  if (!gate.allowed && !opts.force) {
+    log.error(
+      { estimatedBytes: gate.estimatedBytes, maxmemoryBytes: gate.maxmemoryBytes, thresholdBytes: gate.thresholdBytes },
+      `refusing: estimated ${formatBytes(gate.estimatedBytes)} > 50% of cluster maxmemory ` +
+      `(${formatBytes(gate.maxmemoryBytes)}). Re-run with --force to bypass.`,
+    );
+    process.exit(2);
+  }
+  if (opts.dryRun) {
+    log.info({}, "dry-run: plan printed, no rows produced");
+    return;
+  }
+
+  log.info({ totalRows, classes, schemaPath, stream: opts.stream, workers: requestedWorkers, profile: profileName }, "generator starting");
   const start = Date.now();
 
   if (requestedWorkers === 1) {
@@ -301,6 +365,100 @@ function createClient(url: string): Redis | Cluster {
 
 async function closeClient(client: Redis | Cluster): Promise<void> {
   await client.quit().catch(() => undefined);
+}
+
+// Wave 5.84C — probe wrapper used by the CLI entry path. Opens a transient
+// probe client, runs probeCluster(), and always closes — any failure
+// returns the conservative fallback shape with a warn-log so the run can
+// still proceed (DoD #7).
+async function probeForCli(redisUrl: string): Promise<ClusterShape> {
+  let client: Redis | Cluster | null = null;
+  try {
+    client = createClient(redisUrl);
+    const shape = await probeCluster(client);
+    if (shape.fallback) {
+      log.warn({ redisUrl: redacted(redisUrl) }, "probe returned fallback shape; using conservative `small` defaults");
+    }
+    return shape;
+  } catch (err) {
+    log.warn(
+      { err: String(err), redisUrl: redacted(redisUrl) },
+      "cluster probe failed; falling back to conservative `small` profile (DoD #7)",
+    );
+    return fallbackShape();
+  } finally {
+    if (client) await client.quit().catch(() => undefined);
+  }
+}
+
+// Wave 5.84C — plan block printed for any CLI invocation (dry-run + real
+// run). Mirrors the structured `plan` object the api emits in its seed SSE
+// frame. Uses pino's structured-log machinery so callers can pipe through
+// `pino-pretty` or jq; the human label fields are concise enough to be
+// readable in raw JSON too.
+interface PrintPlanArgs {
+  shape: ClusterShape;
+  dials: ResolvedDials;
+  hostCores: number;
+  rows: number;
+  profileRequested: string;
+  gate: ReturnType<typeof refuseOrGo>;
+}
+function printPlan(a: PrintPlanArgs): void {
+  const durationSec = estimateDurationSec(a.rows, a.dials.workers);
+  log.info(
+    {
+      plan: {
+        profile: a.dials.profile,
+        profile_requested: a.profileRequested,
+        shape: {
+          mode: a.shape.mode,
+          shards: a.shape.shards,
+          maxclients: a.shape.maxclients,
+          maxmemory_bytes: a.shape.maxmemoryBytes,
+          used_memory_bytes: a.shape.usedMemoryBytes,
+          fallback: !!a.shape.fallback,
+        },
+        host_cores: a.hostCores,
+        dials: {
+          workers: a.dials.workers,
+          batch_size: a.dials.batchSize,
+          pipeline_window: a.dials.pipelineWindow,
+        },
+        overrides: a.dials.overrides,
+        rows: a.rows,
+        bytes_per_row: BYTES_PER_ROW,
+        estimated_bytes: a.gate.estimatedBytes,
+        memory_gate: {
+          allowed: a.gate.allowed,
+          threshold_bytes: a.gate.thresholdBytes,
+        },
+        estimated_duration_sec: Math.round(durationSec * 100) / 100,
+      },
+    },
+    `plan — profile=${a.dials.profile} (requested=${a.profileRequested}) ` +
+    `shape=${a.shape.mode}/${a.shape.shards}sh ` +
+    `dials=workers:${a.dials.workers} batch:${a.dials.batchSize} window:${a.dials.pipelineWindow} ` +
+    `rows=${a.rows} est=${formatBytes(a.gate.estimatedBytes)} ` +
+    `dur~${durationSec.toFixed(1)}s`,
+  );
+}
+
+// Wave 5.84C — pretty-print a byte count for the plan block / refuse-or-go
+// error line. Conservative rounding (1 decimal place) keeps the line
+// concise; we never display fractional bytes.
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let v = bytes;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return `${v.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+// Strip credentials from the redis URL for log emission.
+function redacted(url: string): string {
+  try { return new URL(url).host; } catch { return "redis"; }
 }
 
 main().catch((err) => {

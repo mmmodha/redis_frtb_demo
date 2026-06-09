@@ -15,3 +15,28 @@ export {
   type StreamProducer,
   type StreamProducerOptions,
 } from "./producer.ts";
+
+// Wave 5.84C — cluster-adaptive profile / probe surfaces. Exposed so the
+// api can build the same `plan` payload from its in-process redis client
+// without duplicating the parser logic.
+export {
+  parseClusterInfo,
+  parseInfoMemory,
+  parseMaxclients,
+  fallbackShape,
+  probeCluster,
+  BYTES_PER_ROW,
+  type ClusterShape,
+} from "./probe.ts";
+
+export {
+  pickProfile,
+  profileDials,
+  resolveDials,
+  refuseOrGo,
+  estimateDurationSec,
+  type ProfileName,
+  type ProfileDials,
+  type ResolvedDials,
+  type RefuseOrGoResult,
+} from "./profile.ts";

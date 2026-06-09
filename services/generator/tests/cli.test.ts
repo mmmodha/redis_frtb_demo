@@ -176,6 +176,84 @@ describe("generator CLI", () => {
     expect(classes).toEqual(new Set(["GIRR", "EQUITY"]));
   });
 
+  // Wave 5.84C — --profile auto against the localhost standalone redis-server
+  // picks the `small` profile; --dry-run exits 0 without writing any rows
+  // and emits the plan block on stderr (pino default sink). DoD #1.
+  it.skipIf(!redisAvailable)("--profile auto + --dry-run against standalone redis → picks small, exit 0, no rows written", async () => {
+    const res = spawnSync(
+      process.execPath,
+      [tsx, cli, "--rows", "1000000", "--profile", "auto", "--dry-run"],
+      {
+        env: {
+          ...process.env,
+          SCHEMA_FILE: multiClass,
+          REDIS_URL: `redis://127.0.0.1:${PORT}`,
+          REDIS_CLUSTER: "false",
+          STREAM_KEY: "sensitivities:in",
+        },
+        encoding: "utf8",
+        timeout: 30_000,
+      }
+    );
+    expect(res.status, `stdout:\n${res.stdout}\nstderr:\n${res.stderr}`).toBe(0);
+    const combined = res.stdout + res.stderr;
+    expect(combined).toMatch(/plan/);
+    expect(combined).toMatch(/profile=small/);
+    expect(combined).toMatch(/dry-run/);
+    // No rows produced — the dry-run path exits before opening the producer.
+    const len = await redis.xlen("sensitivities:in");
+    expect(len).toBe(0);
+  });
+
+  // Wave 5.84C — explicit --profile small forces the small dials regardless
+  // of detected shape (DoD #3). Manual --batch-size overrides the profile's
+  // dial value (manual always wins — DoD #4).
+  it.skipIf(!redisAvailable)("explicit --profile small + manual --batch-size 250 overrides profile dial (DoD #3 + #4)", async () => {
+    const res = spawnSync(
+      process.execPath,
+      [tsx, cli, "--rows", "100", "--profile", "small", "--batch-size", "250", "--dry-run"],
+      {
+        env: { ...process.env, SCHEMA_FILE: multiClass, REDIS_URL: `redis://127.0.0.1:${PORT}`, REDIS_CLUSTER: "false", STREAM_KEY: "sensitivities:in" },
+        encoding: "utf8",
+        timeout: 30_000,
+      }
+    );
+    expect(res.status, `stdout:\n${res.stdout}\nstderr:\n${res.stderr}`).toBe(0);
+    const combined = res.stdout + res.stderr;
+    expect(combined).toMatch(/profile=small/);
+    expect(combined).toMatch(/batch:250/);
+  });
+
+  // Wave 5.84C — refuse-or-go gate. Cap maxmemory at 4 MB on the test redis
+  // and request 100k rows × 2 KB ≈ 200 MB → > 50% of 4 MB → exits non-zero
+  // unless --force is passed (DoD #5).
+  it.skipIf(!redisAvailable)("refuse-or-go: rows*2KB > 50% of maxmemory exits non-zero; --force proceeds", async () => {
+    // CONFIG SET maxmemory 4mb at runtime so the gate trips.
+    await redis.config("SET", "maxmemory", "4mb");
+    try {
+      const env = { ...process.env, SCHEMA_FILE: multiClass, REDIS_URL: `redis://127.0.0.1:${PORT}`, REDIS_CLUSTER: "false", STREAM_KEY: "sensitivities:in" } as NodeJS.ProcessEnv;
+      // No --force → must exit non-zero with a refuse message.
+      const r1 = spawnSync(
+        process.execPath,
+        [tsx, cli, "--rows", "100000", "--profile", "auto", "--dry-run"],
+        { env, encoding: "utf8", timeout: 30_000 },
+      );
+      expect(r1.status, `r1 stdout:\n${r1.stdout}\nstderr:\n${r1.stderr}`).not.toBe(0);
+      expect((r1.stdout + r1.stderr)).toMatch(/refusing|--force/);
+
+      // With --force the run is allowed; --dry-run still skips the actual
+      // write so we only need to assert exit 0.
+      const r2 = spawnSync(
+        process.execPath,
+        [tsx, cli, "--rows", "100000", "--profile", "auto", "--dry-run", "--force"],
+        { env, encoding: "utf8", timeout: 30_000 },
+      );
+      expect(r2.status, `r2 stdout:\n${r2.stdout}\nstderr:\n${r2.stderr}`).toBe(0);
+    } finally {
+      await redis.config("SET", "maxmemory", "0");
+    }
+  });
+
   it.skipIf(!redisAvailable)("re-running with a different SCHEMA_FILE produces rows in the new shape (proves schema swap)", async () => {
     const swap = resolve(here, "fixtures/swap-schema.yaml");
     spawnSync(
