@@ -1,0 +1,13 @@
+[
+  {"class":"GIRR","leg":"Delta","lua_charge":3.811340239425009,"fast_charge":3.8113402394249567,"rel_delta":1.3749107523975084e-14,"lua_engine":"fcall_lua","fast_engine":"ft_aggregate","lua_total_ms":3238.685,"fast_total_ms":723.028,"buckets":11,"rows":33303}
+,
+  {"class":"GIRR","leg":"Vega","lua_charge":417.54285447783707,"fast_charge":417.54285447784,"rel_delta":7.079172231215589e-15,"lua_engine":"fcall_lua","fast_engine":"ft_aggregate","lua_total_ms":3302.127,"fast_total_ms":729.357,"buckets":11,"rows":33364}
+,
+  {"class":"EQUITY","leg":"Delta","lua_charge":53.923588149883244,"fast_charge":53.92358814987944,"rel_delta":7.049611805784046e-14,"lua_engine":"fcall_lua","fast_engine":"ft_aggregate","lua_total_ms":2492.495,"fast_total_ms":576.741,"buckets":13,"rows":33540}
+,
+  {"class":"EQUITY","leg":"Vega","lua_charge":144.1291586750418,"fast_charge":144.1291586750679,"rel_delta":1.812232251034402e-13,"lua_engine":"fcall_lua","fast_engine":"ft_aggregate","lua_total_ms":2494.813,"fast_total_ms":545.754,"buckets":13,"rows":33127}
+,
+  {"class":"FX","leg":"Delta","lua_charge":10.544877039929958,"fast_charge":10.544877039929421,"rel_delta":5.087397069377672e-14,"lua_engine":"fcall_lua","fast_engine":"ft_aggregate","lua_total_ms":2209.99,"fast_total_ms":594.717,"buckets":11,"rows":33422}
+,
+  {"class":"FX","leg":"Vega","lua_charge":105.24610997565287,"fast_charge":105.24610997566032,"rel_delta":7.075309360591055e-14,"lua_engine":"fcall_lua","fast_engine":"ft_aggregate","lua_total_ms":2202.742,"fast_total_ms":577.637,"buckets":11,"rows":33244}
+]
