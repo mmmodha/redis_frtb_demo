@@ -1,0 +1,269 @@
+{
+  "target": "small",
+  "rows": 200000,
+  "samples": 10,
+  "rounds": 1,
+  "plan": {
+    "profile": "small",
+    "profile_requested": "auto",
+    "shape": {
+      "mode": "standalone",
+      "shards": 1,
+      "maxclients": 0,
+      "maxmemory_bytes": 0,
+      "used_memory_bytes": 1600203552,
+      "fallback": false
+    },
+    "host_cores": 12,
+    "dials": {
+      "workers": 1,
+      "batch_size": 500,
+      "pipeline_window": 1
+    },
+    "overrides": {
+      "workers": false,
+      "batchSize": false,
+      "pipelineWindow": false
+    },
+    "rows": 200000,
+    "bytes_per_row": 2048,
+    "estimated_bytes": 409600000,
+    "memory_gate": {
+      "allowed": true,
+      "threshold_bytes": 0
+    },
+    "estimated_duration_sec": 6.67
+  },
+  "elapsedSec": {
+    "median": 70.5515,
+    "p50": 70.5515,
+    "p95": 83.708,
+    "min": 67.271,
+    "max": 83.708
+  },
+  "rowsPerSec": {
+    "median": 2836,
+    "p95": 2973,
+    "min": 2389,
+    "max": 2973
+  },
+  "roundMedians": [
+    70.5515
+  ],
+  "memDeltaBytes": 350609232,
+  "memBeforeBytes": 1600203552,
+  "memAfterBytes": 1950812784,
+  "rawSamples": [
+    {
+      "elapsedSec": 67.324,
+      "rps": 2971,
+      "rowsSent": 200000,
+      "plan": {
+        "profile": "small",
+        "dials": {
+          "workers": 1,
+          "batch_size": 500,
+          "pipeline_window": 1
+        },
+        "shape": {
+          "mode": "standalone",
+          "shards": 1,
+          "maxclients": 0,
+          "maxmemory_bytes": 0,
+          "used_memory_bytes": 1600203552,
+          "fallback": false
+        }
+      }
+    },
+    {
+      "elapsedSec": 73.166,
+      "rps": 2734,
+      "rowsSent": 200000,
+      "plan": {
+        "profile": "small",
+        "dials": {
+          "workers": 1,
+          "batch_size": 500,
+          "pipeline_window": 1
+        },
+        "shape": {
+          "mode": "standalone",
+          "shards": 1,
+          "maxclients": 0,
+          "maxmemory_bytes": 0,
+          "used_memory_bytes": 1946222544,
+          "fallback": false
+        }
+      }
+    },
+    {
+      "elapsedSec": 71.724,
+      "rps": 2788,
+      "rowsSent": 200000,
+      "plan": {
+        "profile": "small",
+        "dials": {
+          "workers": 1,
+          "batch_size": 500,
+          "pipeline_window": 1
+        },
+        "shape": {
+          "mode": "standalone",
+          "shards": 1,
+          "maxclients": 0,
+          "maxmemory_bytes": 0,
+          "used_memory_bytes": 1950826000,
+          "fallback": false
+        }
+      }
+    },
+    {
+      "elapsedSec": 67.271,
+      "rps": 2973,
+      "rowsSent": 200000,
+      "plan": {
+        "profile": "small",
+        "dials": {
+          "workers": 1,
+          "batch_size": 500,
+          "pipeline_window": 1
+        },
+        "shape": {
+          "mode": "standalone",
+          "shards": 1,
+          "maxclients": 0,
+          "maxmemory_bytes": 0,
+          "used_memory_bytes": 1951808400,
+          "fallback": false
+        }
+      }
+    },
+    {
+      "elapsedSec": 67.438,
+      "rps": 2966,
+      "rowsSent": 200000,
+      "plan": {
+        "profile": "small",
+        "dials": {
+          "workers": 1,
+          "batch_size": 500,
+          "pipeline_window": 1
+        },
+        "shape": {
+          "mode": "standalone",
+          "shards": 1,
+          "maxclients": 0,
+          "maxmemory_bytes": 0,
+          "used_memory_bytes": 1954420448,
+          "fallback": false
+        }
+      }
+    },
+    {
+      "elapsedSec": 69.286,
+      "rps": 2887,
+      "rowsSent": 200000,
+      "plan": {
+        "profile": "small",
+        "dials": {
+          "workers": 1,
+          "batch_size": 500,
+          "pipeline_window": 1
+        },
+        "shape": {
+          "mode": "standalone",
+          "shards": 1,
+          "maxclients": 0,
+          "maxmemory_bytes": 0,
+          "used_memory_bytes": 1951718272,
+          "fallback": false
+        }
+      }
+    },
+    {
+      "elapsedSec": 72.018,
+      "rps": 2777,
+      "rowsSent": 200000,
+      "plan": {
+        "profile": "small",
+        "dials": {
+          "workers": 1,
+          "batch_size": 500,
+          "pipeline_window": 1
+        },
+        "shape": {
+          "mode": "standalone",
+          "shards": 1,
+          "maxclients": 0,
+          "maxmemory_bytes": 0,
+          "used_memory_bytes": 1954420784,
+          "fallback": false
+        }
+      }
+    },
+    {
+      "elapsedSec": 83.708,
+      "rps": 2389,
+      "rowsSent": 200000,
+      "plan": {
+        "profile": "small",
+        "dials": {
+          "workers": 1,
+          "batch_size": 500,
+          "pipeline_window": 1
+        },
+        "shape": {
+          "mode": "standalone",
+          "shards": 1,
+          "maxclients": 0,
+          "maxmemory_bytes": 0,
+          "used_memory_bytes": 1949096976,
+          "fallback": false
+        }
+      }
+    },
+    {
+      "elapsedSec": 78.499,
+      "rps": 2548,
+      "rowsSent": 200000,
+      "plan": {
+        "profile": "small",
+        "dials": {
+          "workers": 1,
+          "batch_size": 500,
+          "pipeline_window": 1
+        },
+        "shape": {
+          "mode": "standalone",
+          "shards": 1,
+          "maxclients": 0,
+          "maxmemory_bytes": 0,
+          "used_memory_bytes": 1613140480,
+          "fallback": false
+        }
+      }
+    },
+    {
+      "elapsedSec": 69.379,
+      "rps": 2883,
+      "rowsSent": 200000,
+      "plan": {
+        "profile": "small",
+        "dials": {
+          "workers": 1,
+          "batch_size": 500,
+          "pipeline_window": 1
+        },
+        "shape": {
+          "mode": "standalone",
+          "shards": 1,
+          "maxclients": 0,
+          "maxmemory_bytes": 0,
+          "used_memory_bytes": 1953112752,
+          "fallback": false
+        }
+      }
+    }
+  ],
+  "capturedAt": "2026-06-09T11:00:16.386Z"
+}

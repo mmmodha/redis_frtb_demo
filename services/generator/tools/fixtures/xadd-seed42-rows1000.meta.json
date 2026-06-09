@@ -1,0 +1,13 @@
+{
+  "tool": "services/generator/tools/bench-generator.mjs --verify-equiv",
+  "capturedAt": "2026-06-09T10:47:28.638Z",
+  "seed": "42",
+  "rows": 1000,
+  "schemaFile": "config/schema/frtb-default.yaml",
+  "schemaSha": "e38cdb60648cb91f78f4bea3c35e2f414aa5ae06c5e8f54929832ec580ebeb8c",
+  "batchSize": 1000,
+  "sha256": "47a6a2f27372dcf96fda713015e797f33ada52ecebd6013abb5eba7c219e9025",
+  "bytes": 920183,
+  "lineCount": 1000,
+  "note": "stripped `_id` field-value pair to neutralise ulid monotonic timestamps"
+}
