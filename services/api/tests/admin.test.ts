@@ -118,6 +118,68 @@ describe("POST /admin/flush", () => {
     expect(runBootstrap).toHaveBeenCalledTimes(1);
   });
 
+  // Wave 5.86C — POST /admin/flush invalidates the /facets in-process cache
+  // so the UI sees post-flush row counts immediately. Without this the
+  // identity-keyed 30 s cache (Wave 5.67) would serve the pre-flush body for
+  // up to TTL, requiring `?nocache=true` as a workaround.
+  it("invalidates the /facets cache so a subsequent GET /facets reflects post-flush state immediately", async () => {
+    function aggReply(rows: Array<Record<string, string | number>>) {
+      const out: unknown[] = [rows.length];
+      for (const r of rows) {
+        const flat: unknown[] = [];
+        for (const [k, v] of Object.entries(r)) flat.push(k, String(v));
+        out.push(flat);
+      }
+      return out;
+    }
+    const cursorReply = (rows: Array<Record<string, string | number>>, cursorId: number) =>
+      [aggReply(rows), cursorId];
+
+    const fr = fakeRedis();
+    let nextAgg: unknown = cursorReply(
+      [{ risk_class: "GIRR", bucket: "USD", sensitivity_type: "Delta", n: 10 }],
+      0,
+    );
+    fr.setResponse("FT.AGGREGATE", () => nextAgg);
+
+    const runBootstrap = vi.fn(async () => ({}));
+    const Fastify = (await import("fastify")).default;
+    const { registerAdminRoutes } = await import("../src/routes/admin.ts");
+    const { registerFacetsRoute, __resetFacetsCacheForTests } = await import(
+      "../src/routes/facets.ts"
+    );
+    const { setActiveTarget } = await import("../src/active-target.ts");
+    setActiveTarget({ host: "127.0.0.1", port: 6379, tls: false, db: 0, label: "redis-primary" });
+    __resetFacetsCacheForTests();
+    app = Fastify();
+    registerAdminRoutes(app, () => fr, { schema: stubSchema, bootstrap: runBootstrap });
+    registerFacetsRoute(app, () => fr);
+
+    // Prime the facets cache with the pre-flush body.
+    const r1 = await app.inject({ method: "GET", url: "/facets" });
+    expect(r1.statusCode).toBe(200);
+    expect(r1.json()).toMatchObject({ cached: false, total_rows: 10, risk_class: { GIRR: 10 } });
+    const r1Cached = await app.inject({ method: "GET", url: "/facets" });
+    expect(r1Cached.json().cached).toBe(true);
+
+    // Swap the FT.AGGREGATE response to simulate the post-flush index state.
+    nextAgg = cursorReply(
+      [{ risk_class: "FX", bucket: "EUR", sensitivity_type: "Vega", n: 7 }],
+      0,
+    );
+
+    const flushRes = await app.inject({ method: "POST", url: "/admin/flush" });
+    expect(flushRes.statusCode).toBe(200);
+    const flushBody = flushRes.json();
+    expect(flushBody.bootstrap).toMatchObject({ ok: true, cache_invalidated: true });
+
+    // /facets without ?nocache must drain a fresh aggregate, not serve the
+    // stale pre-flush body that was cached above.
+    const r2 = await app.inject({ method: "GET", url: "/facets" });
+    expect(r2.statusCode).toBe(200);
+    expect(r2.json()).toMatchObject({ cached: false, total_rows: 7, risk_class: { FX: 7 } });
+  });
+
   it("returns bootstrap.ok=false with error 'schema-missing' when no schema is wired", async () => {
     const fr = fakeRedis();
     const runBootstrap = vi.fn();

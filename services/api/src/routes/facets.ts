@@ -71,6 +71,14 @@ export function __resetFacetsCacheForTests(): void {
   cache = null;
 }
 
+// Wave 5.86C — POST /admin/flush invokes this after FLUSHDB + bootstrap so the
+// next /facets call drains the freshly-rebuilt index instead of serving the
+// pre-flush body for up to CACHE_TTL_MS. The active-target identity has not
+// changed, so onActiveTargetChange does not fire on its own.
+export function invalidateFacetsCache(): void {
+  cache = null;
+}
+
 // FT.AGGREGATE ... WITHCURSOR / FT.CURSOR READ each return [result, cursor_id].
 // result is the standard aggregate payload [N, row1, row2, ...] where each row
 // is a flat [field, val, ...] array. Older builds occasionally elide the

@@ -28,6 +28,7 @@ import {
 } from "../bootstrap.ts";
 import { translateRedisError } from "../redis-errors.ts";
 import { bumpDataVersion } from "../sbm/calc-cache.ts";
+import { invalidateFacetsCache } from "./facets.ts";
 
 export interface AdminRoutesOpts {
   // Threaded through from createServer so the post-flush bootstrap can rebuild
@@ -77,7 +78,7 @@ export function registerAdminRoutes(
     // Best-effort: a failed INCR still invalidates the in-process map.
     await bumpDataVersion(redis);
 
-    let bootstrap: { ok: boolean; error?: string };
+    let bootstrap: { ok: boolean; error?: string; cache_invalidated?: boolean; cache_invalidate_error?: string };
     if (!opts.schema) {
       bootstrap = { ok: false, error: "schema-missing" };
     } else {
@@ -86,6 +87,19 @@ export function registerAdminRoutes(
         await runBootstrap(redis as unknown as BootstrapRedis, opts.schema);
         markBootstrapStatusReady(target_label);
         bootstrap = { ok: true };
+        // Wave 5.86C — drop the /facets in-process cache so the UI sees
+        // post-flush row counts immediately instead of waiting up to 30 s
+        // for the entry to expire (active-target identity is unchanged, so
+        // onActiveTargetChange would not fire on its own). Non-fatal:
+        // the flush + bootstrap already succeeded, we just surface a
+        // warning on the body if invalidation throws.
+        try {
+          invalidateFacetsCache();
+          bootstrap.cache_invalidated = true;
+        } catch (err) {
+          bootstrap.cache_invalidated = false;
+          bootstrap.cache_invalidate_error = String(err instanceof Error ? err.message : err);
+        }
       } catch (err) {
         markBootstrapStatusFailed(target_label, err);
         bootstrap = {
