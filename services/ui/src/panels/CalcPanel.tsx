@@ -106,6 +106,21 @@ function toneFor(totalMs: number): Tone {
   return "red";
 }
 
+// Wave 5.96F — humanise ms values that span four orders of magnitude
+// (cache hits land in the single-digit ms range, cold computes can hit
+// 20+ seconds). The headline chip needs both: "Computed in 21.05 s
+// (cached, served in 12 ms)".
+function formatComputeMs(ms: number): string {
+  if (!Number.isFinite(ms)) return `${ms} ms`;
+  if (ms >= 1000) return `${(ms / 1000).toFixed(2)} s`;
+  return `${Math.round(ms)} ms`;
+}
+function formatServedMs(ms: number): string {
+  if (!Number.isFinite(ms)) return `${ms} ms`;
+  if (ms < 1) return `<1 ms`;
+  return `${Math.round(ms)} ms`;
+}
+
 // Re-export so unit tests can import the formatter alongside the panel.
 export { formatCharge };
 
@@ -618,6 +633,22 @@ function TotalSbmCard({
   error: string | null;
   onCalculate: () => void;
 }) {
+  // Wave 5.96D — elapsed-time counter that ticks every 250ms while the
+  // orchestrator is in-flight. Sets expectation that this is a multi-second
+  // operation (cold ~35s, warm ~6s) and resets cleanly between runs because
+  // the effect re-runs whenever `loading` flips.
+  const [elapsedMs, setElapsedMs] = useState(0);
+  useEffect(() => {
+    if (!loading) {
+      setElapsedMs(0);
+      return;
+    }
+    const start = Date.now();
+    setElapsedMs(0);
+    const id = setInterval(() => setElapsedMs(Date.now() - start), 250);
+    return () => clearInterval(id);
+  }, [loading]);
+  const elapsedSeconds = elapsedMs / 1000;
   return (
     <PanelCard title="Total SBM (all classes × legs × scenarios)">
       <p className="calc-panel__lead">
@@ -632,9 +663,21 @@ function TotalSbmCard({
           disabled={loading}
           data-testid="calc-total-cta"
         >
-          {loading ? "Computing 27 cells…" : "Calculate Total SBM"}
+          {loading
+            ? "Computing risk charges across 3 scenarios…"
+            : "Calculate Total SBM"}
         </button>
+        {loading ? (
+          <span
+            className="calc-panel__total-elapsed"
+            data-testid="calc-total-elapsed"
+            aria-live="polite"
+          >
+            elapsed {elapsedSeconds.toFixed(elapsedSeconds < 10 ? 1 : 0)}s
+          </span>
+        ) : null}
       </div>
+      {loading ? <TotalSbmSkeletonGrid /> : null}
       {error ? (
         <div role="alert" className="calc-panel__error">
           {error}
@@ -642,6 +685,49 @@ function TotalSbmCard({
       ) : null}
       {result ? <TotalSbmResultView result={result} /> : null}
     </PanelCard>
+  );
+}
+
+// Wave 5.96D — placeholder 3×3 (class × leg) grid shown during in-flight so
+// the user sees the structure of what's coming. Pure client-side; resolves to
+// the real `TotalSbmResultView` matrix when the orchestrator response lands.
+const TOTAL_SBM_SKELETON_CLASSES: ReadonlyArray<string> = ["GIRR", "Equity", "FX"];
+function TotalSbmSkeletonGrid() {
+  return (
+    <div
+      className="calc-panel__total-skeleton"
+      data-testid="calc-total-skeleton"
+      aria-busy="true"
+      aria-label="Loading risk charges"
+    >
+      {TOTAL_SBM_SKELETON_CLASSES.map((rc) => (
+        <div
+          className="calc-panel__total-skeleton-class"
+          key={rc}
+          data-class={rc}
+        >
+          <div className="calc-panel__total-skeleton-class-name">{rc}</div>
+          <div className="calc-panel__total-skeleton-legs">
+            {TOTAL_SBM_LEG_ORDER.map((leg) => (
+              <div
+                key={leg}
+                className="calc-panel__total-skeleton-cell"
+                data-testid="calc-total-skeleton-cell"
+                data-leg={leg}
+              >
+                <span className="calc-panel__total-skeleton-leg">
+                  {TOTAL_SBM_LEG_LABEL[leg]}
+                </span>
+                <span
+                  className="calc-panel__total-skeleton-shimmer"
+                  aria-hidden
+                />
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
   );
 }
 
@@ -741,10 +827,24 @@ function TotalSbmResultView({ result }: { result: TotalSbmResponse }) {
     (winningSubst.terms.length > 0 ? winningSubst.terms.join(" + ") : "0") +
     ` = ${winningSubst.total.toFixed(2)}`;
 
-  const perfTooltip =
-    `Cumulative compute time across ${perf.redis_ops_count} cells: ${perf.cumulative_ms.toFixed(1)} ms. ` +
-    `Wall-clock elapsed: ${perf.total_ms.toFixed(1)} ms. ` +
-    `Parallelism factor = cumulative / wall-clock = ${perf.parallelism_factor.toFixed(2)}×.`;
+  // Wave 5.96F — when any cell came from the response cache, separate the
+  // freshly-measured cumulative (truthful per-cell elapsed) from the
+  // original cold cumulative preserved through cache hits. The tooltip
+  // makes the distinction explicit so users don't read a sub-100 ms warm
+  // run as evidence that the kernel ran in zero time.
+  const perfCache = perf.cache;
+  const originalCumulativeMs = typeof perf.original_cumulative_ms === "number"
+    ? perf.original_cumulative_ms
+    : perf.cumulative_ms;
+  const perfTooltip = perfCache === "hit" || perfCache === "partial"
+    ? `Served from cache ${perfCache === "hit" ? "(all cells)" : `(${perf.cache_hits ?? 0}/${perf.redis_ops_count} cells)`}. ` +
+      `Wall-clock this request: ${perf.total_ms.toFixed(1)} ms. ` +
+      `Fresh per-cell cumulative: ${perf.cumulative_ms.toFixed(1)} ms. ` +
+      `Original cold compute (preserved): ${originalCumulativeMs.toFixed(1)} ms across ${perf.redis_ops_count} cells. ` +
+      `Parallelism factor = cumulative / wall-clock = ${perf.parallelism_factor.toFixed(2)}×.`
+    : `Cumulative compute time across ${perf.redis_ops_count} cells: ${perf.cumulative_ms.toFixed(1)} ms. ` +
+      `Wall-clock elapsed: ${perf.total_ms.toFixed(1)} ms. ` +
+      `Parallelism factor = cumulative / wall-clock = ${perf.parallelism_factor.toFixed(2)}×.`;
 
   return (
     <div className="calc-panel__total-result" data-testid="calc-total-result">
@@ -921,7 +1021,12 @@ function TotalSbmResultView({ result }: { result: TotalSbmResponse }) {
         data-testid="calc-total-performance"
         title={perfTooltip}
       >
-        <span className="calc-panel__total-perf-chip" data-chip="ops">
+        <span
+          className="calc-panel__total-perf-chip"
+          data-chip="ops"
+          data-testid="calc-total-perf-ops-chip"
+          title="3 risk classes (GIRR, Equity, FX) × 3 legs (Δ delta, V vega, Curvature) × 3 correlation scenarios (low, medium, high) = 27 parallel Lua kernel calls."
+        >
           <span aria-hidden>{"\u26A1"}</span> {perf.redis_ops_count}/{totalCells} cells
         </span>
         <span className="calc-panel__total-perf-chip" data-chip="wall">
@@ -936,6 +1041,19 @@ function TotalSbmResultView({ result }: { result: TotalSbmResponse }) {
           </strong>{" "}
           parallel speedup
         </span>
+        {perfCache === "hit" || perfCache === "partial" ? (
+          <span
+            className="calc-panel__total-perf-chip"
+            data-chip="cache"
+            data-cache={perfCache}
+            data-testid="calc-total-perf-cache-chip"
+            title={`Original cold compute: ${formatComputeMs(originalCumulativeMs)} across ${perf.redis_ops_count} cells.`}
+          >
+            {perfCache === "hit"
+              ? `served from cache in ${formatServedMs(perf.total_ms)} · original ${formatComputeMs(originalCumulativeMs)}`
+              : `${perf.cache_hits ?? 0}/${perf.redis_ops_count} from cache · original ${formatComputeMs(originalCumulativeMs)}`}
+          </span>
+        ) : null}
         {perf.ops_skipped > 0 ? (
           <span className="calc-panel__total-perf-chip" data-chip="skipped">
             {perf.ops_skipped} skipped
@@ -1434,7 +1552,21 @@ function CalcResult({
   onToggleTable: (bucket: string) => void;
   showRedisCommands: boolean;
 }) {
+  // Wave 5.96F — on cache hits the chip headlines the cold-compute cost
+  // (the work the cache saved) and then surfaces the actual served-in time.
+  // On misses the chip is unchanged. Tone reflects served time so cache hits
+  // stay green even when the original cold compute was slow.
+  const isCacheHit = result.cache === "hit";
   const tone = toneFor(result.total_ms);
+  const headlineMs = isCacheHit && typeof result.original_compute_ms === "number"
+    ? result.original_compute_ms
+    : result.total_ms;
+  const chipText = isCacheHit && typeof result.original_compute_ms === "number"
+    ? `Computed in ${formatComputeMs(headlineMs)} (cached, served in ${formatServedMs(result.total_ms)})`
+    : `Computed in ${result.total_ms} ms (${result.fanout_ms} ms of Redis fan-out)`;
+  const chipTooltip = isCacheHit && typeof result.original_compute_ms === "number"
+    ? `Original cold compute: ${formatComputeMs(headlineMs)}. This request was served from the response cache in ${formatServedMs(result.total_ms)}.`
+    : `Wall-clock elapsed: ${result.total_ms} ms (Redis fan-out: ${result.fanout_ms} ms).`;
   const bClass = bucketClassFor(context.riskClass);
   const caption = baselCaption(context.riskClass, context.sensitivityType);
 
@@ -1458,8 +1590,10 @@ function CalcResult({
             className={`calc-panel__wallclock calc-panel__wallclock--${tone}`}
             data-testid="wallclock-badge"
             data-tone={tone}
+            data-cache={isCacheHit ? "hit" : undefined}
+            title={chipTooltip}
           >
-            Computed in {result.total_ms} ms ({result.fanout_ms} ms of Redis fan-out)
+            {chipText}
           </span>
         }
       >

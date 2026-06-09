@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
-import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
+import { act, render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { CalcPanel } from "../../src/panels/CalcPanel";
 import type { TotalSbmResponse } from "../../src/lib/calc";
 
@@ -209,6 +209,84 @@ describe("<CalcPanel /> — Total SBM card (Wave 5.96B)", () => {
     expect(screen.getByTestId("calc-total-winner-pill").textContent).toMatch(/HIGH/);
   });
 
+  // Wave 5.96F — when the orchestrator reports cache participation, the
+  // performance strip surfaces a "served from cache" chip that carries
+  // both the freshly-measured wall-clock and the original cold-compute
+  // cumulative so users see what Redis caching saved them.
+  it("renders the served-from-cache chip with both fresh and original timing when performance.cache='hit'", async () => {
+    mockTotalResponse(buildTotalResponse({
+      performance: {
+        total_ms: 12,
+        cumulative_ms: 8,
+        original_cumulative_ms: 21050,
+        parallelism_factor: 0.67,
+        redis_ops_count: 27,
+        ops_skipped: 0,
+        cache: "hit",
+        cache_hits: 27,
+      },
+    }));
+    render(<CalcPanel />);
+    fireEvent.click(screen.getByTestId("calc-total-cta"));
+    await waitFor(() => expect(screen.getByTestId("calc-total-result")).toBeInTheDocument());
+
+    const cacheChip = screen.getByTestId("calc-total-perf-cache-chip");
+    // Both numbers must appear: the freshly-measured served-in time AND
+    // the original cold-compute cost (preserved through the cache hit).
+    expect(cacheChip.textContent).toMatch(/served from cache/i);
+    expect(cacheChip.textContent).toMatch(/12 ms/);
+    // Original cumulative formatted as "21.05 s" (>=1000 ms → seconds).
+    expect(cacheChip.textContent).toMatch(/21\.05 s/);
+
+    // The strip-level tooltip distinguishes original cold compute from the
+    // freshly-measured per-cell cumulative so the hover affordance carries
+    // the full story.
+    const perf = screen.getByTestId("calc-total-performance");
+    expect(perf.getAttribute("title") ?? "").toMatch(/Served from cache/);
+    expect(perf.getAttribute("title") ?? "").toMatch(/Original cold compute/);
+  });
+
+  // Wave 5.96F — partial cache participation (some cells hit, some missed)
+  // still surfaces the chip with an X/Y suffix instead of headline "served
+  // from cache" wording.
+  it("renders the cache chip with hit-count when performance.cache='partial'", async () => {
+    mockTotalResponse(buildTotalResponse({
+      performance: {
+        total_ms: 220,
+        cumulative_ms: 500,
+        original_cumulative_ms: 18000,
+        parallelism_factor: 2.27,
+        redis_ops_count: 27,
+        ops_skipped: 0,
+        cache: "partial",
+        cache_hits: 15,
+      },
+    }));
+    render(<CalcPanel />);
+    fireEvent.click(screen.getByTestId("calc-total-cta"));
+    await waitFor(() => expect(screen.getByTestId("calc-total-result")).toBeInTheDocument());
+    const cacheChip = screen.getByTestId("calc-total-perf-cache-chip");
+    expect(cacheChip.textContent).toMatch(/15\/27 from cache/);
+    expect(cacheChip.textContent).toMatch(/18\.00 s/);
+  });
+
+  // Wave 5.96F — when the orchestrator reports `cache: "miss"` (or omits
+  // the field entirely) the chip strip stays compact: no cache chip is
+  // rendered and the tooltip keeps the pre-5.96F wording.
+  it("does not render the cache chip on a fully-cold run", async () => {
+    mockTotalResponse(buildTotalResponse({
+      performance: {
+        total_ms: 270, cumulative_ms: 5400,
+        parallelism_factor: 20, redis_ops_count: 27, ops_skipped: 0,
+        cache: "miss",
+      },
+    }));
+    render(<CalcPanel />);
+    fireEvent.click(screen.getByTestId("calc-total-cta"));
+    await waitFor(() => expect(screen.getByTestId("calc-total-result")).toBeInTheDocument());
+    expect(screen.queryByTestId("calc-total-perf-cache-chip")).toBeNull();
+  });
+
   // Wave 5.96C — fully-skipped classes (e.g. EQUITY when no sensitivities
   // exist for any leg) render as "(no data)" instead of "$0.00", so the
   // empty vs. computed-zero distinction is visible.
@@ -224,5 +302,117 @@ describe("<CalcPanel /> — Total SBM card (Wave 5.96B)", () => {
     expect(within(equity).getByText("(no data)")).toBeInTheDocument();
     // The "(no data)" treatment supplants any "$0.00" / "0.000" charge line.
     expect(within(equity).queryByText(/^0\.000$/)).toBeNull();
+  });
+});
+
+// Wave 5.96D — progressive UX while the orchestrator is in-flight: button
+// language that names what's actually happening ("risk charges across 3
+// scenarios"), a live elapsed-time read-out, a placeholder 3×3 skeleton grid
+// that previews the result shape, and a tooltip on the perf chip explaining
+// the 27-cell number. These tests pin the visible behaviour on the loading
+// state without depending on response field renames being shipped in parallel.
+describe("<CalcPanel /> — Total SBM progressive UX (Wave 5.96D)", () => {
+  // Build a fetch mock that defers /calc/sbm/total resolution until the
+  // returned `resolve` callback is invoked. Lets tests assert in-flight
+  // state for as long as they need to advance fake timers.
+  function deferredTotalFetch(body: TotalSbmResponse): { resolve: () => void } {
+    let resolveTotal: (resp: Response) => void = () => {};
+    globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("/calc/sbm/total")) {
+        return new Promise<Response>((res) => {
+          resolveTotal = res;
+        });
+      }
+      return Promise.resolve(
+        new Response("{}", { headers: { "content-type": "application/json" } }),
+      );
+    }) as typeof fetch;
+    return {
+      resolve: () =>
+        resolveTotal(
+          new Response(JSON.stringify(body), {
+            headers: { "content-type": "application/json" },
+          }),
+        ),
+    };
+  }
+
+  it("transitions the CTA label idle → in-flight → resolved with risk-class-aware copy", async () => {
+    const deferred = deferredTotalFetch(buildTotalResponse());
+    render(<CalcPanel />);
+    const cta = screen.getByTestId("calc-total-cta");
+    expect(cta.textContent).toMatch(/Calculate Total SBM/);
+    expect(cta.textContent).not.toMatch(/27/);
+
+    fireEvent.click(cta);
+    await waitFor(() =>
+      expect(screen.getByTestId("calc-total-cta").textContent).toMatch(
+        /Computing risk charges across 3 scenarios/,
+      ),
+    );
+    // The opaque "27 cells…" wording is gone from the in-flight CTA.
+    expect(screen.getByTestId("calc-total-cta").textContent).not.toMatch(/27 cells/);
+
+    deferred.resolve();
+    await waitFor(() => expect(screen.getByTestId("calc-total-result")).toBeInTheDocument());
+    expect(screen.getByTestId("calc-total-cta").textContent).toMatch(/Calculate Total SBM/);
+  });
+
+  it("renders an elapsed-time counter during in-flight that increments and clears on completion", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const deferred = deferredTotalFetch(buildTotalResponse());
+    try {
+      render(<CalcPanel />);
+      fireEvent.click(screen.getByTestId("calc-total-cta"));
+      await waitFor(() => expect(screen.queryByTestId("calc-total-elapsed")).not.toBeNull());
+
+      const initial = screen.getByTestId("calc-total-elapsed").textContent ?? "";
+      expect(initial).toMatch(/elapsed/);
+
+      await act(async () => {
+        vi.advanceTimersByTime(1500);
+      });
+      const later = screen.getByTestId("calc-total-elapsed").textContent ?? "";
+      expect(later).toMatch(/elapsed/);
+      // 1.5s of fake-time advance must surface as a >= 1s read-out.
+      const match = later.match(/elapsed ([0-9.]+)s/);
+      expect(match).not.toBeNull();
+      expect(parseFloat(match![1]!)).toBeGreaterThanOrEqual(1);
+
+      deferred.resolve();
+      await waitFor(() => expect(screen.getByTestId("calc-total-result")).toBeInTheDocument());
+      expect(screen.queryByTestId("calc-total-elapsed")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("renders a 9-cell skeleton grid during in-flight and replaces it with the real result", async () => {
+    const deferred = deferredTotalFetch(buildTotalResponse());
+    render(<CalcPanel />);
+    expect(screen.queryByTestId("calc-total-skeleton")).toBeNull();
+    fireEvent.click(screen.getByTestId("calc-total-cta"));
+    await waitFor(() => expect(screen.getByTestId("calc-total-skeleton")).toBeInTheDocument());
+    expect(screen.getAllByTestId("calc-total-skeleton-cell").length).toBe(9);
+
+    deferred.resolve();
+    await waitFor(() => expect(screen.getByTestId("calc-total-result")).toBeInTheDocument());
+    expect(screen.queryByTestId("calc-total-skeleton")).toBeNull();
+  });
+
+  it("surfaces a 3×3×3 = 27 tooltip on the perf-chip describing the parallel kernel calls", async () => {
+    mockTotalResponse(buildTotalResponse());
+    render(<CalcPanel />);
+    fireEvent.click(screen.getByTestId("calc-total-cta"));
+    await waitFor(() => expect(screen.getByTestId("calc-total-result")).toBeInTheDocument());
+
+    const opsChip = screen.getByTestId("calc-total-perf-ops-chip");
+    const tip = opsChip.getAttribute("title") ?? "";
+    expect(tip).toMatch(/3 risk classes/);
+    expect(tip).toMatch(/3 legs/);
+    expect(tip).toMatch(/3 correlation scenarios/);
+    expect(tip).toMatch(/27 parallel Lua kernel calls/);
   });
 });

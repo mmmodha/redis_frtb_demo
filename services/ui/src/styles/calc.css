@@ -480,6 +480,82 @@ button.drilldown-pill:focus-visible {
   cursor: progress;
 }
 
+/* Wave 5.96D — live elapsed-time read-out shown next to the in-flight CTA so
+   the user sees concrete progress while the 27-cell orchestrator runs. */
+.calc-panel__total-elapsed {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.25rem 0.625rem;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--redis-border-primary);
+  color: var(--redis-text-secondary);
+  font-size: 0.8125rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* Wave 5.96D — 3×3 class × leg skeleton grid shown during in-flight. Mirrors
+   the structure of the final result matrix so the layout doesn't jump when
+   the response lands; shimmer bands telegraph "live compute in progress". */
+.calc-panel__total-skeleton {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: calc(var(--grid) * 1.5);
+  margin-bottom: calc(var(--grid) * 2);
+}
+.calc-panel__total-skeleton-class {
+  display: flex;
+  flex-direction: column;
+  gap: calc(var(--grid) * 0.75);
+  padding: calc(var(--grid) * 1.25);
+  background: var(--redis-bg-secondary);
+  border: 1px solid var(--redis-border-primary);
+  border-radius: var(--radius);
+}
+.calc-panel__total-skeleton-class-name {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--redis-text-secondary);
+  letter-spacing: 0.02em;
+}
+.calc-panel__total-skeleton-legs {
+  display: flex;
+  flex-direction: column;
+  gap: calc(var(--grid) * 0.5);
+}
+.calc-panel__total-skeleton-cell {
+  display: grid;
+  grid-template-columns: 2.25rem 1fr;
+  align-items: center;
+  gap: calc(var(--grid) * 1);
+}
+.calc-panel__total-skeleton-leg {
+  font-size: 0.8125rem;
+  color: var(--redis-text-muted);
+  font-variant-numeric: tabular-nums;
+}
+.calc-panel__total-skeleton-shimmer {
+  display: block;
+  height: 1.125rem;
+  border-radius: 3px;
+  background: linear-gradient(
+    90deg,
+    var(--redis-bg-tertiary) 0%,
+    var(--redis-border-secondary) 50%,
+    var(--redis-bg-tertiary) 100%
+  );
+  background-size: 200% 100%;
+  animation: calc-total-skeleton-shimmer 1.4s ease-in-out infinite;
+}
+@keyframes calc-total-skeleton-shimmer {
+  0%   { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .calc-panel__total-skeleton-shimmer { animation: none; }
+}
+
 /* Result container: stacks the five sections with consistent 8-px rhythm. */
 .calc-panel__total-result {
   display: flex;
