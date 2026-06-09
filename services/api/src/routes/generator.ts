@@ -12,6 +12,9 @@ import type { Schema } from "@frtb/schema";
 import {
   createRowGenerator,
   createStreamProducer,
+  createStreamFlowControl,
+  DEFAULT_FLOW_CONTROL,
+  type FlowControlOptions,
 } from "@frtb/generator";
 // Wave 5.84C — cluster-adaptive profile module + parsers. Plumbed through
 // the api so the seed SSE frame includes the resolved plan (shape + dials)
@@ -55,6 +58,13 @@ import { corsHeadersForRequest } from "../cors-headers.ts";
 // shard-out actually wins. The knob is still validated + echoed here so a
 // future wave can wire api-side worker_threads without a request-shape break.
 const MAX_WORKERS_API = 16;
+
+// Wave 5.92C-fix — default approximate MAXLEN per stream, mirroring the
+// CLI's DEFAULT_STREAM_MAXLEN (~2 GB at ~1 KB/entry). Threaded into every
+// createStreamProducer constructed by this route so UI / HTTP-initiated
+// runs are protected from OOM when consumers fall behind. Body
+// `stream_maxlen: 0` opts out (XADD args become bit-identical to pre-5.92C).
+const DEFAULT_STREAM_MAXLEN = 2_000_000;
 
 interface GeneratorStartBody {
   rows?: number;
@@ -100,6 +110,21 @@ interface GeneratorStartBody {
   // pre-5.92 single-stream code path bit-identical. Manual override of
   // the profile-resolved dial follows the same "manual wins" rule.
   stream_shards?: number | "per-bucket";
+  // Wave 5.92C-fix — approximate XADD MAXLEN cap. Default 2_000_000
+  // (matching CLI / source defaults). 0 disables the cap (no MAXLEN args
+  // appended, restoring pre-5.92C XADD command sequence). Threaded through
+  // to createStreamProducer at both call sites below.
+  stream_maxlen?: number;
+  // Wave 5.92C-fix — optional producer-side XLEN credit gate. When omitted
+  // the gate is OFF (default), matching the CLI's "no gate unless asked"
+  // contract for the UI/HTTP top-up path. When provided, a
+  // StreamFlowControl is constructed and passed to the producer; the gate
+  // polls XLEN and pauses XADD when the configured high-water mark trips.
+  flow_control?: {
+    pauseAboveLen?: number;
+    resumeBelowLen?: number;
+    checkEveryRows?: number;
+  };
 }
 
 // Wave 5.84C — accepted profile values for body validation.
@@ -245,6 +270,16 @@ interface ParsedGeneratorRequest {
   // body. `undefined` means "use the profile-resolved dial"; explicit
   // values override (manual wins — DoD #4).
   streamShards: StreamShardsConfig | undefined;
+  // Wave 5.92C-fix — resolved approximate XADD MAXLEN cap. `undefined`
+  // means "opt out" (no MAXLEN args appended); a positive integer is
+  // passed through verbatim to createStreamProducer's `streamMaxLen`.
+  streamMaxLen: number | undefined;
+  // Wave 5.92C-fix — resolved producer-side flow-control options.
+  // `undefined` means "no gate" (default for the UI/HTTP top-up path).
+  // When present, the route constructs a StreamFlowControl via
+  // createStreamFlowControl(redis, opts, app.log) and passes it to the
+  // producer.
+  flowControlOptions: FlowControlOptions | undefined;
 }
 interface ParsedGeneratorError {
   ok: false;
@@ -486,6 +521,51 @@ function parseGeneratorRequest(
     }
   }
 
+  // Wave 5.92C-fix — resolve approximate XADD MAXLEN cap. Default
+  // DEFAULT_STREAM_MAXLEN (parity with CLI's --stream-maxlen default);
+  // explicit `0` opts out (XADD args bit-identical to pre-5.92C).
+  let streamMaxLen: number | undefined = DEFAULT_STREAM_MAXLEN;
+  if (body.stream_maxlen !== undefined) {
+    const sm = body.stream_maxlen;
+    if (typeof sm !== "number" || !Number.isFinite(sm) || !Number.isInteger(sm) || sm < 0) {
+      return { ok: false, status: 400, error: "stream_maxlen must be a non-negative integer (0 to disable)" };
+    }
+    streamMaxLen = sm > 0 ? sm : undefined;
+  }
+
+  // Wave 5.92C-fix — validate optional flow_control gate config. Default
+  // is `undefined` (no gate) for the UI/HTTP path — the bench harness in
+  // 5.92D passes this explicitly. Each provided field must be a positive
+  // integer; cross-field invariant resumeBelowLen < pauseAboveLen is
+  // checked here on the merged-with-defaults values so callers get a
+  // clean 400 instead of a 500 from createStreamFlowControl.
+  let flowControlOptions: FlowControlOptions | undefined;
+  if (body.flow_control !== undefined) {
+    const fc = body.flow_control;
+    if (typeof fc !== "object" || fc === null || Array.isArray(fc)) {
+      return { ok: false, status: 400, error: "flow_control must be an object" };
+    }
+    const opts: FlowControlOptions = {};
+    const fieldMap: ReadonlyArray<readonly [keyof NonNullable<GeneratorStartBody["flow_control"]>, keyof FlowControlOptions]> = [
+      ["pauseAboveLen", "pauseAboveLen"],
+      ["resumeBelowLen", "resumeBelowLen"],
+      ["checkEveryRows", "flowCheckEveryRows"],
+    ];
+    for (const [bodyKey, optKey] of fieldMap) {
+      const v = (fc as Record<string, unknown>)[bodyKey];
+      if (v === undefined) continue;
+      if (typeof v !== "number" || !Number.isFinite(v) || !Number.isInteger(v) || v < 1) {
+        return { ok: false, status: 400, error: `flow_control.${bodyKey} must be a positive integer` };
+      }
+      opts[optKey] = v;
+    }
+    const eff = { ...DEFAULT_FLOW_CONTROL, ...opts };
+    if (eff.resumeBelowLen >= eff.pauseAboveLen) {
+      return { ok: false, status: 400, error: `flow_control.resumeBelowLen (${eff.resumeBelowLen}) must be < pauseAboveLen (${eff.pauseAboveLen})` };
+    }
+    flowControlOptions = opts;
+  }
+
   const picker: ClassPicker = classSplitResolved
     ? sequencePicker(interleavedSequence(classSplitResolved))
     : roundRobinPicker(resolvedClasses);
@@ -493,6 +573,7 @@ function parseGeneratorRequest(
   return {
     ok: true, rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker, stopWhen,
     batchSize, pipelineWindow, workers, profile, streamShards,
+    streamMaxLen, flowControlOptions,
   };
 }
 
@@ -598,7 +679,7 @@ export function registerGeneratorRoutes(
       reply.code(parsed.status);
       return { error: parsed.error };
     }
-    const { rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker, stopWhen, batchSize, pipelineWindow, workers, streamShards } = parsed;
+    const { rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker, stopWhen, batchSize, pipelineWindow, workers, streamShards, streamMaxLen, flowControlOptions } = parsed;
 
     const run_id = ulid();
     const t0 = process.hrtime.bigint();
@@ -621,9 +702,20 @@ export function registerGeneratorRoutes(
     const router = streamShards !== undefined && streamShards !== 1
       ? createStreamRouter(streamName, streamShards)
       : undefined;
+    // Wave 5.92C-fix — build the producer-side XLEN credit gate only when
+    // the caller asks for it (default is no gate, parity with pre-fix
+    // behaviour on this route).
+    const flowControl = flowControlOptions
+      ? createStreamFlowControl(redis as unknown as Parameters<typeof createStreamFlowControl>[0], flowControlOptions, app.log)
+      : undefined;
+    // Wave 5.92C-fix — status-line log when the approximate MAXLEN cap is
+    // in effect on XADD (parity with the CLI's --stream-maxlen plumbing).
+    if (streamMaxLen !== undefined) {
+      app.log.info({ evt: "generator-start", run_id, stream_maxlen: streamMaxLen }, `MAXLEN ~ ${streamMaxLen} in effect on XADD`);
+    }
     const producer = createStreamProducer(
       redis as unknown as Parameters<typeof createStreamProducer>[0],
-      { stream: streamName, batchSize, pipelineWindow, router },
+      { stream: streamName, batchSize, pipelineWindow, router, streamMaxLen, flowControl },
     );
 
     // Wave 5.47c — track which condition halts the loop. Defaults to "rows"
@@ -803,7 +895,7 @@ export function registerGeneratorRoutes(
       reply.code(parsed.status);
       return { error: parsed.error };
     }
-    const { rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker, stopWhen, batchSize, pipelineWindow, workers, profile, streamShards } = parsed;
+    const { rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker, stopWhen, batchSize, pipelineWindow, workers, profile, streamShards, streamMaxLen, flowControlOptions } = parsed;
 
     const run_id = ulid();
     const t0 = process.hrtime.bigint();
@@ -927,9 +1019,18 @@ export function registerGeneratorRoutes(
     const sseRouter = dials.streamShards !== 1
       ? createStreamRouter(streamName, dials.streamShards)
       : undefined;
+    // Wave 5.92C-fix — same gate construction as the non-streaming route;
+    // off by default for parity with pre-fix behaviour. The bench harness
+    // (5.92D) supplies `flow_control` explicitly when it wants the gate.
+    const sseFlowControl = flowControlOptions
+      ? createStreamFlowControl(redis as unknown as Parameters<typeof createStreamFlowControl>[0], flowControlOptions, app.log)
+      : undefined;
+    if (streamMaxLen !== undefined) {
+      app.log.info({ evt: "generator-stream", run_id, stream_maxlen: streamMaxLen }, `MAXLEN ~ ${streamMaxLen} in effect on XADD`);
+    }
     const producer = createStreamProducer(
       redis as unknown as Parameters<typeof createStreamProducer>[0],
-      { stream: streamName, batchSize: 200, router: sseRouter },
+      { stream: streamName, batchSize: 200, router: sseRouter, streamMaxLen, flowControl: sseFlowControl },
     );
 
     // Detached run — handle terminal frame + grace-eviction here so the

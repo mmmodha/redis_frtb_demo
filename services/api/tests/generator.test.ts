@@ -33,7 +33,7 @@ interface XaddRecord {
 interface PipelineFakeRedis extends FakeRedis {
   xadds: XaddRecord[];
   pipeline(): {
-    xadd(stream: string, id: string, ...fields: string[]): unknown;
+    xadd(stream: string, ...rest: string[]): unknown;
     exec(): Promise<Array<[Error | null, unknown]>>;
   };
 }
@@ -46,7 +46,12 @@ function pipelineFakeRedis(): PipelineFakeRedis {
   pr.pipeline = () => {
     const buffered: XaddRecord[] = [];
     return {
-      xadd(stream: string, _id: string, ...fields: string[]) {
+      // Wave 5.92C-fix — XADD args may now include `MAXLEN ~ N` before the
+      // `*` id placeholder. Locate `*` and map field pairs from after it so
+      // the recorder is robust whether or not the route passes streamMaxLen.
+      xadd(stream: string, ...rest: string[]) {
+        const starIdx = rest.indexOf("*");
+        const fields = starIdx >= 0 ? rest.slice(starIdx + 1) : rest.slice(1);
         const map: Record<string, string> = {};
         for (let i = 0; i < fields.length; i += 2) {
           map[fields[i]!] = fields[i + 1]!;
@@ -195,6 +200,112 @@ describe("POST /generator/start — in-process synthetic row producer", () => {
     expect(res.statusCode).toBe(503);
     expect(res.json().error).toMatch(/schema not loaded/i);
     expect(fr.xadds).toHaveLength(0);
+  });
+
+  // Wave 5.92C-fix — body's `stream_maxlen` must be threaded into
+  // createStreamProducer so XADDs carry `MAXLEN ~ N`. Verifies the call-site
+  // wiring at services/api/src/routes/generator.ts via the raw XADD args
+  // (a separate raw-args recorder so the existing field-pair recorder is
+  // untouched).
+  it("threads stream_maxlen into createStreamProducer (XADD carries MAXLEN ~ N)", async () => {
+    const schema = loadFixtureSchema();
+    const base = fakeRedis() as FakeRedis & {
+      pipeline: () => { xadd: (...args: string[]) => unknown; exec: () => Promise<Array<[Error | null, unknown]>> };
+      xaddArgs: string[][];
+    };
+    base.xaddArgs = [];
+    base.pipeline = () => {
+      const buffered: string[][] = [];
+      return {
+        xadd(...args: string[]) { buffered.push(args); return this; },
+        async exec() {
+          for (const a of buffered) base.xaddArgs.push(a);
+          return buffered.map(() => [null, "0-0"] as [Error | null, unknown]);
+        },
+      };
+    };
+    app = await createServer({ redis: base, schema });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/generator/start",
+      payload: { rows: 5, stream_maxlen: 1000, seed: "wave-5.92C-fix" },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().rows_queued).toBe(5);
+    expect(base.xaddArgs.length).toBe(5);
+    for (const args of base.xaddArgs) {
+      expect(args[0]).toBe("sensitivities:in");
+      expect(args[1]).toBe("MAXLEN");
+      expect(args[2]).toBe("~");
+      expect(args[3]).toBe("1000");
+      expect(args[4]).toBe("*");
+    }
+  });
+
+  // Wave 5.92C-fix — `stream_maxlen: 0` opts out (bit-identical to pre-5.92C
+  // XADD command sequence: `XADD <key> * <fields...>`, no MAXLEN args).
+  it("stream_maxlen=0 disables MAXLEN args (pre-5.92C XADD sequence)", async () => {
+    const schema = loadFixtureSchema();
+    const base = fakeRedis() as FakeRedis & {
+      pipeline: () => { xadd: (...args: string[]) => unknown; exec: () => Promise<Array<[Error | null, unknown]>> };
+      xaddArgs: string[][];
+    };
+    base.xaddArgs = [];
+    base.pipeline = () => {
+      const buffered: string[][] = [];
+      return {
+        xadd(...args: string[]) { buffered.push(args); return this; },
+        async exec() {
+          for (const a of buffered) base.xaddArgs.push(a);
+          return buffered.map(() => [null, "0-0"] as [Error | null, unknown]);
+        },
+      };
+    };
+    app = await createServer({ redis: base, schema });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/generator/start",
+      payload: { rows: 3, stream_maxlen: 0, seed: "wave-5.92C-fix" },
+    });
+    expect(res.statusCode).toBe(200);
+    for (const args of base.xaddArgs) {
+      expect(args[0]).toBe("sensitivities:in");
+      expect(args[1]).toBe("*");
+      expect(args).not.toContain("MAXLEN");
+    }
+  });
+
+  // Wave 5.92C-fix — validation: stream_maxlen must be a non-negative integer.
+  it("rejects stream_maxlen with negative / non-integer values (400)", async () => {
+    const schema = loadFixtureSchema();
+    const fr = pipelineFakeRedis();
+    app = await createServer({ redis: fr, schema });
+    for (const bad of [-1, 1.5, "many"] as Array<number | string>) {
+      const res = await app.inject({
+        method: "POST",
+        url: "/generator/start",
+        payload: { rows: 5, stream_maxlen: bad as unknown as number },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toMatch(/stream_maxlen/i);
+    }
+  });
+
+  // Wave 5.92C-fix — validation: flow_control cross-field invariant must
+  // be enforced at the route boundary (resumeBelowLen < pauseAboveLen).
+  it("rejects flow_control with resumeBelowLen >= pauseAboveLen (400)", async () => {
+    const schema = loadFixtureSchema();
+    const fr = pipelineFakeRedis();
+    app = await createServer({ redis: fr, schema });
+    const res = await app.inject({
+      method: "POST",
+      url: "/generator/start",
+      payload: { rows: 5, flow_control: { pauseAboveLen: 100, resumeBelowLen: 200 } },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toMatch(/resumeBelowLen/);
   });
 });
 

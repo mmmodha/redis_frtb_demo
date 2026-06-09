@@ -14,7 +14,19 @@ export {
   createStreamProducer,
   type StreamProducer,
   type StreamProducerOptions,
+  type StreamProducerFlowControl,
 } from "./producer.ts";
+
+// Wave 5.92C-fix — re-exported so the api route can construct the same
+// producer-side XLEN credit gate the CLI uses (POST /generator/start{,/stream}
+// previously bypassed the gate entirely). The flow-control module itself is
+// unchanged.
+export {
+  createStreamFlowControl,
+  DEFAULT_FLOW_CONTROL,
+  type FlowControlOptions,
+  type StreamFlowControl,
+} from "./flow-control.ts";
 
 // Wave 5.84C — cluster-adaptive profile / probe surfaces. Exposed so the
 // api can build the same `plan` payload from its in-process redis client

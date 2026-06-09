@@ -26,7 +26,7 @@ interface XaddRecord { stream: string; fields: Record<string, string> }
 interface PipelineFakeRedis extends FakeRedis {
   xadds: XaddRecord[];
   pipeline(): {
-    xadd(stream: string, id: string, ...fields: string[]): unknown;
+    xadd(stream: string, ...rest: string[]): unknown;
     exec(): Promise<Array<[Error | null, unknown]>>;
   };
 }
@@ -38,7 +38,11 @@ function pipelineFakeRedis(): PipelineFakeRedis {
   pr.pipeline = () => {
     const buffered: XaddRecord[] = [];
     return {
-      xadd(stream: string, _id: string, ...fields: string[]) {
+      // Wave 5.92C-fix — skip past optional MAXLEN ~ N args by locating the
+      // `*` id placeholder before mapping field pairs.
+      xadd(stream: string, ...rest: string[]) {
+        const starIdx = rest.indexOf("*");
+        const fields = starIdx >= 0 ? rest.slice(starIdx + 1) : rest.slice(1);
         const map: Record<string, string> = {};
         for (let i = 0; i < fields.length; i += 2) map[fields[i]!] = fields[i + 1]!;
         buffered.push({ stream, fields: map });
