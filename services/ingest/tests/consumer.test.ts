@@ -545,7 +545,7 @@ describe("XREADGROUP consumer → JSON.SET", () => {
       trade_id: "T-w1",
     });
     const equity = makeRow("EQUITY", "1", { sensitivity_type: "Delta", risk_value: { spot: 0.42 }, trade_id: "T-w2" });
-    const fx = makeRow("FX", "EURUSD", { sensitivity_type: "Vega", risk_value: { spot: 0.75 }, trade_id: "T-w3" });
+    const fx = makeRow("FX", "EURUSD", { sensitivity_type: "Delta", risk_value: { spot: 0.75 }, trade_id: "T-w3" });
     for (const r of [girr, equity, fx]) await xaddRow("sensitivities:in", r);
 
     await processBatch(redis, {
