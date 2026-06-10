@@ -39,7 +39,10 @@ export type ObservabilityShardsResponse = ObservabilityShard[];
 
 export function apiBase(): string {
   const fromEnv = (import.meta as ImportMeta & { env?: { VITE_API_BASE?: string } }).env?.VITE_API_BASE;
-  return fromEnv ?? "http://localhost:8080";
+  // Default to "/api" so the browser hits the UI's own origin; the UI server
+  // reverse-proxies "/api/*" → http://localhost:<API_PORT>/*. This lets a
+  // single-VM deploy expose only port 3000.
+  return fromEnv ?? "/api";
 }
 
 async function getJson<T>(path: string): Promise<T> {

@@ -17,6 +17,48 @@ const SERVICE = 'ui';
 const HOST = process.env.UI_HOST ?? process.env.HOST ?? '0.0.0.0';
 const PORT = Number(process.env.UI_PORT ?? process.env.PORT ?? process.env.HEALTH_PORT ?? 3000);
 
+// Wave 6.05: reverse-proxy target for /api/*. Defaults route to the local API
+// service so single-VM deploys only need to expose port 3000.
+function apiProxyTarget() {
+  const host = process.env.UI_API_PROXY_HOST ?? '127.0.0.1';
+  const port = Number(process.env.UI_API_PROXY_PORT ?? process.env.API_PORT ?? 8080);
+  return { host, port };
+}
+
+// Stream /api/* to the upstream API. Body is piped (never buffered) so large
+// multipart uploads at /api/sources/upload stay memory-safe and preserve the
+// exact byte sequence (and boundary token) the client sent. Headers are
+// forwarded verbatim apart from `host`, which is rewritten to the upstream.
+function proxyApi(req, res) {
+  const { host, port } = apiProxyTarget();
+  const original = req.url ?? '/api';
+  const stripped = original.replace(/^\/api(?=\/|\?|#|$)/, '') || '/';
+  const upstreamPath = stripped.startsWith('/') ? stripped : `/${stripped}`;
+
+  const headers = { ...req.headers };
+  headers.host = `${host}:${port}`;
+
+  const upstreamReq = http.request(
+    { host, port, method: req.method, path: upstreamPath, headers },
+    (upstreamRes) => {
+      res.writeHead(upstreamRes.statusCode ?? 502, upstreamRes.headers);
+      upstreamRes.pipe(res);
+    },
+  );
+
+  upstreamReq.on('error', () => {
+    if (res.headersSent) {
+      res.end();
+      return;
+    }
+    res.writeHead(502, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'upstream_unavailable', service: 'api' }));
+  });
+
+  req.on('aborted', () => upstreamReq.destroy());
+  req.pipe(upstreamReq);
+}
+
 function resolveDistDir() {
   if (process.env.UI_DIST_DIR) {
     return path.resolve(process.env.UI_DIST_DIR);
@@ -68,6 +110,14 @@ function serveIndex(res) {
 }
 
 export function handleRequest(req, res) {
+  // Wave 6.05: /api/* is reverse-proxied to the upstream API (any method,
+  // body streamed). Must precede the GET/HEAD guard so uploads work.
+  const rawUrl = req.url ?? '';
+  if (rawUrl === '/api' || rawUrl.startsWith('/api/') || rawUrl.startsWith('/api?')) {
+    proxyApi(req, res);
+    return;
+  }
+
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     res.writeHead(405, { 'content-type': 'text/plain', allow: 'GET, HEAD' });
     res.end('method not allowed');

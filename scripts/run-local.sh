@@ -887,6 +887,16 @@ cmd_doctor() {
     fi
     i=$(( i + 1 ))
   done
+  # Wave 6.05 — informational: does the built UI bundle bypass the same-origin
+  # /api proxy by hard-coding http://localhost:8080? Never fails; skipped when
+  # the dist hasn't been built.
+  if [[ -d "${REPO_ROOT}/services/ui/dist" ]]; then
+    if grep -lq 'http://localhost:8080' "${REPO_ROOT}/services/ui/dist/assets/"index-*.js 2>/dev/null; then
+      doctor_check "UI bundle API mode"        ok "UI bundle pinned to absolute URL; single-VM proxy bypassed"
+    else
+      doctor_check "UI bundle API mode"        ok "UI bundle uses same-origin /api proxy"
+    fi
+  fi
   printf '\n'
   if [[ "${DOCTOR_FAILED}" == "0" ]]; then
     ok "doctor: all checks passed"

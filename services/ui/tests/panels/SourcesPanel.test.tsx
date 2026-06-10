@@ -187,7 +187,7 @@ describe("SourcesPanel", () => {
     fetchMock.mockImplementation(async (input: RequestInfo, init?: RequestInit) => {
       const url = String(input);
       const method = init?.method ?? "GET";
-      seen.push(`${method} ${url.replace(/^https?:\/\/[^/]+/, "")}`);
+      seen.push(`${method} ${url.replace(/^https?:\/\/[^/]+/, "").replace(/^\/api/, "")}`);
       if (url.endsWith("/sources") && method === "GET") return jsonResponse([source]);
       if (/\/sources\/src-1\/infer$/.test(url)) {
         return jsonResponse({
@@ -205,8 +205,8 @@ describe("SourcesPanel", () => {
     fireEvent.click(await waitFor(() => screen.getByRole("button", { name: /auto-suggest/i })));
     fireEvent.click(screen.getByRole("button", { name: /save & ingest/i }));
     await waitFor(() => {
-      expect(seen.some((s) => /POST \/sources\/src-1\/mapping/.test(s))).toBe(true);
-      expect(seen.some((s) => /POST \/sources\/src-1\/ingest/.test(s))).toBe(true);
+      expect(seen.some((s) => /POST (?:\/api)?\/sources\/src-1\/mapping/.test(s))).toBe(true);
+      expect(seen.some((s) => /POST (?:\/api)?\/sources\/src-1\/ingest/.test(s))).toBe(true);
     });
   });
 

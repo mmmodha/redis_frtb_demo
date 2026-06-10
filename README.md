@@ -55,6 +55,8 @@ Auto Tiering, scale pivot moment).
 
 ### Boot the application stack
 
+> For deploy-VM topology and single-port firewall guidance see [Single-port deploy (port 3000 only)](#single-port-deploy-port-3000-only).
+
 A fresh clone needs no environment editing. Bring the stack up and configure
 Redis through the UI:
 
@@ -125,6 +127,89 @@ and then boots the six services. Runtime state (PIDs, logs, env snapshot)
 lives under `./.run/`. Runs as the invoking user; no sudo, no systemd, no
 `/var/lib` paths. To reset cleanly:
 `scripts/run-local.sh stop && rm -rf .run/ .env.local`.
+
+### Single-port deploy (port 3000 only)
+
+After Wave 6.05 both deployment paths only need **port 3000** exposed
+externally. The UI server (node in bare-metal, nginx in Docker compose)
+reverse-proxies every `/api/*` request to the api service over loopback,
+so the browser never has to know the api's host or port.
+
+```text
+browser ──► :3000 (UI) ──► 127.0.0.1:8080 (api)  ◄── same-origin /api/*
+                                  │
+                                  └── never exposed beyond the host
+```
+
+Concretely:
+
+- **Docker compose** — only the `ui` service binds a host port. The other
+  port mappings in `docker-compose.yml` (`8080:8080` for api,
+  `6379:6379` for redis) are convenience exposures for debugging on a
+  developer laptop. On a deploy VM you can remove them or block them at
+  the firewall; the UI still reaches api via the compose-internal DNS name
+  `api:8080`.
+- **Bare-metal (`scripts/run-local.sh`)** — services still bind on their
+  individual ports on `127.0.0.1` by default. Only `:3000` needs to be
+  reachable from your browser; everything else stays on loopback.
+
+#### Quick validation
+
+```bash
+# UI's own healthz (served locally by the UI server, not proxied):
+curl -fsS http://localhost:3000/healthz
+# → {"service":"ui","status":"ok"}
+
+# api's healthz reached through the UI proxy (path /api/healthz is stripped
+# to /healthz upstream):
+curl -fsS http://localhost:3000/api/healthz
+# → {"service":"api",...}   (NOT the UI shell HTML)
+```
+
+If the second call returns HTML, the bundle was built against an older
+`VITE_API_BASE` or the proxy block in `nginx.conf` / `src/index.mjs` is
+missing — rebuild the UI image (`docker compose build ui`) or re-run
+`scripts/run-local.sh doctor` for guidance.
+
+#### Remote VM deploy
+
+The browser only ever needs to reach port 3000. With a host firewall
+(UFW / cloud security group):
+
+```bash
+# Allow inbound 3000 only; everything else stays on loopback.
+ufw allow 3000/tcp
+```
+
+No `VITE_API_BASE` override is needed — the bundle's default of `/api` is
+correct for any same-origin deploy.
+
+#### Split-host or custom upstream (escape hatches)
+
+If you ever need to point the UI at an api running on a different host or
+port (multi-VM, sidecar, blue/green), use these overrides:
+
+| Knob | Path | Default | Use when |
+|---|---|---|---|
+| `VITE_API_BASE` | UI build-time env | `/api` | The api lives at a different origin (e.g. `https://api.example.com`). Baked into the JS bundle at `npm run build` time. |
+| `UI_API_PROXY_HOST` | UI runtime env (bare-metal) | `127.0.0.1` | The api isn't on the same machine as the UI server. |
+| `UI_API_PROXY_PORT` | UI runtime env (bare-metal) | `8080` (falls back to `API_PORT`) | The api binds a non-default port. |
+
+In Docker compose the upstream is hardcoded to `api:8080` (the compose
+service hostname); change `services/ui/nginx.conf` if you genuinely need a
+different upstream. `VITE_API_BASE` is still respected.
+
+#### Streaming, uploads, SSE
+
+The proxy is configured to never buffer:
+
+- **CSV / JSON uploads** (`POST /api/sources/upload`) stream the request
+  body straight through with no `maxBodyLength` cap on either side.
+- **Server-Sent Events** (`/api/inflight/stream`, `/api/loadgen/metrics`,
+  generator progress) keep the connection open for 24h with response
+  buffering off, so the browser sees each chunk as it lands.
+- Headers are forwarded verbatim, including `content-type` with multipart
+  boundaries — large CSV drops are byte-exact end-to-end.
 
 ### Synthetic data: the `generator` one-shot tool
 
