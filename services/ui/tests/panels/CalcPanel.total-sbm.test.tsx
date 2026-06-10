@@ -688,3 +688,89 @@ describe("<CalcPanel /> — empty-cell badges & banner (Wave 5.96G-ui)", () => {
     expect(screen.queryByTestId("calc-total-empty-banner")).toBeNull();
   });
 });
+
+// Wave 6.02 — elapsed pill polish: while loading the existing pill gets a
+// --running modifier (drives the rotating red comet arc via ::before in CSS);
+// when the result lands a static "computed in Ns" pill is rendered in the
+// result headline next to the binding-scenario pill.
+describe("<CalcPanel /> — Total SBM elapsed pill polish (Wave 6.02)", () => {
+  function deferredTotalFetch(body: TotalSbmResponse): { resolve: () => void } {
+    let resolveTotal: (resp: Response) => void = () => {};
+    globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("/calc/sbm/total")) {
+        return new Promise<Response>((res) => {
+          resolveTotal = res;
+        });
+      }
+      return Promise.resolve(
+        new Response("{}", { headers: { "content-type": "application/json" } }),
+      );
+    }) as typeof fetch;
+    return {
+      resolve: () =>
+        resolveTotal(
+          new Response(JSON.stringify(body), {
+            headers: { "content-type": "application/json" },
+          }),
+        ),
+    };
+  }
+
+  it("applies --running on the in-flight pill and removes it after the result lands", async () => {
+    const deferred = deferredTotalFetch(buildTotalResponse());
+    render(<CalcPanel />);
+    fireEvent.click(screen.getByTestId("calc-total-cta"));
+    await waitFor(() => expect(screen.queryByTestId("calc-total-elapsed")).not.toBeNull());
+
+    const running = screen.getByTestId("calc-total-elapsed");
+    expect(running.className).toMatch(/calc-panel__total-elapsed--running/);
+
+    deferred.resolve();
+    await waitFor(() => expect(screen.getByTestId("calc-total-result")).toBeInTheDocument());
+    // In-flight pill is removed once loading flips false.
+    expect(screen.queryByTestId("calc-total-elapsed")).toBeNull();
+  });
+
+  it("renders a static 'computed in Ns' pill in the headline once the result lands", async () => {
+    const deferred = deferredTotalFetch(buildTotalResponse());
+    render(<CalcPanel />);
+    // No final pill before any run.
+    expect(screen.queryByTestId("calc-total-elapsed-final")).toBeNull();
+    fireEvent.click(screen.getByTestId("calc-total-cta"));
+    await waitFor(() => expect(screen.queryByTestId("calc-total-elapsed")).not.toBeNull());
+    // Still no final pill while in-flight.
+    expect(screen.queryByTestId("calc-total-elapsed-final")).toBeNull();
+
+    deferred.resolve();
+    await waitFor(() => expect(screen.getByTestId("calc-total-elapsed-final")).toBeInTheDocument());
+    const finalPill = screen.getByTestId("calc-total-elapsed-final");
+    expect(finalPill.textContent ?? "").toMatch(/^computed in \d+(\.\d)?s$/);
+    expect(finalPill.className).toMatch(/calc-panel__total-elapsed--final/);
+    // Lives inside the headline row, alongside the binding-scenario pill.
+    const winner = screen.getByTestId("calc-total-winner-pill");
+    expect(winner.parentElement).toBe(finalPill.parentElement);
+  });
+
+  it("clears the final pill on a second run and restores the spinning pill", async () => {
+    const first = deferredTotalFetch(buildTotalResponse());
+    render(<CalcPanel />);
+    fireEvent.click(screen.getByTestId("calc-total-cta"));
+    first.resolve();
+    await waitFor(() => expect(screen.getByTestId("calc-total-elapsed-final")).toBeInTheDocument());
+
+    // Second click — re-arm a deferred fetch so loading stays true and we
+    // can assert the final pill disappears while the in-flight pill returns.
+    const second = deferredTotalFetch(buildTotalResponse());
+    fireEvent.click(screen.getByTestId("calc-total-cta"));
+    await waitFor(() => expect(screen.queryByTestId("calc-total-elapsed")).not.toBeNull());
+    expect(screen.queryByTestId("calc-total-elapsed-final")).toBeNull();
+    expect(screen.getByTestId("calc-total-elapsed").className).toMatch(
+      /calc-panel__total-elapsed--running/,
+    );
+
+    second.resolve();
+    await waitFor(() => expect(screen.getByTestId("calc-total-elapsed-final")).toBeInTheDocument());
+  });
+});

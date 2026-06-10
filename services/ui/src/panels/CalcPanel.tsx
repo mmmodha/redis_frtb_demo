@@ -647,7 +647,11 @@ function TotalSbmCard({
   // orchestrator is in-flight. Sets expectation that this is a multi-second
   // operation (cold ~35s, warm ~6s) and resets cleanly between runs because
   // the effect re-runs whenever `loading` flips.
+  // Wave 6.02 — also capture the final elapsed ms in the cleanup so the
+  // result headline can surface a static "computed in Ns" pill alongside
+  // the binding-scenario pill. Reset to null on each new run.
   const [elapsedMs, setElapsedMs] = useState(0);
+  const [finalElapsedMs, setFinalElapsedMs] = useState<number | null>(null);
   useEffect(() => {
     if (!loading) {
       setElapsedMs(0);
@@ -655,8 +659,12 @@ function TotalSbmCard({
     }
     const start = Date.now();
     setElapsedMs(0);
+    setFinalElapsedMs(null);
     const id = setInterval(() => setElapsedMs(Date.now() - start), 250);
-    return () => clearInterval(id);
+    return () => {
+      clearInterval(id);
+      setFinalElapsedMs(Date.now() - start);
+    };
   }, [loading]);
   const elapsedSeconds = elapsedMs / 1000;
   return (
@@ -679,7 +687,7 @@ function TotalSbmCard({
         </button>
         {loading ? (
           <span
-            className="calc-panel__total-elapsed"
+            className="calc-panel__total-elapsed calc-panel__total-elapsed--running"
             data-testid="calc-total-elapsed"
             aria-live="polite"
           >
@@ -693,7 +701,9 @@ function TotalSbmCard({
           {error}
         </div>
       ) : null}
-      {result ? <TotalSbmResultView result={result} /> : null}
+      {result ? (
+        <TotalSbmResultView result={result} finalElapsedMs={finalElapsedMs} />
+      ) : null}
     </PanelCard>
   );
 }
@@ -806,7 +816,13 @@ function classSubtotalForScenario(
   return { value, allSkipped: computed === 0 };
 }
 
-function TotalSbmResultView({ result }: { result: TotalSbmResponse }) {
+function TotalSbmResultView({
+  result,
+  finalElapsedMs,
+}: {
+  result: TotalSbmResponse;
+  finalElapsedMs: number | null;
+}) {
   const perf = result.performance;
   const totalCells = perf.redis_ops_count + perf.ops_skipped;
   const classGroups = useMemo(() => groupBreakdownByClass(result.breakdown), [result.breakdown]);
@@ -912,6 +928,17 @@ function TotalSbmResultView({ result }: { result: TotalSbmResponse }) {
         >
           binding scenario: {winningScenario.toUpperCase()}
         </span>
+        {finalElapsedMs !== null ? (() => {
+          const finalSeconds = finalElapsedMs / 1000;
+          return (
+            <span
+              className="calc-panel__total-elapsed calc-panel__total-elapsed--final"
+              data-testid="calc-total-elapsed-final"
+            >
+              computed in {finalSeconds.toFixed(finalSeconds < 10 ? 1 : 0)}s
+            </span>
+          );
+        })() : null}
       </div>
 
       {/* 2. §21.4(8) formula — symbolic + substituted for the binding scenario */}

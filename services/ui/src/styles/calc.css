@@ -493,6 +493,58 @@ button.drilldown-pill:focus-visible {
   font-size: 0.8125rem;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+  position: relative;
+}
+
+/* Wave 6.02 — rotating red comet arc around the in-flight elapsed pill. The
+   ::before pseudo carries a conic-gradient and is masked to a ring shape via
+   mask-composite: exclude so only the border-rim glows; the arc rotates at
+   1.2s/rev to telegraph "live compute". Reduced-motion falls back to a
+   static soft glow so the affordance survives accessibility settings. */
+.calc-panel__total-elapsed--running::before {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  padding: 1px;
+  background: conic-gradient(
+    from 0deg,
+    transparent 0deg,
+    var(--redis-hyper, #FF4438) 90deg,
+    transparent 180deg,
+    transparent 360deg
+  );
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  animation: calc-total-elapsed-spin 1.2s linear infinite;
+  pointer-events: none;
+}
+@keyframes calc-total-elapsed-spin {
+  to { transform: rotate(360deg); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .calc-panel__total-elapsed--running::before {
+    animation: none;
+    background: none;
+  }
+  .calc-panel__total-elapsed--running {
+    box-shadow: 0 0 8px rgba(255, 68, 56, 0.45);
+    border-color: rgba(255, 68, 56, 0.55);
+  }
+}
+
+/* Wave 6.02 — static "computed in Ns" pill in the result headline. Reuses
+   the base pill shape; the --final modifier swaps in a faded red border so
+   the visual lineage from the spinning in-flight pill stays obvious. */
+.calc-panel__total-elapsed--final {
+  border-color: rgba(255, 68, 56, 0.35);
+  color: var(--redis-text-secondary);
 }
 
 /* Wave 5.96D — 3×3 class × leg skeleton grid shown during in-flight. Mirrors
