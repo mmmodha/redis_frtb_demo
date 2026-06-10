@@ -496,42 +496,39 @@ button.drilldown-pill:focus-visible {
   position: relative;
 }
 
-/* Wave 6.02 — rotating red comet arc around the in-flight elapsed pill. The
-   ::before pseudo carries a conic-gradient and is masked to a ring shape via
-   mask-composite: exclude so only the border-rim glows; the arc rotates at
-   1.2s/rev to telegraph "live compute". Reduced-motion falls back to a
-   static soft glow so the affordance survives accessibility settings. */
+/* Wave 6.02a — comet trail traveling along the in-flight elapsed pill's
+   border. The pill body stays static; only a short bright streak rides the
+   rounded-rectangle outline via offset-path: inset(0 round 999px). The
+   streak is tangent-rotated to the path so the bright head leads and the
+   tail fades behind. Reduced-motion falls back to a static soft glow so the
+   affordance survives accessibility settings. */
 .calc-panel__total-elapsed--running::before {
   content: "";
   position: absolute;
-  inset: -1px;
-  border-radius: inherit;
-  padding: 1px;
-  background: conic-gradient(
-    from 0deg,
-    transparent 0deg,
-    var(--redis-hyper, #FF4438) 90deg,
-    transparent 180deg,
-    transparent 360deg
+  width: 48px;
+  height: 2px;
+  background: linear-gradient(
+    to right,
+    rgba(255, 68, 56, 0) 0%,
+    rgba(255, 68, 56, 0.35) 40%,
+    var(--redis-hyper, #FF4438) 100%
   );
-  -webkit-mask:
-    linear-gradient(#000 0 0) content-box,
-    linear-gradient(#000 0 0);
-  -webkit-mask-composite: xor;
-  mask:
-    linear-gradient(#000 0 0) content-box,
-    linear-gradient(#000 0 0);
-  mask-composite: exclude;
-  animation: calc-total-elapsed-spin 1.2s linear infinite;
+  border-radius: 2px;
+  offset-path: inset(0 round 999px);
+  offset-rotate: auto;
+  offset-anchor: right center;
+  filter: drop-shadow(0 0 4px rgba(255, 68, 56, 0.65));
   pointer-events: none;
+  animation: calc-total-elapsed-comet 1.6s linear infinite;
 }
-@keyframes calc-total-elapsed-spin {
-  to { transform: rotate(360deg); }
+@keyframes calc-total-elapsed-comet {
+  to { offset-distance: 100%; }
 }
 @media (prefers-reduced-motion: reduce) {
   .calc-panel__total-elapsed--running::before {
     animation: none;
     background: none;
+    filter: none;
   }
   .calc-panel__total-elapsed--running {
     box-shadow: 0 0 8px rgba(255, 68, 56, 0.45);
