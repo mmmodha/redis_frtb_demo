@@ -163,4 +163,155 @@ describe("createActiveTargetWatcher", () => {
     });
     expect(() => watcher.getRedis()).toThrow(/not initialised|before start/i);
   });
+
+  // Wave 5.99 — regression: a wedged Redis client used to hang /sources
+  // forever. asRedisLike().call(...) must reject within a bounded window,
+  // force a re-poll, and transparently retry once against the swapped-in
+  // client. Two scenarios: (a) retry succeeds against a recovered client,
+  // (b) retry also fails — the second error propagates without hanging.
+  describe("Wave 5.99 — wedged-client recovery", () => {
+    function timeoutErr(): Error {
+      const err = new Error("Command timed out");
+      (err as Error & { name: string }).name = "MaxRetriesPerRequestError";
+      return err;
+    }
+
+    it("retries asRedisLike().call() once against a swapped-in client after a transient error", async () => {
+      const responses: ActiveTargetFull[] = [
+        { host: "h1", port: 6379, tls: false, db: 0, password: "P1", label: "first",  version: 1 },
+        { host: "h2", port: 6379, tls: false, db: 0, password: "P2", label: "second", version: 2 },
+      ];
+      let i = 0;
+      const fetchImpl = vi.fn(async () => mkResponse(responses[Math.min(i++, responses.length - 1)]!));
+      const built: Array<{ ping: () => Promise<string>; disconnect: () => void; call: ReturnType<typeof vi.fn> }> = [];
+      const watcher = createActiveTargetWatcher({
+        apiBase: "http://api:8080",
+        token: "tok",
+        pollMs: 60_000,
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        redisFactory: () => {
+          const wedged = built.length === 0;
+          const r = {
+            async ping() { return "PONG"; },
+            disconnect: vi.fn(),
+            call: wedged
+              ? vi.fn(async () => { throw timeoutErr(); })
+              : vi.fn(async () => ["a", "b"]),
+          };
+          built.push(r);
+          return r as unknown as Redis;
+        },
+        logger: silentLogger,
+      });
+
+      await watcher.start();
+      expect(built).toHaveLength(1);
+
+      const result = await watcher.asRedisLike().call("SMEMBERS", "source:index");
+      expect(result).toEqual(["a", "b"]);
+      expect(built).toHaveLength(2);
+      expect(built[0]!.call).toHaveBeenCalledTimes(1);
+      expect(built[1]!.call).toHaveBeenCalledTimes(1);
+      expect(built[0]!.disconnect).toHaveBeenCalled();
+
+      await watcher.stop();
+    });
+
+    it("rejects within a bounded window when the retry also fails", async () => {
+      const responses: ActiveTargetFull[] = [
+        { host: "h1", port: 6379, tls: false, db: 0, password: "P1", label: "first",  version: 1 },
+        { host: "h2", port: 6379, tls: false, db: 0, password: "P2", label: "second", version: 2 },
+      ];
+      let i = 0;
+      const fetchImpl = vi.fn(async () => mkResponse(responses[Math.min(i++, responses.length - 1)]!));
+      let totalCalls = 0;
+      const watcher = createActiveTargetWatcher({
+        apiBase: "http://api:8080",
+        token: "tok",
+        pollMs: 60_000,
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        redisFactory: () => ({
+          async ping() { return "PONG"; },
+          disconnect: () => undefined,
+          call: vi.fn(async () => { totalCalls += 1; throw timeoutErr(); }),
+        } as unknown as Redis),
+        logger: silentLogger,
+      });
+
+      await watcher.start();
+
+      const t0 = Date.now();
+      await expect(watcher.asRedisLike().call("SMEMBERS", "source:index")).rejects.toThrow(/timed out|max retries/i);
+      expect(Date.now() - t0).toBeLessThan(2_000);
+      expect(totalCalls).toBe(2); // initial attempt + exactly one retry
+
+      await watcher.stop();
+    });
+
+    // The hardest case in production: ioredis's own commandTimeout option
+    // doesn't always fire (TCP socket stays ESTABLISHED, no error event), so
+    // the wrapper enforces its own Promise.race timeout. Without that race,
+    // /sources would hang indefinitely waiting for SMEMBERS to resolve.
+    it("times out (via wrapper Promise.race) when the underlying call never resolves", async () => {
+      vi.useFakeTimers();
+      try {
+        const responses: ActiveTargetFull[] = [
+          { host: "h1", port: 6379, tls: false, db: 0, password: "P1", label: "first",  version: 1 },
+          { host: "h2", port: 6379, tls: false, db: 0, password: "P2", label: "second", version: 2 },
+        ];
+        let i = 0;
+        const fetchImpl = vi.fn(async () => mkResponse(responses[Math.min(i++, responses.length - 1)]!));
+        const watcher = createActiveTargetWatcher({
+          apiBase: "http://api:8080",
+          token: "tok",
+          pollMs: 60_000,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          redisFactory: () => ({
+            async ping() { return "PONG"; },
+            disconnect: () => undefined,
+            // The wedge we saw in production: command queued, never responds.
+            call: vi.fn(() => new Promise<unknown>(() => { /* never resolves */ })),
+          } as unknown as Redis),
+          logger: silentLogger,
+        });
+
+        await watcher.start();
+        const pending = watcher.asRedisLike().call("SMEMBERS", "source:index");
+        // Attach the rejection handler BEFORE advancing fake time so the
+        // intermediate rejection (initial-attempt timeout) is not flagged as
+        // an unhandled rejection by vitest. Initial attempt times out (≤5s),
+        // then re-poll, then retry times out (≤5s); advancing 11s surfaces
+        // the final rejection.
+        const assertion = expect(pending).rejects.toThrow(/timed out/i);
+        await vi.advanceTimersByTimeAsync(11_000);
+        await assertion;
+        await watcher.stop();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("does not retry when the error is non-transient", async () => {
+      const target: ActiveTargetFull = { host: "h1", port: 6379, tls: false, db: 0, password: "P1", label: "x", version: 1 };
+      const fetchImpl = vi.fn(async () => mkResponse(target));
+      let calls = 0;
+      const watcher = createActiveTargetWatcher({
+        apiBase: "http://api:8080",
+        token: "tok",
+        pollMs: 60_000,
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        redisFactory: () => ({
+          async ping() { return "PONG"; },
+          disconnect: () => undefined,
+          call: vi.fn(async () => { calls += 1; throw new Error("WRONGTYPE Operation against a key holding the wrong kind of value"); }),
+        } as unknown as Redis),
+        logger: silentLogger,
+      });
+
+      await watcher.start();
+      await expect(watcher.asRedisLike().call("SMEMBERS", "source:index")).rejects.toThrow(/WRONGTYPE/);
+      expect(calls).toBe(1);
+      await watcher.stop();
+    });
+  });
 });

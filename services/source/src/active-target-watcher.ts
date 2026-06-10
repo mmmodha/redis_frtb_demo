@@ -7,7 +7,7 @@
 // in-flight swap never tears callers between hosts. NEVER log the bearer
 // token or the password.
 
-import { Redis } from "ioredis";
+import { Redis, type RedisOptions } from "ioredis";
 import type { RedisLike } from "./store.ts";
 
 export interface ActiveTargetFull {
@@ -48,8 +48,11 @@ export interface ActiveTargetWatcher {
   getState(): WatcherState;
 }
 
-function defaultRedisFactory(t: ActiveTargetFull): Redis {
-  return new Redis({
+// Wave 5.99 — central place to build ioredis options. Kept as a small helper
+// so Wave 5.99B can extend it with a cluster-mode branch (Redis Cluster vs
+// standalone) without further refactoring of defaultRedisFactory.
+function buildStandaloneRedisOptions(t: ActiveTargetFull): RedisOptions {
+  return {
     host: t.host,
     port: t.port,
     db: t.db,
@@ -57,7 +60,35 @@ function defaultRedisFactory(t: ActiveTargetFull): Redis {
     password: t.password,
     lazyConnect: true,
     maxRetriesPerRequest: 3,
-  });
+    // Wave 5.99 — bound every connect/command so a half-open socket can never
+    // hang /sources forever. If the cloud Redis goes quiet mid-handshake or a
+    // queued command stalls behind a dead connection, ioredis rejects with
+    // ETIMEDOUT/"Command timed out" and the asRedisLike() retry path below
+    // forces a re-poll of the api's active target.
+    connectTimeout: 5000,
+    commandTimeout: 5000,
+  };
+}
+
+function defaultRedisFactory(t: ActiveTargetFull): Redis {
+  return new Redis(buildStandaloneRedisOptions(t));
+}
+
+// Wave 5.99 — classify ioredis failures that mean "this client is wedged or
+// the connection is dead, rebuild and retry". We deliberately match by name,
+// node error code, and message substring so we cover MaxRetriesPerRequestError,
+// commandTimeout rejections, and raw socket errors without depending on
+// internal ioredis exports.
+function isTransientRedisError(err: unknown): boolean {
+  if (!err) return false;
+  const e = err as { name?: string; message?: string; code?: string };
+  if (e.name === "MaxRetriesPerRequestError") return true;
+  const code = e.code ?? "";
+  if (code === "ETIMEDOUT" || code === "ECONNREFUSED" || code === "ECONNRESET" || code === "ENOTFOUND" || code === "EPIPE") {
+    return true;
+  }
+  const msg = e.message ?? String(err);
+  return /timed out|timeout|max retries|connection is closed|stream isn't writeable/i.test(msg);
 }
 
 const defaultLogger: WatcherLogger = {
@@ -86,6 +117,28 @@ export function createActiveTargetWatcher(opts: WatcherOpts): ActiveTargetWatche
   // when a client is in hand or "waiting" if we kept polling without one.
   let started = false;
 
+  // Wave 5.99 — wrapper-level command timeout. ioredis's own `commandTimeout`
+  // option turns out to be unreliable when the underlying socket is half-open
+  // (the TCP connection is ESTABLISHED but commands neither flush nor receive
+  // a reply, and no error event fires). Promise.race-ing every call against a
+  // local setTimeout guarantees /sources can never hang forever, regardless
+  // of what ioredis's internal state machine is doing. Used by both swapTo's
+  // ping and asRedisLike's per-command path.
+  const CALL_TIMEOUT_MS = 5000;
+  function withTimeout<T>(label: string, p: Promise<T>): Promise<T> {
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`redis ${label} timed out after ${CALL_TIMEOUT_MS}ms`)),
+        CALL_TIMEOUT_MS,
+      );
+      if (typeof timer.unref === "function") timer.unref();
+    });
+    return Promise.race([p, timeout]).finally(() => {
+      if (timer) clearTimeout(timer);
+    }) as Promise<T>;
+  }
+
   async function fetchTarget(): Promise<ActiveTargetFull> {
     const url = `${opts.apiBase}/internal/redis/active-target/full`;
     const r = await fetchImpl(url, { headers: { Authorization: `Bearer ${opts.token}` } });
@@ -97,7 +150,7 @@ export function createActiveTargetWatcher(opts: WatcherOpts): ActiveTargetWatche
     if (t.version === currentVersion) return;
     const next = redisFactory(t);
     try {
-      await next.ping();
+      await withTimeout("PING", next.ping());
     } catch (err) {
       // Wave 5.97D.1 — api reports an active target but Redis itself isn't
       // reachable yet (e.g. MaxRetriesPerRequestError against a placeholder
@@ -154,7 +207,12 @@ export function createActiveTargetWatcher(opts: WatcherOpts): ActiveTargetWatche
       await sleep(initialRetryMs);
     }
     if (opts.fallbackUrl) {
-      const client = new Redis(opts.fallbackUrl, { lazyConnect: true, maxRetriesPerRequest: 3 });
+      const client = new Redis(opts.fallbackUrl, {
+        lazyConnect: true,
+        maxRetriesPerRequest: 3,
+        connectTimeout: 5000,
+        commandTimeout: 5000,
+      });
       try { await client.ping(); } catch { /* future polls may recover */ }
       current = client;
       currentVersion = -1;
@@ -195,8 +253,20 @@ export function createActiveTargetWatcher(opts: WatcherOpts): ActiveTargetWatche
 
   function asRedisLike(): RedisLike {
     return {
-      call: (cmd: string, ...args: unknown[]) =>
-        (getRedis() as unknown as RedisLike).call(cmd, ...args),
+      async call(cmd: string, ...args: unknown[]) {
+        try {
+          return await withTimeout(cmd, (getRedis() as unknown as RedisLike).call(cmd, ...args));
+        } catch (err) {
+          if (!isTransientRedisError(err)) throw err;
+          // Wave 5.99 — the current client is wedged (timed out, max retries,
+          // closed socket). Force a re-poll so swapTo() can replace it with a
+          // fresh client built from the api's latest active target, then retry
+          // the command exactly once. A second failure propagates.
+          logger.warn(`redis ${cmd} failed; forcing re-poll and retrying once`, err);
+          try { await pollOnce(); } catch { /* pollOnce already logs */ }
+          return await withTimeout(cmd, (getRedis() as unknown as RedisLike).call(cmd, ...args));
+        }
+      },
     };
   }
 
