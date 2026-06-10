@@ -56,6 +56,11 @@ const INDEX_KEY = "source:index";
 
 export function createSourceStore({ redis }: { redis: RedisLike }): SourceStore {
   const key = (id: string) => `${KEY_PREFIX}${id}`;
+  // Wave 5.99 - once the migration SCAN has been attempted (whether it found
+  // anything or was bounded by the iteration/time cap), skip it on subsequent
+  // list() calls so a large keyspace does not pay the 3s SCAN cost on every
+  // poll. Per-store flag so each createSourceStore() call gets its own state.
+  let migrationAttempted = false;
 
   async function write(s: Source): Promise<Source> {
     await redis.call("SET", key(s.id), JSON.stringify(s));
@@ -94,15 +99,26 @@ export function createSourceStore({ redis }: { redis: RedisLike }): SourceStore 
     get: read,
     async list() {
       let members = (await redis.call("SMEMBERS", INDEX_KEY)) as string[];
-      if (members.length === 0) {
+      if (members.length === 0 && !migrationAttempted) {
         // One-time migration: if the index has never been populated, SCAN
         // the keyspace once to seed it from any pre-existing source:<ulid>
         // keys. Subsequent calls skip the SCAN because SCARD will be > 0
         // (or the keyspace will simply have no sources).
         const card = Number(await redis.call("SCARD", INDEX_KEY));
         if (card === 0) {
+          // Wave 5.99 - hard-cap the SCAN. The dev compose talks to a shared
+          // cloud Redis with millions of unrelated keys, where a full sweep
+          // (cursor back to "0") never completes in a reasonable time and
+          // /sources hangs forever. Bound by both iteration count and elapsed
+          // wall time; if we hit either limit, give up on the migration and
+          // treat the index as empty. The first real upload will populate
+          // source:index via SADD anyway.
+          const MAX_SCAN_ITERATIONS = 50;
+          const MAX_SCAN_MS = 3000;
+          const startedAt = Date.now();
           let cursor = "0";
           const found: string[] = [];
+          let iterations = 0;
           do {
             const reply = (await redis.call(
               "SCAN",
@@ -118,12 +134,17 @@ export function createSourceStore({ redis }: { redis: RedisLike }): SourceStore 
                 found.push(k.slice(KEY_PREFIX.length));
               }
             }
+            iterations++;
+            if (iterations >= MAX_SCAN_ITERATIONS || Date.now() - startedAt > MAX_SCAN_MS) {
+              break;
+            }
           } while (cursor !== "0");
           if (found.length > 0) {
             await redis.call("SADD", INDEX_KEY, ...found);
           }
           members = found;
         }
+        migrationAttempted = true;
       }
       if (members.length === 0) return [];
       const keys = members.map((id) => key(id));

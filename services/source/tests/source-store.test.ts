@@ -110,6 +110,41 @@ describe("createSourceStore", () => {
     expect(redis.sets.get("source:index")?.has(s.id)).toBe(true);
   });
 
+  it("list() bounds the migration SCAN when the cursor never returns to 0 (large keyspace)", async () => {
+    // Wave 5.99 - against shared cloud Redis with millions of unrelated keys
+    // the SCAN cursor never reaches "0" in any reasonable time. list() must
+    // give up after a bounded number of iterations instead of hanging.
+    let scanCalls = 0;
+    const stubRedis = {
+      async call(command: string, ...args: unknown[]) {
+        const cmd = command.toUpperCase();
+        if (cmd === "SMEMBERS") return [];
+        if (cmd === "SCARD") return 0;
+        if (cmd === "SCAN") {
+          scanCalls += 1;
+          // Never return cursor "0" - the loop must self-bound.
+          void args;
+          return ["42", []];
+        }
+        throw new Error(`unexpected command ${cmd}`);
+      },
+    };
+    const bounded = createSourceStore({ redis: stubRedis });
+    const t0 = Date.now();
+    const all = await bounded.list();
+    const elapsed = Date.now() - t0;
+    expect(all).toEqual([]);
+    expect(scanCalls).toBeLessThanOrEqual(60);
+    expect(scanCalls).toBeGreaterThan(0);
+    expect(elapsed).toBeLessThan(4000);
+    // Second call must NOT re-run the bounded SCAN: the migration is
+    // attempted at most once per store instance.
+    const scansAfterFirst = scanCalls;
+    const again = await bounded.list();
+    expect(again).toEqual([]);
+    expect(scanCalls).toBe(scansAfterFirst);
+  });
+
   it("setMapping() stores the mapping on the source and moves status to 'mapped'", async () => {
     const s = await store.create({ name: "x", format: "csv", origin: "upload", path: "/tmp/x" });
     const mapping = { fields: { risk_class: { from: "risk_class" } } } as Source["mapping"];
