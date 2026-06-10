@@ -6,8 +6,8 @@
 // `pollOnce()` so the suite stays deterministic.
 
 import { describe, it, expect, vi } from "vitest";
-import { createActiveTargetWatcher, type ActiveTargetFull } from "../src/active-target-watcher.ts";
-import type { Redis } from "ioredis";
+import { createActiveTargetWatcher, defaultRedisFactory, type ActiveTargetFull } from "../src/active-target-watcher.ts";
+import { Redis, Cluster } from "ioredis";
 
 interface FakeRedis {
   id: number;
@@ -312,6 +312,71 @@ describe("createActiveTargetWatcher", () => {
       await expect(watcher.asRedisLike().call("SMEMBERS", "source:index")).rejects.toThrow(/WRONGTYPE/);
       expect(calls).toBe(1);
       await watcher.stop();
+    });
+  });
+
+  // Wave 5.99B — defaultRedisFactory must branch strictly on `clusterMode ===
+  // true`. The standalone path (clusterMode false / omitted / truthy-string)
+  // MUST continue to return a single-node ioredis client so Enterprise / proxy-
+  // endpoint users see zero behavioural change from Wave 5.99. Only an explicit
+  // boolean `true` opts into ioredis Cluster.
+  //
+  // Note on identity check: ioredis applies an EventEmitter mixin to Redis and
+  // Cluster which rewires their prototype so `client.constructor.name` evaluates
+  // to "EventEmitter" for both classes (ioredis 5.10.1 — confirmed at the node
+  // REPL). `instanceof Redis` / `instanceof Cluster` is the only reliable
+  // runtime discriminator and is what we use here.
+  describe("defaultRedisFactory (Wave 5.99B cluster-mode branch)", () => {
+    const baseTarget = {
+      host: "127.0.0.1",
+      port: 6_399,
+      tls: false,
+      db: 0,
+      label: "factory-test",
+      version: 1,
+    } as const;
+
+    it("returns a single-node Redis client when clusterMode is false", () => {
+      const client = defaultRedisFactory({ ...baseTarget, clusterMode: false });
+      try {
+        expect(client).toBeInstanceOf(Redis);
+        expect(client).not.toBeInstanceOf(Cluster);
+      } finally {
+        client.disconnect();
+      }
+    });
+
+    it("returns a Cluster client when clusterMode is true", () => {
+      const client = defaultRedisFactory({ ...baseTarget, clusterMode: true });
+      try {
+        expect(client).toBeInstanceOf(Cluster);
+        expect(client).not.toBeInstanceOf(Redis);
+      } finally {
+        client.disconnect();
+      }
+    });
+
+    it("returns a single-node Redis client when clusterMode is omitted (backward compat for legacy ActiveTargetFull payloads)", () => {
+      const client = defaultRedisFactory({ ...baseTarget });
+      try {
+        expect(client).toBeInstanceOf(Redis);
+        expect(client).not.toBeInstanceOf(Cluster);
+      } finally {
+        client.disconnect();
+      }
+    });
+
+    it("returns a single-node Redis client when clusterMode is the string \"true\" (no truthy coercion)", () => {
+      // Guards against api/UI accidentally sending the wrong type. The branch
+      // is `=== true`, not `if (clusterMode)`, so a stringified flag MUST NOT
+      // opt the user into ioredis Cluster.
+      const client = defaultRedisFactory({ ...baseTarget, clusterMode: "true" as unknown as boolean });
+      try {
+        expect(client).toBeInstanceOf(Redis);
+        expect(client).not.toBeInstanceOf(Cluster);
+      } finally {
+        client.disconnect();
+      }
     });
   });
 });

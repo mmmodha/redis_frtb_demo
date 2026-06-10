@@ -7,8 +7,13 @@
 // in-flight swap never tears callers between hosts. NEVER log the bearer
 // token or the password.
 
-import { Redis, type RedisOptions } from "ioredis";
+import { Redis, Cluster, type RedisOptions } from "ioredis";
 import type { RedisLike } from "./store.ts";
+
+// Wave 5.99B — RedisClient is the union returned by the redis factory. Both
+// ioredis classes expose the same .call(...) / .ping() / .disconnect() surface
+// the watcher uses, so consumers don't need to discriminate.
+export type RedisClient = Redis | Cluster;
 
 export interface ActiveTargetFull {
   host: string;
@@ -18,6 +23,11 @@ export interface ActiveTargetFull {
   password?: string;
   label: string;
   version: number;
+  // Wave 5.99B — true OSS Redis Cluster (CLUSTER SLOTS / MOVED redirects). When
+  // omitted or non-true the watcher uses the single-node client; the cluster
+  // branch is strictly opt-in (=== true) so the existing proxy-endpoint /
+  // Enterprise-style path stays bit-for-bit identical to what Wave 5.99 shipped.
+  clusterMode?: boolean;
 }
 
 export interface WatcherLogger {
@@ -33,7 +43,7 @@ export interface WatcherOpts {
   initialTimeoutMs?: number;
   initialRetryMs?: number;
   fetchImpl?: typeof fetch;
-  redisFactory?: (t: ActiveTargetFull) => Redis;
+  redisFactory?: (t: ActiveTargetFull) => RedisClient;
   logger?: WatcherLogger;
 }
 
@@ -43,14 +53,15 @@ export interface ActiveTargetWatcher {
   start(): Promise<void>;
   stop(): Promise<void>;
   pollOnce(): Promise<void>;
-  getRedis(): Redis;
+  getRedis(): RedisClient;
   asRedisLike(): RedisLike;
   getState(): WatcherState;
 }
 
-// Wave 5.99 — central place to build ioredis options. Kept as a small helper
-// so Wave 5.99B can extend it with a cluster-mode branch (Redis Cluster vs
-// standalone) without further refactoring of defaultRedisFactory.
+// Wave 5.99 — central place to build ioredis options. Wave 5.99B extends this
+// with a cluster-mode branch (Redis Cluster vs standalone) below; this helper
+// itself is unchanged and still produces the single-node options that Wave 5.99
+// shipped (callers on the standalone path see no behavioural change).
 function buildStandaloneRedisOptions(t: ActiveTargetFull): RedisOptions {
   return {
     host: t.host,
@@ -70,7 +81,36 @@ function buildStandaloneRedisOptions(t: ActiveTargetFull): RedisOptions {
   };
 }
 
-function defaultRedisFactory(t: ActiveTargetFull): Redis {
+// Wave 5.99B — defaultRedisFactory branches strictly on `clusterMode === true`.
+// No truthy coercion (string "true" must NOT enable cluster mode) and no auto-
+// detection: Enterprise/proxy-endpoint users (clusterMode false or omitted)
+// keep the exact single-node code path Wave 5.99 shipped. Exported so the
+// regression tests can pin both branches.
+export function defaultRedisFactory(t: ActiveTargetFull): RedisClient {
+  if (t.clusterMode === true) {
+    return new Cluster(
+      [{ host: t.host, port: t.port }],
+      {
+        // Wave 5.99B — mirror Wave 5.99's bounded-timeout discipline on the
+        // per-node connection options. ioredis Cluster opens one socket per
+        // master and these knobs apply to every one of them, so a half-open
+        // socket to any node still rejects within 5s instead of hanging.
+        redisOptions: {
+          db: t.db,
+          tls: t.tls ? {} : undefined,
+          password: t.password,
+          connectTimeout: 5000,
+          commandTimeout: 5000,
+        },
+        lazyConnect: true,
+        // Bound the connect handshake the same way the standalone path bounds
+        // its initial connect. Cluster falls back to its own default (10s) if
+        // omitted; we lower it to keep the swapTo() ping() check inside the
+        // watcher's 5s withTimeout wrapper.
+        clusterRetryStrategy: (times) => (times > 3 ? null : 200),
+      },
+    );
+  }
   return new Redis(buildStandaloneRedisOptions(t));
 }
 
@@ -109,7 +149,7 @@ export function createActiveTargetWatcher(opts: WatcherOpts): ActiveTargetWatche
   const redisFactory = opts.redisFactory ?? defaultRedisFactory;
   const logger = opts.logger ?? defaultLogger;
 
-  let current: Redis | null = null;
+  let current: RedisClient | null = null;
   let currentVersion: number | null = null;
   let pollTimer: NodeJS.Timeout | null = null;
   // Wave 5.98B — surface watcher progress for /healthz body without blocking
@@ -246,7 +286,7 @@ export function createActiveTargetWatcher(opts: WatcherOpts): ActiveTargetWatche
     return "starting";
   }
 
-  function getRedis(): Redis {
+  function getRedis(): RedisClient {
     if (!current) throw new Error("active-target watcher: getRedis() called before start() resolved");
     return current;
   }

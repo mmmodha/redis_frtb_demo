@@ -156,6 +156,64 @@ describe("GET /internal/redis/active-target/full", () => {
     expect(internalBody.password).toBe("PW-LIVE");
   });
 
+  // Wave 5.99B — the source watcher's defaultRedisFactory branches strictly on
+  // `clusterMode === true`. The wire format MUST therefore carry an explicit
+  // boolean (not omitted, not stringified) so legacy ActiveTarget payloads
+  // without a clusterMode field default to false and the proxy-endpoint /
+  // Enterprise-style single-node path stays bit-for-bit identical to Wave 5.99.
+  it("surfaces clusterMode as a boolean on the standalone path", async () => {
+    const created = await app.inject({
+      method: "POST",
+      url: "/connections",
+      payload: {
+        name: "live-standalone",
+        host: "rs.live",
+        port: 6390,
+        password: "PW-LIVE",
+        tls: { enabled: false },
+        db: 0,
+      },
+    });
+    const id = created.json().id;
+    const act = await app.inject({ method: "POST", url: `/connections/${id}/activate` });
+    expect(act.statusCode).toBe(200);
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/internal/redis/active-target/full",
+      headers: { authorization: "Bearer test-internal-token" },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body).toHaveProperty("clusterMode");
+    expect(body.clusterMode).toBe(false);
+    expect(typeof body.clusterMode).toBe("boolean");
+  });
+
+  it("surfaces clusterMode: true when the active connection was registered with clusterMode: true", async () => {
+    const created = await app.inject({
+      method: "POST",
+      url: "/connections",
+      payload: {
+        name: "live-cluster",
+        host: "rs.cluster",
+        port: 6391,
+        password: "PW-CLUSTER",
+        clusterMode: true,
+      },
+    });
+    const id = created.json().id;
+    await app.inject({ method: "POST", url: `/connections/${id}/activate` });
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/internal/redis/active-target/full",
+      headers: { authorization: "Bearer test-internal-token" },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().clusterMode).toBe(true);
+  });
+
   it("returns 503 when INTERNAL_API_TOKEN is not configured", async () => {
     await app.close();
     delete process.env.INTERNAL_API_TOKEN;

@@ -42,12 +42,17 @@ export function registerInternalTargetRoutes(
       return { error: "unauthorized" };
     }
     const t = getActiveTarget();
+    // Wave 5.99B — surface clusterMode so the source watcher can branch between
+    // ioredis Cluster (true OSS Redis Cluster) and the single-node client
+    // (proxy-endpoint / Enterprise-style). Always emitted as a boolean; legacy
+    // ActiveTarget payloads with no clusterMode default to false.
     const out: Record<string, unknown> = {
       host: t.host,
       port: t.port,
       tls: !!t.tls,
       db: t.db ?? 0,
       label: t.label,
+      clusterMode: t.clusterMode === true,
       version,
     };
     if (store) {
