@@ -498,24 +498,24 @@ button.drilldown-pill:focus-visible {
 
 /* Wave 6.04 — Iris primitive: soft breathing halo in Redis Hyper.
    Two-layer box-shadow (inner crisp + outer soft) breathes in opacity +
-   radius over 2s. Used on --running (animated) and --final (paused
+   radius over 1.4s. Used on --running (animated) and --final (paused
    snapshot — same shadow values at the breath's mid-point, no animation). */
 @keyframes calc-total-elapsed-iris {
   0%, 100% {
     box-shadow:
-      0 0 4px rgba(255, 68, 56, 0.35),
-      0 0 10px rgba(255, 68, 56, 0.20);
+      0 0 4px rgba(255, 68, 56, 0.42),
+      0 0 10px rgba(255, 68, 56, 0.24);
   }
   50% {
     box-shadow:
-      0 0 6px rgba(255, 68, 56, 0.65),
-      0 0 18px rgba(255, 68, 56, 0.40);
+      0 0 6px rgba(255, 68, 56, 0.78),
+      0 0 18px rgba(255, 68, 56, 0.48);
   }
 }
 
 .calc-panel__total-elapsed--running {
   border-color: rgba(255, 68, 56, 0.55);
-  animation: calc-total-elapsed-iris 2s ease-in-out infinite;
+  animation: calc-total-elapsed-iris 1.4s ease-in-out infinite;
 }
 
 .calc-panel__total-elapsed--final {
@@ -523,8 +523,8 @@ button.drilldown-pill:focus-visible {
      animation. Visual lineage is obvious. */
   border-color: rgba(255, 68, 56, 0.55);
   box-shadow:
-    0 0 6px rgba(255, 68, 56, 0.65),
-    0 0 18px rgba(255, 68, 56, 0.40);
+    0 0 6px rgba(255, 68, 56, 0.78),
+    0 0 18px rgba(255, 68, 56, 0.48);
   color: var(--redis-text-secondary);
 }
 
@@ -533,8 +533,8 @@ button.drilldown-pill:focus-visible {
     animation: none;
     /* Static mid-breath shadow so the affordance is still visible. */
     box-shadow:
-      0 0 6px rgba(255, 68, 56, 0.65),
-      0 0 18px rgba(255, 68, 56, 0.40);
+      0 0 6px rgba(255, 68, 56, 0.78),
+      0 0 18px rgba(255, 68, 56, 0.48);
   }
 }
 
