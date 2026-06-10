@@ -5,7 +5,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import { Observability } from "../../src/routes/Observability";
+import { Observability, humanizeSeconds } from "../../src/routes/Observability";
 import { OBS_REFRESH_STORAGE_KEY } from "../../src/hooks/useObservabilityRefresh";
 
 type FetchMock = ReturnType<typeof vi.fn>;
@@ -153,8 +153,9 @@ describe("<Observability /> live refresh", () => {
     await flush(15000);
     expect(countObservabilityCalls(fetchMock)).toBe(afterOff);
 
-    // Badge collapses to "Off".
-    expect(screen.getByTestId("obs-updated-badge").textContent).toBe("Off");
+    // Wave 6.00 — with cadence Off the badge shows humanized time-since-fetch.
+    // 15s elapsed since the only fetch (the initial one at mount).
+    expect(screen.getByTestId("obs-updated-badge").textContent).toBe("Updated 15s ago");
   });
 
   it("selecting 1s causes a fresh fetch every second", async () => {
@@ -174,21 +175,63 @@ describe("<Observability /> live refresh", () => {
     expect(afterTwo).toBeGreaterThan(afterOne);
   });
 
-  it("the Updated-Ns-ago badge resets to 0s on each successful fetch", async () => {
+  it("Wave 6.00 — with cadence on, the badge shows just the cadence label", async () => {
     installFetchMock();
     renderRoute();
     await flush(0);
     const badge = screen.getByTestId("obs-updated-badge");
-    expect(badge.textContent).toContain("Updated 0s ago");
-    expect(badge.textContent).toContain("2s");
+    // Default cadence is 2s — badge is just "2s", no "Updated Ns ago" prefix.
+    expect(badge.textContent).toBe("2s");
 
-    // Advance only the 1s ticker — no cadence tick yet (cadence is 2s).
+    // 1s ticker advance — still just "2s" (no time-since text in this mode).
     await flush(1000);
-    expect(badge.textContent).toContain("Updated 1s ago");
+    expect(badge.textContent).toBe("2s");
 
-    // One more second triggers the cadence tick + fresh fetch → reset to 0.
+    // Cadence tick fires + refetches — badge is still just "2s".
     await flush(1000);
-    expect(badge.textContent).toContain("Updated 0s ago");
+    expect(badge.textContent).toBe("2s");
+  });
+
+  it("Wave 6.00 — with cadence Off, the badge humanizes time-since-fetch", async () => {
+    installFetchMock();
+    renderRoute();
+    await flush(0);
+    fireEvent.change(screen.getByTestId("obs-refresh-select"), { target: { value: "0" } });
+    await flush(0);
+    const badge = screen.getByTestId("obs-updated-badge");
+    expect(badge.textContent).toBe("Updated 0s ago");
+
+    await flush(12_000);
+    expect(badge.textContent).toBe("Updated 12s ago");
+
+    // Cross the 60s boundary → switches to minutes.
+    await flush(78_000); // total 90s
+    expect(badge.textContent).toBe("Updated 1m ago");
+  });
+
+  it("Wave 6.00 — manual refresh button fires a fetch and bumps the pulse key", async () => {
+    const fetchMock = installFetchMock();
+    renderRoute();
+    await flush(0);
+    // Turn polling off so only the manual click drives subsequent fetches.
+    fireEvent.change(screen.getByTestId("obs-refresh-select"), { target: { value: "0" } });
+    await flush(0);
+
+    const badge = screen.getByTestId("obs-updated-badge");
+    const beforeKey = badge.getAttribute("data-pulse-key");
+    const beforeCount = countObservabilityCalls(fetchMock);
+
+    const button = screen.getByTestId("obs-manual-refresh") as HTMLButtonElement;
+    expect(button.disabled).toBe(false);
+
+    fireEvent.click(button);
+    await flush(0);
+
+    expect(countObservabilityCalls(fetchMock)).toBeGreaterThan(beforeCount);
+    const afterKey = badge.getAttribute("data-pulse-key");
+    expect(afterKey).not.toBe(beforeKey);
+    // Once the in-flight fetch resolves the button is enabled again.
+    expect(button.disabled).toBe(false);
   });
 
   it("passes the latest shards through to the ShardMetricsStrip", async () => {
@@ -216,5 +259,33 @@ describe("<Observability /> live refresh", () => {
     expect(screen.getByTestId("obs-refresh-error")).toBeInTheDocument();
     // Last successful value is still visible.
     expect(screen.getByText("42")).toBeInTheDocument();
+  });
+});
+
+
+// Wave 6.00 — compact unit-boundary tests for the time-since humanizer.
+describe("humanizeSeconds", () => {
+  it("renders sub-minute values as seconds", () => {
+    expect(humanizeSeconds(0)).toBe("0s");
+    expect(humanizeSeconds(12)).toBe("12s");
+    expect(humanizeSeconds(59)).toBe("59s");
+  });
+
+  it("crosses to minutes at 60s and floors", () => {
+    expect(humanizeSeconds(60)).toBe("1m");
+    expect(humanizeSeconds(90)).toBe("1m"); // 90s → 1m (floored)
+    expect(humanizeSeconds(60 * 59)).toBe("59m");
+  });
+
+  it("crosses to hours at 60m and floors", () => {
+    expect(humanizeSeconds(60 * 60)).toBe("1h");
+    expect(humanizeSeconds(60 * 70)).toBe("1h"); // 70m → 1h (floored)
+    expect(humanizeSeconds(60 * 60 * 23)).toBe("23h");
+  });
+
+  it("crosses to days at 24h and floors", () => {
+    expect(humanizeSeconds(60 * 60 * 24)).toBe("1d");
+    expect(humanizeSeconds(60 * 60 * 26)).toBe("1d"); // 26h → 1d (floored)
+    expect(humanizeSeconds(60 * 60 * 24 * 3)).toBe("3d");
   });
 });

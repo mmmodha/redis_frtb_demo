@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { PanelCard } from "../components/PanelCard";
 import { MetricTile } from "../components/MetricTile";
 import { MetricHistoryModal } from "../components/MetricHistoryModal";
@@ -38,6 +38,19 @@ function cadenceLabel(cadenceMs: number): string {
   return cadenceMs === 0 ? "Off" : `${cadenceMs / 1000}s`;
 }
 
+// Wave 6.00 — compact humanized time-since: Ns (<60s), Nm (<60m), Nh (<24h),
+// Nd (≥24h). Exported for unit tests covering each unit boundary.
+export function humanizeSeconds(s: number): string {
+  const n = Math.max(0, Math.floor(s));
+  if (n < 60) return `${n}s`;
+  const m = Math.floor(n / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h`;
+  const d = Math.floor(h / 24);
+  return `${d}d`;
+}
+
 export function Observability() {
   const { cadenceMs, setCadenceMs } = useObservabilityRefresh();
   const [status, setStatus] = useState<Status>({ kind: "loading" });
@@ -45,36 +58,44 @@ export function Observability() {
   const [lastFetchAt, setLastFetchAt] = useState<number | null>(null);
   const [now, setNow] = useState<number>(() => Date.now());
   const [pulseKey, setPulseKey] = useState<number>(0);
+  const [inFlight, setInFlight] = useState<boolean>(false);
+  const inFlightRef = useRef<boolean>(false);
+
+  // Hoisted fetch so the polling loop and the manual refresh button can share
+  // a single in-flight guard. inFlightRef avoids a stale-closure race where
+  // two near-simultaneous callers both see inFlight=false.
+  const fetchOnce = useCallback(async (): Promise<void> => {
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
+    setInFlight(true);
+    try {
+      const [keys, memory, shards] = await Promise.all([
+        getObservabilityKeys("sens:"),
+        getObservabilityMemory(),
+        getObservabilityShards(),
+      ]);
+      setStatus({ kind: "ready", data: { keys, memory, shards } });
+      setLastError(null);
+      setLastFetchAt(Date.now());
+      setNow(Date.now());
+      setPulseKey((k) => k + 1);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // Only blow away the page on first-load failure. After we have data,
+      // keep showing it and surface the failure as an inline pill.
+      setStatus((prev) => (prev.kind === "loading" ? { kind: "error", message: msg } : prev));
+      setLastError(msg);
+    } finally {
+      inFlightRef.current = false;
+      setInFlight(false);
+    }
+  }, []);
 
   // Cadence-driven polling loop. Pauses when the tab is hidden and resumes
   // (with an immediate fetch) on visibilitychange. Cleanup clears the
   // interval on unmount or cadence change.
   useEffect(() => {
-    let cancelled = false;
     let timer: ReturnType<typeof setInterval> | null = null;
-
-    const fetchOnce = async (): Promise<void> => {
-      try {
-        const [keys, memory, shards] = await Promise.all([
-          getObservabilityKeys("sens:"),
-          getObservabilityMemory(),
-          getObservabilityShards(),
-        ]);
-        if (cancelled) return;
-        setStatus({ kind: "ready", data: { keys, memory, shards } });
-        setLastError(null);
-        setLastFetchAt(Date.now());
-        setNow(Date.now());
-        setPulseKey((k) => k + 1);
-      } catch (err) {
-        if (cancelled) return;
-        const msg = err instanceof Error ? err.message : String(err);
-        // Only blow away the page on first-load failure. After we have data,
-        // keep showing it and surface the failure as an inline pill.
-        setStatus((prev) => (prev.kind === "loading" ? { kind: "error", message: msg } : prev));
-        setLastError(msg);
-      }
-    };
 
     const start = (): void => {
       if (cadenceMs === 0 || timer !== null) return;
@@ -107,13 +128,12 @@ export function Observability() {
     }
 
     return () => {
-      cancelled = true;
       stop();
       if (typeof document !== "undefined") {
         document.removeEventListener("visibilitychange", onVisibility);
       }
     };
-  }, [cadenceMs]);
+  }, [cadenceMs, fetchOnce]);
 
   // Lightweight 1s ticker so the "Updated Ns ago" badge counts up between
   // fetches; independent of the cadence loop so it stays smooth even when
@@ -125,7 +145,11 @@ export function Observability() {
 
   const secondsAgo = lastFetchAt !== null ? Math.max(0, Math.floor((now - lastFetchAt) / 1000)) : 0;
   const showRefreshError = lastError !== null && status.kind === "ready";
-  const badgeText = cadenceMs === 0 ? "Off" : `Updated ${secondsAgo}s ago · ${cadenceLabel(cadenceMs)}`;
+  // Wave 6.00 — when auto-refresh is on, the cadence itself tells you how
+  // fresh the data is, so the "Updated Ns ago" prefix is redundant noise.
+  // When cadence is Off, the humanized timestamp is the most useful thing.
+  const badgeText =
+    cadenceMs === 0 ? `Updated ${humanizeSeconds(secondsAgo)} ago` : cadenceLabel(cadenceMs);
 
   return (
     <>
@@ -148,8 +172,38 @@ export function Observability() {
               </option>
             ))}
           </select>
+          <button
+            type="button"
+            data-testid="obs-manual-refresh"
+            className="observability__manual-refresh"
+            title="Refresh now"
+            aria-label="Refresh now"
+            disabled={inFlight}
+            onClick={() => {
+              void fetchOnce();
+            }}
+          >
+            <svg
+              viewBox="0 0 24 24"
+              width="14"
+              height="14"
+              aria-hidden="true"
+              focusable="false"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M3 12a9 9 0 0 1 15-6.7L21 8" />
+              <path d="M21 3v5h-5" />
+              <path d="M21 12a9 9 0 0 1-15 6.7L3 16" />
+              <path d="M3 21v-5h5" />
+            </svg>
+          </button>
           <span
             data-testid="obs-updated-badge"
+            data-pulse-key={pulseKey}
             className={`observability__updated${cadenceMs === 0 ? " observability__updated--off" : ""}`}
           >
             <span key={pulseKey} className="observability__updated-pulse">

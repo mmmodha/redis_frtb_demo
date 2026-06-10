@@ -40,6 +40,33 @@
   font-family: inherit;
   font-size: 0.8125rem;
 }
+/* Wave 6.00 — manual refresh button. Same chrome family as the cadence
+   dropdown; square so the inline-SVG circle-arrow stays centered. */
+.observability__manual-refresh {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  min-height: 0;
+  padding: 0;
+  background: var(--redis-bg-tertiary);
+  color: var(--redis-text-secondary);
+  border: 1px solid var(--redis-border-primary);
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: color 0.12s, border-color 0.12s, background 0.12s;
+}
+.observability__manual-refresh:hover:not(:disabled),
+.observability__manual-refresh:focus-visible:not(:disabled) {
+  color: var(--redis-hyper);
+  border-color: var(--redis-hyper);
+  outline: none;
+}
+.observability__manual-refresh:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
 .observability__updated {
   display: inline-block;
   font-family: var(--font-mono);
