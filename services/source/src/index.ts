@@ -52,12 +52,6 @@ async function main(): Promise<void> {
     pollMs: POLL_MS,
     fallbackUrl: process.env.REDIS_URL,
   });
-  try {
-    await watcher.start();
-  } catch (err) {
-    console.error(JSON.stringify({ service: "source", status: "fatal", err: String(err) }));
-    process.exit(1);
-  }
 
   const schema = existsSync(SCHEMA_PATH) ? loadSchema(SCHEMA_PATH) : null;
   if (!schema) {
@@ -67,9 +61,21 @@ async function main(): Promise<void> {
 
   const redisLike = watcher.asRedisLike();
   const store = createSourceStore({ redis: redisLike });
-  const app = await createServer({ redis: redisLike, store, schema, uploadDir: UPLOAD_DIR, logger: true });
+  const app = await createServer({
+    redis: redisLike, store, schema, uploadDir: UPLOAD_DIR, logger: true,
+    watcherState: () => watcher.getState(),
+  });
+  // Wave 5.98B — bind /healthz BEFORE awaiting watcher.start(). The watcher's
+  // initial poll loop can take up to ~30s when Redis isn't reachable, which
+  // exceeded scripts/run-local.sh's 10s health window and produced spurious
+  // "refused" warnings. The watcher is already tolerant (Wave 5.97D.1) so it
+  // never throws; kick it in the background and surface progress via /healthz.
   await app.listen({ port: PORT, host: HOST });
   console.log(JSON.stringify({ service: "source", status: "ready", port: PORT }));
+
+  void watcher.start().catch((err) => {
+    console.error(JSON.stringify({ service: "source", level: "warn", msg: "watcher.start() rejected", err: String(err) }));
+  });
 
   if (process.env.SMOKE === "1") {
     await app.close();

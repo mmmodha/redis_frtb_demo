@@ -22,6 +22,9 @@ export interface CreateServerOpts {
   schema: Schema;
   uploadDir: string;
   logger?: boolean;
+  // Wave 5.98B — optional getter for active-target watcher state so /healthz
+  // can surface "starting" | "running" | "waiting" without blocking listen().
+  watcherState?: () => string;
 }
 
 export async function createServer(opts: CreateServerOpts): Promise<FastifyInstance> {
@@ -31,7 +34,11 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
     limits: { fileSize: 2 * 1024 * 1024 * 1024 }, // 2 GiB demo cap
   });
 
-  app.get("/healthz", async () => ({ service: "source", status: "ok" }));
+  app.get("/healthz", async () => ({
+    service: "source",
+    status: "ok",
+    ...(opts.watcherState ? { watcher: opts.watcherState() } : {}),
+  }));
 
   const deps: UploadDeps = {
     redis: opts.redis,

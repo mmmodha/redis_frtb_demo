@@ -37,12 +37,15 @@ export interface WatcherOpts {
   logger?: WatcherLogger;
 }
 
+export type WatcherState = "starting" | "running" | "waiting";
+
 export interface ActiveTargetWatcher {
   start(): Promise<void>;
   stop(): Promise<void>;
   pollOnce(): Promise<void>;
   getRedis(): Redis;
   asRedisLike(): RedisLike;
+  getState(): WatcherState;
 }
 
 function defaultRedisFactory(t: ActiveTargetFull): Redis {
@@ -78,6 +81,10 @@ export function createActiveTargetWatcher(opts: WatcherOpts): ActiveTargetWatche
   let current: Redis | null = null;
   let currentVersion: number | null = null;
   let pollTimer: NodeJS.Timeout | null = null;
+  // Wave 5.98B — surface watcher progress for /healthz body without blocking
+  // the http listen call. "starting" until start() resolves; then "running"
+  // when a client is in hand or "waiting" if we kept polling without one.
+  let started = false;
 
   async function fetchTarget(): Promise<ActiveTargetFull> {
     const url = `${opts.apiBase}/internal/redis/active-target/full`;
@@ -133,6 +140,7 @@ export function createActiveTargetWatcher(opts: WatcherOpts): ActiveTargetWatche
         const t = await fetchTarget();
         await swapTo(t);
         if (current) {
+          started = true;
           startPolling();
           return;
         }
@@ -151,6 +159,7 @@ export function createActiveTargetWatcher(opts: WatcherOpts): ActiveTargetWatche
       current = client;
       currentVersion = -1;
       logger.warn("active target: fallback REDIS_URL (api unreachable)", lastErr);
+      started = true;
       startPolling();
       return;
     }
@@ -161,6 +170,7 @@ export function createActiveTargetWatcher(opts: WatcherOpts): ActiveTargetWatche
     logger.warn(
       `active-target watcher: no active target after ${initialTimeoutMs}ms; continuing to poll (${String(lastErr)})`,
     );
+    started = true;
     startPolling();
   }
 
@@ -169,6 +179,13 @@ export function createActiveTargetWatcher(opts: WatcherOpts): ActiveTargetWatche
     if (current) { try { current.disconnect(); } catch { /* ignore */ } }
     current = null;
     currentVersion = null;
+    started = false;
+  }
+
+  function getState(): WatcherState {
+    if (current) return "running";
+    if (started) return "waiting";
+    return "starting";
   }
 
   function getRedis(): Redis {
@@ -183,5 +200,5 @@ export function createActiveTargetWatcher(opts: WatcherOpts): ActiveTargetWatche
     };
   }
 
-  return { start, stop, pollOnce, getRedis, asRedisLike };
+  return { start, stop, pollOnce, getRedis, asRedisLike, getState };
 }
