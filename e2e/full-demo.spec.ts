@@ -192,6 +192,9 @@ async function installCommonRoutes(page: Page, opts: { activeName?: string } = {
   await page.route("**/calc/sbm", (route: Route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(fastCalcResponse) }),
   );
+  await page.route("**/calc/recent**", (route: Route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ items: [] }) }),
+  );
 
   // Wave 4.2 — loadgen control routes (mocked so spec can drive Step 8).
   await page.route("**/loadgen/start", (route: Route) =>
