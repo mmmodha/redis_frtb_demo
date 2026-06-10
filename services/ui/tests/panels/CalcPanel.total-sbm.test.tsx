@@ -513,7 +513,6 @@ describe("<CalcPanel /> — Total SBM progressive UX (Wave 5.96D)", () => {
     expect(tip).toMatch(/3 risk classes/);
     expect(tip).toMatch(/3 legs/);
     expect(tip).toMatch(/3 correlation scenarios/);
-    expect(tip).toMatch(/27 parallel Lua kernel calls/);
   });
 });
 

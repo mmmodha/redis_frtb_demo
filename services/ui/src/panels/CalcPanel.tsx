@@ -1143,7 +1143,7 @@ function TotalSbmResultView({
           className="calc-panel__total-perf-chip"
           data-chip="ops"
           data-testid="calc-total-perf-ops-chip"
-          title="3 risk classes (GIRR, Equity, FX) × 3 legs (Δ delta, V vega, Curvature) × 3 correlation scenarios (low, medium, high) = 27 parallel Lua kernel calls."
+          title="3 risk classes (GIRR, Equity, FX) × 3 legs (Δ delta, V vega, Curvature) × 3 correlation scenarios (low, medium, high)."
         >
           <span aria-hidden>{"\u26A1"}</span> {perf.redis_ops_count}/{totalCells} cells
         </span>
