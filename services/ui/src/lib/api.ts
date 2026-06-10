@@ -84,3 +84,39 @@ export function getObservabilityHistory(
     `/observability/history?metric=${encodeURIComponent(metric)}&windowMs=${windowMs}`,
   );
 }
+
+// Wave 6.01 — process-local ring buffer of recent /calc/sbm and
+// /calc/sbm/total runs surfaced via GET /calc/recent. Discriminated union by
+// `kind` so the Observability "Last Calculation" card can render distinct
+// metric tile sets without sniffing payload shape.
+export interface RecentCalcRunCommon {
+  id: string;
+  ts: string;
+  charge: number;
+  total_ms: number;
+  cache: "hit" | "miss";
+  engine: string;
+}
+export interface RecentCalcRunPerClass extends RecentCalcRunCommon {
+  kind: "per_class";
+  risk_class: string;
+  leg: string;
+  scenario?: string;
+  fanout_ms: number;
+  cells_evaluated: number;
+}
+export interface RecentCalcRunTotal extends RecentCalcRunCommon {
+  kind: "total";
+  cumulative_ms: number;
+  parallelism_factor: number;
+  redis_ops_count: number;
+  ops_skipped: number;
+  cells_empty: number;
+  cache_hits: number;
+}
+export type RecentCalcRun = RecentCalcRunPerClass | RecentCalcRunTotal;
+export interface RecentCalcRunsResponse { items: RecentCalcRun[] }
+
+export function getRecentCalcRuns(limit = 5): Promise<RecentCalcRunsResponse> {
+  return getJson<RecentCalcRunsResponse>(`/calc/recent?limit=${limit}`);
+}

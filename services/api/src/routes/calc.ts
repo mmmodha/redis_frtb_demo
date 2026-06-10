@@ -28,6 +28,11 @@ import {
   lookupCalcCache,
   storeCalcCache,
 } from "../sbm/calc-cache.ts";
+// Wave 6.01 — recent-runs ring buffer push happens at the tail of each
+// successful /calc/sbm and /calc/sbm/total response so the Observability
+// "Last Calculation" card can surface concrete telemetry without re-hitting
+// the calculator UI. In-memory only; cleared on active-target switch.
+import { listRecentRuns, pushRecentRun } from "../calc/recent-runs.ts";
 
 // Wave 5.83C-1 — engine label stamped on every per-bucket result so the UI can
 // render the badge (fast path vs. legacy Lua kernel). Mirrors the literals in
@@ -618,6 +623,16 @@ export function registerCalcRoute(
   getRedis: () => RedisLike,
   opts: CalcOpts,
 ): void {
+  // Wave 6.01 — read-only listing of the recent-runs ring buffer. Default
+  // limit=5 covers the Observability card's expanded mini-table; max=20
+  // matches the buffer capacity. Out-of-range / non-numeric inputs clamp
+  // silently so a stray "?limit=foo" still returns a usable response.
+  app.get<{ Querystring: { limit?: string } }>("/calc/recent", async (req) => {
+    const raw = Number(req.query?.limit);
+    const limit = Number.isFinite(raw) && raw > 0 ? Math.min(Math.floor(raw), 20) : 5;
+    return { items: listRecentRuns(limit) };
+  });
+
   app.post<{ Body: CalcBody; Querystring: CalcQuery }>("/calc/sbm", async (req, reply) => {
     const risk_class_raw = req.body?.risk_class;
     const legRaw = req.body?.sensitivity_type;
@@ -744,6 +759,31 @@ export function registerCalcRoute(
       reply.code(outcome.statusCode);
       return outcome.body;
     }
+    // Wave 6.01 — record the served per-class response so the Observability
+    // "Last Calculation" card can surface it. Push on cache hits too with
+    // cache: "hit" so a warm cell still updates the card. Scenario only
+    // rides along when the request explicitly set correlation_regime; the
+    // default "medium" stays implicit.
+    const b = outcome.body as {
+      charge?: number;
+      total_ms?: number;
+      fanout_ms?: number;
+      cache?: "hit" | "miss";
+      engine?: string;
+      per_bucket?: unknown[];
+    };
+    pushRecentRun({
+      kind: "per_class",
+      risk_class,
+      leg,
+      ...(regimeRaw !== undefined && regimeRaw !== null ? { scenario: regime } : {}),
+      charge: Number(b.charge) || 0,
+      total_ms: Number(b.total_ms) || 0,
+      fanout_ms: Number(b.fanout_ms) || 0,
+      cells_evaluated: Array.isArray(b.per_bucket) ? b.per_bucket.length : 0,
+      cache: b.cache === "hit" ? "hit" : "miss",
+      engine: typeof b.engine === "string" ? b.engine : "",
+    });
     return outcome.body;
   });
 
@@ -1054,7 +1094,7 @@ export function registerCalcRoute(
           : cacheHits === 0 ? "miss"
           : "partial";
 
-      return {
+      const responseBody = {
         total_sbm,
         winning_scenario,
         scenario_totals: {
@@ -1081,6 +1121,26 @@ export function registerCalcRoute(
         },
         resolved_command_summary: `${plan.length} FT.AGGREGATE+FCALL fan-out via /calc/sbm (${classes.length} classes × ${legs.length} legs × ${scenarios.length} scenarios)`,
       };
+      // Wave 6.01 — push the orchestrated total onto the recent-runs ring
+      // buffer so the Observability "Last Calculation" card flips from the
+      // per-class headline to "Total SBM" after a /calc/sbm/total run.
+      // `cache: "hit"` only when every cell was a cache hit (orchestratorCache
+      // === "hit"); partial / miss both record as "miss" — the precise count
+      // lives in `cache_hits`.
+      pushRecentRun({
+        kind: "total",
+        charge: total_sbm,
+        total_ms: responseBody.performance.total_ms,
+        cumulative_ms: responseBody.performance.cumulative_ms,
+        parallelism_factor: responseBody.performance.parallelism_factor,
+        redis_ops_count: opsFired,
+        ops_skipped,
+        cells_empty: cellsEmpty,
+        cache_hits: cacheHits,
+        cache: orchestratorCache === "hit" ? "hit" : "miss",
+        engine: "orchestrator",
+      });
+      return responseBody;
     },
   );
 

@@ -5,13 +5,16 @@ import { MetricHistoryModal } from "../components/MetricHistoryModal";
 import { TimingStrip } from "../components/TimingStrip";
 import { EnterpriseCallout } from "../components/EnterpriseCallout";
 import { ShardMetricsStrip } from "../components/ShardMetricsStrip";
+import { LastCalcCard } from "../components/LastCalcCard";
 import {
   getObservabilityKeys,
   getObservabilityMemory,
   getObservabilityShards,
+  getRecentCalcRuns,
   type ObservabilityKeysResponse,
   type ObservabilityMemoryResponse,
   type ObservabilityShardsResponse,
+  type RecentCalcRun,
 } from "../lib/api";
 import {
   OBS_REFRESH_OPTIONS,
@@ -23,6 +26,7 @@ interface ObservabilityData {
   keys: ObservabilityKeysResponse;
   memory: ObservabilityMemoryResponse;
   shards: ObservabilityShardsResponse;
+  recent: RecentCalcRun[];
 }
 
 type Status =
@@ -69,12 +73,13 @@ export function Observability() {
     inFlightRef.current = true;
     setInFlight(true);
     try {
-      const [keys, memory, shards] = await Promise.all([
+      const [keys, memory, shards, recent] = await Promise.all([
         getObservabilityKeys("sens:"),
         getObservabilityMemory(),
         getObservabilityShards(),
+        getRecentCalcRuns(5),
       ]);
-      setStatus({ kind: "ready", data: { keys, memory, shards } });
+      setStatus({ kind: "ready", data: { keys, memory, shards, recent: recent.items } });
       setLastError(null);
       setLastFetchAt(Date.now());
       setNow(Date.now());
@@ -239,7 +244,9 @@ export function Observability() {
         </div>
       )}
 
-      {status.kind === "ready" && <ObservabilityReady data={status.data} pulseKey={pulseKey} />}
+      {status.kind === "ready" && (
+        <ObservabilityReady data={status.data} pulseKey={pulseKey} now={now} />
+      )}
     </>
   );
 }
@@ -253,7 +260,15 @@ interface SnapshotMetricSpec {
   format: (v: number) => string;
 }
 
-function ObservabilityReady({ data, pulseKey }: { data: ObservabilityData; pulseKey: number }) {
+function ObservabilityReady({
+  data,
+  pulseKey,
+  now,
+}: {
+  data: ObservabilityData;
+  pulseKey: number;
+  now: number;
+}) {
   const totalKeys = data.keys.dbsize;
   const memHuman = data.memory.used_memory_human ?? "—";
   const memBytes = Number(data.memory.used_memory ?? 0);
@@ -287,6 +302,7 @@ function ObservabilityReady({ data, pulseKey }: { data: ObservabilityData; pulse
           ))}
         </div>
       </PanelCard>
+      <LastCalcCard items={data.recent} now={now} />
       <PanelCard title="Per-shard ops/sec">
         <TimingStrip
           shards={shards.map((s) => ({

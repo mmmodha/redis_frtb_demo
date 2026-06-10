@@ -34,6 +34,7 @@ function defaultHandler(url: string): Response {
       { shardId: "shard-beta",  role: "master", opsPerSec: 200, slotCount: 8192, usedMemoryBytes: 2048, netInBytes: 0, netOutBytes: 0 },
     ]);
   }
+  if (url.includes("/calc/recent")) return jsonResponse({ items: [] });
   return jsonResponse({}, 404);
 }
 

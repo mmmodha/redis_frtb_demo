@@ -59,6 +59,7 @@ describe("<Observability />", () => {
           { shardId: "shard-2", role: "master", opsPerSec: 980, slotCount: 5462, usedMemoryBytes: 524288, netInBytes: 0, netOutBytes: 0 },
         ]);
       }
+      if (url.includes("/calc/recent")) return jsonResponse({ items: [] });
       return jsonResponse({}, 404);
     });
     renderRoute();
@@ -81,6 +82,7 @@ describe("<Observability />", () => {
       if (url.endsWith("/observability/shards")) {
         return jsonResponse([]);
       }
+      if (url.includes("/calc/recent")) return jsonResponse({ items: [] });
       return jsonResponse({}, 404);
     });
     renderRoute();
@@ -121,6 +123,7 @@ describe("<Observability />", () => {
           target_label: "tA",
         });
       }
+      if (url.includes("/calc/recent")) return jsonResponse({ items: [] });
       return jsonResponse({}, 404);
     });
     renderRoute();
@@ -152,6 +155,7 @@ describe("<Observability />", () => {
           points: [], reason: "module-not-loaded", target_label: "tA",
         });
       }
+      if (url.includes("/calc/recent")) return jsonResponse({ items: [] });
       return jsonResponse({}, 404);
     });
     renderRoute();
@@ -171,6 +175,7 @@ describe("<Observability />", () => {
       if (url.endsWith("/observability/shards")) {
         return jsonResponse([]);
       }
+      if (url.includes("/calc/recent")) return jsonResponse({ items: [] });
       return jsonResponse({}, 404);
     });
     renderRoute();

@@ -126,3 +126,57 @@
 .shard-tile__row { display: flex; justify-content: space-between; align-items: baseline; font-size: 0.8125rem; }
 .shard-tile__label { color: var(--redis-text-secondary); }
 .shard-tile__value { font-family: var(--font-mono); color: var(--redis-text-primary); font-weight: 600; }
+
+/* Wave 6.01 — "Last Calculation" card on the Observability page. Reuses the
+   existing PanelCard frame + MetricTile grid; the toggle button is a
+   transparent full-bleed wrapper so the entire card body is clickable. */
+.last-calc__empty {
+  color: var(--redis-text-secondary);
+  font-size: 0.8125rem;
+  padding: calc(var(--grid) * 0.5) 0;
+}
+.last-calc__toggle {
+  display: grid;
+  gap: calc(var(--grid) * 0.75);
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  color: inherit;
+  font: inherit;
+}
+.last-calc__toggle:focus-visible {
+  outline: 2px solid var(--redis-hyper);
+  outline-offset: 2px;
+  border-radius: var(--radius);
+}
+.last-calc__header {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  color: var(--redis-text-primary);
+}
+.last-calc__table {
+  width: 100%;
+  margin-top: var(--grid);
+  border-collapse: collapse;
+  font-size: 0.8125rem;
+}
+.last-calc__table th,
+.last-calc__table td {
+  text-align: left;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--redis-border-secondary);
+}
+.last-calc__table th {
+  font-weight: 600;
+  color: var(--redis-text-secondary);
+  text-transform: uppercase;
+  font-size: 0.6875rem;
+  letter-spacing: 0.04em;
+}
+.last-calc__table td {
+  font-family: var(--font-mono);
+  color: var(--redis-text-primary);
+}
