@@ -496,48 +496,46 @@ button.drilldown-pill:focus-visible {
   position: relative;
 }
 
-/* Wave 6.02b — single LED dot traveling the in-flight elapsed pill's
-   border. The pill body stays static; a small round bright dot rides the
-   rounded-rectangle outline via offset-path: inset(0 round 999px). A point
-   has no tangent, so the dot stays glued to the path through the rounded
-   corners (no streak artifact). Reduced-motion falls back to a static soft
-   glow so the affordance survives accessibility settings. */
-.calc-panel__total-elapsed--running::before {
-  content: "";
-  position: absolute;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--redis-hyper, #FF4438);
-  box-shadow:
-    0 0 6px rgba(255, 68, 56, 0.85),
-    0 0 12px rgba(255, 68, 56, 0.45);
-  offset-path: inset(0 round 999px);
-  offset-distance: 0%;
-  pointer-events: none;
-  animation: calc-total-elapsed-comet 1.6s linear infinite;
-}
-@keyframes calc-total-elapsed-comet {
-  to { offset-distance: 100%; }
-}
-@media (prefers-reduced-motion: reduce) {
-  .calc-panel__total-elapsed--running::before {
-    animation: none;
-    background: none;
-    filter: none;
+/* Wave 6.04 — Iris primitive: soft breathing halo in Redis Hyper.
+   Two-layer box-shadow (inner crisp + outer soft) breathes in opacity +
+   radius over 2s. Used on --running (animated) and --final (paused
+   snapshot — same shadow values at the breath's mid-point, no animation). */
+@keyframes calc-total-elapsed-iris {
+  0%, 100% {
+    box-shadow:
+      0 0 4px rgba(255, 68, 56, 0.35),
+      0 0 10px rgba(255, 68, 56, 0.20);
   }
-  .calc-panel__total-elapsed--running {
-    box-shadow: 0 0 8px rgba(255, 68, 56, 0.45);
-    border-color: rgba(255, 68, 56, 0.55);
+  50% {
+    box-shadow:
+      0 0 6px rgba(255, 68, 56, 0.65),
+      0 0 18px rgba(255, 68, 56, 0.40);
   }
 }
 
-/* Wave 6.02 — static "computed in Ns" pill in the result headline. Reuses
-   the base pill shape; the --final modifier swaps in a faded red border so
-   the visual lineage from the spinning in-flight pill stays obvious. */
+.calc-panel__total-elapsed--running {
+  border-color: rgba(255, 68, 56, 0.55);
+  animation: calc-total-elapsed-iris 2s ease-in-out infinite;
+}
+
 .calc-panel__total-elapsed--final {
-  border-color: rgba(255, 68, 56, 0.35);
+  /* Paused snapshot of the iris at its mid-breath — same primitive, no
+     animation. Visual lineage is obvious. */
+  border-color: rgba(255, 68, 56, 0.55);
+  box-shadow:
+    0 0 6px rgba(255, 68, 56, 0.65),
+    0 0 18px rgba(255, 68, 56, 0.40);
   color: var(--redis-text-secondary);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .calc-panel__total-elapsed--running {
+    animation: none;
+    /* Static mid-breath shadow so the affordance is still visible. */
+    box-shadow:
+      0 0 6px rgba(255, 68, 56, 0.65),
+      0 0 18px rgba(255, 68, 56, 0.40);
+  }
 }
 
 /* Wave 5.96D — 3×3 class × leg skeleton grid shown during in-flight. Mirrors
