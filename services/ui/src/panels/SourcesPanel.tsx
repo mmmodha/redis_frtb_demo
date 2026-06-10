@@ -232,7 +232,7 @@ export function SourcesPanel() {
         </div>
       ) : null}
 
-      {error || (unreachable && uploads.length > 0) ? (
+      {error || unreachable ? (
         <PanelCard
           title="Sources error"
           actions={
@@ -241,18 +241,6 @@ export function SourcesPanel() {
         >
           <p role="alert" className="sources-panel__error">
             {error ?? "Failed to load sources: source service unreachable"}
-          </p>
-        </PanelCard>
-      ) : null}
-
-      {unreachable && uploads.length === 0 ? (
-        <PanelCard title="Data sources">
-          <p>
-            No sources yet — drop a CSV to begin, or use the synthetic generator on the
-            Ingest tab.
-          </p>
-          <p data-testid="sources-empty-offline" className="panel__subhead">
-            (source service is offline — uploads will retry once it's back)
           </p>
         </PanelCard>
       ) : null}

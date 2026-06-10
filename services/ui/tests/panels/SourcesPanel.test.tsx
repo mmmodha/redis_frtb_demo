@@ -80,8 +80,13 @@ describe("SourcesPanel", () => {
   it("shows the empty-state copy when GET /sources returns []", async () => {
     fetchMock.mockImplementation(async () => jsonResponse([]));
     renderPanel();
-    await waitFor(() => expect(screen.getByText(/no sources yet/i)).toBeInTheDocument());
-    expect(screen.getByText(/drop a CSV to begin/i)).toBeInTheDocument();
+    await waitFor(() =>
+      expect(
+        screen.getByText(
+          "No sources yet — drop a CSV to begin, or use the synthetic generator on the Ingest tab.",
+        ),
+      ).toBeInTheDocument(),
+    );
   });
 
   it("shows a loading indicator while GET /sources is in flight", () => {
@@ -97,20 +102,19 @@ describe("SourcesPanel", () => {
     expect(screen.getByRole("button", { name: /retry/i })).toBeInTheDocument();
   });
 
-  it("Wave 5.90 — 502 unreachable + no uploads → renders empty-state with offline hint", async () => {
+  it("Wave 5.90a — 502 unreachable → renders red error card (regardless of uploads)", async () => {
     fetchMock.mockImplementation(async () =>
       jsonResponse({ error: "source service unreachable" }, 502),
     );
     renderPanel();
     await waitFor(() =>
-      expect(screen.getByTestId("sources-empty-offline")).toBeInTheDocument(),
+      expect(screen.getByText(/failed to load sources/i)).toBeInTheDocument(),
     );
-    expect(screen.getByText(/no sources yet/i)).toBeInTheDocument();
-    expect(screen.getByText(/source service is offline/i)).toBeInTheDocument();
-    expect(screen.queryByText(/failed to load sources/i)).toBeNull();
+    expect(screen.getByRole("button", { name: /retry/i })).toBeInTheDocument();
+    expect(screen.queryByTestId("sources-empty-offline")).toBeNull();
   });
 
-  it("Wave 5.90 — 502 unreachable + an upload entry → renders red error card", async () => {
+  it("Wave 5.90a — 502 unreachable with an upload entry → still renders red error card", async () => {
     const harness = installFakeXHR();
     fetchMock.mockImplementation(async () =>
       jsonResponse({ error: "source service unreachable" }, 502),
