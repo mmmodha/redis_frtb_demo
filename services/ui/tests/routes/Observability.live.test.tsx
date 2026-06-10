@@ -235,6 +235,23 @@ describe("<Observability /> live refresh", () => {
     expect(button.disabled).toBe(false);
   });
 
+  it("Wave 6.03 — manual refresh button is hidden when auto-refresh is on", async () => {
+    installFetchMock();
+    renderRoute();
+    await flush(0);
+    // Default cadence is 2s — button is redundant and should not render.
+    expect(screen.queryByTestId("obs-manual-refresh")).toBeNull();
+
+    // Switching to Off reveals it; switching back hides it again.
+    fireEvent.change(screen.getByTestId("obs-refresh-select"), { target: { value: "0" } });
+    await flush(0);
+    expect(screen.queryByTestId("obs-manual-refresh")).not.toBeNull();
+
+    fireEvent.change(screen.getByTestId("obs-refresh-select"), { target: { value: "2000" } });
+    await flush(0);
+    expect(screen.queryByTestId("obs-manual-refresh")).toBeNull();
+  });
+
   it("passes the latest shards through to the ShardMetricsStrip", async () => {
     installFetchMock();
     renderRoute();
