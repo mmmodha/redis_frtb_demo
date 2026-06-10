@@ -7,6 +7,7 @@ import {
   ingestSource,
   listSources,
   saveMapping,
+  ServiceUnreachableError,
   type ColumnMapping,
   type InferredColumn,
   type SourceRecord,
@@ -36,6 +37,7 @@ export function SourcesPanel() {
   const [sources, setSources] = useState<SourceRecord[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [emptyError, setEmptyError] = useState<EmptyTargetError | null>(null);
+  const [unreachable, setUnreachable] = useState(false);
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [wizard, setWizard] = useState<WizardState | null>(null);
@@ -49,12 +51,16 @@ export function SourcesPanel() {
     setLoading(true);
     setError(null);
     setEmptyError(null);
+    setUnreachable(false);
     try {
       const s = await listSources();
       setSources(s);
     } catch (e) {
       if (e instanceof EmptyTargetError) {
         setEmptyError(e);
+        setSources(null);
+      } else if (e instanceof ServiceUnreachableError) {
+        setUnreachable(true);
         setSources(null);
       } else {
         setError(`Failed to load sources: ${(e as Error).message}`);
@@ -226,18 +232,32 @@ export function SourcesPanel() {
         </div>
       ) : null}
 
-      {error ? (
+      {error || (unreachable && uploads.length > 0) ? (
         <PanelCard
           title="Sources error"
           actions={
             <button type="button" className="btn" onClick={() => { void refresh(); }}>Retry</button>
           }
         >
-          <p role="alert" className="sources-panel__error">{error}</p>
+          <p role="alert" className="sources-panel__error">
+            {error ?? "Failed to load sources: source service unreachable"}
+          </p>
         </PanelCard>
       ) : null}
 
-      {!loading && !error && sources && sources.length === 0 ? (
+      {unreachable && uploads.length === 0 ? (
+        <PanelCard title="Data sources">
+          <p>
+            No sources yet — drop a CSV to begin, or use the synthetic generator on the
+            Ingest tab.
+          </p>
+          <p data-testid="sources-empty-offline" className="panel__subhead">
+            (source service is offline — uploads will retry once it's back)
+          </p>
+        </PanelCard>
+      ) : null}
+
+      {!loading && !error && !unreachable && sources && sources.length === 0 ? (
         <PanelCard title="Data sources">
           <p>
             No sources yet — drop a CSV to begin, or use the synthetic generator on the

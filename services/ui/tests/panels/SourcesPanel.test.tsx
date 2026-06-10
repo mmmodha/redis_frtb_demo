@@ -97,6 +97,37 @@ describe("SourcesPanel", () => {
     expect(screen.getByRole("button", { name: /retry/i })).toBeInTheDocument();
   });
 
+  it("Wave 5.90 — 502 unreachable + no uploads → renders empty-state with offline hint", async () => {
+    fetchMock.mockImplementation(async () =>
+      jsonResponse({ error: "source service unreachable" }, 502),
+    );
+    renderPanel();
+    await waitFor(() =>
+      expect(screen.getByTestId("sources-empty-offline")).toBeInTheDocument(),
+    );
+    expect(screen.getByText(/no sources yet/i)).toBeInTheDocument();
+    expect(screen.getByText(/source service is offline/i)).toBeInTheDocument();
+    expect(screen.queryByText(/failed to load sources/i)).toBeNull();
+  });
+
+  it("Wave 5.90 — 502 unreachable + an upload entry → renders red error card", async () => {
+    const harness = installFakeXHR();
+    fetchMock.mockImplementation(async () =>
+      jsonResponse({ error: "source service unreachable" }, 502),
+    );
+    renderPanel();
+    const dz = await waitFor(() => screen.getByTestId("sources-dropzone"));
+    const file = new File(["a,b\n1,2"], "drop.csv", { type: "text/csv" });
+    const dt = { files: [file], items: [{ kind: "file", type: "text/csv", getAsFile: () => file }], types: ["Files"] } as unknown as DataTransfer;
+    fireEvent.drop(dz, { dataTransfer: dt });
+    await harness.waitForSend();
+    await waitFor(() =>
+      expect(screen.getByText(/failed to load sources/i)).toBeInTheDocument(),
+    );
+    expect(screen.getByRole("button", { name: /retry/i })).toBeInTheDocument();
+    expect(screen.queryByTestId("sources-empty-offline")).toBeNull();
+  });
+
   it("renders one source-row per source with name, size, status pill, and per-row actions", async () => {
     const sources = [
       makeSource({ id: "src-1", name: "girr-100k.csv", size_bytes: 1024 * 1024, status: "mapped" }),

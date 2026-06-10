@@ -5,7 +5,19 @@
 // across Wave 3.5 A/B/C agents.
 
 import { apiBase } from "./api";
-import { buildApiError } from "./empty-target";
+import { buildApiError, readErrorBody } from "./empty-target";
+
+// Wave 5.90 — typed signal for the api's 502 {error:"source service
+// unreachable"} response from sources-proxy.ts. Panels use this to render a
+// friendly empty-state instead of a red error when the user hasn't uploaded
+// anything yet this session.
+export class ServiceUnreachableError extends Error {
+  readonly kind = "service-unreachable" as const;
+  constructor(message = "source service unreachable") {
+    super(message);
+    this.name = "ServiceUnreachableError";
+  }
+}
 
 export type SourceFormat = "csv" | "jsonl" | "parquet";
 export type SourceOrigin = "upload" | "synthetic";
@@ -75,7 +87,23 @@ async function asError(res: Response, fallback: string): Promise<Error> {
 export async function listSources(): Promise<SourceRecord[]> {
   const res = await fetch(`${apiBase()}/sources`);
   if (res.status === 404) return [];
-  if (!res.ok) throw await asError(res, `api /sources ${res.status}`);
+  if (!res.ok) {
+    if (res.status === 502) {
+      const body = await readErrorBody(res);
+      if (
+        body && typeof body === "object" &&
+        (body as { error?: unknown }).error === "source service unreachable"
+      ) {
+        throw new ServiceUnreachableError();
+      }
+      if (body && typeof body === "object" && "error" in body) {
+        const e = (body as { error?: unknown }).error;
+        if (typeof e === "string" && e.length > 0) throw new Error(e);
+      }
+      throw new Error(`api /sources ${res.status}`);
+    }
+    throw await asError(res, `api /sources ${res.status}`);
+  }
   const body = (await res.json()) as SourceRecord[] | { sources?: SourceRecord[] };
   if (Array.isArray(body)) return body;
   if (body && Array.isArray(body.sources)) return body.sources;
