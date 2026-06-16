@@ -21,6 +21,7 @@ import { registerFacetsRoute } from "./routes/facets.ts";
 import { registerObservabilityRoutes } from "./routes/observability.ts";
 import { registerSourcesProxyRoutes } from "./routes/sources-proxy.ts";
 import { registerLoadgenProxyRoutes } from "./routes/loadgen-proxy.ts";
+import { registerIngestShardsRoutes } from "./routes/ingest-shards.ts";
 import { registerGeneratorRoutes } from "./routes/generator.ts";
 import { registerAdminRoutes } from "./routes/admin.ts";
 import { registerInternalTargetRoutes } from "./routes/internal-target.ts";
@@ -94,6 +95,9 @@ export interface CreateServerOpts {
   // Upstream base URL for the loadgen-service proxy. Falls back to
   // LOADGEN_BASE env var, then to the compose-internal default.
   loadgenBase?: string;
+  // Wave 6.12a — upstream base URL for the ingest shard-control proxy.
+  // Falls back to INGEST_URL env var, then to the compose-internal default.
+  ingestBase?: string;
   // SSE tick interval for /observability/shards/stream (default 1000ms). The
   // tests dial this down so the suite stays fast.
   sseIntervalMs?: number;
@@ -231,6 +235,7 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
 
   registerSourcesProxyRoutes(app, { sourceBase: opts.sourceBase, corsAllowed });
   registerLoadgenProxyRoutes(app, { loadgenBase: opts.loadgenBase, corsAllowed });
+  registerIngestShardsRoutes(app, { ingestBase: opts.ingestBase, corsAllowed });
 
   // Wave 5.16w — in-flight registry surface. Polled by the UI every 2s for
   // the lockout banner; SSE channel pushes immediate updates so the banner
