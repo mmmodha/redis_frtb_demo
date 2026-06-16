@@ -26,13 +26,18 @@ vi.mock("../../src/components/MetricTile", () => ({
 }));
 
 function renderPanel() {
-  return render(
+  const r = render(
     <MemoryRouter>
       <GeneratorRunProvider>
         <IngestPanel />
       </GeneratorRunProvider>
     </MemoryRouter>,
   );
+  // Wave 6.17 — preflight banner now lives under the outer Advanced
+  // (custom run) disclosure on the IngestPanel; open it so banner queries
+  // resolve.
+  fireEvent.click(screen.getByTestId("ingest-advanced-toggle"));
+  return r;
 }
 
 const preflightFail = {

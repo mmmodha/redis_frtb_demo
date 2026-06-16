@@ -49,6 +49,10 @@ export interface GeneratorConfig {
   // profile-derived value (1 on standalone-presenting targets). Numbers map
   // to N modulo-routed streams; "per-bucket" emits one stream per bucket.
   stream_shards?: number | "per-bucket";
+  // Wave 6.13b — defer XADD-time trimming; producer issues XTRIM with the
+  // resolved stream_maxlen cap at close(). Used by the Large / Overnight
+  // presets in IngestPanel where XADD-time MAXLEN would slow the producer.
+  defer_trim?: boolean;
 }
 
 export interface GeneratorStartResponse extends IngestRunResponse {
@@ -350,6 +354,25 @@ export async function rebuildIndexes(): Promise<RebuildIndexesResponse> {
     throw new Error(`api /admin/rebuild-indexes ${detail}`);
   }
   return (await res.json()) as RebuildIndexesResponse;
+}
+
+// Wave 6.17 — preset auto-fix coordinator. Runs preflight; if a check failed
+// and the api advertises can_rebuild=true, calls /admin/rebuild-indexes and
+// re-runs preflight so the caller observes the post-repair state. The
+// rebuilt flag tells the IngestPanel preset flow whether to surface a
+// "Repaired indexes" line in the status bar.
+export interface PreflightAutoFixResult {
+  preflight: PreflightResponse;
+  rebuilt: boolean;
+}
+
+export async function preflightAndRebuildIfNeeded(): Promise<PreflightAutoFixResult> {
+  const initial = await preflight();
+  if (initial.ok) return { preflight: initial, rebuilt: false };
+  if (!initial.can_rebuild) return { preflight: initial, rebuilt: false };
+  await rebuildIndexes();
+  const after = await preflight();
+  return { preflight: after, rebuilt: true };
 }
 
 export async function cancelGenerator(runId: string): Promise<void> {

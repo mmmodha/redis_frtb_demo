@@ -31,13 +31,17 @@ function fakeCtx(run: GeneratorRunState | null): GeneratorRunContextValue {
 }
 
 function renderPanel(run: GeneratorRunState | null) {
-  return render(
+  const r = render(
     <MemoryRouter>
       <GeneratorRunContext.Provider value={fakeCtx(run)}>
         <IngestPanel />
       </GeneratorRunContext.Provider>
     </MemoryRouter>,
   );
+  // Wave 6.17 — fan-out card now lives under the outer Advanced (custom run)
+  // disclosure on the IngestPanel; open it so subsequent queries find it.
+  fireEvent.click(screen.getByTestId("ingest-advanced-toggle"));
+  return r;
 }
 
 function runningRun(runId: string): GeneratorRunState {

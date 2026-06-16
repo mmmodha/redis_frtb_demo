@@ -201,6 +201,9 @@ describe("IngestPanel", () => {
       return { ok: true, json: async () => ({}) };
     });
     renderPanel();
+    // Wave 6.17 — Generate button moved under the outer "Advanced
+    // (custom run)" disclosure on the IngestPanel; open it first.
+    fireEvent.click(await screen.findByTestId("ingest-advanced-toggle"));
     const generateBtn = await waitFor(() => screen.getByRole("button", { name: /^generate$/i }));
     fireEvent.click(generateBtn);
     await waitFor(() => {

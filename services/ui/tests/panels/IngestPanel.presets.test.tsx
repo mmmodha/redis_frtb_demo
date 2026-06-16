@@ -74,6 +74,13 @@ function baselineFetch(fetchMock: ReturnType<typeof vi.fn>) {
 }
 
 function generatorCard() {
+  // Wave 6.17 — synthetic generator now lives under the outer "Advanced
+  // (custom run)" disclosure on the IngestPanel; open it on first call so
+  // the inner card is mounted before the test queries it.
+  const outer = screen.queryByTestId("ingest-advanced-toggle");
+  if (outer && outer.getAttribute("aria-expanded") === "false") {
+    fireEvent.click(outer);
+  }
   return screen.getAllByTestId("panel-card").find((el) => el.getAttribute("data-title") === "Synthetic generator")!;
 }
 

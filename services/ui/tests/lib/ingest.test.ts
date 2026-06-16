@@ -7,6 +7,8 @@ import {
   flushDb,
   cancelGenerator,
   cancelAllGeneratorRuns,
+  preflightAndRebuildIfNeeded,
+  type PreflightResponse,
   type ProgressFrame,
   type TerminalFrame,
 } from "../../src/lib/ingest";
@@ -261,5 +263,101 @@ describe("ingest api client", () => {
     // The cancel path must not abort the SSE fetch — the server is expected
     // to deliver the terminal frame on its own.
     expect(capturedSignal!.aborted).toBe(false);
+  });
+
+  // Wave 6.17 — preflightAndRebuildIfNeeded coordinates GET /admin/preflight
+  // with the conditional POST /admin/rebuild-indexes. The four branches the
+  // IngestPanel preset orchestrator relies on:
+  //   (a) ok=true                     → no rebuild, rebuilt=false
+  //   (b) ok=false, can_rebuild=true  → rebuild + re-preflight returned
+  //   (c) ok=false, can_rebuild=false → no rebuild, original preflight kept
+  //   (d) rebuild 500                 → error propagates to the caller
+  describe("preflightAndRebuildIfNeeded", () => {
+    function pf(ok: boolean, canRebuild: boolean): PreflightResponse {
+      return {
+        ok,
+        checks: {
+          idx_sens: { ok, missing: ok ? [] : ["node-0"] },
+          frtb_library: { ok: true, loaded: true },
+          stream: { ok: true, exists: true },
+        },
+        can_rebuild: canRebuild,
+      };
+    }
+
+    function recordingFetch(handler: (url: string, method: string) => Response) {
+      const calls: Array<{ url: string; method: string }> = [];
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const method = init?.method ?? "GET";
+        calls.push({ url, method });
+        return handler(url, method);
+      }) as typeof fetch;
+      return calls;
+    }
+
+    it("short-circuits on ok=true (no /admin/rebuild-indexes call, rebuilt=false)", async () => {
+      const calls = recordingFetch((url) => {
+        if (/\/admin\/preflight$/.test(url)) {
+          return new Response(JSON.stringify(pf(true, false)), { headers: { "content-type": "application/json" } });
+        }
+        return new Response("{}", { status: 500 });
+      });
+      const res = await preflightAndRebuildIfNeeded();
+      expect(res.rebuilt).toBe(false);
+      expect(res.preflight.ok).toBe(true);
+      expect(calls.filter((c) => /\/admin\/rebuild-indexes$/.test(c.url))).toHaveLength(0);
+      expect(calls.filter((c) => /\/admin\/preflight$/.test(c.url))).toHaveLength(1);
+    });
+
+    it("on ok=false + can_rebuild=true: POSTs /admin/rebuild-indexes, re-runs preflight, returns rebuilt=true", async () => {
+      let preflightCalls = 0;
+      const calls = recordingFetch((url, method) => {
+        if (/\/admin\/preflight$/.test(url)) {
+          preflightCalls += 1;
+          // First probe fails; the re-probe after rebuild reports healthy.
+          const body = preflightCalls === 1 ? pf(false, true) : pf(true, false);
+          return new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } });
+        }
+        if (/\/admin\/rebuild-indexes$/.test(url) && method === "POST") {
+          return new Response(JSON.stringify({ ok: true, ms: 1, bootstrap: { ok: true } }), {
+            headers: { "content-type": "application/json" },
+          });
+        }
+        return new Response("{}", { status: 500 });
+      });
+      const res = await preflightAndRebuildIfNeeded();
+      expect(res.rebuilt).toBe(true);
+      expect(res.preflight.ok).toBe(true);
+      expect(calls.filter((c) => /\/admin\/rebuild-indexes$/.test(c.url) && c.method === "POST")).toHaveLength(1);
+      expect(calls.filter((c) => /\/admin\/preflight$/.test(c.url))).toHaveLength(2);
+    });
+
+    it("on ok=false + can_rebuild=false: skips rebuild and returns the original preflight verbatim", async () => {
+      const calls = recordingFetch((url) => {
+        if (/\/admin\/preflight$/.test(url)) {
+          return new Response(JSON.stringify(pf(false, false)), { headers: { "content-type": "application/json" } });
+        }
+        return new Response("{}", { status: 500 });
+      });
+      const res = await preflightAndRebuildIfNeeded();
+      expect(res.rebuilt).toBe(false);
+      expect(res.preflight.ok).toBe(false);
+      expect(res.preflight.can_rebuild).toBe(false);
+      expect(calls.filter((c) => /\/admin\/rebuild-indexes$/.test(c.url))).toHaveLength(0);
+    });
+
+    it("propagates the error when /admin/rebuild-indexes fails", async () => {
+      recordingFetch((url, method) => {
+        if (/\/admin\/preflight$/.test(url)) {
+          return new Response(JSON.stringify(pf(false, true)), { headers: { "content-type": "application/json" } });
+        }
+        if (/\/admin\/rebuild-indexes$/.test(url) && method === "POST") {
+          return new Response(JSON.stringify({ error: "bootstrap failed" }), { status: 500, headers: { "content-type": "application/json" } });
+        }
+        return new Response("{}", { status: 500 });
+      });
+      await expect(preflightAndRebuildIfNeeded()).rejects.toThrow(/rebuild-indexes/);
+    });
   });
 });

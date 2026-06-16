@@ -19,6 +19,7 @@ import {
   getIngestShards,
   listSources,
   preflight,
+  preflightAndRebuildIfNeeded,
   rebuildIndexes,
   setIngestShards,
   startIngest,
@@ -126,6 +127,43 @@ function parseManualMaxlen(raw: string): number | null | Error {
     return new Error("Stream cap must be a non-negative integer (0 to disable).");
   }
   return n;
+}
+
+// Wave 6.17 — five fixed run presets that wire all dials (rows, stream
+// fan-out, stream_maxlen, defer_trim) for the primary IngestPanel surface.
+// Each preset is paired with an auto-align step that POSTs /ingest/shards
+// before /generator/start/stream so the consumer fan-out matches the
+// producer dial without manual fiddling. Numbers mirror the task spec; the
+// description is the small grey line under each radio button.
+export type RunPresetKey = "quick" | "demo" | "medium" | "large" | "overnight";
+export interface RunPreset {
+  key: RunPresetKey;
+  label: string;
+  rows: number;
+  shards: number;
+  // 0 ⇒ no MAXLEN cap (XADD without ~ MAXLEN); positive ⇒ ship as the
+  // resolved stream_maxlen on the generator request.
+  maxlen: number;
+  deferTrim: boolean;
+  description: string;
+}
+export const RUN_PRESETS: Record<RunPresetKey, RunPreset> = {
+  quick:     { key: "quick",     label: "Quick",     rows: 10_000,      shards: 1,  maxlen: 100_000,    deferTrim: false, description: "10k rows · 1 shard · 100k cap" },
+  demo:      { key: "demo",      label: "Demo",      rows: 100_000,     shards: 1,  maxlen: 200_000,    deferTrim: false, description: "100k rows · 1 shard · 200k cap" },
+  medium:    { key: "medium",    label: "Medium",    rows: 1_000_000,   shards: 4,  maxlen: 2_000_000,  deferTrim: false, description: "1M rows · 4 shards · 2M cap" },
+  large:     { key: "large",     label: "Large",     rows: 10_000_000,  shards: 8,  maxlen: 0,          deferTrim: true,  description: "10M rows · 8 shards · deferred trim" },
+  overnight: { key: "overnight", label: "Overnight", rows: 100_000_000, shards: 16, maxlen: 0,          deferTrim: true,  description: "100M rows · 16 shards · deferred trim" },
+};
+const RUN_PRESET_ORDER: RunPresetKey[] = ["quick", "demo", "medium", "large", "overnight"];
+
+export function buildRunPresetConfig(p: RunPreset): GeneratorConfig {
+  const cfg: GeneratorConfig = {
+    rows: p.rows,
+    stream_shards: p.shards,
+    stream_maxlen: p.maxlen,
+  };
+  if (p.deferTrim) cfg.defer_trim = true;
+  return cfg;
 }
 
 const POLL_MS = 1000;
@@ -321,9 +359,20 @@ export function IngestPanel() {
   // the run the IngestPanel is currently showing happens to be in the
   // cancelled list, we clear it immediately so the progress UI doesn't sit
   // on "running" for the next polling tick.
-  const { run: trackedRun, clearRun: clearTrackedRun } = useGeneratorRun();
+  const { run: trackedRun, clearRun: clearTrackedRun, startRun } = useGeneratorRun();
   // Wave 5.47b — pre-flight banner + submit gate shared with SyntheticGeneratorCard.
   const preflightHandle = usePreflight();
+  // Wave 6.17 — primary preset card state. `presetKey` is the currently
+  // staged preset; `presetStep` is the human-readable label for the current
+  // automation step (preflight → rebuild → shards → start); `presetError`
+  // surfaces any failure that halted the flow. `presetInflight` is true
+  // while the orchestrator is between buttons (preflight call started, run
+  // not yet handed off to GeneratorRunContext).
+  const [presetKey, setPresetKey] = useState<RunPresetKey>("quick");
+  const [presetStep, setPresetStep] = useState<string | null>(null);
+  const [presetError, setPresetError] = useState<string | null>(null);
+  const [presetInflight, setPresetInflight] = useState<boolean>(false);
+  const [advancedOpen, setAdvancedOpen] = useState<boolean>(false);
   // Wave 6.12b — ingest fan-out card state. `ingestShards` mirrors the most
   // recent GET /ingest/shards; `producerDial` is the resolved
   // dials.stream_shards from the active run (when one exists). Both are
@@ -503,6 +552,53 @@ export function IngestPanel() {
     }
   }
 
+  // Wave 6.17 — orchestrator for the primary preset-Start button. Runs
+  // pre-flight, auto-repairs indexes if needed, aligns the ingest consumer
+  // fan-out to the preset's stream_shards, then hands off to startRun. Each
+  // step updates `presetStep` so the operator sees what's happening; any
+  // step throwing bubbles up via `presetError` and halts the flow. The
+  // Start button stays disabled (via presetStartDisabled below) for the
+  // whole sequence and through the tracked-run lifetime.
+  async function onStartPreset(): Promise<void> {
+    const p = RUN_PRESETS[presetKey];
+    setPresetInflight(true);
+    setPresetError(null);
+    setPresetStep("Checking indexes…");
+    try {
+      const { preflight: pf, rebuilt } = await preflightAndRebuildIfNeeded();
+      // Refresh the banner state so the existing rebuild affordance reflects
+      // the post-flow truth; tolerate failures (banner stays stale at worst).
+      void preflightHandle.runPreflight();
+      if (pf.ok === false) {
+        setPresetError("Pre-flight failed after rebuild — open Advanced to inspect.");
+        setPresetStep(null);
+        return;
+      }
+      if (rebuilt) setPresetStep("Indexes repaired.");
+      setPresetStep(`Aligning consumer to ${p.shards} shard${p.shards === 1 ? "" : "s"}…`);
+      const snap = await setIngestShards(p.shards);
+      setIngestShardsState(snap.totalShards);
+      setPresetStep(`Starting ${p.label} run…`);
+      startRun(buildRunPresetConfig(p));
+      // Hand-off is complete: startRun has spawned the SSE stream and
+      // GeneratorRunContext now owns the run lifecycle. Drop the step
+      // label so the run-status line below takes over.
+      setPresetStep(null);
+    } catch (e) {
+      setPresetError((e as Error).message);
+      setPresetStep(null);
+    } finally {
+      setPresetInflight(false);
+    }
+  }
+
+  // Wave 6.17 — Start stays disabled while any step is in flight: the
+  // orchestrator's own pre-startRun window, plus the entire tracked-run
+  // lifetime ("running" + "cancelling"). Once the run hits a terminal
+  // status the button re-enables for the next preset selection.
+  const presetRunInflight = trackedRun?.status === "running" || trackedRun?.status === "cancelling";
+  const presetStartDisabled = presetInflight || presetRunInflight;
+
   // Wave 6.12b — Apply handler for the ingest fan-out card. POST returns
   // the new snapshot synchronously, so the displayed value updates straight
   // away; we still flip `shardRebuilding` until the next GET tick confirms
@@ -573,17 +669,54 @@ export function IngestPanel() {
         </div>
       </PanelCard>
 
-      <PreflightBanner state={preflightHandle.state} onRebuild={() => { void preflightHandle.rebuild(); }} />
-
-      <IngestFanoutCard
-        ingestShards={ingestShards}
-        producerDial={producerDial}
-        rebuilding={shardRebuilding}
-        error={shardError}
-        onApply={onApplyShards}
+      {/* Wave 6.17 — primary preset surface. Five fixed presets wire all
+          dials (rows / fan-out / maxlen / defer_trim) and auto-align the
+          consumer + indexes before each run. The historical free-form
+          controls (preflight banner, fan-out card, synthetic generator
+          form) are moved into the collapsed "Advanced (custom run)"
+          disclosure below. */}
+      <RunPresetCard
+        presetKey={presetKey}
+        onSelect={setPresetKey}
+        onStart={() => { void onStartPreset(); }}
+        startDisabled={presetStartDisabled}
+        inflight={presetInflight}
+        runStatus={trackedRun?.status ?? null}
+        step={presetStep}
+        error={presetError}
       />
 
-      <SyntheticGeneratorCard preflightGate={preflightHandle.ensureFresh} />
+      <button
+        type="button"
+        className="ingest-advanced-toggle"
+        aria-expanded={advancedOpen}
+        aria-controls="ingest-advanced-body"
+        onClick={() => setAdvancedOpen((v) => !v)}
+        data-testid="ingest-advanced-toggle"
+      >
+        {advancedOpen ? "▾ Hide advanced (custom run)" : "▸ Advanced (custom run)"}
+      </button>
+      {advancedOpen ? (
+        <div id="ingest-advanced-body" className="ingest-advanced-body" data-testid="ingest-advanced-body">
+          <PreflightBanner state={preflightHandle.state} onRebuild={() => { void preflightHandle.rebuild(); }} />
+
+          <IngestFanoutCard
+            ingestShards={ingestShards}
+            producerDial={producerDial}
+            rebuilding={shardRebuilding}
+            error={shardError}
+            onApply={onApplyShards}
+          />
+
+          <SyntheticGeneratorCard
+            preflightGate={preflightHandle.ensureFresh}
+            onAlignShards={async (n) => {
+              const snap = await setIngestShards(n);
+              setIngestShardsState(snap.totalShards);
+            }}
+          />
+        </div>
+      ) : null}
 
       <PanelCard title="Admin actions">
         <div className="ingest-admin">
@@ -693,6 +826,99 @@ export function IngestPanel() {
         </PanelCard>
       </section>
     </div>
+  );
+}
+
+// Wave 6.17 — Primary preset surface. Renders the five fixed presets as a
+// radio group and a single Start button. The Start button hands off to the
+// IngestPanel orchestrator (onStartPreset), which runs preflight, repairs
+// indexes if needed, aligns /ingest/shards, then kicks off the run via
+// startRun. Status line below mirrors `step` (orchestrator-side) and the
+// terminal run summary (from GeneratorRunContext via `runStatus`).
+function RunPresetCard(props: {
+  presetKey: RunPresetKey;
+  onSelect: (k: RunPresetKey) => void;
+  onStart: () => void;
+  startDisabled: boolean;
+  inflight: boolean;
+  runStatus: "running" | "cancelling" | "done" | "cancelled" | "error" | null;
+  step: string | null;
+  error: string | null;
+}) {
+  const { presetKey, onSelect, onStart, startDisabled, inflight, runStatus, step, error } = props;
+  const selected = RUN_PRESETS[presetKey];
+  // Button label tracks the high-level state: idle / pre-run automation /
+  // run in flight / cancelling / done. Idle text names the staged preset so
+  // the user knows what Start will fire.
+  const buttonLabel = inflight
+    ? "Starting…"
+    : runStatus === "running"
+      ? "Generating…"
+      : runStatus === "cancelling"
+        ? "Cancelling…"
+        : `Start ${selected.label}`;
+  return (
+    <PanelCard title="Run preset">
+      <div
+        className="ingest-presets"
+        role="radiogroup"
+        aria-label="Run preset"
+        data-testid="ingest-preset-radiogroup"
+      >
+        {RUN_PRESET_ORDER.map((k) => {
+          const p = RUN_PRESETS[k];
+          const checked = presetKey === k;
+          return (
+            <label
+              key={k}
+              className={`ingest-presets__btn${checked ? " ingest-presets__btn--selected" : ""}`}
+              data-testid={`ingest-preset-${k}`}
+            >
+              <input
+                type="radio"
+                name="ingest-preset"
+                value={k}
+                checked={checked}
+                disabled={startDisabled}
+                onChange={() => onSelect(k)}
+              />
+              <span className="ingest-presets__label">{p.label}</span>
+              <span className="ingest-presets__desc">{p.description}</span>
+            </label>
+          );
+        })}
+      </div>
+      <div className="ingest-presets__actions">
+        <button
+          type="button"
+          className="btn btn--primary"
+          disabled={startDisabled}
+          onClick={onStart}
+          data-testid="ingest-preset-start-btn"
+        >
+          {buttonLabel}
+        </button>
+        {step ? (
+          <span
+            className="ingest-presets__step"
+            data-testid="ingest-preset-step"
+            role="status"
+            aria-live="polite"
+          >
+            {step}
+          </span>
+        ) : null}
+        {error ? (
+          <span
+            className="ingest-presets__error"
+            data-testid="ingest-preset-error"
+            role="alert"
+          >
+            {error}
+          </span>
+        ) : null}
+      </div>
+    </PanelCard>
   );
 }
 
@@ -890,8 +1116,15 @@ function fmtMB(n: number): string {
 // progress bar (running / cancelling) and the post-run success/cancelled
 // summary line. Wave 5.38a — state lives in GeneratorRunContext so it
 // survives route changes; the panel only owns form-validation errors.
-function SyntheticGeneratorCard(props: { preflightGate?: () => Promise<PreflightResponse | null> }) {
-  const { preflightGate } = props;
+function SyntheticGeneratorCard(props: {
+  preflightGate?: () => Promise<PreflightResponse | null>;
+  // Wave 6.17 — when the Advanced submission carries an explicit numeric
+  // stream_shards, align the ingest consumer first so the consumer fan-out
+  // matches the producer dial. Mirrors the preset-Start orchestrator's
+  // /ingest/shards hop. Omitted ⇒ no alignment (caller manages it).
+  onAlignShards?: (shards: number) => Promise<void>;
+}) {
+  const { preflightGate, onAlignShards } = props;
   // Wave 5.52 — the two simple-mode controls: Total rows and Class mix.
   const [rows, setRows] = useState<number>(DEFAULT_GEN_ROWS);
   const [mixPct, setMixPct] = useState<Record<(typeof GENERATOR_CLASSES)[number], number>>(
@@ -1143,6 +1376,18 @@ function SyntheticGeneratorCard(props: { preflightGate?: () => Promise<Preflight
       const pf = await preflightGate();
       if (pf && pf.ok === false) {
         setFormError("Pre-flight failed. Use the Rebuild indexes button above.");
+        return;
+      }
+    }
+    // Wave 6.17 — align the ingest consumer fan-out to the explicit numeric
+    // stream_shards before kicking off the run, so an Advanced submission
+    // does not race against a stale consumer shard count. "auto" / "per-bucket"
+    // skip alignment (no number to post).
+    if (onAlignShards && cfg && typeof cfg.stream_shards === "number") {
+      try {
+        await onAlignShards(cfg.stream_shards);
+      } catch (e) {
+        setFormError(`Aligning ingest shards failed: ${(e as Error).message}`);
         return;
       }
     }
