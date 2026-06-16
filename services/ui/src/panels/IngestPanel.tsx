@@ -362,7 +362,7 @@ export function IngestPanel() {
   // the run the IngestPanel is currently showing happens to be in the
   // cancelled list, we clear it immediately so the progress UI doesn't sit
   // on "running" for the next polling tick.
-  const { run: trackedRun, clearRun: clearTrackedRun, startRun } = useGeneratorRun();
+  const { run: trackedRun, clearRun: clearTrackedRun, startRun, cancelRun } = useGeneratorRun();
   // Wave 5.47b — pre-flight banner + submit gate shared with SyntheticGeneratorCard.
   const preflightHandle = usePreflight();
   // Wave 6.17 — primary preset card state. `presetKey` is the currently
@@ -687,6 +687,8 @@ export function IngestPanel() {
         runStatus={trackedRun?.status ?? null}
         step={presetStep}
         error={presetError}
+        trackedRun={trackedRun}
+        onCancelRun={cancelRun}
       />
 
       <button
@@ -867,8 +869,16 @@ function RunPresetCard(props: {
   runStatus: "running" | "cancelling" | "done" | "cancelled" | "error" | null;
   step: string | null;
   error: string | null;
+  // Wave 6.17b — full tracked-run state + cancel handler so the preset
+  // surface can render the live <GeneratorProgress> bar inline (rows-done,
+  // throughput, % complete, ETA, Cancel) while a run is in flight. Mirrors
+  // the bar that already renders inside the Advanced disclosure.
+  trackedRun: GeneratorRunState | null;
+  onCancelRun: () => void;
 }) {
-  const { presetKey, onSelect, onStart, startDisabled, inflight, runStatus, step, error } = props;
+  const { presetKey, onSelect, onStart, startDisabled, inflight, runStatus, step, error, trackedRun, onCancelRun } = props;
+  const showProgress = trackedRun !== null
+    && (trackedRun.status === "running" || trackedRun.status === "cancelling");
   const selected = RUN_PRESETS[presetKey];
   // Button label tracks the high-level state: idle / pre-run automation /
   // run in flight / cancelling / done. Idle text names the staged preset so
@@ -941,6 +951,9 @@ function RunPresetCard(props: {
           </span>
         ) : null}
       </div>
+      {showProgress ? (
+        <GeneratorProgress run={trackedRun!} onCancel={onCancelRun} />
+      ) : null}
     </PanelCard>
   );
 }

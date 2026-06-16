@@ -162,6 +162,79 @@
   gap: 0.75rem;
 }
 
+/* Wave 6.17b — Run preset radio card. Vertical list of preset rows in the
+   primary preset surface. Each row is a clickable <label> with a radio input,
+   bold label, and muted description. Selected row picks up a hyper-red
+   border + faint background tint; hover/focus-visible mirrors the shared
+   .btn outline pattern. Actions row holds Start + step/error inline. */
+.ingest-presets {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.ingest-presets__btn {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  column-gap: 0.75rem;
+  row-gap: 0.15rem;
+  align-items: baseline;
+  padding: 0.6rem 0.85rem;
+  border: 1px solid var(--redis-border-primary);
+  background: var(--redis-bg-tertiary);
+  border-radius: var(--radius);
+  color: var(--redis-text-primary);
+  cursor: pointer;
+  transition: background 120ms, border-color 120ms;
+}
+.ingest-presets__btn:hover,
+.ingest-presets__btn:focus-within {
+  border-color: var(--redis-hyper);
+}
+
+.ingest-presets__btn--selected {
+  border-color: var(--redis-hyper);
+  background: rgba(255, 68, 56, 0.06);
+}
+
+.ingest-presets__btn input[type="radio"] {
+  grid-row: 1 / span 2;
+  align-self: center;
+  accent-color: var(--redis-hyper);
+  margin: 0;
+}
+
+.ingest-presets__label {
+  font-weight: 600;
+  color: var(--redis-text-primary);
+}
+
+.ingest-presets__desc {
+  font-size: 0.875em;
+  color: var(--redis-text-secondary);
+}
+
+.ingest-presets__actions {
+  margin-top: 0.75rem;
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.ingest-presets__step {
+  color: var(--redis-text-secondary);
+  font-size: 0.9em;
+}
+
+.ingest-presets__error {
+  color: var(--redis-hyper);
+  background: rgba(255, 68, 56, 0.10);
+  border-left: 3px solid var(--redis-hyper);
+  padding: 0.35rem 0.6rem;
+  border-radius: 3px;
+}
+
 /* Wave 5.20a — sparkline numeric labels (current · min · max). */
 .chart-card__labels {
   display: flex;

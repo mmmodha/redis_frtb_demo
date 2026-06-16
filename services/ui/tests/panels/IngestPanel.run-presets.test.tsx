@@ -342,6 +342,25 @@ describe("IngestPanel — Wave 6.17 presets-only run", () => {
     expect(startBody.stream_shards).toBe(8);
   });
 
+  // Wave 6.17b — the live <GeneratorProgress> bar must render on the primary
+  // preset surface (not only inside the collapsed Advanced disclosure) so the
+  // operator keeps rows-done / throughput / cancel visibility after Start.
+  // Sending a progress-shaped frame (no `done:true`) leaves the tracked run
+  // in status "running" once the SSE body closes — the bar should be in the
+  // DOM without ever opening the Advanced toggle.
+  it("renders the live <GeneratorProgress> bar on the preset surface while a preset run is in flight", async () => {
+    mockFetch({
+      terminalFrame: { run_id: "01HXRUN", rows_done: 5, rows_total: 100, elapsed_ms: 10, rows_per_sec: 100 },
+    });
+    renderPanel();
+    fireEvent.click(await screen.findByTestId("ingest-preset-start-btn"));
+    const bar = await screen.findByTestId("generator-progress");
+    expect(bar).toBeInTheDocument();
+    // The Advanced disclosure must remain collapsed — the bar is on the
+    // primary surface, not behind the disclosure.
+    expect(screen.getByTestId("ingest-advanced-toggle")).toHaveAttribute("aria-expanded", "false");
+  });
+
   // Wave 6.17 verifier (item 1) — Advanced submit also halts before
   // /generator/start when /ingest/shards conflicts (409), with the error
   // surfaced inline in the generator form.
