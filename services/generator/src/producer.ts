@@ -26,8 +26,11 @@ export interface StreamProducerOptions {
   // buffer code path verbatim, preserving the pre-5.92 XADD command sequence
   // (bit-equivalence canary in workers.test.ts). When N>1 (or per-bucket),
   // the producer maintains one in-memory buffer per resolved stream key;
-  // pipelineWindow is the GLOBAL cap across all in-flight pipeline.exec()
-  // calls, not per-stream.
+  // Wave 6.13a — pipelineWindow is the PER-STREAM cap on in-flight
+  // pipeline.exec() calls (not global): fan-out=N + window=W → up to N×W
+  // concurrent dispatches, which is what actually lifts producer throughput
+  // on multi-shard clusters (single-stream behaviour at fan-out=1 is bit-
+  // identical to pre-6.13a).
   router?: StreamRouter;
   // Wave 5.92C — when set, every XADD includes `MAXLEN ~ <streamMaxLen>` so
   // Redis approximately caps the stream length and protects holding shards
@@ -44,7 +47,11 @@ export interface StreamProducerOptions {
   flowControl?: StreamProducerFlowControl;
 }
 
-export const MAX_PIPELINE_WINDOW = 8;
+// Wave 6.13a — raised from 8 to 32 alongside the per-stream windowing
+// change: per-stream caps × fan-out can now legitimately use far more than
+// 8 concurrent pipeline.exec() calls on wide clusters. Default
+// pipelineWindow=1 is unchanged so the bit-equivalence canary holds.
+export const MAX_PIPELINE_WINDOW = 32;
 
 export interface StreamProducer {
   add(row: SensitivityRow): Promise<void>;
@@ -95,13 +102,13 @@ export function createStreamProducer(
     batchCount: 0,
     byClass: {} as Record<string, number>,
   };
-  // Pipelines currently dispatched but not yet resolved. Bounded by
-  // `pipelineWindow`; flush()/close() must drain this before returning.
-  const inFlight = new Set<Promise<void>>();
-  // First pipeline error observed across any in-flight dispatch — re-thrown
-  // on the next dispatch/drain so a background rejection cannot silently
-  // disappear when window>1 (the auto-removal in `finally` would otherwise
-  // drop a rejected promise out of the set before drain could observe it).
+  // Wave 6.13a — pipelines currently dispatched but not yet resolved, keyed
+  // by stream key. Each per-stream Set is bounded by `pipelineWindow`;
+  // flush()/close() must drain every set before returning. firstError is
+  // GLOBAL (any in-flight dispatch on any stream surfaces on the next
+  // dispatchBatch / drain call) so a background rejection cannot silently
+  // disappear when window>1.
+  const inFlight = new Map<string, Set<Promise<void>>>();
   let firstError: unknown = null;
 
   function bufferFor(streamKey: string): SensitivityRow[] {
@@ -111,6 +118,15 @@ export function createStreamProducer(
       buffers.set(streamKey, b);
     }
     return b;
+  }
+
+  function inFlightFor(streamKey: string): Set<Promise<void>> {
+    let s = inFlight.get(streamKey);
+    if (!s) {
+      s = new Set();
+      inFlight.set(streamKey, s);
+    }
+    return s;
   }
 
   async function dispatchBatch(streamKey: string): Promise<void> {
@@ -148,7 +164,10 @@ export function createStreamProducer(
       if (flowControl) await flowControl.afterBatch(streamKey, batch.length);
       return;
     }
-    // Window>1 — keep up to `pipelineWindow` pipeline.exec() calls in flight.
+    // Window>1 — keep up to `pipelineWindow` pipeline.exec() calls in flight
+    // PER STREAM (Wave 6.13a). Fan-out=N + window=W → up to N×W concurrent
+    // dispatches; we only block this stream's loop when its own set fills.
+    const streamInFlight = inFlightFor(streamKey);
     let p!: Promise<void>;
     p = (async () => {
       try {
@@ -164,22 +183,31 @@ export function createStreamProducer(
         if (!firstError) firstError = e;
         throw e;
       } finally {
-        inFlight.delete(p);
+        streamInFlight.delete(p);
       }
     })();
-    inFlight.add(p);
+    streamInFlight.add(p);
     // Swallow unhandled-rejection here — the error is captured in firstError
     // and will be re-thrown on the next dispatch or drain call.
     p.catch(() => undefined);
-    if (inFlight.size >= pipelineWindow) {
-      await Promise.race([...inFlight]).catch(() => undefined);
+    if (streamInFlight.size >= pipelineWindow) {
+      await Promise.race([...streamInFlight]).catch(() => undefined);
       if (firstError) throw firstError;
     }
   }
 
   async function drainInFlight(): Promise<void> {
+    // Drain every per-stream set. A finished promise removes itself from its
+    // set via the IIFE's finally; emptied sets are dropped from the Map so
+    // the outer loop terminates.
     while (inFlight.size > 0) {
-      await Promise.allSettled([...inFlight]);
+      const all: Promise<void>[] = [];
+      for (const set of inFlight.values()) all.push(...set);
+      if (all.length === 0) break;
+      await Promise.allSettled(all);
+      for (const [key, set] of inFlight) {
+        if (set.size === 0) inFlight.delete(key);
+      }
     }
     if (firstError) throw firstError;
   }

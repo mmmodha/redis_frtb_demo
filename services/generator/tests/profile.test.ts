@@ -53,17 +53,18 @@ describe("Wave 5.84C — profileDials (concrete dial values)", () => {
     // small keeps streamShards=1 (single-shard slot-affinity contract)
     expect(s.streamShards).toBe(1);
   });
-  it("medium profile: workers=2 batch=1500 window=2 streamShards=shards", () => {
+  it("medium profile: workers=2 batch=2000 window=8 streamShards=shards (Wave 6.13a, fan-out>1)", () => {
     expect(profileDials("medium", shape("cluster", 3), 8)).toEqual({
-      workers: 2, batchSize: 1500, pipelineWindow: 2, streamShards: 3,
+      workers: 2, batchSize: 2000, pipelineWindow: 8, streamShards: 3,
     });
   });
-  it("large profile: workers=min(shards, host_cores), batch=2000, window=2, streamShards=min(shards,32)", () => {
+  it("large profile: workers=min(shards, host_cores), batch=2000, window=8 (fan-out>1), streamShards=min(shards,32)", () => {
     expect(profileDials("large", shape("cluster", 6), 8).workers).toBe(6);
     expect(profileDials("large", shape("cluster", 6), 4).workers).toBe(4);
     expect(profileDials("large", shape("cluster", 12), 8).workers).toBe(8);
     expect(profileDials("large", shape("cluster", 6), 8).streamShards).toBe(6);
     expect(profileDials("large", shape("cluster", 64), 8).streamShards).toBe(32);
+    expect(profileDials("large", shape("cluster", 6), 8).pipelineWindow).toBe(8);
   });
   it("large profile: never returns workers < 1 even when hostCores=0", () => {
     expect(profileDials("large", shape("cluster", 4), 0).workers).toBe(1);
@@ -74,7 +75,7 @@ describe("Wave 5.84C — resolveDials (manual overrides always win — DoD #4)",
   const s = shape("cluster", 6);
   it("no overrides → profile dials passthrough", () => {
     const r = resolveDials("large", s, 8);
-    expect(r).toMatchObject({ profile: "large", workers: 6, batchSize: 2000, pipelineWindow: 2, streamShards: 6 });
+    expect(r).toMatchObject({ profile: "large", workers: 6, batchSize: 2000, pipelineWindow: 8, streamShards: 6 });
     expect(r.overrides).toEqual({ workers: false, batchSize: false, pipelineWindow: false, streamShards: false });
   });
   it("manual workers wins over profile", () => {

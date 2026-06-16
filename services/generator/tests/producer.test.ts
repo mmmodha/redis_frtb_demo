@@ -222,9 +222,9 @@ describe("Wave 5.84A — pipeline window", () => {
     expect(b.maxInFlight).toBeLessThanOrEqual(4);
   });
 
-  it("clamps pipelineWindow to MAX_PIPELINE_WINDOW (8)", async () => {
+  it("clamps pipelineWindow to MAX_PIPELINE_WINDOW", async () => {
     const c = stubPipelineClient();
-    const p = createStreamProducer(c as never, { stream: "s", batchSize: 10, pipelineWindow: 99 });
+    const p = createStreamProducer(c as never, { stream: "s", batchSize: 10, pipelineWindow: 999 });
     for (let i = 0; i < 200; i++) await p.add(makeRow(i));
     await p.flush();
     expect(c.maxInFlight).toBeLessThanOrEqual(MAX_PIPELINE_WINDOW);
@@ -320,7 +320,31 @@ describe("Wave 5.92A — stream-router fan-out", () => {
     }
   });
 
-  it("pipelineWindow is the GLOBAL cap across all per-stream pipelines (≤window in flight, summed)", async () => {
+  // Wave 6.13a — pipelineWindow is now PER-STREAM, not global. With fan-out
+  // N + window W the producer may keep up to N×W pipeline.exec() calls
+  // concurrently in flight (one stream's set filling never blocks another
+  // stream's dispatch). The two tests below pin the contract: the global
+  // ceiling (the pre-6.13a behaviour) is BROKEN — maxInFlight must exceed
+  // `pipelineWindow` — while the per-stream ceiling (N×W) is respected.
+  it("pipelineWindow is the PER-STREAM cap: fan-out=4 + window=4 ⇒ up to 16 concurrent (4 per stream), strictly > global window (Wave 6.13a)", async () => {
+    const c = stubPipelineClient();
+    const router = createStreamRouter("sensitivities:in", 4);
+    const p = createStreamProducer(c as never, { stream: "sensitivities:in", batchSize: 25, pipelineWindow: 4, router });
+    for (let i = 0; i < 400; i++) {
+      await p.add(makeRowWithTag(i, `GIRR:B${i % 16}`));
+    }
+    await p.flush();
+    // 4 streams × 4 batches/stream = 16 dispatches launched before the first
+    // exec resolves. A pre-6.13a GLOBAL cap of 4 would clamp maxInFlight to
+    // 4 — this assertion is the canary against regressing back to global
+    // windowing. The upper bound 16 is the per-stream ceiling × fan-out;
+    // the lower bound `> pipelineWindow` is the load-bearing check.
+    expect(c.maxInFlight).toBeGreaterThan(4);
+    expect(c.maxInFlight).toBeLessThanOrEqual(16);
+    expect(p.rowsSent).toBe(400);
+  });
+
+  it("per-stream cap: fan-out=4 + window=2 ⇒ up to 8 in flight (2 per stream), strictly > 2", async () => {
     const c = stubPipelineClient();
     const router = createStreamRouter("sensitivities:in", 4);
     const p = createStreamProducer(c as never, { stream: "sensitivities:in", batchSize: 25, pipelineWindow: 2, router });
@@ -328,7 +352,8 @@ describe("Wave 5.92A — stream-router fan-out", () => {
       await p.add(makeRowWithTag(i, `GIRR:B${i % 16}`));
     }
     await p.flush();
-    expect(c.maxInFlight).toBeLessThanOrEqual(2);
+    expect(c.maxInFlight).toBeGreaterThan(2);
+    expect(c.maxInFlight).toBeLessThanOrEqual(8);
     expect(p.rowsSent).toBe(400);
   });
 });

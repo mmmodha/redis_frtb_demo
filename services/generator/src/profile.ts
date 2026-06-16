@@ -59,18 +59,35 @@ export function pickProfile(shape: ClusterShape): ProfileName {
 // Wave 5.92A — `streamShards` follows the same shape-driven shape: small=1
 // (single-shard target), medium=shards (one shard-per-master so XADDs land
 // slot-local), large=min(shards, STREAM_SHARDS_CAP) (bounded fan-out).
+// Wave 6.13a — `pipelineWindow` (and the medium `batchSize`) are derived
+// from the resolved `streamShards`: fan-out>1 lifts the per-stream window
+// to 8 and the batch to 2000 so the new per-stream pipelining in
+// producer.ts actually delivers N×W concurrent XADD pipelines. Fan-out=1
+// keeps the smaller dials (window=4, medium batch=1500) so single-stream
+// runs aren't perturbed.
 export function profileDials(name: ProfileName, shape: ClusterShape, hostCores: number): ProfileDials {
   switch (name) {
     case "small":  return { workers: 2, batchSize: 2000, pipelineWindow: 4, streamShards: 1 };
-    case "medium": return {
-      workers: 2, batchSize: 1500, pipelineWindow: 2,
-      streamShards: Math.max(1, Math.min(shape.shards, STREAM_SHARDS_CAP)),
-    };
-    case "large":  return {
-      workers: Math.max(1, Math.min(shape.shards, Math.max(1, hostCores))),
-      batchSize: 2000, pipelineWindow: 2,
-      streamShards: Math.max(1, Math.min(shape.shards, STREAM_SHARDS_CAP)),
-    };
+    case "medium": {
+      const streamShards = Math.max(1, Math.min(shape.shards, STREAM_SHARDS_CAP));
+      const fanOut = streamShards > 1;
+      return {
+        workers: 2,
+        batchSize: fanOut ? 2000 : 1500,
+        pipelineWindow: fanOut ? 8 : 4,
+        streamShards,
+      };
+    }
+    case "large": {
+      const streamShards = Math.max(1, Math.min(shape.shards, STREAM_SHARDS_CAP));
+      const fanOut = streamShards > 1;
+      return {
+        workers: Math.max(1, Math.min(shape.shards, Math.max(1, hostCores))),
+        batchSize: 2000,
+        pipelineWindow: fanOut ? 8 : 4,
+        streamShards,
+      };
+    }
   }
 }
 

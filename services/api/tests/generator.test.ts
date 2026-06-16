@@ -464,7 +464,11 @@ describe("POST /generator/start/stream (Wave 5.20c) — SSE progress + cancellat
     expect(plan.profile_requested).toBe("medium");
     const dials = plan.dials as Record<string, unknown>;
     expect(dials.batch_size).toBe(333);
-    expect(dials.pipeline_window).toBe(2);
+    // Wave 6.13a — fakeRedis probes as standalone (no CLUSTER INFO stub) →
+    // shape.shards=1 → medium streamShards collapses to 1 (fan-out=1) →
+    // resolved pipeline_window is the fan-out=1 default (4), not the
+    // fan-out>1 default (8).
+    expect(dials.pipeline_window).toBe(4);
     expect((plan.overrides as Record<string, unknown>).batchSize).toBe(true);
   });
 
