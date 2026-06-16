@@ -152,3 +152,35 @@ describe("ingest-shards proxy: upstream failure handling", () => {
     expect(res.json()).toEqual({ error: "ingest service unreachable" });
   });
 });
+
+// Wave 6.12d — parity with loadgen-proxy: the fallback when INGEST_URL is
+// unset must be http://localhost:${INGEST_PORT ?? 8083}, not the
+// compose-internal `ingest` hostname which doesn't resolve outside compose.
+describe("ingest-shards proxy: default base URL", () => {
+  it("defaults to http://localhost:${INGEST_PORT|8083} when INGEST_URL is unset", async () => {
+    const localUpstream = Fastify({ logger: false });
+    localUpstream.get("/ingest/shards", async () => ({ totalShards: 7, assignment: [0], streams: ["sensitivities:in"] }));
+    await localUpstream.listen({ port: 0, host: "localhost" });
+    const addr = localUpstream.server.address();
+    if (!addr || typeof addr === "string") throw new Error("no upstream address");
+
+    const savedUrl = process.env.INGEST_URL;
+    const savedPort = process.env.INGEST_PORT;
+    delete process.env.INGEST_URL;
+    process.env.INGEST_PORT = String(addr.port);
+    try {
+      const defaulted = await createServer({});
+      try {
+        const res = await defaulted.inject({ method: "GET", url: "/ingest/shards" });
+        expect(res.statusCode).toBe(200);
+        expect(res.json()).toMatchObject({ totalShards: 7 });
+      } finally {
+        await defaulted.close();
+      }
+    } finally {
+      if (savedUrl === undefined) delete process.env.INGEST_URL; else process.env.INGEST_URL = savedUrl;
+      if (savedPort === undefined) delete process.env.INGEST_PORT; else process.env.INGEST_PORT = savedPort;
+      await localUpstream.close();
+    }
+  });
+});
