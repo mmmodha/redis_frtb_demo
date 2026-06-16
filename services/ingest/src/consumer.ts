@@ -1,5 +1,6 @@
 import type { Redis, Cluster } from "ioredis";
 import type { Schema, RiskWeightTable } from "@frtb/schema";
+import { rollupKey } from "@frtb/calc-shared";
 import type { RunnerProfile } from "./profile.ts";
 
 // Stream consumer for the FRTB ingest service.
@@ -257,6 +258,88 @@ export function enrichDoc(
   return enriched;
 }
 
+// Wave 6.14a — incremental rollup-hash writer. After JSON.SET, the apply
+// path also HINCRBYFLOATs a per-(risk_class, bucket, sensitivity_type)
+// rollup hash with this row's contribution so calc can read pre-aggregated
+// Σws / Σws² / count without scanning per-row docs. Hash-tagged on
+// `<rc>:<bkt>` to co-locate with the matching `sens:{rc:bkt}:<ulid>` keys.
+//
+// Scalar (Delta/Vega) rows write `sum_ws`, `sum_ws_sq`, `count`. Curvature
+// rows sign-split into `sum_ws_up`, `sum_ws_up_sq`, `sum_ws_down`,
+// `sum_ws_down_sq`, `count` so the calc reduce can apply the ψ-gate +
+// max(K_up, K_down) without re-reading the underlying docs. PerTenor
+// classes (GIRR Delta/Vega/Curvature) additionally maintain per-tenor
+// breakdowns at `rollup:{rc:bkt}:sens:tenor:<t>` with the same fields.
+//
+// All HINCRBYFLOAT calls are pushed onto the same pipeline as the JSON.SET
+// + XACK so the whole apply is one round-trip per row. Idempotency follows
+// the existing XACK + group-state contract: an entry that has been
+// XACKed is never re-delivered, so its rollup contribution is applied
+// exactly once. (Re-XADDing the same logical _id with a fresh XADD id is
+// a different envelope and will double-count — same as the SUGADD path.)
+type PipelineLike = { call: (cmd: string, ...args: unknown[]) => unknown };
+
+export function emitRollupHincrs(pipeline: PipelineLike, doc: Record<string, unknown>): void {
+  const rc = typeof doc.risk_class === "string" ? doc.risk_class : undefined;
+  const bkt = typeof doc.bucket === "string" ? doc.bucket : undefined;
+  const sens = typeof doc.sensitivity_type === "string" ? doc.sensitivity_type : undefined;
+  if (!rc || !bkt || !sens) return;
+
+  if (sens === "Curvature") {
+    const up = doc.weighted_cvr_up;
+    const down = doc.weighted_cvr_down;
+    if (typeof up === "number" && typeof down === "number") {
+      const baseKey = rollupKey(rc, bkt, sens);
+      pipeline.call("HINCRBYFLOAT", baseKey, "sum_ws_up", String(up));
+      pipeline.call("HINCRBYFLOAT", baseKey, "sum_ws_up_sq", String(up * up));
+      pipeline.call("HINCRBYFLOAT", baseKey, "sum_ws_down", String(down));
+      pipeline.call("HINCRBYFLOAT", baseKey, "sum_ws_down_sq", String(down * down));
+      pipeline.call("HINCRBYFLOAT", baseKey, "count", "1");
+    }
+    const upMap = doc.weighted_cvr_up_per_tenor;
+    const downMap = doc.weighted_cvr_down_per_tenor;
+    if (
+      upMap && typeof upMap === "object" && !Array.isArray(upMap) &&
+      downMap && typeof downMap === "object" && !Array.isArray(downMap)
+    ) {
+      const ups = upMap as Record<string, number>;
+      const downs = downMap as Record<string, number>;
+      for (const t of Object.keys(ups)) {
+        const u = ups[t];
+        const d = downs[t];
+        if (typeof u !== "number" || typeof d !== "number") continue;
+        const tKey = rollupKey(rc, bkt, sens, t);
+        pipeline.call("HINCRBYFLOAT", tKey, "sum_ws_up", String(u));
+        pipeline.call("HINCRBYFLOAT", tKey, "sum_ws_up_sq", String(u * u));
+        pipeline.call("HINCRBYFLOAT", tKey, "sum_ws_down", String(d));
+        pipeline.call("HINCRBYFLOAT", tKey, "sum_ws_down_sq", String(d * d));
+        pipeline.call("HINCRBYFLOAT", tKey, "count", "1");
+      }
+    }
+    return;
+  }
+
+  const ws = doc.weighted_value;
+  if (typeof ws === "number") {
+    const baseKey = rollupKey(rc, bkt, sens);
+    pipeline.call("HINCRBYFLOAT", baseKey, "sum_ws", String(ws));
+    pipeline.call("HINCRBYFLOAT", baseKey, "sum_ws_sq", String(ws * ws));
+    pipeline.call("HINCRBYFLOAT", baseKey, "count", "1");
+  }
+  const perTenor = doc.weighted_value_per_tenor;
+  if (perTenor && typeof perTenor === "object" && !Array.isArray(perTenor)) {
+    const m = perTenor as Record<string, number>;
+    for (const t of Object.keys(m)) {
+      const v = m[t];
+      if (typeof v !== "number") continue;
+      const tKey = rollupKey(rc, bkt, sens, t);
+      pipeline.call("HINCRBYFLOAT", tKey, "sum_ws", String(v));
+      pipeline.call("HINCRBYFLOAT", tKey, "sum_ws_sq", String(v * v));
+      pipeline.call("HINCRBYFLOAT", tKey, "count", "1");
+    }
+  }
+}
+
 // Creates the consumer group on the stream, MKSTREAM to handle the
 // pre-publish case. Treats BUSYGROUP (group already exists) as success.
 export async function ensureGroup(client: RedisLike, stream: string, group: string): Promise<void> {
@@ -335,6 +418,12 @@ export async function processBatch(
       const buildStart = profile ? process.hrtime.bigint() : 0n;
       if (profile) profile.recordStep("parse", buildStart - parseStart);
       pipeline.call("JSON.SET", key, "$", docJson);
+      // Wave 6.14a — per-row contribution to the per-bucket rollup hashes
+      // (and per-tenor sub-rollups for perTenor classes). Pipelined alongside
+      // the JSON.SET so the whole apply is one round-trip per row; placed
+      // before XACK so a HINCRBYFLOAT pipeline-level failure rolls back the
+      // ack and the row is redelivered.
+      emitRollupHincrs(pipeline as unknown as PipelineLike, doc);
       // Wave 5.30a — autocomplete suggester live-populate. INCR bumps the
       // score on duplicate values so frequent terms rank higher in FT.SUGGET.
       // Pipelined alongside JSON.SET (and before XACK) so a SUGADD failure

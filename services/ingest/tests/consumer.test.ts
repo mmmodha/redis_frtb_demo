@@ -12,6 +12,7 @@ import {
   buildKey,
   buildDoc,
   enrichDoc,
+  emitRollupHincrs,
   CALIBRATION_TAG,
   ensureGroup,
   processBatch,
@@ -19,6 +20,7 @@ import {
 } from "../src/consumer.ts";
 import { backfill } from "../src/backfill-weighted.ts";
 import { loadSchema, type Schema } from "@frtb/schema";
+import { rollupKey } from "@frtb/calc-shared";
 
 // Wave 5.83B — schema loaded from the locked default YAML so the
 // enrichDoc tests assert against the committed risk_weights values
@@ -660,5 +662,286 @@ describe("XREADGROUP consumer → JSON.SET", () => {
     expect(corrected.weighted_value).toBeCloseTo(0.3, 12);
     // Raw risk_value untouched.
     expect(corrected.risk_value).toEqual({ "1Y": 0.3 });
+  });
+});
+
+
+// Wave 6.14a — incremental per-bucket rollup hashes written alongside JSON.SET.
+// The pure-helper tests below drive `emitRollupHincrs` against the recording
+// pipeline stub so we can assert the exact HINCRBYFLOAT field set without a
+// live Redis. The integration tests below those XADD a known fixture, run
+// processBatch, and HGETALL the rollup keys to assert the post-batch totals
+// match a direct Σ over the docs.
+
+describe("emitRollupHincrs — Wave 6.14a", () => {
+  it("Equity Delta scalar → base rollup with sum_ws / sum_ws_sq / count only", () => {
+    const record: RecordedPipelineCall[] = [];
+    const stub = pipelineStub(record);
+    const doc = enrichDoc({ risk_class: "EQUITY", bucket: "1", sensitivity_type: "Delta", risk_value: { spot: 0.5 } }, SCHEMA);
+    emitRollupHincrs(stub as unknown as { call: (cmd: string, ...args: unknown[]) => unknown }, doc);
+    const hincr = record.filter((r) => r.command === "HINCRBYFLOAT");
+    expect(hincr).toHaveLength(3);
+    const baseKey = rollupKey("EQUITY", "1", "Delta");
+    expect(hincr.every((c) => c.args[0] === baseKey)).toBe(true);
+    const ws = EQUITY_W.by_bucket["1"]! * 0.5;
+    const byField = Object.fromEntries(hincr.map((c) => [c.args[1] as string, c.args[2] as string]));
+    expect(Number(byField.sum_ws)).toBeCloseTo(ws, 12);
+    expect(Number(byField.sum_ws_sq)).toBeCloseTo(ws * ws, 12);
+    expect(byField.count).toBe("1");
+  });
+
+  it("GIRR Delta per-tenor → base scalar rollup + one per-tenor rollup per tenor key", () => {
+    const record: RecordedPipelineCall[] = [];
+    const stub = pipelineStub(record);
+    const rv = { "3M": 0.1, "1Y": 0.2, "10Y": 0.3 };
+    const doc = enrichDoc({ risk_class: "GIRR", bucket: "USD-IRS", sensitivity_type: "Delta", risk_value: rv }, SCHEMA);
+    emitRollupHincrs(stub as unknown as { call: (cmd: string, ...args: unknown[]) => unknown }, doc);
+    const hincr = record.filter((r) => r.command === "HINCRBYFLOAT");
+    // 3 fields × (1 base + 3 tenors) = 12 calls
+    expect(hincr).toHaveLength(12);
+    const baseKey = rollupKey("GIRR", "USD-IRS", "Delta");
+    const baseHincr = hincr.filter((c) => c.args[0] === baseKey);
+    expect(baseHincr).toHaveLength(3);
+    const scalar = (doc.weighted_value as number);
+    const baseByField = Object.fromEntries(baseHincr.map((c) => [c.args[1] as string, c.args[2] as string]));
+    expect(Number(baseByField.sum_ws)).toBeCloseTo(scalar, 12);
+    expect(Number(baseByField.sum_ws_sq)).toBeCloseTo(scalar * scalar, 12);
+    expect(baseByField.count).toBe("1");
+    for (const t of ["3M", "1Y", "10Y"] as const) {
+      const tKey = rollupKey("GIRR", "USD-IRS", "Delta", t);
+      const tHincr = hincr.filter((c) => c.args[0] === tKey);
+      expect(tHincr).toHaveLength(3);
+      const wst = GIRR_W.by_tenor[t]! * rv[t]!;
+      const byField = Object.fromEntries(tHincr.map((c) => [c.args[1] as string, c.args[2] as string]));
+      expect(Number(byField.sum_ws)).toBeCloseTo(wst, 12);
+      expect(Number(byField.sum_ws_sq)).toBeCloseTo(wst * wst, 12);
+      expect(byField.count).toBe("1");
+    }
+  });
+
+  it("Equity Curvature scalar → base rollup with sign-split fields (sum_ws_up / sum_ws_up_sq / sum_ws_down / sum_ws_down_sq / count)", () => {
+    const record: RecordedPipelineCall[] = [];
+    const stub = pipelineStub(record);
+    const doc = enrichDoc({ risk_class: "EQUITY", bucket: "5", sensitivity_type: "Curvature", risk_value: { cvr_up: 0.4, cvr_down: -0.3 } }, SCHEMA);
+    emitRollupHincrs(stub as unknown as { call: (cmd: string, ...args: unknown[]) => unknown }, doc);
+    const hincr = record.filter((r) => r.command === "HINCRBYFLOAT");
+    expect(hincr).toHaveLength(5);
+    const baseKey = rollupKey("EQUITY", "5", "Curvature");
+    expect(hincr.every((c) => c.args[0] === baseKey)).toBe(true);
+    const byField = Object.fromEntries(hincr.map((c) => [c.args[1] as string, c.args[2] as string]));
+    expect(Number(byField.sum_ws_up)).toBeCloseTo(0.4, 12);
+    expect(Number(byField.sum_ws_up_sq)).toBeCloseTo(0.16, 12);
+    expect(Number(byField.sum_ws_down)).toBeCloseTo(-0.3, 12);
+    expect(Number(byField.sum_ws_down_sq)).toBeCloseTo(0.09, 12);
+    expect(byField.count).toBe("1");
+    expect(byField.sum_ws).toBeUndefined();
+  });
+
+  it("GIRR Curvature per-tenor → base sign-split rollup + per-tenor sign-split rollups", () => {
+    const record: RecordedPipelineCall[] = [];
+    const stub = pipelineStub(record);
+    const tenors = SCHEMA.risk_classes.GIRR!.tenor!.nodes;
+    const up = tenors.map((_, i) => 0.1 * (i + 1));
+    const down = tenors.map((_, i) => -0.05 * (i + 1));
+    const doc = enrichDoc({
+      risk_class: "GIRR", bucket: "USD", sensitivity_type: "Curvature",
+      risk_value: { cvr_up: up, cvr_down: down },
+    }, SCHEMA);
+    emitRollupHincrs(stub as unknown as { call: (cmd: string, ...args: unknown[]) => unknown }, doc);
+    const hincr = record.filter((r) => r.command === "HINCRBYFLOAT");
+    expect(hincr).toHaveLength(5 * (1 + tenors.length));
+    const baseKey = rollupKey("GIRR", "USD", "Curvature");
+    const baseHincr = hincr.filter((c) => c.args[0] === baseKey);
+    expect(baseHincr).toHaveLength(5);
+    const upSum = up.reduce((a, b) => a + b, 0);
+    const downSum = down.reduce((a, b) => a + b, 0);
+    const baseByField = Object.fromEntries(baseHincr.map((c) => [c.args[1] as string, c.args[2] as string]));
+    expect(Number(baseByField.sum_ws_up)).toBeCloseTo(upSum, 12);
+    expect(Number(baseByField.sum_ws_up_sq)).toBeCloseTo(upSum * upSum, 12);
+    expect(Number(baseByField.sum_ws_down)).toBeCloseTo(downSum, 12);
+    expect(Number(baseByField.sum_ws_down_sq)).toBeCloseTo(downSum * downSum, 12);
+    for (let i = 0; i < tenors.length; i++) {
+      const t = tenors[i]!;
+      const tKey = rollupKey("GIRR", "USD", "Curvature", t);
+      const tHincr = hincr.filter((c) => c.args[0] === tKey);
+      expect(tHincr).toHaveLength(5);
+      const byField = Object.fromEntries(tHincr.map((c) => [c.args[1] as string, c.args[2] as string]));
+      expect(Number(byField.sum_ws_up)).toBeCloseTo(up[i]!, 12);
+      expect(Number(byField.sum_ws_up_sq)).toBeCloseTo(up[i]! * up[i]!, 12);
+      expect(Number(byField.sum_ws_down)).toBeCloseTo(down[i]!, 12);
+      expect(Number(byField.sum_ws_down_sq)).toBeCloseTo(down[i]! * down[i]!, 12);
+    }
+  });
+
+  it("no risk_class / bucket / sensitivity_type → no rollup writes", () => {
+    const record: RecordedPipelineCall[] = [];
+    const stub = pipelineStub(record);
+    emitRollupHincrs(stub as unknown as { call: (cmd: string, ...args: unknown[]) => unknown }, { risk_class: "GIRR", bucket: "USD" });
+    expect(record.filter((r) => r.command === "HINCRBYFLOAT")).toHaveLength(0);
+  });
+});
+
+describe("processBatch rollup HINCRBYFLOAT integration [Wave 6.14a]", () => {
+  integration("mixed 1000-row fixture → HGETALL on rollup keys matches the manual Σ over docs", async () => {
+    await ensureGroup(redis, "sensitivities:in", "ingest");
+    // Three buckets / sens combos exercised in one batch. Deterministic
+    // risk values so the expected Σ is computable from the fixture alone.
+    const N_EACH = 200;
+    type Combo = { rc: string; bkt: string; sens: string; mk: (i: number) => Record<string, unknown> };
+    const combos: Combo[] = [
+      { rc: "GIRR", bkt: "USD-IRS", sens: "Delta", mk: (i) => ({ sensitivity_type: "Delta", risk_value: { "3M": 0.001 * (i + 1), "1Y": 0.002 * (i + 1), "10Y": -0.0005 * (i + 1) }, trade_id: `T-G-${i}` }) },
+      { rc: "EQUITY", bkt: "1", sens: "Delta", mk: (i) => ({ sensitivity_type: "Delta", risk_value: { spot: 0.01 * (i + 1) }, trade_id: `T-E-${i}` }) },
+      { rc: "FX", bkt: "EURUSD", sens: "Delta", mk: (i) => ({ sensitivity_type: "Delta", risk_value: { spot: 0.02 * (i + 1) }, trade_id: `T-F-${i}` }) },
+      { rc: "EQUITY", bkt: "5", sens: "Curvature", mk: (i) => ({ sensitivity_type: "Curvature", risk_value: { cvr_up: 0.1 * (i + 1), cvr_down: -0.05 * (i + 1) }, trade_id: `T-EC-${i}` }) },
+      { rc: "GIRR", bkt: "USD", sens: "Curvature", mk: (i) => {
+        const tenors = SCHEMA.risk_classes.GIRR!.tenor!.nodes;
+        const up = tenors.map((_, k) => 0.001 * (i + 1) * (k + 1));
+        const down = tenors.map((_, k) => -0.0005 * (i + 1) * (k + 1));
+        return { sensitivity_type: "Curvature", risk_value: { cvr_up: up, cvr_down: down }, trade_id: `T-GC-${i}` };
+      } },
+    ];
+    // 5 combos × 200 rows = 1000 rows in one batch.
+    const rows: Array<{ combo: Combo; row: ReturnType<typeof makeRow>; doc: Record<string, unknown> }> = [];
+    for (const c of combos) {
+      for (let i = 0; i < N_EACH; i++) {
+        const payload = c.mk(i);
+        const row = makeRow(c.rc, c.bkt, payload);
+        const doc = enrichDoc(buildDoc({ ...row }), SCHEMA);
+        rows.push({ combo: c, row, doc });
+      }
+    }
+    // Shuffle the XADD order so the rollup arithmetic is exercised under
+    // interleaved fan-in across combos (Σ in Redis vs. Σ in JS must agree
+    // regardless of the order of pipelined HINCRBYFLOATs).
+    for (let i = rows.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [rows[i]!, rows[j]!] = [rows[j]!, rows[i]!];
+    }
+    for (const { row } of rows) await xaddRow("sensitivities:in", row);
+
+    const processed = await processBatch(redis, {
+      stream: "sensitivities:in", group: "ingest", consumerName: "ingest-rollup", batchSize: 2000, schema: SCHEMA,
+    }, ">");
+    expect(processed).toBe(rows.length);
+
+    // Build expected rollup totals from the JS-enriched docs (single pass).
+    type Acc = { sum_ws?: number; sum_ws_sq?: number; sum_ws_up?: number; sum_ws_up_sq?: number; sum_ws_down?: number; sum_ws_down_sq?: number; count: number };
+    const acc = new Map<string, Acc>();
+    const bump = (key: string, patch: Partial<Acc>) => {
+      const cur = acc.get(key) ?? { count: 0 };
+      for (const [k, v] of Object.entries(patch)) {
+        if (k === "count") cur.count += v as number;
+        else (cur as unknown as Record<string, number>)[k] = ((cur as unknown as Record<string, number>)[k] ?? 0) + (v as number);
+      }
+      acc.set(key, cur);
+    };
+    for (const { combo, doc } of rows) {
+      const { rc, bkt, sens } = combo;
+      if (sens === "Curvature") {
+        const up = doc.weighted_cvr_up as number;
+        const down = doc.weighted_cvr_down as number;
+        bump(rollupKey(rc, bkt, sens), { sum_ws_up: up, sum_ws_up_sq: up * up, sum_ws_down: down, sum_ws_down_sq: down * down, count: 1 });
+        const upMap = doc.weighted_cvr_up_per_tenor as Record<string, number> | undefined;
+        const downMap = doc.weighted_cvr_down_per_tenor as Record<string, number> | undefined;
+        if (upMap && downMap) {
+          for (const t of Object.keys(upMap)) {
+            const u = upMap[t]!;
+            const d = downMap[t]!;
+            bump(rollupKey(rc, bkt, sens, t), { sum_ws_up: u, sum_ws_up_sq: u * u, sum_ws_down: d, sum_ws_down_sq: d * d, count: 1 });
+          }
+        }
+      } else {
+        const ws = doc.weighted_value as number;
+        bump(rollupKey(rc, bkt, sens), { sum_ws: ws, sum_ws_sq: ws * ws, count: 1 });
+        const perTenor = doc.weighted_value_per_tenor as Record<string, number> | undefined;
+        if (perTenor) {
+          for (const t of Object.keys(perTenor)) {
+            const v = perTenor[t]!;
+            bump(rollupKey(rc, bkt, sens, t), { sum_ws: v, sum_ws_sq: v * v, count: 1 });
+          }
+        }
+      }
+    }
+
+    // Every expected key must HGETALL with matching fields. Σ-of-many floats
+    // through HINCRBYFLOAT (vs. JS Σ) introduces accumulation rounding; 1e-6
+    // is comfortably above the noise floor for N=200 increments per key.
+    const ROLLUP_TOL = 1e-6;
+    for (const [key, want] of acc.entries()) {
+      const got = await redis.hgetall(key);
+      expect(Object.keys(got).length, `rollup ${key} should have fields`).toBeGreaterThan(0);
+      expect(Number(got.count)).toBe(want.count);
+      if (want.sum_ws != null) expect(Math.abs(Number(got.sum_ws) - want.sum_ws)).toBeLessThanOrEqual(ROLLUP_TOL);
+      if (want.sum_ws_sq != null) expect(Math.abs(Number(got.sum_ws_sq) - want.sum_ws_sq)).toBeLessThanOrEqual(ROLLUP_TOL);
+      if (want.sum_ws_up != null) expect(Math.abs(Number(got.sum_ws_up) - want.sum_ws_up)).toBeLessThanOrEqual(ROLLUP_TOL);
+      if (want.sum_ws_up_sq != null) expect(Math.abs(Number(got.sum_ws_up_sq) - want.sum_ws_up_sq)).toBeLessThanOrEqual(ROLLUP_TOL);
+      if (want.sum_ws_down != null) expect(Math.abs(Number(got.sum_ws_down) - want.sum_ws_down)).toBeLessThanOrEqual(ROLLUP_TOL);
+      if (want.sum_ws_down_sq != null) expect(Math.abs(Number(got.sum_ws_down_sq) - want.sum_ws_down_sq)).toBeLessThanOrEqual(ROLLUP_TOL);
+    }
+
+    // GIRR per-tenor sub-rollups must exist for every tenor in the schema.
+    const girrTenors = SCHEMA.risk_classes.GIRR!.tenor!.nodes;
+    for (const t of ["3M", "1Y", "10Y"]) {
+      expect(acc.has(rollupKey("GIRR", "USD-IRS", "Delta", t))).toBe(true);
+    }
+    for (const t of girrTenors) {
+      const k = rollupKey("GIRR", "USD", "Curvature", t);
+      const got = await redis.hgetall(k);
+      expect(Number(got.count)).toBe(N_EACH);
+    }
+  });
+
+  integration("idempotency: re-running processBatch with no new entries leaves rollups unchanged", async () => {
+    await ensureGroup(redis, "sensitivities:in", "ingest");
+    const rows = Array.from({ length: 30 }, (_, i) =>
+      makeRow("EQUITY", "2", { sensitivity_type: "Delta", risk_value: { spot: 0.1 * (i + 1) }, trade_id: `T-idem-${i}` })
+    );
+    for (const r of rows) await xaddRow("sensitivities:in", r);
+    await processBatch(redis, {
+      stream: "sensitivities:in", group: "ingest", consumerName: "ingest-idem", batchSize: 100, schema: SCHEMA,
+    }, ">");
+
+    const key = rollupKey("EQUITY", "2", "Delta");
+    const first = await redis.hgetall(key);
+    expect(Number(first.count)).toBe(30);
+
+    // Second processBatch call with no new XADDs — XREADGROUP returns null,
+    // no HINCRBYFLOATs fire, the rollup hash is untouched.
+    const processed = await processBatch(redis, {
+      stream: "sensitivities:in", group: "ingest", consumerName: "ingest-idem", batchSize: 100, schema: SCHEMA,
+    }, ">", 100);
+    expect(processed).toBe(0);
+    const second = await redis.hgetall(key);
+    expect(second).toEqual(first);
+  });
+
+  integration("Curvature sign-split lives on the base rollup key and per-tenor sub-rollups (GIRR)", async () => {
+    await ensureGroup(redis, "sensitivities:in", "ingest");
+    const tenors = SCHEMA.risk_classes.GIRR!.tenor!.nodes;
+    const up = tenors.map((_, i) => 0.2 * (i + 1));
+    const down = tenors.map((_, i) => -0.1 * (i + 1));
+    const row = makeRow("GIRR", "JPY", { sensitivity_type: "Curvature", risk_value: { cvr_up: up, cvr_down: down }, trade_id: "T-CG-1" });
+    await xaddRow("sensitivities:in", row);
+    await processBatch(redis, {
+      stream: "sensitivities:in", group: "ingest", consumerName: "ingest-cv-girr", batchSize: 10, schema: SCHEMA,
+    }, ">");
+
+    const baseKey = rollupKey("GIRR", "JPY", "Curvature");
+    const base = await redis.hgetall(baseKey);
+    const upSum = up.reduce((a, b) => a + b, 0);
+    const downSum = down.reduce((a, b) => a + b, 0);
+    expect(Math.abs(Number(base.sum_ws_up) - upSum)).toBeLessThanOrEqual(1e-9);
+    expect(Math.abs(Number(base.sum_ws_down) - downSum)).toBeLessThanOrEqual(1e-9);
+    expect(Number(base.count)).toBe(1);
+    // No scalar field name leaks on the Curvature rollup.
+    expect(base.sum_ws).toBeUndefined();
+
+    for (let i = 0; i < tenors.length; i++) {
+      const t = tenors[i]!;
+      const sub = await redis.hgetall(rollupKey("GIRR", "JPY", "Curvature", t));
+      expect(Math.abs(Number(sub.sum_ws_up) - up[i]!)).toBeLessThanOrEqual(1e-12);
+      expect(Math.abs(Number(sub.sum_ws_down) - down[i]!)).toBeLessThanOrEqual(1e-12);
+      expect(Number(sub.count)).toBe(1);
+    }
   });
 });
