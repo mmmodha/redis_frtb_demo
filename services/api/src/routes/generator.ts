@@ -129,6 +129,15 @@ interface GeneratorStartBody {
     resumeBelowLen?: number;
     checkEveryRows?: number;
   };
+  // Wave 6.13b — defer per-XADD MAXLEN trim to end-of-run. When true,
+  // XADDs omit the `MAXLEN ~ N` args (matching the pre-5.92C command
+  // sequence bit-for-bit) and the producer issues one
+  // `XTRIM <stream> MAXLEN ~ <stream_maxlen>` per active stream key on
+  // close() instead. Default false keeps the per-XADD trim behaviour.
+  // Safe ONLY when consumers are expected to drain within the run window;
+  // otherwise MAXLEN drift can leave the cluster memory-pressured if a
+  // consumer falls behind. No UI control yet — toggle via curl/DevTools.
+  defer_trim?: boolean;
 }
 
 // Wave 5.84C — accepted profile values for body validation.
@@ -293,6 +302,10 @@ interface ParsedGeneratorRequest {
   // createStreamFlowControl(redis, opts, app.log) and passes it to the
   // producer.
   flowControlOptions: FlowControlOptions | undefined;
+  // Wave 6.13b — resolved deferred-MAXLEN-trim flag. Defaults to false
+  // (per-XADD MAXLEN trim). When true the producer omits MAXLEN args from
+  // XADD and issues one XTRIM per active stream key on close().
+  deferTrim: boolean;
 }
 interface ParsedGeneratorError {
   ok: false;
@@ -579,6 +592,16 @@ function parseGeneratorRequest(
     flowControlOptions = opts;
   }
 
+  // Wave 6.13b — validate optional defer_trim flag. Must be a strict
+  // boolean; default false (per-XADD MAXLEN trim path, unchanged).
+  let deferTrim = false;
+  if (body.defer_trim !== undefined) {
+    if (typeof body.defer_trim !== "boolean") {
+      return { ok: false, status: 400, error: "defer_trim must be a boolean" };
+    }
+    deferTrim = body.defer_trim;
+  }
+
   const picker: ClassPicker = classSplitResolved
     ? sequencePicker(interleavedSequence(classSplitResolved))
     : roundRobinPicker(resolvedClasses);
@@ -586,7 +609,7 @@ function parseGeneratorRequest(
   return {
     ok: true, rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker, stopWhen,
     batchSize, pipelineWindow, workers, profile, streamShards,
-    streamMaxLen, flowControlOptions,
+    streamMaxLen, flowControlOptions, deferTrim,
   };
 }
 
@@ -661,7 +684,7 @@ export function registerGeneratorRoutes(
       reply.code(parsed.status);
       return { error: parsed.error };
     }
-    const { rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker, stopWhen, batchSize, pipelineWindow, workers, streamShards, streamMaxLen, flowControlOptions } = parsed;
+    const { rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker, stopWhen, batchSize, pipelineWindow, workers, streamShards, streamMaxLen, flowControlOptions, deferTrim } = parsed;
 
     const run_id = ulid();
 
@@ -686,7 +709,7 @@ export function registerGeneratorRoutes(
       redis, log: app.log, evt: "generator-start", run_id, target_label,
       schema, seed: body.seed, sensitivity_types, tradePool, factorPool,
       streamName, batchSize, pipelineWindow, router, streamMaxLen, flowControlOptions,
-      rows, picker, stopWhen,
+      rows, picker, stopWhen, deferTrim,
     });
     if (result.error) {
       if (result.error.translated) {
@@ -744,7 +767,7 @@ export function registerGeneratorRoutes(
       reply.code(parsed.status);
       return { error: parsed.error };
     }
-    const { rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker, stopWhen, batchSize, pipelineWindow, workers, profile, streamShards, streamMaxLen, flowControlOptions } = parsed;
+    const { rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker, stopWhen, batchSize, pipelineWindow, workers, profile, streamShards, streamMaxLen, flowControlOptions, deferTrim } = parsed;
 
     const run_id = ulid();
     const redis = getRedis();
@@ -908,7 +931,7 @@ export function registerGeneratorRoutes(
       redis, log: app.log, evt: "generator-stream", run_id, target_label,
       schema, seed: body.seed, sensitivity_types, tradePool, factorPool,
       streamName, batchSize: 200, router: sseRouter, streamMaxLen, flowControlOptions,
-      rows, picker, stopWhen,
+      rows, picker, stopWhen, deferTrim,
       cancelFlag: state.cancelFlag,
       onTick: (rowsSent, elapsedNs) => {
         state.rows_done = rowsSent;

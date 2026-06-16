@@ -57,6 +57,10 @@ export interface RunGeneratorOptions {
   router: StreamRouter | undefined;
   streamMaxLen: number | undefined;
   flowControlOptions: FlowControlOptions | undefined;
+  // Wave 6.13b — when true, the producer omits per-XADD MAXLEN args during
+  // the run and issues one `XTRIM <stream> MAXLEN ~ <cap>` per active stream
+  // key on `close()`. Threaded straight into createStreamProducer.
+  deferTrim?: boolean;
   // Per-row loop.
   rows: number;
   picker: ClassPicker;
@@ -157,6 +161,7 @@ export async function runGeneratorLoop(
       router: opts.router,
       streamMaxLen: opts.streamMaxLen,
       flowControl,
+      deferTrim: opts.deferTrim,
     },
   );
 

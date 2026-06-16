@@ -293,6 +293,75 @@ describe("POST /generator/start — in-process synthetic row producer", () => {
     }
   });
 
+  // Wave 6.13b — body's `defer_trim: true` must thread through both routes
+  // so the producer omits per-XADD `MAXLEN ~ N` args during the run and
+  // issues one `XTRIM <stream> MAXLEN ~ <cap>` per active stream key on
+  // close(). Verifies the call-site wiring at services/api/src/routes/
+  // generator.ts via the raw XADD + XTRIM args.
+  it("defer_trim=true threads through: XADDs omit MAXLEN, close() issues XTRIM with cap", async () => {
+    const schema = loadFixtureSchema();
+    const base = fakeRedis() as FakeRedis & {
+      pipeline: () => {
+        xadd: (...args: string[]) => unknown;
+        xtrim: (...args: string[]) => unknown;
+        exec: () => Promise<Array<[Error | null, unknown]>>;
+      };
+      xaddArgs: string[][];
+      xtrimArgs: string[][];
+    };
+    base.xaddArgs = [];
+    base.xtrimArgs = [];
+    base.pipeline = () => {
+      const xadds: string[][] = [];
+      const xtrims: string[][] = [];
+      return {
+        xadd(...args: string[]) { xadds.push(args); return this; },
+        xtrim(...args: string[]) { xtrims.push(args); return this; },
+        async exec() {
+          for (const a of xadds) base.xaddArgs.push(a);
+          for (const a of xtrims) base.xtrimArgs.push(a);
+          return [...xadds, ...xtrims].map(() => [null, "0-0"] as [Error | null, unknown]);
+        },
+      };
+    };
+    app = await createServer({ redis: base, schema });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/generator/start",
+      payload: { rows: 7, stream_maxlen: 1234, defer_trim: true, seed: "wave-6.13b" },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().rows_queued).toBe(7);
+    expect(base.xaddArgs.length).toBe(7);
+    // Every XADD goes straight `XADD sensitivities:in * ...` — no MAXLEN
+    // args sneaked in between the key and `*`.
+    for (const args of base.xaddArgs) {
+      expect(args[0]).toBe("sensitivities:in");
+      expect(args[1]).toBe("*");
+      expect(args).not.toContain("MAXLEN");
+    }
+    // close() must dispatch exactly one XTRIM with the deferred cap.
+    expect(base.xtrimArgs).toEqual([["sensitivities:in", "MAXLEN", "~", "1234"]]);
+  });
+
+  // Wave 6.13b — validation: `defer_trim` must be a strict boolean. Numbers,
+  // strings, and null are rejected at the route boundary (400).
+  it("rejects defer_trim with non-boolean values (400)", async () => {
+    const schema = loadFixtureSchema();
+    const fr = pipelineFakeRedis();
+    app = await createServer({ redis: fr, schema });
+    for (const bad of [1, 0, "true", "false", null] as Array<unknown>) {
+      const res = await app.inject({
+        method: "POST",
+        url: "/generator/start",
+        payload: { rows: 5, defer_trim: bad as boolean },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toMatch(/defer_trim/);
+    }
+  });
+
   // Wave 5.92C-fix — validation: flow_control cross-field invariant must
   // be enforced at the route boundary (resumeBelowLen < pauseAboveLen).
   it("rejects flow_control with resumeBelowLen >= pauseAboveLen (400)", async () => {

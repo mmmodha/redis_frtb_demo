@@ -45,6 +45,14 @@ export interface StreamProducerOptions {
   // the gate may sleep when XLEN exceeds a threshold so the producer pauses
   // generation until consumers drain.
   flowControl?: StreamProducerFlowControl;
+  // Wave 6.13b — defer the MAXLEN trim to end-of-run. When true AND
+  // `streamMaxLen` is set, XADDs omit the `MAXLEN ~ N` args (matching the
+  // undefined-streamMaxLen code path bit-for-bit) and `close()` issues one
+  // `XTRIM <stream> MAXLEN ~ <cap>` per active stream key instead. Default
+  // false keeps the per-XADD trim semantics — safe only when consumers are
+  // expected to drain within the run window; otherwise MAXLEN drift can
+  // leave the cluster memory-pressured if a consumer falls behind.
+  deferTrim?: boolean;
 }
 
 // Wave 6.13a — raised from 8 to 32 alongside the per-stream windowing
@@ -92,7 +100,12 @@ export function createStreamProducer(
   // hot loop is a spread, not a per-row branch. Undefined streamMaxLen
   // collapses to an empty array, preserving the pre-5.92C XADD command
   // sequence (canary in workers.test.ts).
-  const maxLenArgs: readonly string[] = opts.streamMaxLen !== undefined
+  // Wave 6.13b — when `deferTrim` is true the per-XADD MAXLEN args are
+  // omitted as well (same empty-array collapse) so the hot loop is bit-
+  // identical to the undefined-streamMaxLen path; the recorded cap is
+  // applied via one `XTRIM` per active stream in `close()` instead.
+  const deferTrim = opts.deferTrim === true;
+  const maxLenArgs: readonly string[] = (opts.streamMaxLen !== undefined && !deferTrim)
     ? ["MAXLEN", "~", String(opts.streamMaxLen)]
     : [];
   const flowControl = opts.flowControl;
@@ -249,6 +262,27 @@ export function createStreamProducer(
         await dispatchBatch(streamKey);
       }
       await drainInFlight();
+      // Wave 6.13b — deferred MAXLEN trim: one `XTRIM <stream> MAXLEN ~ <cap>`
+      // per active stream key, pipelined in a single round-trip. Skipped when
+      // `deferTrim` is false (legacy per-XADD trim path) or when no cap was
+      // configured. Fan-out aware: one XTRIM per resolved stream key, not
+      // one global XTRIM.
+      if (deferTrim && opts.streamMaxLen !== undefined) {
+        const keys = [...buffers.keys()];
+        if (keys.length > 0) {
+          const cap = String(opts.streamMaxLen);
+          const trimPipeline = client.pipeline();
+          for (const streamKey of keys) {
+            trimPipeline.xtrim(streamKey, "MAXLEN", "~", cap);
+          }
+          const result = await trimPipeline.exec();
+          if (result) {
+            for (const [err] of result) {
+              if (err) throw err;
+            }
+          }
+        }
+      }
     },
     get rowsSent() {
       return stats.rowsSent;

@@ -130,25 +130,36 @@ describe("createStreamProducer (XADD batching + pipelining)", () => {
 // produce the same XADD command sequence as the pre-5.84A producer.
 type StubPipelineClient = {
   execCalls: string[][][];
+  // Wave 6.13b — separate recorder for end-of-run XTRIM commands so the
+  // existing XADD-batch assertions on `execCalls` are unaffected.
+  xtrimCalls: string[][];
   readonly maxInFlight: number;
   pipeline(): {
     xadd(...args: string[]): unknown;
+    xtrim(...args: string[]): unknown;
     exec(): Promise<Array<[Error | null, unknown]>>;
   };
 };
 
 function stubPipelineClient(): StubPipelineClient {
   const execCalls: string[][][] = [];
+  const xtrimCalls: string[][] = [];
   let inFlight = 0;
   let maxInFlight = 0;
   const client = {
     execCalls,
+    xtrimCalls,
     get maxInFlight() { return maxInFlight; },
     pipeline() {
       const buffered: string[][] = [];
+      const trims: string[][] = [];
       return {
         xadd(...args: string[]) {
           buffered.push(args);
+          return this;
+        },
+        xtrim(...args: string[]) {
+          trims.push(args);
           return this;
         },
         async exec(): Promise<Array<[Error | null, unknown]>> {
@@ -159,8 +170,9 @@ function stubPipelineClient(): StubPipelineClient {
           await new Promise<void>((r) => setImmediate(r));
           await new Promise<void>((r) => setImmediate(r));
           inFlight--;
-          execCalls.push(buffered);
-          return buffered.map(() => [null, "0-0"] as [Error | null, unknown]);
+          if (buffered.length > 0) execCalls.push(buffered);
+          for (const args of trims) xtrimCalls.push(args);
+          return [...buffered, ...trims].map(() => [null, "0-0"] as [Error | null, unknown]);
         },
       };
     },
@@ -522,5 +534,113 @@ describe("Wave 6.11a — route streams by ULID `_id`", () => {
       expect(got).toBeGreaterThanOrEqual(expected * 0.9);
       expect(got).toBeLessThanOrEqual(expected * 1.1);
     }
+  });
+});
+
+
+// Wave 6.13b — defer per-XADD MAXLEN trim to end-of-run. When `deferTrim`
+// is true AND `streamMaxLen` is set, the producer omits MAXLEN args from
+// every XADD (matching the undefined-streamMaxLen code path bit-for-bit)
+// and issues one `XTRIM <stream> MAXLEN ~ <cap>` per active stream key on
+// `close()`. Default `deferTrim` (absent or false) is byte-identical to
+// pre-6.13b — both the XADD command sequence and the absence of any
+// XTRIM at close time.
+describe("Wave 6.13b — deferred MAXLEN trim", () => {
+  it("deferTrim=true + streamMaxLen=N: XADDs omit MAXLEN; close() issues 1 XTRIM with the cap", async () => {
+    const c = stubPipelineClient();
+    const p = createStreamProducer(c as never, {
+      stream: "s", batchSize: 10, streamMaxLen: 100_000_000, deferTrim: true,
+    });
+    for (let i = 0; i < 25; i++) await p.add(makeRow(i));
+    await p.flush();
+    // Every XADD goes straight `XADD <key> * <fields...>` — no MAXLEN args
+    // sneaked in between the key and `*`.
+    let totalXadds = 0;
+    for (const batch of c.execCalls) {
+      for (const args of batch) {
+        expect(args[0]).toBe("s");
+        expect(args[1]).toBe("*");
+        expect(args).not.toContain("MAXLEN");
+        totalXadds++;
+      }
+    }
+    expect(totalXadds).toBe(25);
+    // close() must dispatch one XTRIM with the deferred cap.
+    expect(c.xtrimCalls.length).toBe(0);
+    await p.close();
+    expect(c.xtrimCalls).toEqual([["s", "MAXLEN", "~", "100000000"]]);
+  });
+
+  it("deferTrim=true + fan-out=4 + streamMaxLen=100M: 1 XTRIM per active stream key (fan-out aware)", async () => {
+    const c = stubPipelineClient();
+    const router = createStreamRouter("sensitivities:in", 4);
+    const p = createStreamProducer(c as never, {
+      stream: "sensitivities:in", batchSize: 50, router,
+      streamMaxLen: 100_000_000, deferTrim: true,
+    });
+    // 200 rows with varied `_id` spread XADDs across all 4 shard streams
+    // (router keys on FNV-1a(_id) % 4 per Wave 6.11a).
+    for (let i = 0; i < 200; i++) {
+      await p.add(makeRowWithTag(i, `GIRR:B${i % 16}`));
+    }
+    await p.flush();
+    // No MAXLEN ever made it onto an XADD during the run.
+    for (const batch of c.execCalls) {
+      for (const args of batch) {
+        expect(args).not.toContain("MAXLEN");
+      }
+    }
+    expect(c.xtrimCalls.length).toBe(0);
+    await p.close();
+    // One XTRIM per resolved stream key — fan-out=4 → 4 XTRIMs, each
+    // carrying the deferred cap. Order isn't load-bearing so we compare
+    // as a set against the router's shard keys.
+    expect(c.xtrimCalls).toHaveLength(4);
+    const trimStreams = new Set(c.xtrimCalls.map((args) => args[0]!));
+    for (const key of router.shardKeys()!) {
+      expect(trimStreams.has(key)).toBe(true);
+    }
+    for (const args of c.xtrimCalls) {
+      expect(args[1]).toBe("MAXLEN");
+      expect(args[2]).toBe("~");
+      expect(args[3]).toBe("100000000");
+    }
+  });
+
+  it("default deferTrim (absent) is bit-identical to today: XADDs carry MAXLEN, close() issues no XTRIM", async () => {
+    const a = stubPipelineClient();
+    const b = stubPipelineClient();
+    // a: pre-6.13b call shape (no deferTrim field).
+    const pa = createStreamProducer(a as never, { stream: "s", batchSize: 50, streamMaxLen: 1_000_000 });
+    // b: explicit deferTrim=false — must produce exactly the same XADD
+    // command sequence and no XTRIM at close().
+    const pb = createStreamProducer(b as never, { stream: "s", batchSize: 50, streamMaxLen: 1_000_000, deferTrim: false });
+    for (let i = 0; i < 75; i++) {
+      await pa.add(makeRow(i));
+      await pb.add(makeRow(i));
+    }
+    await pa.flush();
+    await pb.flush();
+    await pa.close();
+    await pb.close();
+    // XADD sequence bit-equivalence (every XADD still carries `MAXLEN ~ N`).
+    expect(b.execCalls).toEqual(a.execCalls);
+    expect(a.execCalls[0]![0]![1]).toBe("MAXLEN");
+    expect(b.execCalls[0]![0]![1]).toBe("MAXLEN");
+    // close() emits no XTRIM in either case.
+    expect(a.xtrimCalls).toEqual([]);
+    expect(b.xtrimCalls).toEqual([]);
+  });
+
+  it("deferTrim=true with no streamMaxLen: no MAXLEN on XADD AND no XTRIM at close (nothing to defer)", async () => {
+    const c = stubPipelineClient();
+    const p = createStreamProducer(c as never, { stream: "s", batchSize: 10, deferTrim: true });
+    for (let i = 0; i < 25; i++) await p.add(makeRow(i));
+    await p.flush();
+    await p.close();
+    for (const batch of c.execCalls) {
+      for (const args of batch) expect(args).not.toContain("MAXLEN");
+    }
+    expect(c.xtrimCalls).toEqual([]);
   });
 });
