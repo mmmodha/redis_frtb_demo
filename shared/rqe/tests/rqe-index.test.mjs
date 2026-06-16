@@ -369,5 +369,15 @@ describe.skipIf(!STACK_BUNDLED_PRESENT)("@frtb/rqe — ensureSensIndex (integrat
     await expect(redis.call("FT.INFO", IDX_NAME)).rejects.toThrow();
     // dropping an absent index must not throw — supports demo "drop then recreate" UX
     await dropSensIndex(redis);
+
+    // Wave 6.09 — Redis 8.x surfaces the missing-index condition as
+    // "SEARCH_INDEX_NOT_FOUND Index not found: idx:sens" instead of the
+    // legacy "Unknown Index name". Stub the client so we cover the matcher
+    // independently of whichever RediSearch build is on the boot path.
+    const stub = {
+      call: () =>
+        Promise.reject(new Error("SEARCH_INDEX_NOT_FOUND Index not found: idx:sens")),
+    };
+    await expect(dropSensIndex(stub)).resolves.toEqual({ dropped: false, name: IDX_NAME });
   });
 });

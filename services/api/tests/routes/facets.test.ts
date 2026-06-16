@@ -187,6 +187,25 @@ describe("GET /facets", () => {
     expect(body.bucket_by_risk_class).toEqual({});
   });
 
+  // Wave 6.09 — Redis 8.x surfaces the missing-index condition as
+  // "SEARCH_INDEX_NOT_FOUND Index not found: …". /facets must keep returning
+  // the empty-index 200 shape (not 412/500) so the UI doesn't trip on a
+  // bootstrapping Redis 8 cluster.
+  it("returns ok=false reason='empty-index' (200) on Redis 8 'SEARCH_INDEX_NOT_FOUND Index not found' error", async () => {
+    const fr = fakeRedis();
+    fr.setResponse("FT.AGGREGATE", () => {
+      throw new Error("SEARCH_INDEX_NOT_FOUND Index not found: idx:sens");
+    });
+    app = await createServer({ redis: fr });
+
+    const res = await app.inject({ method: "GET", url: "/facets" });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.ok).toBe(false);
+    expect(body.reason).toBe("empty-index");
+    expect(body.total_rows).toBe(0);
+  });
+
   it("returns ok=false reason='empty-index' (200) when the index exists but is empty (0 groups)", async () => {
     const fr = fakeRedis();
     fr.setResponse("FT.AGGREGATE", cursorReply([], 0));

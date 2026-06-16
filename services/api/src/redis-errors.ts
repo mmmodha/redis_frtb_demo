@@ -33,7 +33,9 @@ export function translateRedisError(
   const raw = err instanceof Error ? err.message : String(err);
   const msg = raw.toLowerCase();
 
-  if (msg.includes("unknown index name")) {
+  // Redis 8.x replaces "Unknown Index name" with
+  // "SEARCH_INDEX_NOT_FOUND Index not found: …" — accept both phrasings.
+  if (msg.includes("unknown index name") || msg.includes("index not found")) {
     return {
       status: 412,
       body: {

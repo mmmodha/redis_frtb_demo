@@ -141,8 +141,9 @@ function isAlreadyExistsError(err) {
 function isUnknownIndexError(err) {
   const msg = String(err && err.message ? err.message : err);
   // RediSearch returns "Unknown Index name" / "Unknown index name" for
-  // FT.DROPINDEX against a missing index — treat as success.
-  return /unknown index/i.test(msg) || /no such index/i.test(msg);
+  // FT.DROPINDEX against a missing index — treat as success. Redis 8.x
+  // surfaces the same condition as "SEARCH_INDEX_NOT_FOUND Index not found: …".
+  return /unknown index/i.test(msg) || /no such index/i.test(msg) || /index not found/i.test(msg);
 }
 
 // ensureSensIndex — idempotently create idx:sens.

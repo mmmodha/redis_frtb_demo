@@ -135,6 +135,26 @@ describe("Wave 5.16t — api routes follow active-target per-request", () => {
     expect(body.bootstrap_phase).toBe("idle");
   });
 
+  // Wave 6.09 — Redis 8.x replaces the legacy "Unknown Index name" with
+  // "SEARCH_INDEX_NOT_FOUND Index not found: …". translateRedisError must
+  // recognise the new phrasing or /pivot 500s on a fresh Redis 8 deploy.
+  it("translateRedisError: 'SEARCH_INDEX_NOT_FOUND Index not found' → 412 idx:sens body on /pivot", async () => {
+    const fr = fakeRedis();
+    fr.setResponse("FT.SEARCH", () => {
+      throw new Error("SEARCH_INDEX_NOT_FOUND Index not found: idx:sens");
+    });
+    setActiveTarget(TARGET_A);
+    app = await createServer({ redis: fr });
+
+    const res = await app.inject({ method: "GET", url: "/pivot" });
+    expect(res.statusCode).toBe(412);
+    const body = res.json();
+    expect(body.error).toContain("idx:sens not found on 'target-A'");
+    expect(body.error).toContain("bootstrap required");
+    expect(body.target_label).toBe("target-A");
+    expect(body.bootstrap_phase).toBe("idle");
+  });
+
   it("translateRedisError: 'Function not found' on FCALL → 412 with frtb-library body on /calc/sbm", async () => {
     const fr = fakeRedis();
     fr.setResponse("FT.AGGREGATE", ftAggregateReply(["USD-IRS"]));

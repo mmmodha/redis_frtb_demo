@@ -120,7 +120,14 @@ async function deleteCursor(redis: RedisLike, cursorId: number): Promise<void> {
 
 function isUnknownIndexError(err: unknown): boolean {
   const msg = String(err instanceof Error ? err.message : err).toLowerCase();
-  return msg.includes("unknown index name") || msg.includes("no such index");
+  // Redis 8.x reports the missing-index condition as
+  // "SEARCH_INDEX_NOT_FOUND Index not found: …" — accept it alongside the
+  // legacy RediSearch phrasings.
+  return (
+    msg.includes("unknown index name") ||
+    msg.includes("no such index") ||
+    msg.includes("index not found")
+  );
 }
 
 function emptyResponse(target_label: string, ms: number): FacetsResponseEmpty {

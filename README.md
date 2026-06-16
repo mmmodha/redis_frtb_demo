@@ -281,6 +281,30 @@ Monorepo-level contract tests live in `tests/monorepo/` and assert:
 - Root `package.json` declares npm workspaces for `services/*` and `shared/*`
 - Each service exposes a `start` script and a Dockerfile
 
+## Troubleshooting
+
+### "Rebuild indexes" fails with `SEARCH_INDEX_NOT_FOUND Index not found: idx:sens`
+
+On a fresh Redis 8.x cluster, bootstrap's `FT.DROPINDEX idx:sens` call rejects
+with `SEARCH_INDEX_NOT_FOUND Index not found: idx:sens` because the index
+hasn't been created yet — older builds expected the legacy RediSearch
+`"Unknown Index name"` phrasing and surfaced the rejection instead of treating
+it as a no-op. Wave 6.09 relaxes the matcher so current builds tolerate this
+automatically; the manual recovery below works on any version.
+
+Manual recovery from Redis Workbench or `redis-cli`:
+
+```
+FT.CREATE idx:sens ON JSON PREFIX 1 sens: SCHEMA $.book AS book TAG
+```
+
+Then click **Rebuild indexes** in the UI — bootstrap will now drop the stub
+and recreate the proper schema-aware index.
+
+Prefer a CLI? Run `node tools/rqe-index-cli/src/bin.mjs ensure` against the
+target Redis — it performs the same idempotent create without the Workbench
+round-trip.
+
 ## Redis Enterprise license
 
 The recommended path is the **Redis Enterprise trial / eval license**, valid for
