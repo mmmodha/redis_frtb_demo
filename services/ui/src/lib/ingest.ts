@@ -45,6 +45,10 @@ export interface GeneratorConfig {
   // 2_000_000; UI auto-flips this to match `rows` when the user picks a
   // simple-mode row count above the default (no silent truncation).
   stream_maxlen?: number;
+  // Wave 6.11b — explicit hash-tag stream fan-out. Omitted ⇒ server uses the
+  // profile-derived value (1 on standalone-presenting targets). Numbers map
+  // to N modulo-routed streams; "per-bucket" emits one stream per bucket.
+  stream_shards?: number | "per-bucket";
 }
 
 export interface GeneratorStartResponse extends IngestRunResponse {

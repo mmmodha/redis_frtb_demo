@@ -482,6 +482,57 @@ describe("POST /generator/start/stream (Wave 5.20c) — SSE progress + cancellat
     expect(res.json().error).toMatch(/profile must be one of/i);
   });
 
+  // Wave 6.11b — manual stream_shards on a standalone-presenting target
+  // surfaces a soft warning on the plan response (Redis Enterprise DMC
+  // proxy case). Cluster-presenting targets get no warning.
+  it("plan response carries a warning when shape=standalone and stream_shards is set (Wave 6.11b)", async () => {
+    const schema = loadFixtureSchema();
+    const fr = pipelineFakeRedis();
+    // Default fake redis throws on CLUSTER INFO → probeForApi falls back to
+    // shape.mode = "standalone", matching the seed-plan test above.
+    app = await createServer({ redis: fr, schema });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/generator/start/stream",
+      payload: { rows: 25, stream_shards: 16 },
+      headers: { accept: "text/event-stream" },
+      payloadAsStream: true,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = await collectStream(res.stream() as unknown as NodeJS.ReadableStream);
+    const seed = parseSseFrames(body)[0]!;
+    const plan = seed.plan as Record<string, unknown>;
+    expect((plan.shape as Record<string, unknown>).mode).toBe("standalone");
+    expect(Array.isArray(plan.warnings)).toBe(true);
+    const warnings = plan.warnings as string[];
+    expect(warnings.length).toBeGreaterThan(0);
+    expect(warnings[0]).toMatch(/standalone/i);
+    expect(warnings[0]).toMatch(/16/);
+  });
+
+  it("plan response carries no warning when shape=cluster, even with stream_shards set (Wave 6.11b)", async () => {
+    const schema = loadFixtureSchema();
+    const fr = pipelineFakeRedis();
+    // Stub CLUSTER INFO so the probe reports cluster mode (3 shards).
+    fr.setResponse("CLUSTER", "cluster_enabled:1\r\ncluster_state:ok\r\ncluster_size:3\r\n");
+    app = await createServer({ redis: fr, schema });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/generator/start/stream",
+      payload: { rows: 25, stream_shards: 16 },
+      headers: { accept: "text/event-stream" },
+      payloadAsStream: true,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = await collectStream(res.stream() as unknown as NodeJS.ReadableStream);
+    const seed = parseSseFrames(body)[0]!;
+    const plan = seed.plan as Record<string, unknown>;
+    expect((plan.shape as Record<string, unknown>).mode).toBe("cluster");
+    expect(plan.warnings).toBeUndefined();
+  });
+
   // Wave 5.21c — regression: the previous implementation listened on
   // `req.raw` for `close`/`error`, which Fastify fires as soon as the
   // inbound JSON body finishes parsing. That flipped `cancelFlag` before

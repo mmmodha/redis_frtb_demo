@@ -243,4 +243,53 @@ describe("<IngestPanel /> — synthetic generator card (Wave 5.17b / 5.52)", () 
     const status = await within(card).findByTestId("generator-status");
     expect(status.textContent).toMatch(/cancelled\s*\u2014\s*60\s+rows\s+queued\s+in\s+120ms/i);
   });
+
+  // Wave 6.11b — advanced-mode stream fan-out dial. Default ("auto") omits
+  // stream_shards from the body so the server uses the profile-derived
+  // value; selecting "16" ships a numeric body field.
+  it("advanced stream-shards dial ships stream_shards=16 when set; omits it when left on auto (Wave 6.11b)", async () => {
+    baselineFetch(fetchMock);
+    renderPanel();
+    const card = await waitFor(() => generatorCard());
+    openAdvanced(card);
+    // The dial row is wrapped in data-testid="ingest-stream-shards" and
+    // contains a single <select>; default value is "auto".
+    const dialRow = within(card).getByTestId("ingest-stream-shards");
+    const select = within(dialRow).getByRole("combobox") as HTMLSelectElement;
+    expect(select.value).toBe("auto");
+    fireEvent.change(select, { target: { value: "16" } });
+
+    fireEvent.click(within(card).getByTestId("generator-generate-btn"));
+    await waitFor(() => {
+      const posted = fetchMock.mock.calls.find(
+        (c) => /\/generator\/start\/stream$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",
+      );
+      expect(posted).toBeDefined();
+    });
+    const posted = fetchMock.mock.calls.find(
+      (c) => /\/generator\/start\/stream$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",
+    )!;
+    const body = JSON.parse((posted[1] as RequestInit).body as string);
+    expect(body.stream_shards).toBe(16);
+  });
+
+  it("advanced submit with default stream-shards dial omits stream_shards from the body (Wave 6.11b)", async () => {
+    baselineFetch(fetchMock);
+    renderPanel();
+    const card = await waitFor(() => generatorCard());
+    openAdvanced(card);
+    // Do not touch the dial — default "auto" should leave stream_shards off.
+    fireEvent.click(within(card).getByTestId("generator-generate-btn"));
+    await waitFor(() => {
+      const posted = fetchMock.mock.calls.find(
+        (c) => /\/generator\/start\/stream$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",
+      );
+      expect(posted).toBeDefined();
+    });
+    const posted = fetchMock.mock.calls.find(
+      (c) => /\/generator\/start\/stream$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",
+    )!;
+    const body = JSON.parse((posted[1] as RequestInit).body as string);
+    expect(body).not.toHaveProperty("stream_shards");
+  });
 });

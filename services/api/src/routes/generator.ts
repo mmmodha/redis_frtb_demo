@@ -752,7 +752,19 @@ export function registerGeneratorRoutes(
       streamShards,
     });
     const gate = refuseOrGo(shape, rows);
-    const plan = {
+    // Wave 6.11b — soft warning: target reports redis_mode=standalone but
+    // the caller asked for multi-shard fan-out. This is the Redis Enterprise
+    // DMC-proxy case (cluster hidden behind a single endpoint); we don't
+    // block the run, just surface a heads-up on the plan response.
+    const warnings: string[] = [];
+    if (shape.mode === "standalone" && dials.streamShards !== 1) {
+      warnings.push(
+        `Target reports redis_mode=standalone; manual stream_shards=${dials.streamShards} is enabled. `
+        + "This works on Redis Enterprise behind a DMC proxy. Verify the target accepts "
+        + "hash-tagged keys before running at high volume.",
+      );
+    }
+    const plan: Record<string, unknown> = {
       profile: dials.profile,
       profile_requested: profile,
       shape: {
@@ -774,6 +786,7 @@ export function registerGeneratorRoutes(
       memory_gate: { allowed: gate.allowed, threshold_bytes: gate.thresholdBytes },
       estimated_duration_sec: Math.round(estimateDurationSec(rows, dials.workers) * 100) / 100,
     };
+    if (warnings.length > 0) plan.warnings = warnings;
 
     const state: ActiveRun = {
       run_id,

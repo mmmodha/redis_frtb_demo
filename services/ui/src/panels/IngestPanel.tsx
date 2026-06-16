@@ -718,6 +718,11 @@ function SyntheticGeneratorCard(props: { preflightGate?: () => Promise<Preflight
   // "user has not touched it" (empty) from an explicit value). Empty ⇒ the
   // submit path auto-flips to match `rows` when rows > DEFAULT_STREAM_MAXLEN.
   const [streamMaxlen, setStreamMaxlen] = useState<string>("");
+  // Wave 6.11b — explicit stream-shard fan-out dial. "auto" ⇒ omit from
+  // body so the server uses the profile-derived value (1 on standalone-
+  // presenting targets). Numeric strings ship as numbers; "per-bucket"
+  // ships as a literal string. The api validates the value at the route.
+  const [streamShards, setStreamShards] = useState<string>("auto");
   const [seed, setSeed] = useState<string>("0");
   const [preset, setPreset] = useState<GeneratorPreset>(DEFAULT_PRESET);
   const [tradePool, setTradePool] = useState<string>(String(DEFAULT_GEN_TRADE_POOL));
@@ -880,6 +885,12 @@ function SyntheticGeneratorCard(props: { preflightGate?: () => Promise<Preflight
     if (parsedMaxlen instanceof Error) return parsedMaxlen.message;
     if (parsedMaxlen !== null) cfg.stream_maxlen = parsedMaxlen;
     else if (effectiveRows > DEFAULT_STREAM_MAXLEN) cfg.stream_maxlen = effectiveRows;
+    // Wave 6.11b — explicit stream-shard fan-out. "auto" leaves the field
+    // off so the server uses the profile-derived value; numeric strings
+    // ship as numbers; "per-bucket" ships as a literal string.
+    if (streamShards !== "auto") {
+      cfg.stream_shards = streamShards === "per-bucket" ? "per-bucket" : Number(streamShards);
+    }
     return cfg;
   }
 
@@ -1331,6 +1342,34 @@ function SyntheticGeneratorCard(props: { preflightGate?: () => Promise<Preflight
               </label>
             ))}
           </fieldset>
+
+          {/* Wave 6.11b — explicit stream-shard fan-out dial. Default "auto"
+              omits stream_shards from the body so the server uses the
+              profile-derived value (1 on standalone-presenting targets);
+              4/8/16/32 ship as numbers, "per-bucket" ships as a literal
+              string. Useful on Redis Enterprise DMC where the target
+              advertises redis_mode=standalone but is actually clustered. */}
+          <div className="generator-form__row" data-testid="ingest-stream-shards">
+            <label htmlFor="gen-stream-shards">Stream fan-out (hash-tag slots)</label>
+            <select
+              id="gen-stream-shards"
+              value={streamShards}
+              disabled={busy}
+              onChange={(e) => setStreamShards(e.target.value)}
+            >
+              <option value="auto">1 (auto / profile-derived)</option>
+              <option value="4">4</option>
+              <option value="8">8</option>
+              <option value="16">16</option>
+              <option value="32">32</option>
+              <option value="per-bucket">per-bucket</option>
+            </select>
+            <span className="generator-form__hint">
+              Profile auto picks 1 on standalone-presenting targets. If your
+              target is Redis Enterprise behind a DMC proxy (cluster hidden),
+              set 16 or 32 for balanced fan-out.
+            </span>
+          </div>
 
           {/* Wave 5.52 — Advanced disclosure always surfaces the raw trade /
               factor pool inputs (preset just stages new values into them); in
