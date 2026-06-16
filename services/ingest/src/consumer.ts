@@ -1,5 +1,6 @@
 import type { Redis, Cluster } from "ioredis";
 import type { Schema, RiskWeightTable } from "@frtb/schema";
+import type { RunnerProfile } from "./profile.ts";
 
 // Stream consumer for the FRTB ingest service.
 // Reads from Redis Stream `sensitivities:in` via XREADGROUP, builds the locked
@@ -23,6 +24,11 @@ export interface ConsumerOptions {
   // exercise pipeline-call ordering — enrichDoc still stamps the
   // `_calibration: "demo"` tag in that case.
   schema?: Schema;
+  // Wave 6.15a — optional per-runner profiler. Constructed only when
+  // INGEST_PROFILE=1; when undefined every timed branch in processBatch
+  // is a single nil-check and skipped, keeping the hot path byte-identical
+  // to pre-6.15a behaviour.
+  profile?: RunnerProfile;
 }
 
 export interface ConsumerStats {
@@ -286,23 +292,35 @@ export async function processBatch(
 ): Promise<number> {
   const count = Math.max(1, opts.batchSize ?? 500);
   const block = blockMs ?? opts.blockMs ?? 0;
+  // Wave 6.15a — `profile` is set only when INGEST_PROFILE=1; every
+  // `if (profile)` branch below is skipped when undefined so the hot path
+  // stays byte-identical to pre-6.15a behaviour.
+  const profile = opts.profile;
+  const fetchStart = profile ? process.hrtime.bigint() : 0n;
   const reply = (await (client as Redis).xreadgroup(
     "GROUP", opts.group, opts.consumerName,
     "COUNT", count,
     "BLOCK", block,
     "STREAMS", opts.stream, id
   )) as XReadGroupReply;
+  if (profile) profile.recordStep("fetch", process.hrtime.bigint() - fetchStart);
   if (!reply) return 0;
 
   let processed = 0;
   for (const [, entries] of reply) {
     if (entries.length === 0) continue;
+    if (profile) profile.recordRowsRead(entries.length);
     const pipeline = client.pipeline();
     for (const [entryId, fields] of entries) {
+      const parseStart = profile ? process.hrtime.bigint() : 0n;
       const msg = fieldsToMap(fields);
       const hashTag = msg._hash_tag ?? (msg.risk_class && msg.bucket ? `${msg.risk_class}:${msg.bucket}` : undefined);
       const ulid = msg._id;
       if (!hashTag || !ulid) {
+        if (profile) {
+          profile.recordStep("parse", process.hrtime.bigint() - parseStart);
+          profile.recordRowsAcked(1);
+        }
         // Malformed entry — ack so it leaves the PEL but don't write a doc.
         pipeline.xack(opts.stream, opts.group, entryId);
         continue;
@@ -313,7 +331,10 @@ export async function processBatch(
       // the `_calibration: "demo"` literal tag, then JSON.SET writes the
       // full enriched doc in one shot.
       const doc = enrichDoc(buildDoc(msg), opts.schema);
-      pipeline.call("JSON.SET", key, "$", JSON.stringify(doc));
+      const docJson = JSON.stringify(doc);
+      const buildStart = profile ? process.hrtime.bigint() : 0n;
+      if (profile) profile.recordStep("parse", buildStart - parseStart);
+      pipeline.call("JSON.SET", key, "$", docJson);
       // Wave 5.30a — autocomplete suggester live-populate. INCR bumps the
       // score on duplicate values so frequent terms rank higher in FT.SUGGET.
       // Pipelined alongside JSON.SET (and before XACK) so a SUGADD failure
@@ -328,9 +349,16 @@ export async function processBatch(
         pipeline.call("FT.SUGADD", "sug:risk_factor", String(doc.risk_factor), "1", "INCR");
       }
       pipeline.xack(opts.stream, opts.group, entryId);
+      if (profile) {
+        profile.recordStep("pipe_build", process.hrtime.bigint() - buildStart);
+        profile.recordRowsApplied(1);
+        profile.recordRowsAcked(1);
+      }
       processed++;
     }
+    const execStart = profile ? process.hrtime.bigint() : 0n;
     await pipeline.exec();
+    if (profile) profile.recordStep("pipe_exec", process.hrtime.bigint() - execStart);
   }
   return processed;
 }

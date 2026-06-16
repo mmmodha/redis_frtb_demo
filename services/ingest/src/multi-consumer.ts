@@ -14,12 +14,16 @@ import {
   type RedisLike,
 } from "./consumer.ts";
 import { shardStreamKey } from "./sharding.ts";
+import { PROFILE_ENABLED, createRunnerProfile, type RunnerProfile } from "./profile.ts";
 
 export interface ShardConsumerHandle {
   shard: number;
   stream: string;
   consumerName: string;
   runner: ConsumerRunner;
+  // Wave 6.15a — populated only when INGEST_PROFILE=1; null otherwise so the
+  // multi-consumer's start/stop fan-out can no-op cheaply in production.
+  profile: RunnerProfile | null;
 }
 
 export interface MultiConsumerOptions {
@@ -65,6 +69,9 @@ export function createMultiShardConsumer(
     const consumerName = opts.totalShards <= 1
       ? opts.consumerNameBase
       : `${opts.consumerNameBase}-s${shard}`;
+    // Wave 6.15a — one profiler per shard runner, labelled with the
+    // shard index. Only constructed when INGEST_PROFILE=1.
+    const profile = PROFILE_ENABLED ? createRunnerProfile(`s${shard}`) : null;
     const runner = createConsumer(client, {
       stream,
       group: opts.group,
@@ -72,8 +79,9 @@ export function createMultiShardConsumer(
       batchSize: opts.batchSize,
       blockMs: opts.blockMs,
       schema: opts.schema,
+      profile: profile ?? undefined,
     });
-    return { shard, stream, consumerName, runner };
+    return { shard, stream, consumerName, runner, profile };
   });
 
   // Aggregated stats expose live sums via getters so /healthz and the
@@ -105,12 +113,23 @@ export function createMultiShardConsumer(
     handles,
     stats,
     start(): void {
-      for (const h of handles) h.runner.start();
+      for (const h of handles) {
+        h.profile?.start();
+        h.runner.start();
+      }
     },
     // Drain every shard's in-flight XREADGROUP batch in parallel so the
     // active-target swap window is bounded by max(blockMs), not sum(blockMs).
     async stop(): Promise<void> {
       await Promise.all(handles.map((h) => h.runner.stop()));
+      // Wave 6.15a — emit a consolidated lifetime summary per shard once
+      // the runner has fully drained, then stop the 5s reporter timer.
+      for (const h of handles) {
+        if (h.profile) {
+          h.profile.emitFinalSummary();
+          h.profile.stop();
+        }
+      }
     },
   };
 }
