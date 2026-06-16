@@ -137,7 +137,7 @@ describe("<IngestPanel /> — Wave 5.52 simple-mode generator", () => {
     expect(body.class_split).toEqual({ GIRR: 68, Equity: 66, FX: 66 });
     const counts = Object.values(body.class_split as Record<string, number>);
     expect(Math.max(...counts) - Math.min(...counts)).toBeLessThanOrEqual(2);
-    expect(body.sensitivity_types).toEqual(["Delta", "Vega"]);
+    expect(body.sensitivity_types).toEqual(["Delta", "Vega", "Curvature"]);
     // rows=200 ⇒ max(50, min(10000, floor(200/20))) = 50
     expect(body.trade_pool_size).toBe(50);
     // rows=200 ⇒ max(8, min(256, floor(200/200))) = 8
@@ -242,10 +242,10 @@ describe("<IngestPanel /> — Wave 5.52 simple-mode generator", () => {
     expect((within(stop).getByLabelText(/Stop after rows/i) as HTMLInputElement).value).toBe("20000");
     expect((within(stop).getByLabelText(/Stop at memory %/i) as HTMLInputElement).value).toBe("75");
     expect((within(stop).getByLabelText(/Stop after seconds/i) as HTMLInputElement).value).toBe("600");
-    // Delta + Vega checked, Curvature unchecked.
+    // Wave 6.10 — Delta + Vega + Curvature all checked by default.
     expect((within(card).getByRole("checkbox", { name: "Delta" }) as HTMLInputElement).checked).toBe(true);
     expect((within(card).getByRole("checkbox", { name: "Vega" }) as HTMLInputElement).checked).toBe(true);
-    expect((within(card).getByRole("checkbox", { name: "Curvature" }) as HTMLInputElement).checked).toBe(false);
+    expect((within(card).getByRole("checkbox", { name: "Curvature" }) as HTMLInputElement).checked).toBe(true);
   });
 
   it("rows quick-pick clears any staged canonical seed (next Generate draws a fresh seed)", async () => {

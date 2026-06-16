@@ -41,6 +41,10 @@ export interface GeneratorConfig {
   factor_pool_size?: number;
   class_split?: Record<string, number>;
   stop_when?: StopWhen;
+  // Wave 6.10 — approximate XADD MAXLEN cap. Default cap on the api side is
+  // 2_000_000; UI auto-flips this to match `rows` when the user picks a
+  // simple-mode row count above the default (no silent truncation).
+  stream_maxlen?: number;
 }
 
 export interface GeneratorStartResponse extends IngestRunResponse {

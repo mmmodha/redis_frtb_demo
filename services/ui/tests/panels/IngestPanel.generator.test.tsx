@@ -118,7 +118,8 @@ describe("<IngestPanel /> — synthetic generator card (Wave 5.17b / 5.52)", () 
     }
     expect((within(card).getByRole("checkbox", { name: "Delta" }) as HTMLInputElement).checked).toBe(true);
     expect((within(card).getByRole("checkbox", { name: "Vega" }) as HTMLInputElement).checked).toBe(true);
-    expect((within(card).getByRole("checkbox", { name: "Curvature" }) as HTMLInputElement).checked).toBe(false);
+    // Wave 6.10 — Curvature is checked by default in advanced mode.
+    expect((within(card).getByRole("checkbox", { name: "Curvature" }) as HTMLInputElement).checked).toBe(true);
 
     expect((within(card).getByTestId("generator-preset") as HTMLSelectElement).value).toBe("custom");
     expect((within(card).getByLabelText(/trade pool size/i) as HTMLInputElement).value).toBe("50");
@@ -142,7 +143,7 @@ describe("<IngestPanel /> — synthetic generator card (Wave 5.17b / 5.52)", () 
     )!;
     const body = JSON.parse((posted[1] as RequestInit).body as string);
     expect(body.class_split).toEqual({ GIRR: 68, Equity: 66, FX: 66 });
-    expect(body.sensitivity_types).toEqual(["Delta", "Vega"]);
+    expect(body.sensitivity_types).toEqual(["Delta", "Vega", "Curvature"]);
     expect(body.trade_pool_size).toBe(50);
     expect(body.factor_pool_size).toBe(8);
     expect(body.stop_when).toEqual({ rows: 200, memory_pct: 75, elapsed_seconds: 600 });

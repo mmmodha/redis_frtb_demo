@@ -62,7 +62,16 @@ const QUICK_PICK_ROWS = [
   { label: "20k", value: 20_000 },
   { label: "200k", value: 200_000 },
   { label: "2M", value: 2_000_000 },
+  { label: "10M", value: 10_000_000 },
+  { label: "50M", value: 50_000_000 },
+  { label: "100M", value: 100_000_000 },
 ] as const;
+// Wave 6.10 — api-side default XADD MAXLEN cap (mirrors
+// DEFAULT_STREAM_MAXLEN in services/api/src/routes/generator.ts). When the
+// user picks a simple-mode row count above this and has NOT manually set a
+// cap in Advanced, the submitted request auto-flips stream_maxlen to match
+// the row count so no rows are silently truncated.
+const DEFAULT_STREAM_MAXLEN = 2_000_000;
 // Wave 5.87a — balanced-thirds default. Mirrors the canonical 200k baseline
 // (README "Canonical 200k baseline (Wave 5.84)") used to pin
 // calc-live-200k.test.ts charge anchors — the legacy 60/30/10 default
@@ -101,6 +110,19 @@ function formatSeedHex(seed: number): string {
 }
 function randomSeed(): number {
   return (Math.floor(Math.random() * 0xFFFFFFFF)) >>> 0;
+}
+
+// Wave 6.10 — parse the Advanced "Stream cap" input. Empty ⇒ null (no
+// manual override, callers may auto-flip). 0 ⇒ explicit opt-out (no cap).
+// Returns Error on a malformed entry so the caller can surface a form error.
+function parseManualMaxlen(raw: string): number | null | Error {
+  const trimmed = raw.trim();
+  if (trimmed === "") return null;
+  const n = Number(trimmed);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0) {
+    return new Error("Stream cap must be a non-negative integer (0 to disable).");
+  }
+  return n;
 }
 
 const POLL_MS = 1000;
@@ -688,7 +710,14 @@ function SyntheticGeneratorCard(props: { preflightGate?: () => Promise<Preflight
   // Wave 5.49 / pre-5.52 — advanced-mode state. Only consulted when
   // advancedOpen=true; otherwise auto-derivation builds the body.
   const [classes, setClasses] = useState<Set<string>>(() => new Set(GENERATOR_CLASSES));
-  const [sensTypes, setSensTypes] = useState<Set<string>>(() => new Set(["Delta", "Vega"]));
+  // Wave 6.10 — Curvature on by default so a fresh-page run populates all
+  // three sensitivity legs. CANONICAL_DEMO_SENS_TYPES (Delta+Vega only) is
+  // still applied by onResetToCanonical so calc-live-200k anchors hold.
+  const [sensTypes, setSensTypes] = useState<Set<string>>(() => new Set(["Delta", "Vega", "Curvature"]));
+  // Wave 6.10 — optional stream MAXLEN cap (string state to distinguish
+  // "user has not touched it" (empty) from an explicit value). Empty ⇒ the
+  // submit path auto-flips to match `rows` when rows > DEFAULT_STREAM_MAXLEN.
+  const [streamMaxlen, setStreamMaxlen] = useState<string>("");
   const [seed, setSeed] = useState<string>("0");
   const [preset, setPreset] = useState<GeneratorPreset>(DEFAULT_PRESET);
   const [tradePool, setTradePool] = useState<string>(String(DEFAULT_GEN_TRADE_POOL));
@@ -722,7 +751,10 @@ function SyntheticGeneratorCard(props: { preflightGate?: () => Promise<Preflight
     const derivedTrade = deriveTradePool(rows);
     const derivedFactor = deriveFactorPool(rows);
     const derivedSplit = deriveClassSplit(rows, mixPct);
-    setSensTypes(new Set(CANONICAL_DEMO_SENS_TYPES));
+    // Wave 6.10 — opening Advanced mirrors the simple-mode default
+    // (Delta+Vega+Curvature). CANONICAL_DEMO_SENS_TYPES stays Delta+Vega and
+    // is only applied by onResetToCanonical.
+    setSensTypes(new Set(["Delta", "Vega", "Curvature"]));
     setClasses(new Set(GENERATOR_CLASSES));
     setSeed(String(pendingSeed ?? lastSeed ?? randomSeed()));
     setPreset("custom");
@@ -751,6 +783,28 @@ function SyntheticGeneratorCard(props: { preflightGate?: () => Promise<Preflight
     return sum;
   }, [classes, classSplit]);
   const classSplitActive = classSplitSum > 0;
+
+  // Wave 6.10 — surfaced just above the Submit button: either an "auto-flip"
+  // hint (no manual cap, rows exceed the api default) or an orange warning
+  // (manual cap < effective rows ⇒ silent truncation risk). Mirrors the
+  // build-time logic in buildSimpleConfig / buildAdvancedConfig.
+  const maxlenHint = useMemo<
+    { kind: "auto"; cap: number } | { kind: "warn"; cap: number; rows: number } | null
+  >(() => {
+    const effectiveRows = advancedOpen && classSplitActive
+      ? classSplitSum
+      : (Number.isFinite(rows) ? rows : 0);
+    if (effectiveRows <= 0) return null;
+    const trimmed = streamMaxlen.trim();
+    if (trimmed === "") {
+      if (effectiveRows > DEFAULT_STREAM_MAXLEN) return { kind: "auto", cap: effectiveRows };
+      return null;
+    }
+    const n = Number(trimmed);
+    if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) return null;
+    if (n < effectiveRows) return { kind: "warn", cap: n, rows: effectiveRows };
+    return null;
+  }, [advancedOpen, classSplitActive, classSplitSum, rows, streamMaxlen]);
 
   function toggleMember(prev: Set<string>, value: string): Set<string> {
     const next = new Set(prev);
@@ -816,6 +870,16 @@ function SyntheticGeneratorCard(props: { preflightGate?: () => Promise<Preflight
       stopWhen.elapsed_seconds = n;
     }
     if (Object.keys(stopWhen).length > 0) cfg.stop_when = stopWhen;
+    // Wave 6.10 — propagate the manual / auto-flipped MAXLEN cap. Manual
+    // entry always wins; otherwise auto-flip to the effective row count when
+    // it exceeds the api-side default so no rows are silently truncated.
+    const effectiveRows = hasSplit
+      ? Object.values(splitOut).reduce((a, b) => a + b, 0)
+      : rows;
+    const parsedMaxlen = parseManualMaxlen(streamMaxlen);
+    if (parsedMaxlen instanceof Error) return parsedMaxlen.message;
+    if (parsedMaxlen !== null) cfg.stream_maxlen = parsedMaxlen;
+    else if (effectiveRows > DEFAULT_STREAM_MAXLEN) cfg.stream_maxlen = effectiveRows;
     return cfg;
   }
 
@@ -830,15 +894,26 @@ function SyntheticGeneratorCard(props: { preflightGate?: () => Promise<Preflight
     if (!mixValid) return `Class mix must sum to 100 (currently ${mixSum})`;
     const split = deriveClassSplit(rows, mixPct);
     if (Object.keys(split).length === 0) return "At least one class must have a non-zero percentage.";
+    if (sensTypes.size === 0) return "Select at least one sensitivity type.";
     const seedUsed = pendingSeed ?? randomSeed();
     const cfg: GeneratorConfig = {
       class_split: split,
-      sensitivity_types: [...CANONICAL_DEMO_SENS_TYPES],
+      // Wave 6.10 — simple mode now emits the user's sensTypes (fresh-page
+      // default Delta+Vega+Curvature). Reset to canonical demo restores the
+      // Delta+Vega pair via onResetToCanonical so the 200-row canary stays
+      // bit-identical.
+      sensitivity_types: Array.from(sensTypes),
       seed: seedUsed,
       trade_pool_size: deriveTradePool(rows),
       factor_pool_size: deriveFactorPool(rows),
       stop_when: { rows, memory_pct: 75, elapsed_seconds: 600 },
     };
+    // Wave 6.10 — MAXLEN cap. Manual entry wins; otherwise auto-flip when
+    // rows exceed the api-side default cap (DEFAULT_STREAM_MAXLEN).
+    const parsedMaxlen = parseManualMaxlen(streamMaxlen);
+    if (parsedMaxlen instanceof Error) return parsedMaxlen.message;
+    if (parsedMaxlen !== null) cfg.stream_maxlen = parsedMaxlen;
+    else if (rows > DEFAULT_STREAM_MAXLEN) cfg.stream_maxlen = rows;
     return { cfg, seedUsed };
   }
 
@@ -929,6 +1004,12 @@ function SyntheticGeneratorCard(props: { preflightGate?: () => Promise<Preflight
     setRows(CANONICAL_DEMO_ROWS);
     setMixPct({ ...CANONICAL_DEMO_MIX });
     setPendingSeed(CANONICAL_DEMO_SEED);
+    // Wave 6.10 — restore the Delta+Vega sens-type pair so the 200-row
+    // canonical canary stays bit-identical to the calc-live-200k anchors
+    // (CANONICAL_DEMO_SENS_TYPES). Also drop any manual MAXLEN override so
+    // the 200-row run requires no cap argument at all.
+    setSensTypes(new Set(CANONICAL_DEMO_SENS_TYPES));
+    setStreamMaxlen("");
     setFormError(null);
   }
 
@@ -1051,6 +1132,24 @@ function SyntheticGeneratorCard(props: { preflightGate?: () => Promise<Preflight
             </span>
           ) : null}
         </fieldset>
+
+        {maxlenHint?.kind === "auto" ? (
+          <div
+            className="generator-form__hint generator-form__hint--info"
+            data-testid="ingest-maxlen-auto"
+            role="status"
+          >
+            Stream cap auto-set to {maxlenHint.cap.toLocaleString()} entries — no truncation. Override in Advanced.
+          </div>
+        ) : maxlenHint?.kind === "warn" ? (
+          <div
+            className="generator-form__hint generator-form__hint--warn"
+            data-testid="ingest-maxlen-warn"
+            role="status"
+          >
+            ⚠ Stream cap is {maxlenHint.cap.toLocaleString()} entries; this run produces {maxlenHint.rows.toLocaleString()} rows. Only the most recent {maxlenHint.cap.toLocaleString()} will be retained.
+          </div>
+        ) : null}
 
         <div className="generator-form__actions">
           <button
@@ -1262,6 +1361,24 @@ function SyntheticGeneratorCard(props: { preflightGate?: () => Promise<Preflight
               disabled={busy}
               onChange={(e) => setFactorPool(Number(e.target.value) || 0)}
             />
+          </div>
+
+          {/* Wave 6.10 — manual stream MAXLEN override. Empty ⇒ simple-mode
+              auto-flips to rows when rows > DEFAULT_STREAM_MAXLEN. 0 opts out
+              of the cap entirely (XADD bit-identical to pre-5.92C). */}
+          <div className="generator-form__row">
+            <label htmlFor="gen-stream-maxlen">Stream cap (MAXLEN)</label>
+            <input
+              id="gen-stream-maxlen"
+              type="number"
+              min={0}
+              placeholder="auto"
+              value={streamMaxlen}
+              disabled={busy}
+              onChange={(e) => setStreamMaxlen(e.target.value)}
+              data-testid="generator-stream-maxlen"
+            />
+            <span className="generator-form__hint">empty = auto-flip to rows above 2M · 0 = no cap</span>
           </div>
 
           {/* Wave 5.47c — optional stop conditions. Whichever trips first

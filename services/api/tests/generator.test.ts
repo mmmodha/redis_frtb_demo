@@ -91,7 +91,7 @@ describe("POST /generator/start — in-process synthetic row producer", () => {
     expect(typeof body.run_id).toBe("string");
     expect(body.run_id.length).toBeGreaterThan(0);
     expect(body.classes).toEqual(["GIRR", "EQUITY", "FX"]);
-    expect(body.sensitivity_types).toEqual(["Delta", "Vega"]);
+    expect(body.sensitivity_types).toEqual(["Delta", "Vega", "Curvature"]);
     expect(typeof body.ms).toBe("number");
 
     // Exactly 50 XADDs all against the default stream.

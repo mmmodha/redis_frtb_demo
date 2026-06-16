@@ -157,7 +157,7 @@ export interface GeneratorRoutesOpts {
 
 const DEFAULT_ROWS = 200;
 const DEFAULT_CLASSES = ["GIRR", "Equity", "FX"] as const;
-const DEFAULT_SENSITIVITY_TYPES = ["Delta", "Vega"] as const;
+const DEFAULT_SENSITIVITY_TYPES = ["Delta", "Vega", "Curvature"] as const;
 
 // Wave 5.84A — generator throughput defaults. DEFAULT_BATCH_SIZE was bumped
 // from 200 to 1000 (the CLI default) to halve round-trip overhead on the

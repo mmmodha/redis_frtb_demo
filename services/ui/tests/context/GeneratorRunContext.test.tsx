@@ -240,6 +240,48 @@ describe("<GeneratorRunProvider /> — Wave 5.40b reconnect", () => {
     expect(stored.rows_total).toBe(1000);
   });
 
+  // Wave 6.10 — pill stability. The AppShell nav pill only renders while the
+  // provider's `run` is non-null. Simulate a long-running run (60s of polls
+  // all returning "running") and confirm `run.runId` stays set the whole time
+  // so the pill never flickers out mid-run.
+  it("pill stability: run + runId persist across 60s of running-status polls", async () => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ run_id: "01HXLONG", rows_total: 1000, started_at: Date.now() }));
+    let rowsDone = 50;
+    fetchMock.on(
+      (url, method) => /\/generator\/runs\/[^/]+\/status$/.test(url) && method === "GET",
+      () => ({
+        status: 200,
+        body: { run_id: "01HXLONG", status: "running", rows_done: rowsDone, rows_total: 1000, rows_per_sec: 800, elapsed_ms: rowsDone * 10 },
+      }),
+    );
+    fetchMock.on(
+      (url, method) => /\/generator\/runs$/.test(url) && method === "GET",
+      () => ({ status: 200, body: { active: [] } }),
+    );
+
+    vi.useFakeTimers();
+    const ui = renderProvider();
+    // Drain the mount-time async fetch chain under fake timers.
+    for (let i = 0; i < 20; i++) await act(async () => { await Promise.resolve(); });
+    expect(ui.value.run).not.toBeNull();
+    expect(ui.value.run!.runId).toBe("01HXLONG");
+    expect(ui.value.run!.status).toBe("running");
+
+    // Advance 60s in 1s ticks so each 500ms poll interval fires and its
+    // async response is drained. The pill must remain mounted the whole time.
+    for (let elapsed = 0; elapsed < 60_000; elapsed += 1000) {
+      rowsDone = Math.min(950, rowsDone + 10);
+      await act(async () => {
+        vi.advanceTimersByTime(1000);
+        for (let i = 0; i < 5; i++) await Promise.resolve();
+      });
+      expect(ui.value.run, `run vanished at ~${elapsed + 1000}ms`).not.toBeNull();
+      expect(ui.value.run!.runId).toBe("01HXLONG");
+      expect(ui.value.run!.status).toBe("running");
+    }
+    vi.useRealTimers();
+  });
+
   it("adopts orphan when localStorage points to a different (404) run_id", async () => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ run_id: "01HXGHOST", rows_total: 200, started_at: Date.now() }));
     fetchMock.on(
