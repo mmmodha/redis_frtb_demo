@@ -193,6 +193,20 @@ interface ActiveRun {
   // Wave 5.84B — resolved worker count for this run. Echoed in the seed +
   // terminal SSE frames so the UI can surface "running with N workers".
   workers?: number;
+  // Wave 6.12c — resolved plan dials for this run. Populated by the SSE
+  // route from the same object the seed frame surfaces, so a refresh after
+  // the seed frame is gone can still confirm what shard count / workers /
+  // batch / window were used. The non-streaming /generator/start path omits
+  // this (the JSON response shape stays untouched — there's no seed frame
+  // there for the UI to lose).
+  dials?: {
+    workers: number;
+    batch_size: number;
+    pipeline_window: number;
+    // StreamShardsConfig = number | "per-bucket" — matches the seed-frame
+    // plan.dials shape so the two surfaces stay byte-identical.
+    stream_shards: StreamShardsConfig;
+  };
 }
 const activeRuns = new Map<string, ActiveRun>();
 
@@ -764,6 +778,17 @@ export function registerGeneratorRoutes(
         + "hash-tagged keys before running at high volume.",
       );
     }
+    // Wave 6.12c — dials block shared between the seed-frame `plan` and
+    // the per-run ActiveRun, so /generator/runs/:id/status returns identical
+    // values after the seed frame is gone (refresh-after-seed survival).
+    const dialsBlock = {
+      workers: dials.workers,
+      batch_size: dials.batchSize,
+      pipeline_window: dials.pipelineWindow,
+      // Wave 5.92A — resolved stream-shard fan-out surfaces in the plan
+      // so the UI can show "fan-out across N streams" from frame 0.
+      stream_shards: dials.streamShards,
+    };
     const plan: Record<string, unknown> = {
       profile: dials.profile,
       profile_requested: profile,
@@ -773,12 +798,7 @@ export function registerGeneratorRoutes(
         fallback: !!shape.fallback,
       },
       host_cores: availableParallelism(),
-      dials: {
-        workers: dials.workers, batch_size: dials.batchSize, pipeline_window: dials.pipelineWindow,
-        // Wave 5.92A — resolved stream-shard fan-out surfaces in the plan
-        // so the UI can show "fan-out across N streams" from frame 0.
-        stream_shards: dials.streamShards,
-      },
+      dials: dialsBlock,
       overrides: dials.overrides,
       rows,
       bytes_per_row: BYTES_PER_ROW,
@@ -800,8 +820,26 @@ export function registerGeneratorRoutes(
       sensitivity_types,
       cancelFlag: { cancelled: false },
       workers,
+      // Wave 6.12c — surface the resolved plan dials on the status endpoint.
+      dials: dialsBlock,
     };
     activeRuns.set(run_id, state);
+
+    // Wave 6.12c — boot log line for this run. Logs the resolved
+    // stream_shards alongside the existing stream_maxlen so .run/logs/api.log
+    // shows the resolved fan-out shape for the run (the per-MAXLEN status
+    // log in runGeneratorLoop only fires when streamMaxLen !== undefined,
+    // and never carried stream_shards). This is the on-disk counterpart
+    // to the SSE seed frame's `plan.dials` block.
+    app.log.info(
+      {
+        evt: "generator-stream",
+        run_id,
+        stream_maxlen: streamMaxLen ?? null,
+        stream_shards: dials.streamShards,
+      },
+      `boot: stream_shards=${dials.streamShards} stream_maxlen=${streamMaxLen ?? "off"}`,
+    );
 
     // Open the SSE channel before kicking off generation so the client
     // immediately sees `run_id` in the first progress frame.
@@ -979,6 +1017,12 @@ export function registerGeneratorRoutes(
       // late-arriving clients (post-refresh) can render the same label as
       // the SSE terminal frame.
       ...(entry.stop_reason ? { stop_reason: entry.stop_reason } : {}),
+      // Wave 6.12c — surface the resolved plan dials (same object the SSE
+      // seed frame carries) so a refresh after the seed frame is gone can
+      // still confirm what shard count / workers / batch / window were used.
+      // Only populated on the streaming route's runs; absent on the
+      // non-streaming /generator/start path (no seed frame, no dials).
+      ...(entry.dials ? { dials: entry.dials } : {}),
     };
   });
 

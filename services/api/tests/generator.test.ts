@@ -533,6 +533,100 @@ describe("POST /generator/start/stream (Wave 5.20c) — SSE progress + cancellat
     expect(plan.warnings).toBeUndefined();
   });
 
+  // Wave 6.12c — GET /generator/runs/:id/status returns the resolved
+  // `dials` block (workers, batch_size, pipeline_window, stream_shards)
+  // populated from the same object the SSE seed frame carries, so a
+  // refresh after the seed frame is gone can still confirm the plan.
+  it("GET /generator/runs/:id/status returns the resolved dials block (Wave 6.12c)", async () => {
+    const schema = loadFixtureSchema();
+    const fr = pipelineFakeRedis();
+    app = await createServer({ redis: fr, schema });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/generator/start/stream",
+      payload: { rows: 25, stream_shards: 16 },
+      headers: { accept: "text/event-stream" },
+      payloadAsStream: true,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = await collectStream(res.stream() as unknown as NodeJS.ReadableStream);
+    const frames = parseSseFrames(body);
+    const seed = frames[0]!;
+    const runId = seed.run_id as string;
+    const seedDials = (seed.plan as Record<string, unknown>).dials as Record<string, unknown>;
+
+    const statusRes = await app.inject({ method: "GET", url: `/generator/runs/${runId}/status` });
+    expect(statusRes.statusCode).toBe(200);
+    const statusJson = statusRes.json() as Record<string, unknown>;
+    expect(statusJson.dials).toBeDefined();
+    const dials = statusJson.dials as Record<string, unknown>;
+    expect(dials.stream_shards).toBe(16);
+    // Resolved dials must match the seed-frame plan dials byte-for-byte so
+    // the UI can switch between the seed frame and the status endpoint
+    // without drift.
+    expect(dials.workers).toBe(seedDials.workers);
+    expect(dials.batch_size).toBe(seedDials.batch_size);
+    expect(dials.pipeline_window).toBe(seedDials.pipeline_window);
+    expect(dials.stream_shards).toBe(seedDials.stream_shards);
+  });
+
+  // Wave 6.12c — the non-streaming /generator/start path has no seed
+  // frame and never populates ActiveRun.dials, so the response body shape
+  // must stay unchanged (no `dials` key sneaking into the JSON response).
+  it("non-streaming /generator/start response shape stays unchanged — no dials key (Wave 6.12c)", async () => {
+    const schema = loadFixtureSchema();
+    const fr = pipelineFakeRedis();
+    app = await createServer({ redis: fr, schema });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/generator/start",
+      payload: { rows: 5 },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as Record<string, unknown>;
+    expect(body.dials).toBeUndefined();
+  });
+
+  // Wave 6.12c — boot log line for a streaming run includes both
+  // stream_shards and stream_maxlen so .run/logs/api.log shows the
+  // resolved fan-out shape (the per-MAXLEN log in runGeneratorLoop
+  // never carried stream_shards). Uses the calc-sbm.test pattern of
+  // swapping app.log.info for a capturing spy without flipping
+  // `logger: true` (which would spam stdout for the whole suite).
+  it("boot log line includes stream_shards alongside stream_maxlen (Wave 6.12c)", async () => {
+    const schema = loadFixtureSchema();
+    const fr = pipelineFakeRedis();
+    app = await createServer({ redis: fr, schema });
+    const infos: unknown[] = [];
+    (app.log as unknown as { info: (obj: unknown, msg?: string) => void }).info = (obj: unknown) => {
+      infos.push(obj);
+    };
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/generator/start/stream",
+      payload: { rows: 10, stream_shards: 8 },
+      headers: { accept: "text/event-stream" },
+      payloadAsStream: true,
+    });
+    expect(res.statusCode).toBe(200);
+    await collectStream(res.stream() as unknown as NodeJS.ReadableStream);
+
+    const bootHit = infos.find(
+      (i) => typeof i === "object" && i !== null
+        && (i as { evt?: string }).evt === "generator-stream"
+        && typeof (i as { stream_shards?: unknown }).stream_shards === "number",
+    ) as Record<string, unknown> | undefined;
+    expect(bootHit).toBeDefined();
+    expect(bootHit!.stream_shards).toBe(8);
+    // Default DEFAULT_STREAM_MAXLEN (2_000_000) is in effect when the body
+    // omits stream_maxlen; mirrors the const in services/api/src/routes/generator.ts.
+    expect(bootHit!.stream_maxlen).toBe(2_000_000);
+    expect(typeof bootHit!.run_id).toBe("string");
+  });
+
   // Wave 5.21c — regression: the previous implementation listened on
   // `req.raw` for `close`/`error`, which Fastify fires as soon as the
   // inbound JSON body finishes parsing. That flipped `cancelFlag` before
