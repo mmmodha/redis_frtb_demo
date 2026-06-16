@@ -253,6 +253,80 @@ export async function bootstrapFrtb(
   }
   log({ service: "api", bootstrap: "suggesters", action: "backfilled", counts: sugCounts });
 
+  // Step 4 (Wave 6.14c) — rollup completeness sanity check. Cross-reference
+  // the set of distinct (risk_class, bucket) pairs in idx:sens against the
+  // set of `rollup:{rc:bkt}:*` hash-tags discovered by SCAN. A short rollup
+  // count means the cluster holds sens docs that landed before 6.14a was
+  // deployed; surface a single non-fatal WARN so operators know to run the
+  // BACKFILL_ROLLUPS=1 tool. Index- or SCAN-level errors on individual
+  // shards are tolerated by design (the index may be cold on a fresh shard)
+  // — the same per-master loop pattern as Step 3 above.
+  const discoveredBuckets = new Set<string>();
+  for (const node of nodes) {
+    try {
+      const aggReply = (await node.call(
+        "FT.AGGREGATE", "idx:sens", "*",
+        "GROUPBY", "2", "@risk_class", "@bucket",
+        "LIMIT", "0", "100000",
+        "DIALECT", "2",
+        "TIMEOUT", "30000",
+      )) as unknown[];
+      if (!Array.isArray(aggReply)) continue;
+      for (let i = 1; i < aggReply.length; i++) {
+        const row = aggReply[i];
+        if (!Array.isArray(row)) continue;
+        let rc: string | undefined;
+        let bkt: string | undefined;
+        for (let j = 0; j < row.length; j += 2) {
+          const k = String(row[j]).replace(/^@/, "");
+          const v = String(row[j + 1]);
+          if (k === "risk_class") rc = v;
+          else if (k === "bucket") bkt = v;
+        }
+        if (rc && bkt) discoveredBuckets.add(`${rc}:${bkt}`);
+      }
+    } catch {
+      // Index missing on this shard / cold start — skip; partial coverage
+      // here just biases the check toward NOT warning.
+    }
+  }
+  const rollupHashtags = new Set<string>();
+  for (const node of nodes) {
+    let cursor = "0";
+    try {
+      do {
+        const reply = (await node.call(
+          "SCAN", cursor, "MATCH", "rollup:{*}:*", "COUNT", "500",
+        )) as unknown;
+        if (
+          !Array.isArray(reply) || reply.length < 2 ||
+          typeof reply[0] !== "string" || !Array.isArray(reply[1])
+        ) {
+          break;
+        }
+        cursor = reply[0];
+        for (const key of reply[1] as string[]) {
+          const m = /^rollup:\{([^}]+)\}:/.exec(key);
+          if (m) rollupHashtags.add(m[1]!);
+        }
+      } while (cursor !== "0");
+    } catch {
+      // SCAN failure on a single shard is non-fatal — bias toward NOT
+      // warning (partial coverage on the rollup side too).
+    }
+  }
+  if (discoveredBuckets.size > 0 && rollupHashtags.size < discoveredBuckets.size) {
+    log({
+      service: "api",
+      bootstrap: "rollups",
+      action: "incomplete",
+      level: "warn",
+      buckets: discoveredBuckets.size,
+      rollup_buckets: rollupHashtags.size,
+      hint: "run BACKFILL_ROLLUPS=1 against the ingest service to rebuild rollup hashes",
+    });
+  }
+
   const result: BootstrapResult = {
     index: { nodes: nodes.length, ok: nodes.length - indexFailed.length, failed: indexFailed },
     functions: {

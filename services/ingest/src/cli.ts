@@ -13,6 +13,7 @@ import { createActiveTargetWatcher, defaultRedisFactory, type ActiveTargetWatche
 import { parseShardAssignment, shardStreamKey } from "./sharding.ts";
 import { createMultiShardConsumer, ensureGroupsForShards } from "./multi-consumer.ts";
 import { createShardRuntime, type ShardRuntime } from "./shard-runtime.ts";
+import { backfillRollups } from "./backfill-rollups.ts";
 
 const log = pino({ level: process.env.LOG_LEVEL ?? "info" });
 
@@ -90,6 +91,23 @@ async function main(): Promise<void> {
   const redisUrl = process.env.REDIS_URL;
   const apiUrl = process.env.API_URL;
   const internalToken = process.env.INTERNAL_API_TOKEN;
+
+  // Wave 6.14c — one-shot rollup backfill. Walks the existing sens:* docs
+  // and rebuilds the per-bucket rollup hashes via HSET (idempotent). Runs
+  // before schema/consumer wiring so an operator can rebuild rollups on a
+  // cluster that may not have a SCHEMA_FILE staged. Exits 0 on success.
+  if (process.env.BACKFILL_ROLLUPS === "1") {
+    if (!redisUrl) throw new Error("BACKFILL_ROLLUPS=1 requires REDIS_URL");
+    const client = createClientFromUrl(redisUrl);
+    try {
+      const t0 = Date.now();
+      const report = await backfillRollups(client);
+      log.info({ ...report, elapsed_ms: Date.now() - t0 }, "ingest backfill-rollups done");
+    } finally {
+      await (client as Redis).quit().catch(() => undefined);
+    }
+    return;
+  }
 
   // Wave 5.83B — load the schema once. enrichDoc needs `risk_weights` and
   // per-class tenor nodes to pre-compute `weighted_value`; a missing schema

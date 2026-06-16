@@ -253,9 +253,14 @@ describe("bootstrap — Step 3 backfill suggesters", () => {
     await bootstrapFrtb(r, schema, (e) => logs.push(e));
 
     expect(recorded.filter((c) => c.command === "FT.SUGADD")).toHaveLength(0);
-    expect(recorded.filter((c) => c.command === "FT.AGGREGATE")).toHaveLength(0);
-    const last = logs[logs.length - 1]!;
-    expect(last).toMatchObject({
+    // Wave 6.14c — Step 4 always issues one FT.AGGREGATE for the rollup
+    // completeness check (GROUPBY @risk_class @bucket). The suggester
+    // backfill path is still fully skipped here (zero suggester aggregates).
+    const aggs = recorded.filter((c) => c.command === "FT.AGGREGATE");
+    const suggesterAggs = aggs.filter((c) => !(c.args.includes("@risk_class") && c.args.includes("@bucket")));
+    expect(suggesterAggs).toHaveLength(0);
+    const suggLog = logs.find((l) => l.bootstrap === "suggesters")!;
+    expect(suggLog).toMatchObject({
       bootstrap: "suggesters",
       action: "backfilled",
       counts: { book: 5, trade_id: 7, risk_factor: 3 },
@@ -404,3 +409,95 @@ describe("bootstrap — idempotent at the orchestration layer", () => {
     expect(funcReplace.every((a) => a === "REPLACE")).toBe(true);
   });
 });
+
+// Wave 6.14c — Step 4 rollup completeness sanity check. When the discovery
+// FT.AGGREGATE finds (rc, bkt) buckets but the SCAN over `rollup:{*}:*` keys
+// turns up a smaller distinct hash-tag count, bootstrap emits a single
+// non-fatal WARN log entry pointing operators at the backfill tool. No log
+// line is emitted on the healthy path so the existing standalone log shape
+// is unchanged when no docs / no rollups are present.
+function fakeStandaloneWithRollupShortfall(
+  recorded: RecordedCall[],
+  opts: { buckets: string[]; rollupHashtags: string[] },
+): RedisLike {
+  // FT.AGGREGATE GROUPBY 2 @risk_class @bucket reply rows interleave
+  // (field, value, field, value) pairs — match the layout the bootstrap
+  // loop parses. The first array element is the row count.
+  const rcBktRows = opts.buckets.map((b) => {
+    const [rc, bkt] = b.split(":");
+    return ["risk_class", rc, "bucket", bkt];
+  });
+  const rcBktReply: unknown[] = [opts.buckets.length, ...rcBktRows];
+  // SCAN reply is [cursor, [keys]]. One sweep returns the configured set
+  // of rollup keys, then a "0" cursor terminates the do/while loop.
+  let scanCalls = 0;
+  return {
+    async call(command: string, ...args: unknown[]) {
+      const cmd = String(command).toUpperCase();
+      recorded.push({ node: "standalone", command: cmd, args });
+      if (cmd === "FT.AGGREGATE") {
+        const groupbyFields = args.slice(args.indexOf("GROUPBY") + 2, args.indexOf("LIMIT"));
+        const isRollupCheck = groupbyFields.includes("@risk_class") && groupbyFields.includes("@bucket");
+        if (isRollupCheck) return rcBktReply;
+        return [0];
+      }
+      if (cmd === "FT.SUGLEN") return 1;
+      if (cmd === "SCAN") {
+        scanCalls += 1;
+        if (scanCalls === 1) {
+          const keys = opts.rollupHashtags.map((ht) => `rollup:{${ht}}:Delta`);
+          return ["0", keys];
+        }
+        return ["0", []];
+      }
+      return "OK";
+    },
+  } as unknown as RedisLike;
+}
+
+describe("bootstrap — Wave 6.14c rollup completeness WARN", () => {
+  it("emits a single WARN log when rollup hashtag count < discovered bucket count", async () => {
+    const schema = loadSchema(SCHEMA_PATH);
+    const recorded: RecordedCall[] = [];
+    // 3 distinct (rc, bkt) buckets vs. 2 rollup hashtags → 1 short.
+    const r = fakeStandaloneWithRollupShortfall(recorded, {
+      buckets: ["EQUITY:1", "EQUITY:5", "GIRR:USD-IRS"],
+      rollupHashtags: ["EQUITY:1", "EQUITY:5"],
+    });
+    const logs: Record<string, unknown>[] = [];
+    await bootstrapFrtb(r, schema, (e) => logs.push(e));
+
+    const warns = logs.filter((l) => l.bootstrap === "rollups");
+    expect(warns).toHaveLength(1);
+    expect(warns[0]).toMatchObject({
+      service: "api",
+      bootstrap: "rollups",
+      action: "incomplete",
+      level: "warn",
+      buckets: 3,
+      rollup_buckets: 2,
+    });
+  });
+
+  it("emits NO rollup log when rollup hashtag count >= discovered bucket count", async () => {
+    const schema = loadSchema(SCHEMA_PATH);
+    const recorded: RecordedCall[] = [];
+    const r = fakeStandaloneWithRollupShortfall(recorded, {
+      buckets: ["EQUITY:1", "EQUITY:5"],
+      rollupHashtags: ["EQUITY:1", "EQUITY:5"],
+    });
+    const logs: Record<string, unknown>[] = [];
+    await bootstrapFrtb(r, schema, (e) => logs.push(e));
+    expect(logs.some((l) => l.bootstrap === "rollups")).toBe(false);
+  });
+
+  it("emits NO rollup log when no buckets are discovered (cold start)", async () => {
+    const schema = loadSchema(SCHEMA_PATH);
+    const recorded: RecordedCall[] = [];
+    const r = fakeStandaloneWithRollupShortfall(recorded, { buckets: [], rollupHashtags: [] });
+    const logs: Record<string, unknown>[] = [];
+    await bootstrapFrtb(r, schema, (e) => logs.push(e));
+    expect(logs.some((l) => l.bootstrap === "rollups")).toBe(false);
+  });
+});
+

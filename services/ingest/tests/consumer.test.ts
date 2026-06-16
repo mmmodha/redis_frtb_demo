@@ -19,6 +19,7 @@ import {
   createConsumer,
 } from "../src/consumer.ts";
 import { backfill } from "../src/backfill-weighted.ts";
+import { backfillRollups, accumulateRollup } from "../src/backfill-rollups.ts";
 import { loadSchema, type Schema } from "@frtb/schema";
 import { rollupKey } from "@frtb/calc-shared";
 
@@ -942,6 +943,91 @@ describe("processBatch rollup HINCRBYFLOAT integration [Wave 6.14a]", () => {
       expect(Math.abs(Number(sub.sum_ws_up) - up[i]!)).toBeLessThanOrEqual(1e-12);
       expect(Math.abs(Number(sub.sum_ws_down) - down[i]!)).toBeLessThanOrEqual(1e-12);
       expect(Number(sub.count)).toBe(1);
+    }
+  });
+});
+
+
+// Wave 6.14c — one-shot rollup backfill walks existing sens:* docs and
+// rebuilds rollup hashes via HSET. Pure-helper test asserts the accumulator
+// matches a manual Σ; integration tests drive a live Redis fixture, drop
+// the rollups, rerun the backfill, and check the rebuilt hashes match the
+// originals + re-running is idempotent.
+describe("backfillRollups — Wave 6.14c", () => {
+  it("accumulateRollup matches the manual Σ across mixed combos", () => {
+    const scalar = new Map<string, { sum_ws: number; sum_ws_sq: number; count: number }>();
+    const curvature = new Map<string, { sum_ws_up: number; sum_ws_up_sq: number; sum_ws_down: number; sum_ws_down_sq: number; count: number }>();
+    const docs = [
+      enrichDoc({ risk_class: "EQUITY", bucket: "1", sensitivity_type: "Delta", risk_value: { spot: 0.5 } }, SCHEMA),
+      enrichDoc({ risk_class: "EQUITY", bucket: "1", sensitivity_type: "Delta", risk_value: { spot: 0.25 } }, SCHEMA),
+      enrichDoc({ risk_class: "EQUITY", bucket: "5", sensitivity_type: "Curvature", risk_value: { cvr_up: 0.4, cvr_down: -0.3 } }, SCHEMA),
+    ];
+    for (const d of docs) accumulateRollup(d, scalar, curvature);
+    const eqKey = rollupKey("EQUITY", "1", "Delta");
+    const ws1 = EQUITY_W.by_bucket["1"]! * 0.5;
+    const ws2 = EQUITY_W.by_bucket["1"]! * 0.25;
+    const a = scalar.get(eqKey)!;
+    expect(a.count).toBe(2);
+    expect(Math.abs(a.sum_ws - (ws1 + ws2))).toBeLessThanOrEqual(TOL);
+    expect(Math.abs(a.sum_ws_sq - (ws1 * ws1 + ws2 * ws2))).toBeLessThanOrEqual(TOL);
+    const cvKey = rollupKey("EQUITY", "5", "Curvature");
+    const c = curvature.get(cvKey)!;
+    expect(c.count).toBe(1);
+    expect(Math.abs(c.sum_ws_up - 0.4)).toBeLessThanOrEqual(TOL);
+    expect(Math.abs(c.sum_ws_down - -0.3)).toBeLessThanOrEqual(TOL);
+  });
+
+  integration("rebuild from sens:* docs matches a fresh consumer-driven rollup; re-run is idempotent", async () => {
+    await ensureGroup(redis, "sensitivities:in", "ingest");
+    const combos = [
+      { rc: "EQUITY", bkt: "1", sens: "Delta", mk: (i: number) => ({ sensitivity_type: "Delta", risk_value: { spot: 0.01 * (i + 1) }, trade_id: `T-E-${i}` }) },
+      { rc: "FX", bkt: "EURUSD", sens: "Delta", mk: (i: number) => ({ sensitivity_type: "Delta", risk_value: { spot: 0.02 * (i + 1) }, trade_id: `T-F-${i}` }) },
+      { rc: "EQUITY", bkt: "5", sens: "Curvature", mk: (i: number) => ({ sensitivity_type: "Curvature", risk_value: { cvr_up: 0.1 * (i + 1), cvr_down: -0.05 * (i + 1) }, trade_id: `T-EC-${i}` }) },
+      { rc: "GIRR", bkt: "USD-IRS", sens: "Delta", mk: (i: number) => ({ sensitivity_type: "Delta", risk_value: { "3M": 0.001 * (i + 1), "1Y": 0.002 * (i + 1), "10Y": -0.0005 * (i + 1) }, trade_id: `T-G-${i}` }) },
+    ];
+    const N_EACH = 12;
+    for (const c of combos) {
+      for (let i = 0; i < N_EACH; i++) {
+        await xaddRow("sensitivities:in", makeRow(c.rc, c.bkt, c.mk(i)));
+      }
+    }
+    await processBatch(redis, {
+      stream: "sensitivities:in", group: "ingest", consumerName: "ingest-bf", batchSize: 1000, schema: SCHEMA,
+    }, ">");
+
+    // Snapshot the consumer-built rollups so we can compare after the rebuild.
+    const rollupKeys = await redis.keys("rollup:*");
+    expect(rollupKeys.length).toBeGreaterThan(0);
+    const expected = new Map<string, Record<string, string>>();
+    for (const k of rollupKeys) expected.set(k, await redis.hgetall(k));
+
+    // Drop every rollup then rebuild from the sens:* docs.
+    for (const k of rollupKeys) await redis.del(k);
+    expect((await redis.keys("rollup:*")).length).toBe(0);
+
+    const report = await backfillRollups(redis as unknown as Parameters<typeof backfillRollups>[0]);
+    expect(report.errors).toBe(0);
+    expect(report.scanned).toBe(combos.length * N_EACH);
+    expect(report.rollups_written).toBe(expected.size);
+
+    const TOL_BF = 1e-9;
+    for (const [k, want] of expected.entries()) {
+      const got = await redis.hgetall(k);
+      expect(Number(got.count)).toBe(Number(want.count));
+      for (const f of ["sum_ws", "sum_ws_sq", "sum_ws_up", "sum_ws_up_sq", "sum_ws_down", "sum_ws_down_sq"] as const) {
+        if (want[f] === undefined) continue;
+        expect(Math.abs(Number(got[f]) - Number(want[f]))).toBeLessThanOrEqual(TOL_BF);
+      }
+    }
+
+    // Re-running on the same corpus is a no-op (HSET overwrites with the
+    // same values) — every HGETALL still matches the snapshot.
+    const second = await backfillRollups(redis as unknown as Parameters<typeof backfillRollups>[0]);
+    expect(second.errors).toBe(0);
+    expect(second.rollups_written).toBe(expected.size);
+    for (const [k, want] of expected.entries()) {
+      const got = await redis.hgetall(k);
+      expect(Number(got.count)).toBe(Number(want.count));
     }
   });
 });
