@@ -9,7 +9,7 @@ import { createRedisClient } from "@frtb/redis-client";
 import { loadSchema, type Schema } from "@frtb/schema";
 import pino from "pino";
 import { type RedisLike } from "./consumer.ts";
-import { createActiveTargetWatcher, type ActiveTargetWatcher } from "./active-target-watcher.ts";
+import { createActiveTargetWatcher, defaultRedisFactory, type ActiveTargetWatcher } from "./active-target-watcher.ts";
 import { parseShardAssignment, shardStreamKey } from "./sharding.ts";
 import { createMultiShardConsumer, ensureGroupsForShards } from "./multi-consumer.ts";
 import { createShardRuntime, type ShardRuntime } from "./shard-runtime.ts";
@@ -114,6 +114,12 @@ async function main(): Promise<void> {
   const useWatcher = !!(apiUrl && internalToken);
 
   let activeClient: RedisLike | null = null;
+  // Wave 6.15b — factory invoked once per shard runner at spawn time so
+  // each runner owns a dedicated ioredis socket for its XREADGROUP /
+  // pipeline.exec / XACK hot path. The closure is replaced on every
+  // active-target swap so post-swap spawns hit the new target with the
+  // exact option shape the watcher uses for its shared activeClient.
+  let makeRunnerClient: (() => RedisLike) | null = null;
 
   // Wave 6.12a — shard config lives in shardRuntime; the active-target
   // watcher's `onTargetChange` and POST /ingest/shards both funnel through
@@ -129,12 +135,27 @@ async function main(): Promise<void> {
     initialAssignmentSpec: SHARD_ASSIGNMENT_SPEC,
     logger: { warn: (msg, meta) => log.warn(meta ?? {}, msg) },
     spawn: async (totalShards, assignment) => {
-      if (!activeClient) throw new Error("no active redis client");
+      const sharedClient = activeClient;
+      const factory = makeRunnerClient;
+      if (!sharedClient || !factory) throw new Error("no active redis client");
+      // Wave 6.15b — operator-visible soft cap. Each runner opens its own
+      // ioredis client (1 socket for standalone; N sockets across masters
+      // for Cluster); the *2 factor leaves headroom for the shared
+      // activeClient + watcher subscribe socket. The cluster's `maxclients`
+      // setting is the hard ceiling — bump this number if your cluster has
+      // been provisioned for more concurrent client connections.
+      if (totalShards * 2 > 32) {
+        log.warn(
+          { totalShards, projectedConnections: totalShards * 2, softCap: 32 },
+          "ingest: per-runner connection count exceeds soft cap (totalShards*2 > 32); confirm cluster maxclients headroom",
+        );
+      }
       const streams = assignment.map((s) => shardStreamKey(STREAM, s, totalShards));
-      await ensureGroupsForShards(activeClient, streams, GROUP);
-      const m = createMultiShardConsumer(activeClient, {
+      await ensureGroupsForShards(sharedClient, streams, GROUP);
+      const m = createMultiShardConsumer(sharedClient, {
         baseStream: STREAM, group: GROUP, consumerNameBase: CONSUMER_NAME,
         totalShards, assignment, batchSize: BATCH_SIZE, blockMs: BLOCK_MS, schema,
+        makeRunnerClient: factory,
       });
       m.start();
       for (const h of m.handles) {
@@ -177,6 +198,11 @@ async function main(): Promise<void> {
         // watcher disconnects prev.client only after this callback resolves,
         // so the drain window is bounded by max(BLOCK_MS) across runners.
         activeClient = next.client;
+        // Wave 6.15b — refresh the per-runner factory so the next spawn
+        // builds fresh ioredis clients against the new target with the
+        // SAME option shape the watcher uses for its own activeClient.
+        const target = next.target;
+        makeRunnerClient = () => defaultRedisFactory(target);
         await shardRuntime.rebuild();
         state.ready = true;
       },
@@ -188,6 +214,12 @@ async function main(): Promise<void> {
       "ingest starting",
     );
     activeClient = createClientFromUrl(redisUrl);
+    // Wave 6.15b — each shard runner builds its own client from the same
+    // URL so the hot path doesn't serialise on the shared activeClient
+    // socket. createClientFromUrl honours REDIS_CLUSTER / REDIS_TLS env
+    // and the legacy `redis-cluster://` prefix exactly like the shared
+    // client above.
+    makeRunnerClient = () => createClientFromUrl(redisUrl);
     await shardRuntime.rebuild();
     state.ready = true;
   } else {

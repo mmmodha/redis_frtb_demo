@@ -54,7 +54,13 @@ export interface ActiveTargetWatcher {
   getCurrent(): ActiveTargetFull;
 }
 
-function defaultRedisFactory(t: ActiveTargetFull): RedisLike {
+// Wave 6.15b — exported so cli.ts can build per-runner ioredis clients with
+// the EXACT same option shape as the shared activeClient produced for cold
+// paths (boot-time index setup, target-watcher subscribe, profile emit). The
+// hot path opens one fresh client per shard runner via this factory so
+// XREADGROUP fetches and pipeline.exec writes don't serialise through one
+// shared socket.
+export function defaultRedisFactory(t: ActiveTargetFull): RedisLike {
   return new Redis({
     host: t.host,
     port: t.port,

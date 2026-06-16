@@ -254,6 +254,10 @@ describe("createActiveTargetWatcher (ingest) — multi-shard onTargetChange", ()
     xreadgroup: (...args: unknown[]) => Promise<null>;
     xgroup: () => Promise<string>;
     pipeline: () => unknown;
+    // Wave 6.15b — runner stop() now closes its client via quit() with a
+    // disconnect() fallback; satisfy the shape so the watcher fixture can
+    // re-use this fake as the per-runner client.
+    quit: () => Promise<string>;
   }
   function makeReadingFakeRedis(): ReadingFakeRedis {
     const reads: string[] = [];
@@ -272,6 +276,7 @@ describe("createActiveTargetWatcher (ingest) — multi-shard onTargetChange", ()
         const pl = { call(): unknown { return pl; }, xack(): unknown { return pl; }, async exec() { return []; } };
         return pl;
       },
+      async quit() { return "OK"; },
     };
     return r;
   }
@@ -311,6 +316,11 @@ describe("createActiveTargetWatcher (ingest) — multi-shard onTargetChange", ()
         multi = createMultiShardConsumer(next.client, {
           baseStream: "sensitivities:in", group: "ingest", consumerNameBase: "ingest-host-1",
           totalShards: TOTAL, assignment: ASSIGNMENT, blockMs: 5,
+          // Wave 6.15b — this fixture asserts XREADGROUP traffic accumulates
+          // on built[0]/built[1] (the watcher-built active clients), so the
+          // runner factory aliases next.client. Per-runner-distinct clients
+          // are covered by the dedicated tests in sharding.test.ts.
+          makeRunnerClient: () => next.client, runnerQuitTimeoutMs: 50,
         });
         multi.start();
       },

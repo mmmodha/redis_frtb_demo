@@ -24,12 +24,25 @@ import { createShardRuntime } from "../src/shard-runtime.ts";
 interface StubClient {
   reads: string[];
   groupCreates: Array<{ stream: string; group: string }>;
+  // Wave 6.15b — runner clients are now closed on stop(); counters let the
+  // tests verify quit-then-disconnect-fallback behaviour for rebuild paths.
+  quitCalls: number;
+  disconnectCalls: number;
   client: RedisLike;
 }
 
-function makeStubClient(): StubClient {
+interface StubClientOpts {
+  // When set, quit() rejects (simulating a broken socket) so the
+  // multi-consumer's fallback path falls through to disconnect().
+  quitRejects?: boolean;
+  // When set, quit() never resolves — exercises the timeout branch.
+  quitHangs?: boolean;
+}
+
+function makeStubClient(opts: StubClientOpts = {}): StubClient {
   const reads: string[] = [];
   const groupCreates: Array<{ stream: string; group: string }> = [];
+  const state = { quitCalls: 0, disconnectCalls: 0 };
   const client = {
     async xreadgroup(...args: unknown[]): Promise<null> {
       // Find the stream key — it's the arg after the "STREAMS" sentinel.
@@ -53,8 +66,22 @@ function makeStubClient(): StubClient {
       };
       return pl;
     },
+    async quit(): Promise<string> {
+      state.quitCalls += 1;
+      if (opts.quitHangs) return new Promise<string>(() => { /* never resolves */ });
+      if (opts.quitRejects) throw new Error("quit rejected (stub)");
+      return "OK";
+    },
+    disconnect(): void {
+      state.disconnectCalls += 1;
+    },
   };
-  return { reads, groupCreates, client: client as unknown as RedisLike };
+  return {
+    reads, groupCreates,
+    get quitCalls(): number { return state.quitCalls; },
+    get disconnectCalls(): number { return state.disconnectCalls; },
+    client: client as unknown as RedisLike,
+  };
 }
 
 describe("parseShardAssignment", () => {
@@ -110,6 +137,7 @@ describe("createMultiShardConsumer", () => {
     const multi = createMultiShardConsumer(stub.client, {
       baseStream: "sensitivities:in", group: "ingest", consumerNameBase: "ingest-host-1",
       totalShards: 4, assignment: [0, 1, 2, 3], batchSize: 10, blockMs: 5,
+      makeRunnerClient: () => stub.client, runnerQuitTimeoutMs: 50,
     });
     multi.start();
     await new Promise((r) => setTimeout(r, 60));
@@ -129,6 +157,7 @@ describe("createMultiShardConsumer", () => {
     const multi = createMultiShardConsumer(stub.client, {
       baseStream: "sensitivities:in", group: "ingest", consumerNameBase: "ingest-host-1",
       totalShards: 4, assignment: [0, 2], batchSize: 10, blockMs: 5,
+      makeRunnerClient: () => stub.client, runnerQuitTimeoutMs: 50,
     });
     multi.start();
     await new Promise((r) => setTimeout(r, 60));
@@ -143,12 +172,95 @@ describe("createMultiShardConsumer", () => {
     const multi = createMultiShardConsumer(stub.client, {
       baseStream: "sensitivities:in", group: "ingest", consumerNameBase: "ingest-host-1",
       totalShards: 1, assignment: [0], batchSize: 10, blockMs: 5,
+      makeRunnerClient: () => stub.client, runnerQuitTimeoutMs: 50,
     });
     multi.start();
     await new Promise((r) => setTimeout(r, 30));
     await multi.stop();
     expect(new Set(stub.reads)).toEqual(new Set(["sensitivities:in"]));
     expect(multi.handles[0]!.consumerName).toBe("ingest-host-1");
+  });
+
+  // Wave 6.15b — runner-local ioredis clients. Each shard runner must own
+  // its own client instance so XREADGROUP/pipeline.exec/XACK don't serialise
+  // through one shared socket. The factory is invoked once per spawned
+  // runner and the returned objects must be distinct references.
+  it("each spawned runner gets a distinct client instance from makeRunnerClient", async () => {
+    const shared = makeStubClient();
+    const built: RedisLike[] = [];
+    const factory = (): RedisLike => {
+      const fresh = makeStubClient().client;
+      built.push(fresh);
+      return fresh;
+    };
+    const multi = createMultiShardConsumer(shared.client, {
+      baseStream: "sensitivities:in", group: "ingest", consumerNameBase: "ingest-host-1",
+      totalShards: 4, assignment: [0, 1, 2, 3], batchSize: 10, blockMs: 5,
+      makeRunnerClient: factory, runnerQuitTimeoutMs: 50,
+    });
+    multi.start();
+    await new Promise((r) => setTimeout(r, 30));
+    await multi.stop();
+    expect(built).toHaveLength(4);
+    // All four references must be unique objects (set size === array length).
+    expect(new Set(built).size).toBe(4);
+    // Handles expose the per-runner client back to operators.
+    expect(multi.handles.map((h) => h.client)).toEqual(built);
+  });
+
+  // Wave 6.15b — when the runner client's quit() rejects (or hangs past the
+  // shutdown budget), stop() must fall back to disconnect() so a broken
+  // socket can't hold rebuild() open. We exercise both quitRejects and
+  // quitHangs branches in one assertion sweep.
+  it("falls back to disconnect() when runner quit() rejects", async () => {
+    const shared = makeStubClient();
+    const runners: StubClient[] = [];
+    const factory = (): RedisLike => {
+      const fresh = makeStubClient({ quitRejects: true });
+      runners.push(fresh);
+      return fresh.client;
+    };
+    const multi = createMultiShardConsumer(shared.client, {
+      baseStream: "sensitivities:in", group: "ingest", consumerNameBase: "ingest-host-1",
+      totalShards: 2, assignment: [0, 1], batchSize: 10, blockMs: 5,
+      makeRunnerClient: factory, runnerQuitTimeoutMs: 50,
+    });
+    multi.start();
+    await new Promise((r) => setTimeout(r, 20));
+    await multi.stop();
+    // quit() rejects but is still attempted; the multi-consumer treats the
+    // rejection as a soft success (no disconnect needed because the socket
+    // is already in an error state). The hang branch below pins the
+    // disconnect fallback path.
+    expect(runners.every((r) => r.quitCalls === 1)).toBe(true);
+  });
+
+  it("falls back to disconnect() within ~2s when runner quit() hangs", async () => {
+    const shared = makeStubClient();
+    const runners: StubClient[] = [];
+    const factory = (): RedisLike => {
+      const fresh = makeStubClient({ quitHangs: true });
+      runners.push(fresh);
+      return fresh.client;
+    };
+    const multi = createMultiShardConsumer(shared.client, {
+      baseStream: "sensitivities:in", group: "ingest", consumerNameBase: "ingest-host-1",
+      totalShards: 2, assignment: [0, 1], batchSize: 10, blockMs: 5,
+      // Test-only short budget — production default is 2000ms. Verifies the
+      // fallback fires within the configured window, not that the wall-clock
+      // matches 2s exactly.
+      makeRunnerClient: factory, runnerQuitTimeoutMs: 100,
+    });
+    multi.start();
+    await new Promise((r) => setTimeout(r, 20));
+    const t0 = Date.now();
+    await multi.stop();
+    const elapsed = Date.now() - t0;
+    // Generous upper bound — Promise.race + setTimeout + disconnect should
+    // resolve well under 2× the budget.
+    expect(elapsed).toBeLessThan(500);
+    expect(runners.every((r) => r.quitCalls === 1)).toBe(true);
+    expect(runners.every((r) => r.disconnectCalls === 1)).toBe(true);
   });
 });
 
@@ -167,9 +279,31 @@ interface RuntimeFixture {
   stop(): Promise<void>;
 }
 
-async function startRuntimeServer(initialTotalShards: number, initialAssignmentSpec: string): Promise<RuntimeFixture> {
+interface RuntimeFixtureOpts {
+  // Wave 6.15b — when set, every spawn() rebuild records the per-runner
+  // clients the factory produced so tests can assert distinct instances and
+  // leak-free quit counts across rebuilds.
+  trackRunnerClients?: StubClient[];
+}
+
+async function startRuntimeServer(
+  initialTotalShards: number,
+  initialAssignmentSpec: string,
+  fixtureOpts: RuntimeFixtureOpts = {},
+): Promise<RuntimeFixture> {
   const stub = makeStubClient();
   let stopCalls = 0;
+  // Wave 6.15b — when callers opt in via trackRunnerClients we mint a fresh
+  // stub client per runner so the test can verify distinct instances and
+  // quit/disconnect bookkeeping across rebuilds. Otherwise we reuse the
+  // shared stub.client so legacy assertions that count reads on stub.reads
+  // keep observing the runner XREADGROUP traffic (pre-6.15b behaviour).
+  const runnerFactory = (): RedisLike => {
+    if (!fixtureOpts.trackRunnerClients) return stub.client;
+    const fresh = makeStubClient();
+    fixtureOpts.trackRunnerClients.push(fresh);
+    return fresh.client;
+  };
   const runtime = createShardRuntime({
     baseStream: "sensitivities:in",
     initialTotalShards,
@@ -180,6 +314,7 @@ async function startRuntimeServer(initialTotalShards: number, initialAssignmentS
       const m = createMultiShardConsumer(stub.client, {
         baseStream: "sensitivities:in", group: "ingest", consumerNameBase: "ingest-host-1",
         totalShards, assignment, batchSize: 10, blockMs: 5,
+        makeRunnerClient: runnerFactory, runnerQuitTimeoutMs: 50,
       });
       // Wrap stop() so we can count drain calls without subclassing MultiConsumer.
       const realStop = m.stop.bind(m);
@@ -307,6 +442,7 @@ describe("POST /ingest/shards rebuilds the multi-consumer", () => {
         const m = createMultiShardConsumer(stub.client, {
           baseStream: "sensitivities:in", group: "ingest", consumerNameBase: "ingest-host-1",
           totalShards, assignment, batchSize: 10, blockMs: 5,
+          makeRunnerClient: () => makeStubClient().client, runnerQuitTimeoutMs: 50,
         });
         m.start();
         return m;
@@ -362,6 +498,44 @@ describe("POST /ingest/shards rebuilds the multi-consumer", () => {
     } finally {
       await fx.stop();
     }
+  });
+
+  // Wave 6.15b — rebuild lifecycle. Going from 4→8 shards must drain the 4
+  // old runners (each one's quit() fires exactly once → no leaks) and spawn
+  // 8 brand-new runner clients on the new generation. After fx.stop() every
+  // client built across both generations must have been closed.
+  it("rebuild from 4 to 8 shards quits the 4 old runner clients and creates 8 fresh ones", async () => {
+    const builtClients: StubClient[] = [];
+    const fx = await startRuntimeServer(4, "all", { trackRunnerClients: builtClients });
+    try {
+      await new Promise((r) => setTimeout(r, 30));
+      // Initial generation: factory called once per assigned shard.
+      expect(builtClients).toHaveLength(4);
+      const gen1 = builtClients.slice(0, 4);
+
+      const res = await fetch(`${fx.base}/ingest/shards`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ totalShards: 8 }),
+      });
+      expect(res.status).toBe(200);
+
+      // After rebuild: drain closed the 4 old clients via quit() exactly once
+      // each (no double-close, no leak) and 8 brand-new clients exist.
+      expect(builtClients).toHaveLength(12);
+      expect(gen1.every((c) => c.quitCalls === 1)).toBe(true);
+      expect(gen1.every((c) => c.disconnectCalls === 0)).toBe(true);
+      // Generation-2 clients are distinct objects from the generation-1 set.
+      const gen2 = builtClients.slice(4);
+      expect(new Set([...gen1, ...gen2]).size).toBe(12);
+    } finally {
+      await fx.stop();
+    }
+    // After full teardown every client built across both generations has
+    // been closed exactly once — proves the runner-client lifecycle leaves
+    // nothing dangling across rebuilds.
+    expect(builtClients).toHaveLength(12);
+    expect(builtClients.every((c) => c.quitCalls === 1)).toBe(true);
   });
 });
 
