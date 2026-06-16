@@ -157,12 +157,15 @@ export const RUN_PRESETS: Record<RunPresetKey, RunPreset> = {
 const RUN_PRESET_ORDER: RunPresetKey[] = ["quick", "demo", "medium", "large", "overnight"];
 
 export function buildRunPresetConfig(p: RunPreset): GeneratorConfig {
+  // Wave 6.17 — emit defer_trim verbatim (true or false) so the request body
+  // matches the spec literally. The api treats omitted ⇔ false, but the
+  // explicit boolean makes the preset's intent self-documenting for ops.
   const cfg: GeneratorConfig = {
     rows: p.rows,
     stream_shards: p.shards,
     stream_maxlen: p.maxlen,
+    defer_trim: p.deferTrim,
   };
-  if (p.deferTrim) cfg.defer_trim = true;
   return cfg;
 }
 
@@ -709,10 +712,30 @@ export function IngestPanel() {
           />
 
           <SyntheticGeneratorCard
-            preflightGate={preflightHandle.ensureFresh}
-            onAlignShards={async (n) => {
-              const snap = await setIngestShards(n);
-              setIngestShardsState(snap.totalShards);
+            // Wave 6.17 — Advanced submit uses the same orchestrator as the
+            // preset Start button: preflight → rebuild-if-needed →
+            // /ingest/shards (when stream_shards is numeric) → startRun. Step
+            // labels surface inline; throws halt before startRun and the
+            // message is shown as a form error. The operator therefore cannot
+            // launch an Advanced run that bypasses /ingest/shards alignment.
+            onPreRun={async (cfg, onStep) => {
+              onStep("Checking indexes…");
+              const { preflight: pf, rebuilt } = await preflightAndRebuildIfNeeded();
+              void preflightHandle.runPreflight();
+              if (pf.ok === false) {
+                throw new Error(
+                  "Pre-flight failed after rebuild — use the Rebuild indexes button above to inspect.",
+                );
+              }
+              if (rebuilt) onStep("Indexes repaired.");
+              if (typeof cfg.stream_shards === "number") {
+                onStep(
+                  `Aligning consumer to ${cfg.stream_shards} shard${cfg.stream_shards === 1 ? "" : "s"}…`,
+                );
+                const snap = await setIngestShards(cfg.stream_shards);
+                setIngestShardsState(snap.totalShards);
+              }
+              onStep("Starting run…");
             }}
           />
         </div>
@@ -1118,13 +1141,20 @@ function fmtMB(n: number): string {
 // survives route changes; the panel only owns form-validation errors.
 function SyntheticGeneratorCard(props: {
   preflightGate?: () => Promise<PreflightResponse | null>;
-  // Wave 6.17 — when the Advanced submission carries an explicit numeric
-  // stream_shards, align the ingest consumer first so the consumer fan-out
-  // matches the producer dial. Mirrors the preset-Start orchestrator's
-  // /ingest/shards hop. Omitted ⇒ no alignment (caller manages it).
-  onAlignShards?: (shards: number) => Promise<void>;
+  // Wave 6.17 — when provided, runs the full preset-style orchestrator
+  // (preflight → rebuild-if-needed → /ingest/shards) before startRun and
+  // supersedes preflightGate. Throws on any step failure; the message is
+  // surfaced verbatim in formError. The onStep callback drives the inline
+  // transient label so operators see what's happening per step.
+  onPreRun?: (
+    cfg: GeneratorConfig,
+    onStep: (step: string | null) => void,
+  ) => Promise<void>;
 }) {
-  const { preflightGate, onAlignShards } = props;
+  const { preflightGate, onPreRun } = props;
+  // Wave 6.17 — transient per-step label for the orchestrator; cleared once
+  // the run hands off to startRun (or on error).
+  const [preRunStep, setPreRunStep] = useState<string | null>(null);
   // Wave 5.52 — the two simple-mode controls: Total rows and Class mix.
   const [rows, setRows] = useState<number>(DEFAULT_GEN_ROWS);
   const [mixPct, setMixPct] = useState<Record<(typeof GENERATOR_CLASSES)[number], number>>(
@@ -1367,27 +1397,29 @@ function SyntheticGeneratorCard(props: {
     seedUsed: number | null,
   ) {
     setFormError(null);
+    setPreRunStep(null);
     clearRun();
-    // Wave 5.47b — gate the run on pre-flight. ensureFresh re-probes when the
-    // last result is older than 30s (or has never run); a strict ok=false
-    // response blocks submit so the panel banner is the next thing the user
-    // sees. Null / missing fields are treated as "unknown" — allow through.
-    if (preflightGate) {
+    // Wave 6.17 — when the panel wires the full orchestrator (preflight →
+    // rebuild-if-needed → /ingest/shards), defer to it and surface per-step
+    // labels via setPreRunStep. Throws propagate to formError so the operator
+    // sees the exact reason inline; the run halts before startRun. This
+    // supersedes preflightGate so the Advanced submit path cannot bypass
+    // /ingest/shards alignment.
+    if (onPreRun && cfg) {
+      try {
+        await onPreRun(cfg, setPreRunStep);
+      } catch (e) {
+        setFormError((e as Error).message);
+        setPreRunStep(null);
+        return;
+      }
+    } else if (preflightGate) {
+      // Wave 5.47b — legacy gate (no rebuild) for callers that haven't
+      // adopted onPreRun; ok=false blocks submit and points to the banner.
       const pf = await preflightGate();
       if (pf && pf.ok === false) {
         setFormError("Pre-flight failed. Use the Rebuild indexes button above.");
-        return;
-      }
-    }
-    // Wave 6.17 — align the ingest consumer fan-out to the explicit numeric
-    // stream_shards before kicking off the run, so an Advanced submission
-    // does not race against a stale consumer shard count. "auto" / "per-bucket"
-    // skip alignment (no number to post).
-    if (onAlignShards && cfg && typeof cfg.stream_shards === "number") {
-      try {
-        await onAlignShards(cfg.stream_shards);
-      } catch (e) {
-        setFormError(`Aligning ingest shards failed: ${(e as Error).message}`);
+        setPreRunStep(null);
         return;
       }
     }
@@ -1396,12 +1428,14 @@ function SyntheticGeneratorCard(props: {
     const est = mem ? computeSanity(rowsForCheck, mem) : null;
     if (!est) {
       startRun(cfg);
+      setPreRunStep(null);
       if (seedUsed !== null) {
         setLastSeed(seedUsed);
         setPendingSeed(null);
       }
       return;
     }
+    setPreRunStep(null);
     setPending({ cfg, rows: rowsForCheck, est });
   }
 
@@ -1916,6 +1950,15 @@ function SyntheticGeneratorCard(props: {
         </div>
         ) : null}
 
+        {preRunStep ? (
+          <div
+            className="generator-form__status"
+            role="status"
+            data-testid="generator-prerun-step"
+          >
+            {preRunStep}
+          </div>
+        ) : null}
         {run && (run.status === "running" || run.status === "cancelling") ? (
           <GeneratorProgress run={run} onCancel={onCancelRun} />
         ) : null}

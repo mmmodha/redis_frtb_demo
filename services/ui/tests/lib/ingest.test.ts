@@ -359,5 +359,15 @@ describe("ingest api client", () => {
       });
       await expect(preflightAndRebuildIfNeeded()).rejects.toThrow(/rebuild-indexes/);
     });
+
+    // Wave 6.17 verifier (item 2f) — a network-level fetch failure on the
+    // initial preflight probe must propagate so the caller (IngestPanel
+    // orchestrator) shows the failure inline rather than silently passing.
+    it("propagates the error when the preflight fetch itself rejects (network error)", async () => {
+      globalThis.fetch = (async () => {
+        throw new TypeError("network down");
+      }) as typeof fetch;
+      await expect(preflightAndRebuildIfNeeded()).rejects.toThrow(/network down/);
+    });
   });
 });

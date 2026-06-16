@@ -161,7 +161,9 @@ describe("IngestPanel — Wave 6.17 presets-only run", () => {
     expect(body.rows).toBe(10_000);
     expect(body.stream_shards).toBe(1);
     expect(body.stream_maxlen).toBe(100_000);
-    expect(body.defer_trim).toBeUndefined();
+    // Wave 6.17 verifier (item 3) — assert literal defer_trim:false, matching
+    // the spec body shape verbatim (not just "absent ⇒ false" server-side).
+    expect(body.defer_trim).toBe(false);
     // Wave 6.17 verifier (item 2) — preflight returned ok=true, so the
     // auto-rebuild step must be skipped entirely.
     expect(findCall(fetchMock, /\/admin\/rebuild-indexes$/, "POST")).toBeUndefined();
@@ -279,16 +281,81 @@ describe("IngestPanel — Wave 6.17 presets-only run", () => {
   });
 
   // Wave 6.17 verifier (item 6) — opening Advanced reveals the synthetic
-  // generator (with its custom rows input), the 6.12b fan-out card, and the
-  // preflight banner host.
-  it("reveals the custom rows input + fan-out card when the Advanced disclosure is opened", async () => {
+  // generator (custom rows input + nested dial controls under its own "Show
+  // advanced…" toggle), the 6.12b fan-out card, and the preflight banner host.
+  // The dial controls actually present in this UI surface are:
+  //   - profile           (data-testid="generator-preset")
+  //   - stream_shards     (data-testid="ingest-stream-shards")
+  //   - stream_maxlen     (data-testid="generator-stream-maxlen")
+  // (workers, batch_size, pipeline_window, flow_control, defer_trim are
+  // server-side request-body knobs only — never surfaced as UI controls in
+  // this panel today, so they are intentionally not asserted here.)
+  it("reveals the custom rows input + nested dial controls + fan-out card when the Advanced disclosure is opened", async () => {
     mockFetch();
     renderPanel();
-    const toggle = await screen.findByTestId("ingest-advanced-toggle");
-    fireEvent.click(toggle);
-    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    const outer = await screen.findByTestId("ingest-advanced-toggle");
+    fireEvent.click(outer);
+    expect(outer).toHaveAttribute("aria-expanded", "true");
     expect(await screen.findByTestId("ingest-advanced-body")).toBeInTheDocument();
     expect(screen.getByTestId("generator-total-rows")).toBeInTheDocument();
     expect(screen.getByTestId("ingest-fanout-card")).toBeInTheDocument();
+    // Inner "Show advanced…" toggle inside the SyntheticGeneratorCard reveals
+    // the dial controls (profile, stream_shards, stream_maxlen).
+    const inner = screen.getByTestId("generator-advanced-toggle");
+    fireEvent.click(inner);
+    expect(screen.getByTestId("generator-preset")).toBeInTheDocument();
+    expect(screen.getByTestId("ingest-stream-shards")).toBeInTheDocument();
+    expect(screen.getByTestId("generator-stream-maxlen")).toBeInTheDocument();
+  });
+
+  // Wave 6.17 verifier (item 1) — the Advanced submit path must use the same
+  // orchestrator as the preset Start button: GET /admin/preflight → POST
+  // /admin/rebuild-indexes (if needed) → POST /ingest/shards{totalShards:N}
+  // → POST /generator/start/stream. The operator must not be able to launch
+  // an Advanced run that bypasses /ingest/shards alignment.
+  it("Advanced 'Generate' button runs preflight → rebuild → /ingest/shards → /generator/start in that order", async () => {
+    const fetchMock = mockFetch({ initialState: "fail", rebuildHeals: true });
+    renderPanel();
+    fireEvent.click(await screen.findByTestId("ingest-advanced-toggle"));
+    fireEvent.click(await screen.findByTestId("generator-advanced-toggle"));
+    // Pick a concrete numeric shard count so the /ingest/shards POST fires.
+    fireEvent.change(screen.getByLabelText(/Stream fan-out/), { target: { value: "8" } });
+    fireEvent.click(screen.getByTestId("generator-generate-btn"));
+    await waitFor(() => {
+      expect(findCall(fetchMock, /\/generator\/start\/stream$/, "POST")).toBeDefined();
+    });
+    // Filter post-mount calls so we can reason about ordering.
+    const calls = fetchMock.mock.calls.map((c) => ({
+      url: String(c[0]),
+      method: (c[1] as RequestInit | undefined)?.method ?? "GET",
+      body: (c[1] as RequestInit | undefined)?.body,
+    }));
+    const idxRebuild = calls.findIndex((c) => /\/admin\/rebuild-indexes$/.test(c.url) && c.method === "POST");
+    const idxShards = calls.findIndex((c) => /\/ingest\/shards$/.test(c.url) && c.method === "POST");
+    const idxStart = calls.findIndex((c) => /\/generator\/start\/stream$/.test(c.url) && c.method === "POST");
+    expect(idxRebuild).toBeGreaterThanOrEqual(0);
+    expect(idxShards).toBeGreaterThan(idxRebuild);
+    expect(idxStart).toBeGreaterThan(idxShards);
+    const shardsBody = JSON.parse(String(calls[idxShards]!.body));
+    expect(shardsBody.totalShards).toBe(8);
+    const startBody = JSON.parse(String(calls[idxStart]!.body));
+    expect(startBody.stream_shards).toBe(8);
+  });
+
+  // Wave 6.17 verifier (item 1) — Advanced submit also halts before
+  // /generator/start when /ingest/shards conflicts (409), with the error
+  // surfaced inline in the generator form.
+  it("Advanced submit surfaces a /ingest/shards 409 inline and skips /generator/start", async () => {
+    const fetchMock = mockFetch({ shardsPostStatus: 409, shardsPostError: "rebuild already in progress" });
+    renderPanel();
+    fireEvent.click(await screen.findByTestId("ingest-advanced-toggle"));
+    fireEvent.click(await screen.findByTestId("generator-advanced-toggle"));
+    fireEvent.change(screen.getByLabelText(/Stream fan-out/), { target: { value: "8" } });
+    fireEvent.click(screen.getByTestId("generator-generate-btn"));
+    // The card's existing formError host (role=alert) carries the message.
+    const err = await screen.findByRole("alert");
+    expect(err.textContent).toMatch(/409/);
+    expect(err.textContent).toMatch(/rebuild already in progress/);
+    expect(findCall(fetchMock, /\/generator\/start\/stream$/, "POST")).toBeUndefined();
   });
 });
