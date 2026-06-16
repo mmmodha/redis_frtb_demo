@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { loadSchema } from "@frtb/schema";
 import {
   bootstrapFrtb,
+  BootstrapPartialError,
   buildFrtbSnippets,
   resolveMasterNodes,
   type RedisLike,
@@ -282,6 +283,107 @@ describe("bootstrap — bootstrapFrtb (cluster fan-out)", () => {
     expect(funcLoadsPerNode.get("m2")).toBe(1);
     expect(logs[0]).toMatchObject({ bootstrap: "idx:sens", nodes: 2 });
     expect(logs[1]).toMatchObject({ bootstrap: "frtb", nodes: 2 });
+  });
+});
+
+// Wave 6.16a — per-node failure tracking. One node throws on FT.CREATE
+// (or FUNCTION LOAD); the other nodes succeed. bootstrapFrtb must
+// collect those tuples instead of fire-and-failing on the first throw
+// and surface them via BootstrapPartialError so callers can publish a
+// `partial` status flag instead of a false `ready`.
+function fakeClusterWithFailingNode(opts: {
+  nodes: string[];
+  failingNode: string;
+  failOn: string; // command to reject on the failing node
+  failError: string;
+}): { client: RedisLike; recorded: RecordedCall[] } {
+  const recorded: RecordedCall[] = [];
+  const nodeImpls = opts.nodes.map((id) => ({
+    id,
+    async call(command: string, ...args: unknown[]) {
+      const cmd = String(command).toUpperCase();
+      recorded.push({ node: id, command: cmd, args });
+      if (id === opts.failingNode && cmd === opts.failOn.toUpperCase()) {
+        throw new Error(opts.failError);
+      }
+      return "OK";
+    },
+  }));
+  const client = {
+    nodes: (_role: string) => nodeImpls as unknown as RedisLike[],
+    call: (command: string, ...args: unknown[]) =>
+      (nodeImpls[0] as { call: (c: string, ...a: unknown[]) => Promise<unknown> })
+        .call(command, ...args),
+  } as unknown as RedisLike;
+  return { client, recorded };
+}
+
+describe("bootstrap — Wave 6.16a per-node failure tracking", () => {
+  it("throws BootstrapPartialError with failures=[{step:'idx:sens',node_id:'node-0',...}] when node-0's FT.CREATE rejects", async () => {
+    const schema = loadSchema(SCHEMA_PATH);
+    // Wave 6.16a — error string must NOT match the "already exists" /
+    // "unknown index" swallowing logic in @frtb/rqe, otherwise
+    // ensureSensIndex / dropSensIndex absorb the throw and the partial
+    // path never trips.
+    const { client } = fakeClusterWithFailingNode({
+      nodes: ["m1", "m2"],
+      failingNode: "m1",
+      failOn: "FT.CREATE",
+      failError: "OOM command not allowed when used memory > maxmemory",
+    });
+    try {
+      await bootstrapFrtb(client, schema, () => undefined);
+      throw new Error("expected throw");
+    } catch (e) {
+      expect(e).toBeInstanceOf(BootstrapPartialError);
+      const failures = (e as BootstrapPartialError).failures;
+      expect(failures).toEqual([
+        {
+          step: "idx:sens",
+          node_id: "node-0",
+          error: "OOM command not allowed when used memory > maxmemory",
+        },
+      ]);
+    }
+  });
+
+  it("continues past a failing node so healthy nodes still receive FT.CREATE + FUNCTION LOAD", async () => {
+    const schema = loadSchema(SCHEMA_PATH);
+    const { client, recorded } = fakeClusterWithFailingNode({
+      nodes: ["m1", "m2", "m3"],
+      failingNode: "m2",
+      failOn: "FT.CREATE",
+      failError: "OOM not enough memory",
+    });
+    await expect(bootstrapFrtb(client, schema, () => undefined)).rejects.toThrow(
+      BootstrapPartialError,
+    );
+    const ftCreates = recorded.filter((c) => c.command === "FT.CREATE");
+    // All three nodes were attempted (per-node loop did not abort on m2).
+    expect(ftCreates.map((c) => c.node).sort()).toEqual(["m1", "m2", "m3"]);
+    // Step 2 still ran against all three nodes despite Step 1 failing on m2.
+    const funcLoads = recorded.filter((c) => c.command === "FUNCTION");
+    expect(funcLoads.map((c) => c.node).sort()).toEqual(["m1", "m2", "m3"]);
+  });
+
+  it("records frtb step failure under node_id matching node ordering", async () => {
+    const schema = loadSchema(SCHEMA_PATH);
+    const { client } = fakeClusterWithFailingNode({
+      nodes: ["m1", "m2"],
+      failingNode: "m2",
+      failOn: "FUNCTION",
+      failError: "OOM",
+    });
+    try {
+      await bootstrapFrtb(client, schema, () => undefined);
+      throw new Error("expected throw");
+    } catch (e) {
+      expect(e).toBeInstanceOf(BootstrapPartialError);
+      const failures = (e as BootstrapPartialError).failures;
+      expect(failures).toHaveLength(1);
+      expect(failures[0]).toMatchObject({ step: "frtb", node_id: "node-1" });
+      expect(failures[0]!.error).toContain("OOM");
+    }
   });
 });
 

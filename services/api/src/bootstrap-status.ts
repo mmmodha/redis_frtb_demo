@@ -12,9 +12,18 @@
 
 import type { Schema } from "@frtb/schema";
 import type { ActiveTarget } from "./active-target.ts";
-import { bootstrapFrtb, type RedisLike as BootstrapRedis } from "./bootstrap.ts";
+import {
+  bootstrapFrtb,
+  BootstrapPartialError,
+  type BootstrapFailure,
+  type RedisLike as BootstrapRedis,
+} from "./bootstrap.ts";
 
-export type BootstrapPhase = "idle" | "running" | "ready" | "failed";
+// Wave 6.16a — `partial` slots between `ready` and `failed`: at least one
+// per-node step (idx:sens, frtb library) refused to come up, but the
+// overall fan-out completed. /admin/rebuild-indexes can transition this
+// back to `ready` once the underlying node recovers.
+export type BootstrapPhase = "idle" | "running" | "ready" | "partial" | "failed";
 
 export interface BootstrapStatusSnapshot {
   phase: BootstrapPhase;
@@ -22,6 +31,8 @@ export interface BootstrapStatusSnapshot {
   started_at?: string;
   finished_at?: string;
   err?: string;
+  // Populated only when phase === "partial". Empty/omitted otherwise.
+  failures?: BootstrapFailure[];
 }
 
 let status: BootstrapStatusSnapshot = { phase: "idle" };
@@ -73,6 +84,27 @@ export function markBootstrapStatusFailed(target_label: string, err: unknown): v
   };
 }
 
+// Wave 6.16a — fan-out completed but at least one node refused a step
+// (idx:sens drop/create, FUNCTION LOAD). Distinct from `failed` (the
+// whole run blew up): per-call routes still work against the healthy
+// shards, while operators get a structured list of nodes to remediate
+// via /admin/rebuild-indexes.
+export function markBootstrapStatusPartial(
+  target_label: string,
+  failures: BootstrapFailure[],
+): void {
+  const prev = status;
+  const summary = failures.map((f) => `${f.step}@${f.node_id}`).join(", ");
+  status = {
+    phase: "partial",
+    target_label,
+    finished_at: new Date().toISOString(),
+    err: `bootstrap partial: ${failures.length} per-node step(s) failed: ${summary}`,
+    failures,
+    ...(prev.started_at ? { started_at: prev.started_at } : {}),
+  };
+}
+
 type BootstrapRunner = (client: BootstrapRedis, schema: Schema) => Promise<unknown>;
 let runner: BootstrapRunner = bootstrapFrtb;
 export function setBootstrapRunnerForTests(fn: BootstrapRunner | null): void {
@@ -110,6 +142,13 @@ export function scheduleBootstrap(
       })
       .catch((err: unknown) => {
         if (myGen !== generation) return;
+        // Wave 6.16a — separate the partial-fan-out case from generic
+        // failures so the UI / operators can distinguish "rebuild this
+        // node" from "the whole target is unreachable".
+        if (err instanceof BootstrapPartialError) {
+          markBootstrapStatusPartial(target.label, err.failures);
+          return;
+        }
         markBootstrapStatusFailed(target.label, err);
       });
   }, debounceMs);

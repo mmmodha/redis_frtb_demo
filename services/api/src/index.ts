@@ -16,12 +16,13 @@ import type { RedisLike } from "./redis-like.ts";
 import { buildCrossBucketCorrelations } from "./sbm/correlations.ts";
 import { createStore } from "./store.ts";
 import { seedConnections } from "./seed.ts";
-import { bootstrapFrtb } from "./bootstrap.ts";
+import { bootstrapFrtb, BootstrapPartialError } from "./bootstrap.ts";
 import { ensureRedisReady } from "./redis-ready.ts";
 import {
   markBootstrapStatusRunning,
   markBootstrapStatusReady,
   markBootstrapStatusFailed,
+  markBootstrapStatusPartial,
 } from "./bootstrap-status.ts";
 
 // Wave 5.79: precedence for self-binding is API_HOST/PORT → HOST/PORT →
@@ -160,15 +161,26 @@ async function main(): Promise<void> {
       markBootstrapStatusReady(target.label);
     } catch (err) {
       // Wave 5.14b.1 — keep logging (diagnostic surface) but also wire the
-      // flag so /healthz returns 503 + the error string. Do NOT crash.
+      // flag so /readyz returns 503 + the error string. Do NOT crash.
+      // Wave 6.16a — distinguish the partial-fan-out case so the status
+      // surface can report which nodes failed and which step. /readyz
+      // still flips to 503 in both cases — operators see a single
+      // bootstrap alarm regardless of whether all nodes or just one
+      // failed; the structured failure list lives on /redis/active-
+      // target/bootstrap-status for targeted remediation.
       console.error(JSON.stringify({
         service: "api",
         bootstrap: "frtb",
-        action: "failed",
+        action: err instanceof BootstrapPartialError ? "partial" : "failed",
         err: String(err),
+        ...(err instanceof BootstrapPartialError ? { failures: err.failures } : {}),
       }));
       markBootstrapFailed(err);
-      markBootstrapStatusFailed(target.label, err);
+      if (err instanceof BootstrapPartialError) {
+        markBootstrapStatusPartial(target.label, err.failures);
+      } else {
+        markBootstrapStatusFailed(target.label, err);
+      }
     }
   } else if (redisConnected && !schema) {
     console.log(JSON.stringify({

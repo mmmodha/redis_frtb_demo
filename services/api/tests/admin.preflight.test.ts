@@ -13,6 +13,12 @@ import {
   setActiveTarget,
   resetActiveTarget,
 } from "../src/active-target.ts";
+import {
+  getBootstrapStatus,
+  markBootstrapStatusPartial,
+  resetBootstrapStatusForTests,
+} from "../src/bootstrap-status.ts";
+import { BootstrapPartialError } from "../src/bootstrap.ts";
 import { fakeRedis, type FakeRedis } from "./helpers/fake-redis.ts";
 
 const stubSchema = {} as Schema;
@@ -42,6 +48,7 @@ describe("GET /admin/preflight (Wave 5.47b)", () => {
     if (app) await app.close();
     app = undefined;
     resetActiveTarget();
+    resetBootstrapStatusForTests();
   });
 
   it("returns ok=true with all three checks passing when the stack is healthy", async () => {
@@ -113,6 +120,40 @@ describe("GET /admin/preflight (Wave 5.47b)", () => {
     expect(body.ok).toBe(false);
     expect(body.can_rebuild).toBe(false);
   });
+
+  // Wave 6.16a — when bootstrap-status holds a `partial` verdict, the
+  // preflight surface must report ok=false even when the live FT.INFO /
+  // FUNCTION LIST probes succeed (e.g., the failing node briefly recovered
+  // after the rebuild attempt). Persisted per-node failures fold into the
+  // response so the UI can guide remediation.
+  it("folds persisted partial-phase failures into the preflight surface", async () => {
+    const fr = fakeRedis();
+    primeHealthy(fr);
+    markBootstrapStatusPartial("redis-primary", [
+      { step: "idx:sens", node_id: "node-1", error: "Unknown Index name" },
+    ]);
+    app = makeApp(fr);
+    const res = await app.inject({ method: "GET", url: "/admin/preflight" });
+    const body = res.json();
+    expect(body.ok).toBe(false);
+    expect(body.checks.idx_sens.ok).toBe(false);
+    expect(body.checks.idx_sens.missing).toContain("node-1");
+    expect(body.can_rebuild).toBe(true);
+  });
+
+  it("folds persisted partial frtb-step failure into preflight frtb_library.ok=false", async () => {
+    const fr = fakeRedis();
+    primeHealthy(fr);
+    markBootstrapStatusPartial("redis-primary", [
+      { step: "frtb", node_id: "node-0", error: "OOM" },
+    ]);
+    app = makeApp(fr);
+    const res = await app.inject({ method: "GET", url: "/admin/preflight" });
+    const body = res.json();
+    expect(body.ok).toBe(false);
+    expect(body.checks.frtb_library.ok).toBe(false);
+    expect(body.checks.frtb_library.loaded).toBe(false);
+  });
 });
 
 describe("POST /admin/rebuild-indexes (Wave 5.47b)", () => {
@@ -121,6 +162,7 @@ describe("POST /admin/rebuild-indexes (Wave 5.47b)", () => {
     if (app) await app.close();
     app = undefined;
     resetActiveTarget();
+    resetBootstrapStatusForTests();
   });
 
   it("calls bootstrap and returns ok=true with timing", async () => {
@@ -224,5 +266,46 @@ describe("POST /admin/rebuild-indexes (Wave 5.47b)", () => {
     const body = res.json();
     expect(body.ok).toBe(false);
     expect(body.bootstrap).toEqual({ ok: false, error: "schema-missing" });
+  });
+
+  // Wave 6.16a — successful rebuild after a prior `partial` bootstrap
+  // must transition the status flag back to `ready` so /readyz stops
+  // returning 503 and the UI dismisses the partial-bootstrap banner.
+  it("transitions bootstrap-status from partial → ready on a successful rebuild", async () => {
+    markBootstrapStatusPartial("redis-primary", [
+      { step: "idx:sens", node_id: "node-0", error: "Unknown Index name" },
+    ]);
+    expect(getBootstrapStatus().phase).toBe("partial");
+    const fr = fakeRedis();
+    fr.setResponse("XGROUP", "OK");
+    const runBootstrap = vi.fn(async () => ({ index: { nodes: 1 } }));
+    app = makeApp(fr, { schema: stubSchema, bootstrap: runBootstrap });
+    const res = await app.inject({
+      method: "POST", url: "/admin/rebuild-indexes",
+      headers: { "content-type": "application/json" }, payload: "{}",
+    });
+    expect(res.json().ok).toBe(true);
+    const snap = getBootstrapStatus();
+    expect(snap.phase).toBe("ready");
+    expect(snap.failures).toBeUndefined();
+  });
+
+  it("keeps bootstrap-status='partial' when rebuild throws BootstrapPartialError", async () => {
+    const failures = [
+      { step: "idx:sens", node_id: "node-2", error: "OOM" },
+    ];
+    const fr = fakeRedis();
+    const runBootstrap = vi.fn(async () => {
+      throw new BootstrapPartialError(failures);
+    });
+    app = makeApp(fr, { schema: stubSchema, bootstrap: runBootstrap });
+    const res = await app.inject({
+      method: "POST", url: "/admin/rebuild-indexes",
+      headers: { "content-type": "application/json" }, payload: "{}",
+    });
+    expect(res.json().ok).toBe(false);
+    const snap = getBootstrapStatus();
+    expect(snap.phase).toBe("partial");
+    expect(snap.failures).toEqual(failures);
   });
 });

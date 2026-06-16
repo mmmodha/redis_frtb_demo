@@ -29,9 +29,42 @@ import { buildFxCurvatureSnippet } from "@frtb/calc/src/fxCurvatureSnippet.ts";
 
 export type RedisLike = Redis | Cluster;
 
+// Wave 6.16a — per-node failure tuple. `step` matches the bootstrap log
+// channel ("idx:sens" | "frtb" | "suggesters"); `node_id` is `node-${i}`
+// using the same indexing convention as /admin/preflight so the two
+// surfaces line up by eye in operator dashboards.
+export interface BootstrapFailure {
+  step: string;
+  node_id: string;
+  error: string;
+}
+
+export interface BootstrapStepResult {
+  nodes: number;
+  ok: number;
+  failed: BootstrapFailure[];
+}
+
 export interface BootstrapResult {
-  index: { nodes: number };
-  functions: { nodes: number; functions: string[] };
+  index: BootstrapStepResult;
+  functions: BootstrapStepResult & { functions: string[] };
+  suggesters: BootstrapStepResult & { counts: Record<string, number> };
+}
+
+// Wave 6.16a — distinguish "some per-node steps failed" from "the whole
+// run blew up (network, schema)". Callers in index.ts / admin.ts catch
+// this separately and call markBootstrapStatusPartial(); generic catch-all
+// still hits markBootstrapStatusFailed for the full-miss case. The flag
+// preventing markBootstrapStatusReady() in the partial case is the throw
+// itself — bootstrapFrtb resolving normally is the only `ready` signal.
+export class BootstrapPartialError extends Error {
+  public readonly failures: BootstrapFailure[];
+  constructor(failures: BootstrapFailure[]) {
+    const summary = failures.map((f) => `${f.step}@${f.node_id}`).join(", ");
+    super(`bootstrap partial: ${failures.length} per-node step(s) failed: ${summary}`);
+    this.name = "BootstrapPartialError";
+    this.failures = failures;
+  }
 }
 
 // Build the nine locked frtb snippets ({girr,equity,fx} × {delta,vega,curvature})
@@ -104,22 +137,46 @@ export async function bootstrapFrtb(
   log: (entry: Record<string, unknown>) => void = (e) => console.log(JSON.stringify(e)),
 ): Promise<BootstrapResult> {
   const nodes = resolveMasterNodes(client);
+  // Wave 6.16a — track per-node failures for Steps 1 + 2 instead of letting
+  // the first throw abort the whole loop. node-${i} matches the indexing
+  // used by /admin/preflight so the two surfaces line up by eye.
+  const indexFailed: BootstrapFailure[] = [];
+  const funcFailed: BootstrapFailure[] = [];
+
   // Step 1: idx:sens on every master. Wave 5.83A — drop-then-recreate so the
   // index picks up the per-class per-tenor pre-weighted NUMERIC SORTABLE
   // fields when the schema evolves. FT.DROPINDEX is called without DD so
   // existing JSON docs are preserved; the index is rebuilt from them on
   // re-create. dropSensIndex is idempotent against a missing index (cold
   // start) so this is safe on first boot too.
-  for (const node of nodes) {
-    await dropSensIndex(node);
-    await ensureSensIndex(node, schema);
+  for (let i = 0; i < nodes.length; i++) {
+    const node = nodes[i]!;
+    try {
+      await dropSensIndex(node);
+      await ensureSensIndex(node, schema);
+    } catch (err) {
+      indexFailed.push({
+        step: "idx:sens",
+        node_id: `node-${i}`,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
   log({ service: "api", bootstrap: "idx:sens", action: "created", nodes: nodes.length });
 
   // Step 2: frtb library on every master.
   const snippets = buildFrtbSnippets(schema);
-  for (const node of nodes) {
-    await loadFrtbLibrary(node, snippets);
+  for (let i = 0; i < nodes.length; i++) {
+    const node = nodes[i]!;
+    try {
+      await loadFrtbLibrary(node, snippets);
+    } catch (err) {
+      funcFailed.push({
+        step: "frtb",
+        node_id: `node-${i}`,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
   // Log in build order — matches the DoD example exactly and stays stable
   // across runs because buildFrtbSnippets is deterministic.
@@ -196,8 +253,27 @@ export async function bootstrapFrtb(
   }
   log({ service: "api", bootstrap: "suggesters", action: "backfilled", counts: sugCounts });
 
-  return {
-    index: { nodes: nodes.length },
-    functions: { nodes: nodes.length, functions },
+  const result: BootstrapResult = {
+    index: { nodes: nodes.length, ok: nodes.length - indexFailed.length, failed: indexFailed },
+    functions: {
+      nodes: nodes.length,
+      ok: nodes.length - funcFailed.length,
+      failed: funcFailed,
+      functions,
+    },
+    // Step 3 is best-effort (cold-start / missing-shard tolerated by design,
+    // see comment above) so suggesters never contributes per-node failures
+    // to the partial-error throw — counts speak for themselves.
+    suggesters: { nodes: nodes.length, ok: nodes.length, failed: [], counts: sugCounts },
   };
+
+  // Wave 6.16a — any Step 1/2 per-node failure prevents a "ready" verdict.
+  // Throw a structured error so the caller can surface a partial status
+  // instead of the catch-all failed status; the returned BootstrapResult
+  // shape is unchanged from the happy path.
+  if (indexFailed.length > 0 || funcFailed.length > 0) {
+    throw new BootstrapPartialError([...indexFailed, ...funcFailed]);
+  }
+
+  return result;
 }

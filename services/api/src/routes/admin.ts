@@ -20,9 +20,11 @@ import {
   markBootstrapStatusRunning,
   markBootstrapStatusReady,
   markBootstrapStatusFailed,
+  markBootstrapStatusPartial,
 } from "../bootstrap-status.ts";
 import {
   bootstrapFrtb,
+  BootstrapPartialError,
   resolveMasterNodes,
   type RedisLike as BootstrapRedis,
 } from "../bootstrap.ts";
@@ -101,7 +103,14 @@ export function registerAdminRoutes(
           bootstrap.cache_invalidate_error = String(err instanceof Error ? err.message : err);
         }
       } catch (err) {
-        markBootstrapStatusFailed(target_label, err);
+        // Wave 6.16a — distinguish partial-fan-out from total failure so the
+        // bootstrap-status surface keeps per-node remediation info instead of
+        // collapsing every failure mode to `failed`.
+        if (err instanceof BootstrapPartialError) {
+          markBootstrapStatusPartial(target_label, err.failures);
+        } else {
+          markBootstrapStatusFailed(target_label, err);
+        }
         bootstrap = {
           ok: false,
           error: String(err instanceof Error ? err.message : err),
@@ -170,12 +179,32 @@ export function registerAdminRoutes(
     let pingOk = true;
     try { await redis.call("PING"); } catch { pingOk = false; }
 
-    const ok = idx_sens_ok && loaded;
+    // Wave 6.16a — when bootstrap-status persisted a partial verdict, fold
+    // those per-node failures into the preflight surface so both endpoints
+    // agree on the missing-index / missing-library set. Runtime FT.INFO /
+    // FUNCTION LIST probes can race with the rebuild itself (idx briefly
+    // gone while ensureSensIndex re-creates), so persisted failures are
+    // additive — never narrower than the live probe.
+    const bsStatus = getBootstrapStatus();
+    let partialMissingIndex: string[] = [];
+    let partialFuncFailed = false;
+    if (bsStatus.phase === "partial" && Array.isArray(bsStatus.failures)) {
+      for (const f of bsStatus.failures) {
+        if (f.step === "idx:sens") partialMissingIndex.push(f.node_id);
+        if (f.step === "frtb") partialFuncFailed = true;
+      }
+    }
+    const idxMissingSet = new Set<string>([...missing, ...partialMissingIndex]);
+    const finalMissing = Array.from(idxMissingSet);
+    const finalIdxOk = finalMissing.length === 0;
+    const finalLoaded = loaded && !partialFuncFailed;
+
+    const ok = finalIdxOk && finalLoaded;
     return {
       ok,
       checks: {
-        idx_sens: { ok: idx_sens_ok, missing },
-        frtb_library: { ok: loaded, loaded },
+        idx_sens: { ok: finalIdxOk, missing: finalMissing },
+        frtb_library: { ok: finalLoaded, loaded: finalLoaded },
         stream: { ok: streamExists, exists: streamExists },
       },
       can_rebuild: !ok && pingOk,
@@ -197,16 +226,36 @@ export function registerAdminRoutes(
       return { ok: false, ms: 0, bootstrap: { ok: false, error: "schema-missing" } };
     }
     const redis = getRedis();
+    // Wave 6.16a — keep the active target_label so we can update the
+    // bootstrap-status flag on the way out. Pre-rebuild status may be
+    // partial (from boot) or anything else; we transition based on
+    // outcome rather than the prior phase so re-runs are idempotent.
+    let target_label = "";
+    try { target_label = getActiveTarget().label; } catch { /* no active target */ }
     const t0 = process.hrtime.bigint();
     let bootstrap: { ok: boolean; error?: string };
     try {
       await runBootstrap(redis as unknown as BootstrapRedis, opts.schema);
       bootstrap = { ok: true };
+      // Wave 6.16a — successful rebuild transitions partial → ready (or
+      // any-prior-state → ready). Only fired when target_label is known
+      // so tests that omit setActiveTarget don't drag a phantom label
+      // onto the snapshot.
+      if (target_label) markBootstrapStatusReady(target_label);
     } catch (err) {
       bootstrap = {
         ok: false,
         error: String(err instanceof Error ? err.message : err),
       };
+      // Wave 6.16a — partial-again stays partial; total failures stay
+      // failed. Both surface via /redis/active-target/bootstrap-status.
+      if (target_label) {
+        if (err instanceof BootstrapPartialError) {
+          markBootstrapStatusPartial(target_label, err.failures);
+        } else {
+          markBootstrapStatusFailed(target_label, err);
+        }
+      }
     }
 
     if (bootstrap.ok) {
