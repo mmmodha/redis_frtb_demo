@@ -21,6 +21,8 @@ import {
   formatRedisCommand,
   LUA_PATH_ENGINE,
   resolveLegFields,
+  ROLLUP_PATH_ENGINE,
+  tryRollupReadout,
 } from "../sbm/aggregate-via-index.ts";
 import {
   calcCacheKey,
@@ -37,7 +39,7 @@ import { listRecentRuns, pushRecentRun } from "../calc/recent-runs.ts";
 // Wave 5.83C-1 — engine label stamped on every per-bucket result so the UI can
 // render the badge (fast path vs. legacy Lua kernel). Mirrors the literals in
 // sbm/aggregate-via-index.ts.
-type EngineTag = typeof FAST_PATH_ENGINE | typeof LUA_PATH_ENGINE;
+type EngineTag = typeof FAST_PATH_ENGINE | typeof LUA_PATH_ENGINE | typeof ROLLUP_PATH_ENGINE;
 interface BucketResultWithEngine extends BucketResult {
   engine: EngineTag;
   // Wave 5.96A — per-bucket Redis command string surfaced to the drilldown UI.
@@ -444,24 +446,17 @@ async function computeSbmCharge(
   const fanoutStart = process.hrtime.bigint();
   const dispatchedKeys = buckets.map((b) => `sens:{${risk_class}:${b}}:_route`);
   let results: BucketResultWithEngine[];
+  let engineUsed: EngineTag = useFastPath ? FAST_PATH_ENGINE : LUA_PATH_ENGINE;
   try {
     if (useFastPath) {
-      const fast = await aggregateBucketsViaIndex({
-        redis,
-        schema: schema!,
-        riskClass: risk_class,
-        leg,
-        filters: {
-          bucketSubset: bucket_subset,
-          exclude: {
-            book: excludeCsv.book ? excludeCsv.book.split(",") : [],
-            trade_id: excludeCsv.trade_id ? excludeCsv.trade_id.split(",") : [],
-            risk_factor: excludeCsv.risk_factor ? excludeCsv.risk_factor.split(",") : [],
-          },
-        },
-        components: { crossTopN: 10 },
-      });
-      const byBucket = new Map(fast.map((r) => [r.bucket, r]));
+      // Wave 6.14b — fast-fast path. When ingest has been writing per-bucket
+      // rollup hashes (Wave 6.14a), HGETALL them and skip FT.AGGREGATE
+      // entirely. Disabled when CALC_ROLLUP_PATH=0 (bit-identical to today)
+      // or when exclude predicates are set (rollups are pre-aggregated and
+      // can't satisfy row-level filters). On any missing rollup the helper
+      // returns null and we drop to the FT.AGGREGATE path below.
+      const hasExclude = !!(excludeCsv.book || excludeCsv.trade_id || excludeCsv.risk_factor);
+      const tryRollup = process.env.CALC_ROLLUP_PATH !== "0" && !hasExclude;
       const legFields = resolveLegFields(schema!, risk_class, leg);
       const perTenor = (schema!.risk_classes[risk_class]?.tenor?.nodes?.length ?? 0) > 0
         && risk_class === "GIRR";
@@ -470,19 +465,59 @@ async function computeSbmCharge(
         trade_id: excludeCsv.trade_id ? excludeCsv.trade_id.split(",") : [],
         risk_factor: excludeCsv.risk_factor ? excludeCsv.risk_factor.split(",") : [],
       };
-      results = buckets.map((b) => {
-        const r = byBucket.get(b) ?? {
-          bucket: b, K_b: 0, S_b: 0, count: 0, ms: 0,
-          intermediate: { path: "fast" as const, ws_squared_sum: 0, cross_term: 0 },
-        };
+      const buildResolvedCommand = (b: string): string => {
         const perBucketQuery = buildFastPathQuery(risk_class, legFields.sensitivityType, {
           bucketSubset: [b],
           exclude: excludeFilter,
         });
         const perBucketArgv = buildFastPathAggregateArgs(perBucketQuery, legFields, perTenor);
-        const resolved_command = formatRedisCommand("FT.AGGREGATE", perBucketArgv);
-        return { ...r, engine: FAST_PATH_ENGINE, resolved_command };
-      });
+        return formatRedisCommand("FT.AGGREGATE", perBucketArgv);
+      };
+      let rollup: BucketResult[] | null = null;
+      if (tryRollup) {
+        try {
+          rollup = await tryRollupReadout(redis, schema!, risk_class, leg, buckets);
+        } catch (err) {
+          log.warn({
+            evt: "calc-rollup-failed",
+            err: err instanceof Error ? err.message : String(err),
+            risk_class,
+            leg,
+          });
+          rollup = null;
+        }
+      }
+      if (rollup) {
+        engineUsed = ROLLUP_PATH_ENGINE;
+        const byBucketR = new Map(rollup.map((r) => [r.bucket, r]));
+        results = buckets.map((b) => {
+          const r = byBucketR.get(b) ?? {
+            bucket: b, K_b: 0, S_b: 0, count: 0, ms: 0,
+            intermediate: { path: "fast" as const, ws_squared_sum: 0, cross_term: 0 },
+          };
+          return { ...r, engine: ROLLUP_PATH_ENGINE, resolved_command: buildResolvedCommand(b) };
+        });
+      } else {
+        const fast = await aggregateBucketsViaIndex({
+          redis,
+          schema: schema!,
+          riskClass: risk_class,
+          leg,
+          filters: {
+            bucketSubset: bucket_subset,
+            exclude: excludeFilter,
+          },
+          components: { crossTopN: 10 },
+        });
+        const byBucket = new Map(fast.map((r) => [r.bucket, r]));
+        results = buckets.map((b) => {
+          const r = byBucket.get(b) ?? {
+            bucket: b, K_b: 0, S_b: 0, count: 0, ms: 0,
+            intermediate: { path: "fast" as const, ws_squared_sum: 0, cross_term: 0 },
+          };
+          return { ...r, engine: FAST_PATH_ENGINE, resolved_command: buildResolvedCommand(b) };
+        });
+      }
     } else {
       results = await Promise.all(
         buckets.map(async (b, i): Promise<BucketResultWithEngine> => {
@@ -581,7 +616,7 @@ async function computeSbmCharge(
     shard_breakdown: results.map((r) => ({ shard: r.bucket, buckets: [r.bucket], ms: r.ms })),
     fanout_ms: Math.round(fanoutMs * 1000) / 1000,
     correlation_regime: regime,
-    engine: useFastPath ? FAST_PATH_ENGINE : LUA_PATH_ENGINE,
+    engine: engineUsed,
     commands,
     data_status,
     ...(curvatureBranch !== undefined ? { curvature_branch: curvatureBranch } : {}),
@@ -1273,7 +1308,7 @@ export function registerCalcRoute(
         ms: 0,
         engine: engineTag,
         resolved_command: "",
-        intermediate: { path: engineTag === FAST_PATH_ENGINE ? ("fast" as const) : ("lua" as const) },
+        intermediate: { path: engineTag === LUA_PATH_ENGINE ? ("lua" as const) : ("fast" as const) },
       };
 
       const body: Record<string, unknown> = {

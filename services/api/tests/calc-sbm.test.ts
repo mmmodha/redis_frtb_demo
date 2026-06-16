@@ -2070,6 +2070,179 @@ describe("POST /calc/sbm — MVP endpoint", () => {
       const body = res.json();
       expect(body.commands.fcall.dispatched_keys).toEqual(["sens:{EQUITY:1}:_route"]);
     });
+
+  // Wave 6.14b — rollup fast-fast path. When ingest has written per-bucket
+  // rollup hashes (Wave 6.14a), calc reads them via HGETALL and skips
+  // FT.AGGREGATE entirely. Nested inside the Wave 5.83C-1 describe so the
+  // fast-path opt-in (CALC_FAST_PATH=1) and the `fastPathSchema` / `ftAggRow`
+  // helpers are already in place; each test additionally flips
+  // CALC_ROLLUP_PATH on/off and asserts the engine tag + K_b/S_b parity with
+  // the FT.AGGREGATE path.
+  describe("Wave 6.14b: rollup fast-fast path", () => {
+    let savedRollup: string | undefined;
+    beforeEach(() => {
+      savedRollup = process.env.CALC_ROLLUP_PATH;
+      process.env.CALC_ROLLUP_PATH = "1";
+    });
+    afterEach(() => {
+      if (savedRollup === undefined) delete process.env.CALC_ROLLUP_PATH;
+      else process.env.CALC_ROLLUP_PATH = savedRollup;
+    });
+
+    it("Equity Delta: rollup HGETALL drives K_b identically to FT.AGGREGATE path", async () => {
+      // ρ=0.5; sum_ws=10, sum_ws_sq=50 → K_b² = 50 + 0.5·(100−50) = 75.
+      const fr = fakeRedis();
+      // Discovery FT.AGGREGATE still runs to find buckets; the fast-path
+      // FT.AGGREGATE (the one with APPLY) MUST NOT be invoked on the rollup
+      // path — assertion below catches a regression that drops back to FT.
+      fr.setResponse("FT.AGGREGATE", (args: unknown[]) => {
+        if (args.includes("APPLY")) {
+          throw new Error("fast-path FT.AGGREGATE should not run when rollup is present");
+        }
+        return ftAggregateReply(["1"]);
+      });
+      fr.setResponse("HGETALL", (args: unknown[]) => {
+        const key = String(args[0]);
+        if (key === "rollup:{EQUITY:1}:Delta") {
+          return ["sum_ws", "10", "sum_ws_sq", "50", "count", "5"];
+        }
+        return [];
+      });
+      app = await createServer({ redis: fr, schema: fastPathSchema() });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: { risk_class: "Equity", sensitivity_type: "Delta" },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.engine).toBe("rollup");
+      expect(body.per_bucket).toHaveLength(1);
+      expect(body.per_bucket[0].engine).toBe("rollup");
+      expect(body.per_bucket[0].K_b).toBeCloseTo(Math.sqrt(75), 9);
+      expect(body.per_bucket[0].S_b).toBeCloseTo(10, 9);
+      expect(body.per_bucket[0].count).toBe(5);
+      expect(body.charge).toBeCloseTo(Math.sqrt(75), 9);
+    });
+
+    it("GIRR Delta per-tenor: rollup path matches FT.AGGREGATE path to ≤1e-9", async () => {
+      // Per-tenor sums chosen so K_b is hand-computable. ρ=0 → K_b = √(Σ ws_t²).
+      // tenors: 3M=2, 6M=3, 1Y=4 → Σ_t (sum_ws_t)² = 4 + 9 + 16 = 29 → K_b = √29.
+      const fr = fakeRedis();
+      fr.setResponse("FT.AGGREGATE", (args: unknown[]) => {
+        if (args.includes("APPLY")) {
+          throw new Error("fast-path FT.AGGREGATE should not run when rollup is present");
+        }
+        return ftAggregateReply(["USD"]);
+      });
+      const tenorSums: Record<string, number> = { "3M": 2, "6M": 3, "1Y": 4 };
+      fr.setResponse("HGETALL", (args: unknown[]) => {
+        const key = String(args[0]);
+        const m = key.match(/^rollup:\{GIRR:USD\}:Delta:tenor:(.+)$/);
+        if (m) {
+          const t = m[1]!;
+          const ws = tenorSums[t];
+          if (ws === undefined) return [];
+          return ["sum_ws", String(ws), "sum_ws_sq", String(ws * ws), "count", "3"];
+        }
+        return [];
+      });
+      app = await createServer({ redis: fr, schema: fastPathSchema() });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: { risk_class: "GIRR", sensitivity_type: "Delta" },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.engine).toBe("rollup");
+      expect(body.per_bucket).toHaveLength(1);
+      expect(body.per_bucket[0].engine).toBe("rollup");
+      // ρ=0 → K_b² = Σ_t ws_t² = 4 + 9 + 16 = 29
+      expect(body.per_bucket[0].K_b).toBeCloseTo(Math.sqrt(29), 9);
+      // S_b = Σ_t ws_t = 2 + 3 + 4 = 9
+      expect(body.per_bucket[0].S_b).toBeCloseTo(9, 9);
+      expect(body.per_bucket[0].count).toBe(9); // 3 tenors × 3
+    });
+
+    it("missing rollup → graceful fallback to FT.AGGREGATE (engine stays ft_aggregate)", async () => {
+      // HGETALL returns empty for the discovered bucket → tryRollupReadout
+      // returns null and the route routes through FT.AGGREGATE with the
+      // standard reducer aliases.
+      const fr = fakeRedis();
+      fr.setResponse("FT.AGGREGATE", (args: unknown[]) => {
+        if (!args.includes("APPLY")) return ftAggregateReply(["1"]);
+        return [
+          1,
+          ftAggRow("1", { sum_d_ws_equity_delta: 10, sum_d_ws_equity_delta_sq: 50, row_count: 5 }),
+        ];
+      });
+      fr.setResponse("HGETALL", []);
+      app = await createServer({ redis: fr, schema: fastPathSchema() });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: { risk_class: "Equity", sensitivity_type: "Delta" },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.engine).toBe("ft_aggregate");
+      expect(body.per_bucket[0].engine).toBe("ft_aggregate");
+      expect(body.per_bucket[0].K_b).toBeCloseTo(Math.sqrt(75), 9);
+      // HGETALL was issued before falling back.
+      expect(fr.calls.some((c) => c.command === "HGETALL")).toBe(true);
+    });
+
+    it("CALC_ROLLUP_PATH=0 disables the rollup readout (no HGETALL issued)", async () => {
+      process.env.CALC_ROLLUP_PATH = "0";
+      const fr = fakeRedis();
+      fr.setResponse("FT.AGGREGATE", (args: unknown[]) => {
+        if (!args.includes("APPLY")) return ftAggregateReply(["1"]);
+        return [
+          1,
+          ftAggRow("1", { sum_d_ws_equity_delta: 10, sum_d_ws_equity_delta_sq: 50, row_count: 5 }),
+        ];
+      });
+      // No HGETALL stub set — would throw if rollup readout fired.
+      app = await createServer({ redis: fr, schema: fastPathSchema() });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: { risk_class: "Equity", sensitivity_type: "Delta" },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.engine).toBe("ft_aggregate");
+      expect(fr.calls.some((c) => c.command === "HGETALL")).toBe(false);
+    });
+
+    it("exclude predicates bypass the rollup path (row-level filters can't be served by pre-aggregates)", async () => {
+      // When the caller supplies exclude.book / trade_id / risk_factor, the
+      // rollup hashes (already pre-aggregated) can't honour the predicate.
+      // The route must fall through to FT.AGGREGATE without issuing HGETALL.
+      const fr = fakeRedis();
+      fr.setResponse("FT.AGGREGATE", (args: unknown[]) => {
+        if (!args.includes("APPLY")) return ftAggregateReply(["1"]);
+        return [
+          1,
+          ftAggRow("1", { sum_d_ws_equity_delta: 10, sum_d_ws_equity_delta_sq: 50, row_count: 5 }),
+        ];
+      });
+      app = await createServer({ redis: fr, schema: fastPathSchema() });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: {
+          risk_class: "Equity",
+          sensitivity_type: "Delta",
+          exclude: { book: ["bookA"] },
+        },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().engine).toBe("ft_aggregate");
+      expect(fr.calls.some((c) => c.command === "HGETALL")).toBe(false);
+    });
+  });
   });
 });
 

@@ -16,6 +16,10 @@ import type {
   WsComponent,
 } from "./reduce.ts";
 import { kbSquaredForDirection, squareCorrelation } from "@frtb/calc/src/curvatureCommon.ts";
+// Wave 6.14b — share the canonical rollup key shape + hash field names with
+// the ingest writer (Wave 6.14a) so a schema change lands atomically in both
+// services rather than drifting under one of them.
+import { rollupKey } from "@frtb/calc-shared/rollup-keys";
 
 export type FastLeg = "delta" | "vega" | "curvature";
 
@@ -125,6 +129,11 @@ function resolveRho(schema: Schema, riskClass: string, leg: FastLeg): number {
 // without a stringly-typed seam.
 export const FAST_PATH_ENGINE = "ft_aggregate" as const;
 export const LUA_PATH_ENGINE = "fcall_lua" as const;
+// Wave 6.14b — fast-fast path: per-bucket rollup hashes maintained
+// incrementally by ingest (Wave 6.14a). When present, the calc route reads
+// `sum_ws` / `sum_ws_sq` (and `sum_ws_up{,_sq}` / `sum_ws_down{,_sq}` for
+// Curvature) directly via HGETALL, bypassing FT.AGGREGATE entirely.
+export const ROLLUP_PATH_ENGINE = "rollup" as const;
 
 // Returns master-shard nodes for fan-out, or [client] in standalone mode —
 // same feature-check shape as routes/calc.ts and bootstrap.ts so cluster +
@@ -651,6 +660,194 @@ function bucketResultFromRow(
     curvature: curvatureInter,
   };
   return { bucket, K_b: winner.K_b, S_b: winner.S_b, count, ms, intermediate };
+}
+
+// Wave 6.14b — pre-computed per-bucket rollup readout. Ingest (Wave 6.14a)
+// maintains a hash per (risk_class, bucket, sensitivity_type) holding the
+// running `sum_ws` / `sum_ws_sq` (and `sum_ws_up{,_sq}` / `sum_ws_down{,_sq}`
+// for Curvature) plus `count`. The base key is hash-tagged on `<rc>:<bkt>`
+// so it lives on the same shard as the per-bucket sens documents. GIRR
+// additionally keeps per-tenor breakdowns at `…:tenor:<t>`.
+//
+// This function pipelines HGETALL across all requested buckets (+ tenors)
+// via `Promise.all` so ioredis batches the requests on the wire. Returns the
+// same `BucketResult[]` shape as `aggregateBucketsViaIndex` so the route
+// drops the result in place. Any missing/incomplete hash collapses the
+// entire batch to `null` (the caller falls back to FT.AGGREGATE) — partial
+// rollups would silently drop buckets from the charge.
+//
+// Non-perTenor Curvature is intentionally unsupported: the 4 sign-split
+// fields cannot reconstruct the ψ-gated cross term (which needs row-level
+// negative-only sums). Such requests return `null` and route through the
+// existing FT.AGGREGATE path.
+
+// HGETALL reply parser tolerating both RESP2 flat key/value arrays and
+// RESP3 map objects (in-process fakes). Returns `null` for empty/missing
+// hashes so callers can detect "no rollup yet" without inspecting the
+// shape themselves.
+function parseHgetall(reply: unknown): Record<string, string> | null {
+  if (reply === null || reply === undefined) return null;
+  const out: Record<string, string> = {};
+  if (Array.isArray(reply)) {
+    if (reply.length === 0) return null;
+    for (let i = 0; i < reply.length; i += 2) {
+      out[String(reply[i])] = String(reply[i + 1]);
+    }
+    return Object.keys(out).length > 0 ? out : null;
+  }
+  if (typeof reply === "object") {
+    for (const [k, v] of Object.entries(reply as Record<string, unknown>)) {
+      out[k] = String(v);
+    }
+    return Object.keys(out).length > 0 ? out : null;
+  }
+  return null;
+}
+
+export async function tryRollupReadout(
+  redis: RedisLike,
+  schema: Schema,
+  riskClass: string,
+  leg: FastLeg,
+  buckets: ReadonlyArray<string>,
+): Promise<BucketResult[] | null> {
+  const start = process.hrtime.bigint();
+  const rc = riskClass.toUpperCase();
+  const cls = schema.risk_classes[rc];
+  const perTenor = PER_TENOR_CLASSES.has(rc) && (cls?.tenor?.nodes?.length ?? 0) > 0;
+  // Non-perTenor Curvature: rollup contract lacks ψ-gating data. Skip
+  // entirely so the route falls back to FT.AGGREGATE.
+  if (leg === "curvature" && !perTenor) return null;
+  if (buckets.length === 0) return [];
+
+  const fields = resolveLegFields(schema, rc, leg);
+  const rho = resolveRho(schema, rc, leg);
+  const sens = fields.sensitivityType;
+  const tenors: ReadonlyArray<string> = perTenor ? cls!.tenor!.nodes : [""];
+
+  // Build the HGETALL plan: one base key per bucket, plus per-tenor keys
+  // for perTenor classes. Each entry tracks its (bucket, tenor) origin so
+  // we can index the replies after Promise.all settles.
+  type Lookup = { bucket: string; tenor: string; key: string };
+  const lookups: Lookup[] = [];
+  for (const b of buckets) {
+    if (perTenor) {
+      for (const t of tenors) lookups.push({ bucket: b, tenor: t, key: rollupKey(rc, b, sens, t) });
+    } else {
+      lookups.push({ bucket: b, tenor: "", key: rollupKey(rc, b, sens) });
+    }
+  }
+
+  let replies: unknown[];
+  try {
+    replies = await Promise.all(lookups.map((l) => redis.call("HGETALL", l.key)));
+  } catch {
+    return null;
+  }
+
+  // Index parsed hashes by bucket (and tenor for perTenor classes). Any
+  // missing hash → bail and fall back to FT.AGGREGATE.
+  const byBucket = new Map<string, Map<string, Record<string, string>>>();
+  for (let i = 0; i < lookups.length; i++) {
+    const parsed = parseHgetall(replies[i]);
+    if (!parsed) return null;
+    const l = lookups[i]!;
+    let tm = byBucket.get(l.bucket);
+    if (!tm) { tm = new Map(); byBucket.set(l.bucket, tm); }
+    tm.set(l.tenor, parsed);
+  }
+
+  const out: BucketResult[] = [];
+  for (const b of buckets) {
+    const tm = byBucket.get(b);
+    if (!tm) return null;
+    const ms = Number(process.hrtime.bigint() - start) / 1e6;
+    if (leg === "delta" || leg === "vega") {
+      let sumWs: number;
+      let sumWsSq: number;
+      let count = 0;
+      if (perTenor && leg === "delta") {
+        // GIRR Delta: ws_squared_sum operates on per-tenor SUMs (Σ_t (sum_ws_t)²),
+        // mirroring girr_delta.lua / bucketResultFromRow.
+        sumWs = 0;
+        sumWsSq = 0;
+        for (const t of tenors) {
+          const h = tm.get(t);
+          if (!h) return null;
+          const ws = Number(h.sum_ws ?? 0);
+          sumWs += ws;
+          sumWsSq += ws * ws;
+          count += Number(h.count ?? 0);
+        }
+      } else if (perTenor) {
+        // GIRR Vega: per-row sum_ws_sq summed across tenors.
+        sumWs = 0;
+        sumWsSq = 0;
+        for (const t of tenors) {
+          const h = tm.get(t);
+          if (!h) return null;
+          sumWs += Number(h.sum_ws ?? 0);
+          sumWsSq += Number(h.sum_ws_sq ?? 0);
+          count += Number(h.count ?? 0);
+        }
+      } else {
+        // Scalar classes (Equity / FX): single hash carries all aggregates.
+        const h = tm.get("");
+        if (!h) return null;
+        sumWs = Number(h.sum_ws ?? 0);
+        sumWsSq = Number(h.sum_ws_sq ?? 0);
+        count = Number(h.count ?? 0);
+      }
+      const r = kbFromConstantRho(sumWs, sumWsSq, rho);
+      out.push({
+        bucket: b,
+        K_b: r.K_b,
+        S_b: sumWs,
+        count,
+        ms,
+        intermediate: { path: "fast", ws_squared_sum: r.ws_squared_sum, cross_term: r.cross_term },
+      });
+      continue;
+    }
+    // Curvature perTenor (GIRR): per-tenor sum_ws_up / sum_ws_down vectors
+    // drive the ψ-aware K_b ± via kbSquaredForDirection; pick the worse
+    // direction per §21.5(3). S_b is the signed Σ_t CVR_t of the winner.
+    const cvrUp: number[] = [];
+    const cvrDown: number[] = [];
+    let count = 0;
+    for (const t of tenors) {
+      const h = tm.get(t);
+      if (!h) return null;
+      cvrUp.push(Number(h.sum_ws_up ?? 0));
+      cvrDown.push(Number(h.sum_ws_down ?? 0));
+      count += Number(h.count ?? 0);
+    }
+    const kbUpSq = Math.max(0, kbSquaredForDirection(cvrUp, rho));
+    const kbDownSq = Math.max(0, kbSquaredForDirection(cvrDown, rho));
+    const kbUp = Math.sqrt(kbUpSq);
+    const kbDown = Math.sqrt(kbDownSq);
+    const winnerIsDown = kbDown > kbUp;
+    const wsSq = winnerIsDown
+      ? cvrDown.reduce((acc, x) => acc + x * x, 0)
+      : cvrUp.reduce((acc, x) => acc + x * x, 0);
+    const S_b = winnerIsDown
+      ? cvrDown.reduce((a, c) => a + c, 0)
+      : cvrUp.reduce((a, c) => a + c, 0);
+    out.push({
+      bucket: b,
+      K_b: winnerIsDown ? kbDown : kbUp,
+      S_b,
+      count,
+      ms,
+      intermediate: {
+        path: "fast",
+        ws_squared_sum: wsSq,
+        cross_term: (winnerIsDown ? kbDownSq : kbUpSq) - wsSq,
+        curvature: { k_plus: kbUp, k_minus: kbDown, winner: winnerIsDown ? "minus" : "plus" },
+      },
+    });
+  }
+  return out;
 }
 
 export async function aggregateBucketsViaIndex(opts: AggregateBucketsOpts): Promise<BucketResult[]> {
