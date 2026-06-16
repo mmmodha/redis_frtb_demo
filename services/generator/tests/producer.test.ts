@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { resolve, join } from "node:path";
 import { setTimeout as wait } from "node:timers/promises";
 import { Redis } from "ioredis";
+import seedrandom from "seedrandom";
 import { createStreamProducer, MAX_PIPELINE_WINDOW, type SensitivityRow } from "../src/producer.ts";
 import { createStreamRouter } from "@frtb/stream-router";
 
@@ -413,6 +414,88 @@ describe("Wave 5.92C — XADD MAXLEN + flow-control hook", () => {
         expect(args[3]).toBe("1000000");
         expect(args[4]).toBe("*");
       }
+    }
+  });
+});
+
+// Wave 6.11a — stream routing now keys on `_id` (ULID, uniform-random) rather
+// than `_hash_tag` (Pareto-skewed by per-bucket weights). The two cases below
+// stub the router so we can read the routed keys directly without booting a
+// real Redis: a balance case (varied tags) and a skew-resistance case (all
+// rows share one bucket → constant `_hash_tag`, but still uniform on `_id`).
+function ulidLikeFromRng(rng: () => number): string {
+  // Crockford base32 alphabet. 26-char strings approximate ULID width; only
+  // the FNV-1a uniformity of the bytes matters for routing.
+  const A = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+  let s = "";
+  for (let i = 0; i < 26; i++) s += A[(rng() * 32) | 0]!;
+  return s;
+}
+
+describe("Wave 6.11a — route streams by ULID `_id`", () => {
+  it("N=16 router balances XADDs within ±10% across all shards (varied hash-tags)", async () => {
+    const c = stubPipelineClient();
+    const router = createStreamRouter("sensitivities:in", 16);
+    const p = createStreamProducer(c as never, { stream: "sensitivities:in", batchSize: 100, router });
+    const rng = seedrandom("wave-6.11a-balance");
+    for (let i = 0; i < 10_000; i++) {
+      await p.add({
+        risk_class: "GIRR",
+        bucket: `B${i % 24}`,
+        risk_value: i,
+        _hash_tag: `GIRR:B${i % 24}`,
+        _id: ulidLikeFromRng(rng),
+      });
+    }
+    await p.flush();
+    const perStream = new Map<string, number>();
+    for (const batch of c.execCalls) {
+      for (const args of batch) {
+        const key = args[0]!;
+        perStream.set(key, (perStream.get(key) ?? 0) + 1);
+      }
+    }
+    const shardKeys = router.shardKeys()!;
+    expect(shardKeys).toHaveLength(16);
+    const expected = 10_000 / 16;
+    for (const key of shardKeys) {
+      const got = perStream.get(key) ?? 0;
+      expect(got).toBeGreaterThanOrEqual(expected * 0.9);
+      expect(got).toBeLessThanOrEqual(expected * 1.1);
+    }
+  });
+
+  it("N=16 router stays uniform even when every row shares one `_hash_tag` (ULID routing bypasses bucket skew)", async () => {
+    const c = stubPipelineClient();
+    const router = createStreamRouter("sensitivities:in", 16);
+    const p = createStreamProducer(c as never, { stream: "sensitivities:in", batchSize: 100, router });
+    const rng = seedrandom("wave-6.11a-skew");
+    for (let i = 0; i < 10_000; i++) {
+      await p.add({
+        risk_class: "GIRR",
+        bucket: "1",
+        risk_value: i,
+        _hash_tag: "GIRR:1",
+        _id: ulidLikeFromRng(rng),
+      });
+    }
+    await p.flush();
+    const perStream = new Map<string, number>();
+    for (const batch of c.execCalls) {
+      for (const args of batch) {
+        const key = args[0]!;
+        perStream.set(key, (perStream.get(key) ?? 0) + 1);
+      }
+    }
+    const shardKeys = router.shardKeys()!;
+    const expected = 10_000 / 16;
+    for (const key of shardKeys) {
+      const got = perStream.get(key) ?? 0;
+      // Single-bucket case: prove _hash_tag-based routing (which would put
+      // every row on one stream) is NOT happening — distribution stays near-
+      // uniform because routing keys on the per-row ULID `_id`.
+      expect(got).toBeGreaterThanOrEqual(expected * 0.9);
+      expect(got).toBeLessThanOrEqual(expected * 1.1);
     }
   });
 });

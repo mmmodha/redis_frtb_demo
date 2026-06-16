@@ -187,10 +187,14 @@ export function createStreamProducer(
   // Wave 5.92A — resolve the target stream key for a row. With no router,
   // every row goes to the base `stream` (single-buffer collapse, byte-for-
   // byte equal to the pre-5.92 XADD sequence — guarded by the canary test
-  // in workers.test.ts). With a router, the row's `_hash_tag` is FNV-1a
-  // hashed and routed to one of the N pre-enumerated stream keys.
+  // in workers.test.ts). Wave 6.11a — when a router is present we route on
+  // the row's ULID `_id` rather than `_hash_tag`: ULIDs are uniform-random
+  // so FNV-1a(_id) % N spreads XADDs evenly across the N shard streams,
+  // bypassing the Pareto skew baked into `_hash_tag` by per-bucket weights.
+  // Doc-key slot-affinity is unaffected — downstream consumers key docs
+  // (`sens:{rc:bkt}:*`) independently of which stream delivered the row.
   const routeRow = router
-    ? (row: SensitivityRow): string => router.route(row._hash_tag)
+    ? (row: SensitivityRow): string => router.route(row._id)
     : (_row: SensitivityRow): string => stream;
 
   return {
