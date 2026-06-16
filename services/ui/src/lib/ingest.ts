@@ -378,6 +378,16 @@ export interface GeneratorRunStatus {
   // Wave 5.47c — surfaced on terminal entries by /generator/runs/:id/status
   // so post-refresh clients can render the same stop-reason label.
   stop_reason?: StopReason;
+  // Wave 6.12c — resolved plan dials surfaced on streaming runs so a
+  // post-refresh / cross-panel reader can confirm the workers / batch /
+  // window / stream-shards picked at run start. Undefined for non-streaming
+  // runs and on builds older than 6.12c.
+  dials?: {
+    workers: number;
+    batch_size: number;
+    pipeline_window: number;
+    stream_shards: number | "per-bucket";
+  };
 }
 
 export interface ActiveGeneratorRun {
@@ -398,4 +408,47 @@ export async function getActiveGeneratorRuns(): Promise<{ active: ActiveGenerato
   const res = await fetch(`${apiBase()}/generator/runs`);
   if (!res.ok) throw new Error(`api /generator/runs ${res.status}`);
   return (await res.json()) as { active: ActiveGeneratorRun[] };
+}
+
+// Wave 6.12b — typed client for the ingest fan-out card. GET returns the
+// runtime snapshot from services/ingest/src/shard-runtime.ts; POST rebuilds
+// the consumer at runtime. The runtime surfaces 400 (invalid totalShards)
+// and 409 (rebuild already in progress) as JSON errors — both are turned
+// into Error.message strings here so the panel can render them as toasts or
+// inline errors rather than silently swallowing them.
+export interface IngestShardsSnapshot {
+  totalShards: number;
+  // The runtime also returns `assignment` and `streams` but the UI only
+  // reads totalShards; kept optional so the type doesn't lie if the api
+  // ever trims the response.
+  assignment?: number[];
+  streams?: string[];
+}
+
+export async function getIngestShards(): Promise<IngestShardsSnapshot> {
+  const res = await fetch(`${apiBase()}/ingest/shards`);
+  if (!res.ok) throw new Error(`api /ingest/shards ${res.status}`);
+  return (await res.json()) as IngestShardsSnapshot;
+}
+
+export async function setIngestShards(
+  totalShards: number,
+  assignment?: string,
+): Promise<IngestShardsSnapshot> {
+  const body: Record<string, unknown> = { totalShards };
+  if (assignment !== undefined) body.assignment = assignment;
+  const res = await fetch(`${apiBase()}/ingest/shards`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    let detail = `${res.status}`;
+    try {
+      const err = (await res.json()) as { error?: string };
+      if (err && typeof err.error === "string") detail = `${res.status}: ${err.error}`;
+    } catch { /* response body not json */ }
+    throw new Error(`api /ingest/shards ${detail}`);
+  }
+  return (await res.json()) as IngestShardsSnapshot;
 }

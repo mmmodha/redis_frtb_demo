@@ -15,9 +15,12 @@ import {
 import {
   cancelAllGeneratorRuns,
   flushDb,
+  getGeneratorRunStatus,
+  getIngestShards,
   listSources,
   preflight,
   rebuildIndexes,
+  setIngestShards,
   startIngest,
   type GeneratorConfig,
   type PreflightResponse,
@@ -321,6 +324,25 @@ export function IngestPanel() {
   const { run: trackedRun, clearRun: clearTrackedRun } = useGeneratorRun();
   // Wave 5.47b — pre-flight banner + submit gate shared with SyntheticGeneratorCard.
   const preflightHandle = usePreflight();
+  // Wave 6.12b — ingest fan-out card state. `ingestShards` mirrors the most
+  // recent GET /ingest/shards; `producerDial` is the resolved
+  // dials.stream_shards from the active run (when one exists). Both are
+  // refreshed by the existing 1s telemetry poll — no new timer.
+  const [ingestShards, setIngestShardsState] = useState<number | null>(null);
+  const [producerDial, setProducerDial] = useState<number | "per-bucket" | null>(null);
+  const [shardRebuilding, setShardRebuilding] = useState<boolean>(false);
+  const [shardError, setShardError] = useState<string | null>(null);
+  // Pending value submitted via POST — used to render the transient
+  // "rebuilding… → N" affordance until the next GET confirms the new value.
+  const pendingShardRef = useRef<number | null>(null);
+  // Capture the tracked run id without restarting the polling effect when it
+  // changes; the poll tick reads the ref each tick to decide whether to
+  // fetch /generator/runs/:id/status.
+  const trackedRunIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    trackedRunIdRef.current = trackedRun?.runId ?? null;
+    if (!trackedRun?.runId) setProducerDial(null);
+  }, [trackedRun?.runId]);
 
   const throughput = useRef<ChartSample[]>([]);
   const memorySeries = useRef<ChartSample[]>([]);
@@ -365,6 +387,33 @@ export function IngestPanel() {
         if (cancelled) return;
         setError(`Failed to load ingest telemetry: ${(e as Error).message}`);
         setLoaded(true);
+      }
+      // Wave 6.12b — fan-out poll. Independent try/catch so a transient
+      // /ingest/shards failure does not clobber the telemetry error and
+      // vice-versa. Once the GET confirms the value the user posted, we
+      // clear the transient `rebuilding…` flag.
+      try {
+        const snap = await getIngestShards();
+        if (cancelled) return;
+        setIngestShardsState(snap.totalShards);
+        if (pendingShardRef.current !== null && snap.totalShards === pendingShardRef.current) {
+          pendingShardRef.current = null;
+          setShardRebuilding(false);
+        }
+      } catch { /* tolerate transient /ingest/shards failure */ }
+      // Wave 6.12b — pick up the producer's resolved dials.stream_shards
+      // from the active run, when one is being tracked. Streaming runs
+      // populate dials; non-streaming runs leave it undefined (we render
+      // "—" + neutral chip in that case).
+      const rid = trackedRunIdRef.current;
+      if (rid) {
+        try {
+          const status = await getGeneratorRunStatus(rid);
+          if (cancelled) return;
+          if (status?.dials?.stream_shards !== undefined) {
+            setProducerDial(status.dials.stream_shards);
+          }
+        } catch { /* tolerate transient /generator/runs failure */ }
       }
     }
     void tick();
@@ -454,6 +503,30 @@ export function IngestPanel() {
     }
   }
 
+  // Wave 6.12b — Apply handler for the ingest fan-out card. POST returns
+  // the new snapshot synchronously, so the displayed value updates straight
+  // away; we still flip `shardRebuilding` until the next GET tick confirms
+  // it so the operator sees the transient state if the POST takes longer
+  // than the immediate response (e.g. a slow drain). 400 (invalid) / 409
+  // (rebuild busy) surface verbatim via `shardError`.
+  async function onApplyShards(next: number): Promise<void> {
+    setShardError(null);
+    setShardRebuilding(true);
+    pendingShardRef.current = next;
+    try {
+      const snap = await setIngestShards(next);
+      setIngestShardsState(snap.totalShards);
+      if (snap.totalShards === next) {
+        pendingShardRef.current = null;
+        setShardRebuilding(false);
+      }
+    } catch (e) {
+      pendingShardRef.current = null;
+      setShardRebuilding(false);
+      setShardError((e as Error).message);
+    }
+  }
+
   const tput = chartPath(throughput.current, 360, 80);
   const memPath = chartPath(memorySeries.current, 360, 80);
   const sampleKeys = keys?.sample ?? [];
@@ -501,6 +574,14 @@ export function IngestPanel() {
       </PanelCard>
 
       <PreflightBanner state={preflightHandle.state} onRebuild={() => { void preflightHandle.rebuild(); }} />
+
+      <IngestFanoutCard
+        ingestShards={ingestShards}
+        producerDial={producerDial}
+        rebuilding={shardRebuilding}
+        error={shardError}
+        onApply={onApplyShards}
+      />
 
       <SyntheticGeneratorCard preflightGate={preflightHandle.ensureFresh} />
 
@@ -612,6 +693,125 @@ export function IngestPanel() {
         </PanelCard>
       </section>
     </div>
+  );
+}
+
+// Wave 6.12b — Ingest fan-out card. Renders the current ingest shard count
+// (poll-refreshed from GET /ingest/shards), the producer's resolved
+// dials.stream_shards from the active streaming run (or "—" when no run is
+// tracked / non-streaming run), and a match-indicator chip. The dropdown
+// limits to integer shard counts (1/4/8/16/32) — "per-bucket" is producer-
+// only and not a valid consumer setting. 400/409 errors from POST surface
+// inline so the operator sees rebuild conflicts instead of a silent retry.
+const INGEST_FANOUT_OPTIONS = [1, 4, 8, 16, 32] as const;
+
+type MatchKind = "match" | "mismatch" | "neutral";
+
+function computeFanoutMatch(
+  ingest: number | null,
+  producer: number | "per-bucket" | null,
+): MatchKind {
+  if (ingest === null || producer === null) return "neutral";
+  if (producer === "per-bucket") return "mismatch";
+  return ingest === producer ? "match" : "mismatch";
+}
+
+function IngestFanoutCard(props: {
+  ingestShards: number | null;
+  producerDial: number | "per-bucket" | null;
+  rebuilding: boolean;
+  error: string | null;
+  onApply: (next: number) => Promise<void>;
+}) {
+  const { ingestShards, producerDial, rebuilding, error, onApply } = props;
+  // Default the dropdown to the current ingest value when known; fall back
+  // to the first option so the form is always submittable.
+  const initial = ingestShards != null && (INGEST_FANOUT_OPTIONS as readonly number[]).includes(ingestShards)
+    ? ingestShards
+    : INGEST_FANOUT_OPTIONS[0];
+  const [pending, setPending] = useState<number>(initial);
+  // Track the last "live" ingest value the user has seen so a server-side
+  // poll update silently re-syncs the dropdown until the user touches it.
+  const lastIngestRef = useRef<number | null>(ingestShards);
+  useEffect(() => {
+    if (ingestShards != null && ingestShards !== lastIngestRef.current) {
+      lastIngestRef.current = ingestShards;
+      if ((INGEST_FANOUT_OPTIONS as readonly number[]).includes(ingestShards)) {
+        setPending(ingestShards);
+      }
+    }
+  }, [ingestShards]);
+
+  const match = computeFanoutMatch(ingestShards, producerDial);
+  const ingestLabel = ingestShards == null ? "—" : String(ingestShards);
+  const producerLabel = producerDial == null ? "—" : String(producerDial);
+  const chipText = match === "match" ? "✓ match" : match === "mismatch" ? "⚠ mismatch" : "no active run";
+  const chipTestId = `ingest-fanout-chip-${match}`;
+  const disabled = rebuilding;
+
+  async function onSubmit(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    await onApply(pending);
+  }
+
+  return (
+    <PanelCard title="Ingest fan-out">
+      <form className="ingest-fanout" onSubmit={onSubmit} aria-label="Ingest fan-out" data-testid="ingest-fanout-card">
+        <div className="ingest-fanout__row">
+          <span data-testid="ingest-fanout-ingest">
+            Ingest fan-out: <strong>{ingestLabel}</strong>
+          </span>
+          <span data-testid="ingest-fanout-producer">
+            Producer fan-out: <strong>{producerLabel}</strong>
+          </span>
+          <span
+            className={`ingest-fanout__chip ingest-fanout__chip--${match}`}
+            data-testid={chipTestId}
+            role="status"
+          >
+            {chipText}
+          </span>
+        </div>
+        {match === "mismatch" ? (
+          <div className="ingest-fanout__hint" data-testid="ingest-fanout-explainer">
+            Ingest reads {ingestLabel} shard{ingestShards === 1 ? "" : "s"}; producer is writing to {producerLabel}
+            {producerDial === "per-bucket" ? "" : producerDial === 1 ? " shard" : " shards"} — rebuild ingest to match for full coverage.
+          </div>
+        ) : null}
+        <div className="ingest-fanout__row">
+          <label htmlFor="ingest-fanout-select">Set ingest shards</label>
+          <select
+            id="ingest-fanout-select"
+            data-testid="ingest-fanout-select"
+            value={pending}
+            disabled={disabled}
+            onChange={(e) => setPending(Number(e.target.value))}
+          >
+            {INGEST_FANOUT_OPTIONS.map((n) => (
+              <option key={n} value={n}>{n}</option>
+            ))}
+          </select>
+          <button
+            type="submit"
+            className="btn btn--primary"
+            disabled={disabled}
+            data-testid="ingest-fanout-apply"
+          >
+            {rebuilding ? "Rebuilding…" : "Apply"}
+          </button>
+        </div>
+        {rebuilding ? (
+          <div className="ingest-fanout__hint" data-testid="ingest-fanout-rebuilding" role="status">
+            Rebuilding ingest consumer — waiting for the next poll to confirm.
+          </div>
+        ) : null}
+        {error ? (
+          <div className="ingest-fanout__error" data-testid="ingest-fanout-error" role="alert">
+            {error}
+          </div>
+        ) : null}
+      </form>
+    </PanelCard>
   );
 }
 
