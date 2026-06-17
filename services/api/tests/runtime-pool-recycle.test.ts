@@ -52,6 +52,14 @@ function timeoutError(): Error {
   return Object.assign(new Error("Command timed out"), {});
 }
 
+// Wave 6.30.B4 — "Command timed out" now fast-trips the circuit on
+// consecutive_failures=1 (covered by `pool-fail-fast.test.ts`). Tests below
+// that exercise the threshold-of-N path use a non-fatal socket error code
+// instead so the threshold semantics remain observable.
+function nonFatalSocketError(): Error {
+  return Object.assign(new Error("socket reset"), { code: "ECONNRESET" });
+}
+
 let capturedEvents: PoolEventPayload[];
 
 beforeEach(() => {
@@ -76,17 +84,19 @@ afterEach(() => {
 });
 
 describe("Wave 6.22 — failure-threshold circuit open", () => {
-  it("3 consecutive timeouts on one member flips it to open; socket is torn down; pool size stays at 4", () => {
+  it("3 consecutive non-fatal failures on one member flips it to open; socket is torn down; pool size stays at 4", () => {
     process.env.RUNTIME_REDIS_POOL_SIZE_HEAVY = "4";
     // Materialise all 4 slots so we have a stable reference to slot 0.
     for (let i = 0; i < 4; i++) getActiveRedisRuntimeClient();
     // Each failure recycles the socket, so we have to rebuild via the
     // round-robin path between emissions. Cycle through 4 acquisitions to
-    // bring us back to slot 0 after each rebuild.
+    // bring us back to slot 0 after each rebuild. Wave 6.30.B4 — use a
+    // non-fatal error code so the threshold-of-3 path is exercised here
+    // (the fatal-pattern fast-trip is covered by `pool-fail-fast.test.ts`).
     for (let attempt = 0; attempt < 3; attempt++) {
       const slot0 = __getRuntimePoolForTests("heavy").members[0]!.client!;
       (slot0 as unknown as { emit: (e: string, p: unknown) => void })
-        .emit("error", timeoutError());
+        .emit("error", nonFatalSocketError());
       // Cycle round-robin back to slot 0 (need 4 acquisitions; the 4th
       // lands on slot 0 since slot 1 just got picked).
       for (let i = 0; i < 4; i++) getActiveRedisRuntimeClient();
@@ -228,10 +238,12 @@ describe("Wave 6.22 — successful command resets failure count", () => {
     process.env.RUNTIME_REDIS_POOL_SIZE_HEAVY = "1";
     process.env.POOL_MEMBER_FAILURE_THRESHOLD = "3";
     // Single-slot pool so every acquisition returns the same wrapper.
+    // Wave 6.30.B4 — non-fatal error so the threshold-of-3 path is what's
+    // tested (fatal patterns now fast-trip on consecutive_failures=1).
     let nextShouldReject = true;
     __setRuntimeClientFactoryForTests((_t, _c, opts) => makeFakeClient(opts.commandTimeout, () =>
       nextShouldReject
-        ? Promise.reject(timeoutError())
+        ? Promise.reject(nonFatalSocketError())
         : Promise.resolve("ok")));
     const w = getActiveRedisRuntimeClient()!;
     // Pattern: fail, fail, success, fail, fail. With threshold=3 and a

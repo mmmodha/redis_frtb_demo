@@ -98,6 +98,36 @@ const RUNTIME_POOL_SIZE_DEFAULT = 4;
 const POOL_MEMBER_FAILURE_THRESHOLD_DEFAULT = 3;
 const CIRCUIT_BACKOFF_DEFAULT_MS = 5_000;
 
+// Wave 6.30.B4 — per-command timeout (Option A) wrapped around each pool
+// dispatch via the recycle Proxy. Heavy commands (FT.AGGREGATE / FCALL /
+// pipelines that touch the 100M-row sensitivity index) get a 5s budget —
+// generous enough for legit slow queries under load but a 7× speedup over
+// ioredis's 35s default when a socket is silently dead. Light commands
+// (GET / SET / PING / observability) get 1.5s since they have no business
+// taking longer. Both env-overridable so an operator can tighten or loosen
+// the window without shipping new code.
+const POOL_COMMAND_TIMEOUT_HEAVY_DEFAULT_MS = 5_000;
+const POOL_COMMAND_TIMEOUT_LIGHT_DEFAULT_MS = 1_500;
+
+// Wave 6.30.B4 — scheduled half-open probe backoff. Once a member opens, a
+// background timer fires after `initial` to issue a single PING via the
+// wrapper; success closes the circuit, failure doubles the next delay up to
+// `cap`. 10s start gives a poisoned cluster time to recover before we burn
+// another rebuild; 5min cap prevents an indefinitely-down member from
+// spinning rebuilds forever.
+const HALF_OPEN_INITIAL_BACKOFF_DEFAULT_MS = 10_000;
+const HALF_OPEN_BACKOFF_CAP_DEFAULT_MS = 300_000;
+
+// Wave 6.30.B4 — Option C: fatal-error-pattern fast-trip. These message
+// fragments unambiguously indicate a wedged socket (the 2026-06-17 incident's
+// `Command timed out` + sibling `Stream isn't writeable` from Wave 6.23's
+// offline-queue-off path). The wrapper's own per-command timeout synthesises
+// a `pool-command-fail-fast` error which is also matched here. On a closed
+// circuit, any of these tripping a single time flips the breaker straight to
+// open (consecutive_failures=1) instead of waiting for the configured
+// threshold — eliminates the ~105s detection window the incident exposed.
+const FATAL_ERROR_PATTERN = /Command timed out|Stream isn'?t writeable|pool-command-fail-fast/;
+
 function getFailureThreshold(): number {
   const raw = process.env.POOL_MEMBER_FAILURE_THRESHOLD;
   if (raw === undefined || raw === "") return POOL_MEMBER_FAILURE_THRESHOLD_DEFAULT;
@@ -110,6 +140,38 @@ function getCircuitBackoffMs(): number {
   if (raw === undefined || raw === "") return CIRCUIT_BACKOFF_DEFAULT_MS;
   const n = Number(raw);
   return Number.isFinite(n) && n >= 0 ? Math.floor(n) : CIRCUIT_BACKOFF_DEFAULT_MS;
+}
+
+function getCommandTimeoutMs(category: RuntimeCategory): number {
+  const envName = category === "light" ? "POOL_COMMAND_TIMEOUT_LIGHT_MS" : "POOL_COMMAND_TIMEOUT_HEAVY_MS";
+  const fallback = category === "light"
+    ? POOL_COMMAND_TIMEOUT_LIGHT_DEFAULT_MS
+    : POOL_COMMAND_TIMEOUT_HEAVY_DEFAULT_MS;
+  const raw = process.env[envName];
+  if (raw === undefined || raw === "") return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
+function getHalfOpenInitialBackoffMs(): number {
+  const raw = process.env.HALF_OPEN_INITIAL_BACKOFF_MS;
+  if (raw === undefined || raw === "") return HALF_OPEN_INITIAL_BACKOFF_DEFAULT_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : HALF_OPEN_INITIAL_BACKOFF_DEFAULT_MS;
+}
+
+function getHalfOpenBackoffCapMs(): number {
+  const raw = process.env.HALF_OPEN_BACKOFF_CAP_MS;
+  if (raw === undefined || raw === "") return HALF_OPEN_BACKOFF_CAP_DEFAULT_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : HALF_OPEN_BACKOFF_CAP_DEFAULT_MS;
+}
+
+function isFatalErrorPattern(err: unknown): boolean {
+  if (!err) return false;
+  const e = err as { message?: unknown };
+  const msg = typeof e.message === "string" ? e.message : String(err);
+  return FATAL_ERROR_PATTERN.test(msg);
 }
 
 // Public category label for the runtime pools. `"heavy"` is the safe default —
@@ -173,6 +235,13 @@ interface PoolMember {
   consecutiveFailures: number;
   circuitState: CircuitState;
   openedAt: number;
+  // Wave 6.30.B4 — scheduled half-open probe backoff state. `currentBackoffMs`
+  // tracks how long the next probe should wait (10s on the first open, doubled
+  // on each probe failure, capped at 5min). `probeTimer` holds the active
+  // setTimeout handle so a target swap / teardown can cancel it without
+  // leaking timers or surprising the test runner with a late rebuild.
+  currentBackoffMs: number;
+  probeTimer: ReturnType<typeof setTimeout> | null;
 }
 
 interface Pool {
@@ -329,6 +398,11 @@ function detachPoolMembersForSwap(): void {
       m.circuitState = "closed";
       m.consecutiveFailures = 0;
       m.openedAt = 0;
+      // Wave 6.30.B4 — a target swap means any half-open recovery for the
+      // previous Redis identity is moot; cancel the probe and reset its
+      // backoff so the next failure on the new target starts fresh at 10s.
+      cancelScheduledProbe(m);
+      m.currentBackoffMs = 0;
       if (old) {
         drainingClients.add(old);
         const timer = setTimeout(() => {
@@ -386,6 +460,11 @@ export function resetActiveTarget(): void {
       m.circuitState = "closed";
       m.consecutiveFailures = 0;
       m.openedAt = 0;
+      // Wave 6.30.B4 — make sure no half-open probe timer survives a test
+      // teardown / process reset (would otherwise fire against a torn-down
+      // pool member and trip the test runner's open-handle detector).
+      cancelScheduledProbe(m);
+      m.currentBackoffMs = 0;
     }
     pool.members.length = 0;
     pool.rrIndex = 0;
@@ -562,6 +641,8 @@ function ensurePoolSized(pool: Pool, size: number): void {
         consecutiveFailures: 0,
         circuitState: "closed",
         openedAt: 0,
+        currentBackoffMs: 0,
+        probeTimer: null,
       });
     }
     return;
@@ -714,6 +795,16 @@ function noteFailure(member: PoolMember, pool: Pool, client: Redis, err: unknown
     recyclePoolMember(member, pool, client);
     return;
   }
+  // Wave 6.30.B4 — Option C: fatal-error-pattern fast-trip. A single
+  // "Command timed out" / "Stream isn't writeable" / per-command timeout
+  // is unambiguous enough to flip the breaker immediately instead of
+  // burning the full `failure-threshold × command-timeout` clock budget
+  // the 2026-06-17 incident demonstrated (~105s for one stuck slot).
+  if (isFatalErrorPattern(err)) {
+    transitionCircuit(member, "open", pool, "fatal-error-fast-trip", err);
+    recyclePoolMember(member, pool, client);
+    return;
+  }
   if (member.consecutiveFailures >= getFailureThreshold()) {
     transitionCircuit(member, "open", pool, "failure-threshold", err);
     recyclePoolMember(member, pool, client);
@@ -747,11 +838,29 @@ function transitionCircuit(
   member.circuitState = next;
   if (next === "open") {
     member.openedAt = Date.now();
+    // Wave 6.30.B4 — schedule a half-open probe. First open uses the
+    // initial backoff; a half-open that flips straight back to open
+    // doubles the prior delay (capped) so a persistently-down member
+    // doesn't burn rebuilds at full speed.
+    if (prev === "half-open" && member.currentBackoffMs > 0) {
+      const cap = getHalfOpenBackoffCapMs();
+      member.currentBackoffMs = Math.min(member.currentBackoffMs * 2, cap);
+    } else {
+      member.currentBackoffMs = getHalfOpenInitialBackoffMs();
+    }
+    scheduleHalfOpenProbe(member, pool);
   } else if (next === "closed") {
     member.openedAt = 0;
+    // Wave 6.30.B4 — recovery: drop any pending probe timer and reset
+    // backoff so the next failure starts fresh at the initial delay.
+    cancelScheduledProbe(member);
+    member.currentBackoffMs = 0;
+  } else if (next === "half-open") {
+    // Wave 6.30.B4 — the probe is firing now (or a forced promotion via
+    // `promoteOldestToHalfOpen`); cancel any still-pending timer so it
+    // can't double-fire mid-probe.
+    cancelScheduledProbe(member);
   }
-  // `half-open` keeps the existing openedAt so an immediate re-open uses
-  // the original window for the next backoff calculation.
   emitPoolEvent("pool-circuit-transition", member, pool, {
     from: prev,
     to: next,
@@ -767,7 +876,8 @@ function transitionCircuit(
 type PoolEvent =
   | "pool-circuit-transition"
   | "pool-member-recycled"
-  | "pool-member-built";
+  | "pool-member-built"
+  | "pool-command-fail-fast";
 
 export interface PoolEventPayload {
   evt: PoolEvent;
@@ -859,18 +969,124 @@ function wrapWithRecycle(client: Redis, member: PoolMember): Redis {
       return function wrapped(...args: unknown[]): unknown {
         const out = (value as (...a: unknown[]) => unknown).apply(target, args);
         if (out && typeof (out as Promise<unknown>).then === "function") {
-          return (out as Promise<unknown>).then(
-            (v) => { noteSuccess(member, pool); return v; },
-            (err) => {
-              if (shouldRecycle(err)) noteFailure(member, pool, client, err);
-              throw err;
-            },
-          );
+          const method = typeof prop === "symbol" ? prop.toString() : String(prop);
+          return raceWithFailFast(out as Promise<unknown>, method, member, pool, client);
         }
         return out;
       };
     },
   }) as Redis;
+}
+
+// Wave 6.30.B4 — Option A: per-command timeout wrapped around each pool
+// dispatch. The category-specific budget (5s heavy / 1.5s light by default)
+// is enforced via `Promise.race`; on timeout we synthesise a
+// `pool-command-fail-fast` error, emit the structured event, and feed the
+// circuit breaker — the synthesised message matches `FATAL_ERROR_PATTERN`
+// so `noteFailure` fast-trips on consecutive_failures=1 instead of waiting
+// for the threshold. The caller sees a clean rejection that names the
+// pool member, the category, and the method that wedged.
+function raceWithFailFast(
+  p: Promise<unknown>,
+  method: string,
+  member: PoolMember,
+  pool: Pool,
+  client: Redis,
+): Promise<unknown> {
+  const timeoutMs = getCommandTimeoutMs(pool.category);
+  return new Promise<unknown>((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      const err = new Error(
+        `pool-command-fail-fast: Command timed out after ${timeoutMs}ms ` +
+        `(category=${pool.category} member=${member.id} method=${method})`,
+      );
+      emitPoolEvent("pool-command-fail-fast", member, pool, {
+        cause: "per-command-timeout",
+        err: err.message,
+      });
+      noteFailure(member, pool, client, err);
+      reject(err);
+    }, timeoutMs);
+    if (typeof timer.unref === "function") timer.unref();
+    p.then(
+      (v) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        noteSuccess(member, pool);
+        resolve(v);
+      },
+      (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (shouldRecycle(err)) noteFailure(member, pool, client, err);
+        reject(err);
+      },
+    );
+  });
+}
+
+// Wave 6.30.B4 — schedule the next half-open probe for `member`. Caller has
+// already populated `currentBackoffMs` with the desired delay (initial on
+// the first open, doubled on a half-open→open). Cancels any prior timer so
+// a forced promotion / target swap doesn't leave a zombie probe waiting.
+function scheduleHalfOpenProbe(member: PoolMember, pool: Pool): void {
+  cancelScheduledProbe(member);
+  const delay = member.currentBackoffMs;
+  if (delay <= 0) return;
+  const timer = setTimeout(() => {
+    member.probeTimer = null;
+    runHalfOpenProbe(member, pool).catch(() => { /* reschedule handled inline */ });
+  }, delay);
+  if (typeof timer.unref === "function") timer.unref();
+  member.probeTimer = timer;
+}
+
+function cancelScheduledProbe(member: PoolMember): void {
+  if (member.probeTimer) {
+    clearTimeout(member.probeTimer);
+    member.probeTimer = null;
+  }
+}
+
+// Wave 6.30.B4 — half-open recovery probe. Transitions the member to
+// `half-open`, blanks the slot, builds a fresh client, and issues a single
+// PING through the recycle wrapper so the success/failure outcome feeds
+// the same circuit-breaker plumbing as a normal command. The wrapper's
+// `noteSuccess` closes the circuit on PONG; `noteFailure` flips it back to
+// open and `transitionCircuit` doubles the backoff for the next attempt.
+async function runHalfOpenProbe(member: PoolMember, pool: Pool): Promise<void> {
+  if (member.circuitState !== "open") return;
+  transitionCircuit(member, "half-open", pool, "scheduled-probe");
+  if (member.client) {
+    try { member.client.disconnect(); } catch { /* ignore */ }
+  }
+  member.client = null;
+  member.wrapper = null;
+  member.key = "";
+  const t = getActiveTarget();
+  const c = overrideCreds;
+  const runtimeOpts: BuildClientOpts = {
+    commandTimeout: getRuntimeCommandTimeoutMs(),
+    fastFail: true,
+  };
+  const built = runtimeClientFactoryForTests
+    ? runtimeClientFactoryForTests(t, c, runtimeOpts)
+    : buildClient(t, c, runtimeOpts);
+  attachErrorRecycle(built, member);
+  member.client = built;
+  member.wrapper = wrapWithRecycle(built, member);
+  member.key = targetKey(t);
+  member.generation += 1;
+  member.createdAt = Date.now();
+  emitPoolEvent("pool-member-built", member, pool, { generation: member.generation });
+  try {
+    await (member.wrapper as unknown as { ping: () => Promise<unknown> }).ping();
+  } catch { /* wrapper has already updated circuit state + scheduled retry */ }
 }
 
 // Test seam — override the pool event sink so unit tests can capture the

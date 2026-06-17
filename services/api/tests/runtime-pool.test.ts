@@ -84,18 +84,22 @@ describe("Wave 6.21 — round-robin pool distribution", () => {
   });
 });
 
-describe("Wave 6.21 — per-member recycle on Command timed out", () => {
-  it("marks a member stale on a 'Command timed out' rejection and rebuilds it on the next acquisition; pool size stays at 4", async () => {
+describe("Wave 6.21 — per-member recycle on transient socket error", () => {
+  it("marks a member stale on a non-fatal socket error (ECONNRESET) and rebuilds it on the next acquisition; pool size stays at 4", async () => {
     // Acquire enough times to materialise all 4 heavy slots.
     for (let i = 0; i < 4; i++) getActiveRedisRuntimeClient();
     const snapBefore = __getRuntimePoolForTests("heavy");
     const slotZeroClient = snapBefore.members[0]!.client;
     expect(slotZeroClient).not.toBeNull();
-    // Trigger the recycle hook by emitting a Command timed out error event.
-    // The error-recycle listener marks the slot stale; the next acquisition
-    // for slot 0 rebuilds.
+    // Trigger the recycle hook by emitting an ECONNRESET error event. The
+    // error-recycle listener marks the slot stale; the next acquisition for
+    // slot 0 rebuilds. Wave 6.30.B4 routes "Command timed out" / "Stream
+    // isn't writeable" through the fast-trip path (circuit opens on the
+    // first hit) — that flow is covered by `pool-fail-fast.test.ts`; this
+    // test exercises the non-fatal recycle path where the circuit stays
+    // closed and round-robin keeps landing on the slot post-rebuild.
     (slotZeroClient as unknown as { emit: (e: string, p: unknown) => void })
-      .emit("error", Object.assign(new Error("Command timed out"), { code: undefined }));
+      .emit("error", Object.assign(new Error("socket reset"), { code: "ECONNRESET" }));
     const snapAfter = __getRuntimePoolForTests("heavy");
     expect(snapAfter.members[0]!.client).toBeNull();
     expect(snapAfter.members.length).toBe(4); // size invariant preserved
