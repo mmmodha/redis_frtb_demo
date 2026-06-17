@@ -263,7 +263,7 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
   registerPivotRoute(app, getRedis);
   registerCalcRoute(app, getRedis, { correlations: opts.correlations ?? {}, schema: opts.schema });
   registerSuggestRoutes(app, getRedis, { corsAllowed });
-  registerFacetsRoute(app, getRedis);
+  registerFacetsRoute(app, getRedis, { schema: opts.schema });
   registerObservabilityRoutes(app, getRedis, { sseIntervalMs: opts.sseIntervalMs, corsAllowed });
   registerGeneratorRoutes(app, getRedis, opts.schema, {
     sseProgressIntervalMs: opts.generatorSseProgressIntervalMs,

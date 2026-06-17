@@ -122,23 +122,45 @@ describe("POST /admin/flush", () => {
   // so the UI sees post-flush row counts immediately. Without this the
   // identity-keyed 30 s cache (Wave 5.67) would serve the pre-flush body for
   // up to TTL, requiring `?nocache=true` as a workaround.
+  //
+  // Wave 6.25 — /facets now derives counts from per-tag FT.SEARCH calls;
+  // the mock targets FT.SEARCH and a one-class fixture schema keeps the
+  // expected fan-out small (1 rc + 3 st + 1 bucket = 5 calls per request).
   it("invalidates the /facets cache so a subsequent GET /facets reflects post-flush state immediately", async () => {
-    function aggReply(rows: Array<Record<string, string | number>>) {
-      const out: unknown[] = [rows.length];
-      for (const r of rows) {
-        const flat: unknown[] = [];
-        for (const [k, v] of Object.entries(r)) flat.push(k, String(v));
-        out.push(flat);
-      }
-      return out;
-    }
-    // Wave 6.18g — /facets no longer wraps FT.AGGREGATE replies in a cursor
-    // envelope; the route reads the raw aggregate payload directly.
+    const facetsSchema = {
+      version: 1,
+      dimensions: [],
+      risk_classes: {
+        GIRR: {
+          dimensions: [],
+          buckets: { naming: "currency", values: ["USD"] },
+          risk_weights_ref: "rw",
+          intra_bucket_correlation_ref: "ibc",
+          cross_bucket_correlation_ref: "cbc",
+        },
+      },
+      frtb_binding: {
+        risk_class: "risk_class",
+        bucket: "bucket",
+        tenor: "tenor",
+        risk_value: "risk_value",
+        weight: "weight",
+        sensitivity_type: "sensitivity_type",
+      },
+      risk_weights: {},
+      correlations: {},
+    } as unknown as Schema;
+
     const fr = fakeRedis();
-    let nextAgg: unknown = aggReply([
-      { risk_class: "GIRR", bucket: "USD", sensitivity_type: "Delta", n: 10 },
-    ]);
-    fr.setResponse("FT.AGGREGATE", () => nextAgg);
+    let counts: Record<string, number> = {
+      "@risk_class:{GIRR}": 10,
+      "@sensitivity_type:{Delta}": 10,
+      "@risk_class:{GIRR} @bucket:{USD}": 10,
+    };
+    fr.setResponse("FT.SEARCH", (args: unknown[]) => {
+      const q = String(args[1] ?? "");
+      return [counts[q] ?? 0];
+    });
 
     const runBootstrap = vi.fn(async () => ({}));
     const Fastify = (await import("fastify")).default;
@@ -151,7 +173,7 @@ describe("POST /admin/flush", () => {
     __resetFacetsCacheForTests();
     app = Fastify();
     registerAdminRoutes(app, () => fr, { schema: stubSchema, bootstrap: runBootstrap });
-    registerFacetsRoute(app, () => fr);
+    registerFacetsRoute(app, () => fr, { schema: facetsSchema });
 
     // Prime the facets cache with the pre-flush body.
     const r1 = await app.inject({ method: "GET", url: "/facets" });
@@ -160,21 +182,23 @@ describe("POST /admin/flush", () => {
     const r1Cached = await app.inject({ method: "GET", url: "/facets" });
     expect(r1Cached.json().cached).toBe(true);
 
-    // Swap the FT.AGGREGATE response to simulate the post-flush index state.
-    nextAgg = aggReply([
-      { risk_class: "FX", bucket: "EUR", sensitivity_type: "Vega", n: 7 },
-    ]);
+    // Swap the FT.SEARCH responses to simulate the post-flush index state.
+    counts = {
+      "@risk_class:{GIRR}": 7,
+      "@sensitivity_type:{Vega}": 7,
+      "@risk_class:{GIRR} @bucket:{USD}": 7,
+    };
 
     const flushRes = await app.inject({ method: "POST", url: "/admin/flush" });
     expect(flushRes.statusCode).toBe(200);
     const flushBody = flushRes.json();
     expect(flushBody.bootstrap).toMatchObject({ ok: true, cache_invalidated: true });
 
-    // /facets without ?nocache must drain a fresh aggregate, not serve the
-    // stale pre-flush body that was cached above.
+    // /facets without ?nocache must re-issue FT.SEARCH, not serve the stale
+    // pre-flush body that was cached above.
     const r2 = await app.inject({ method: "GET", url: "/facets" });
     expect(r2.statusCode).toBe(200);
-    expect(r2.json()).toMatchObject({ cached: false, total_rows: 7, risk_class: { FX: 7 } });
+    expect(r2.json()).toMatchObject({ cached: false, total_rows: 7, risk_class: { GIRR: 7 } });
   });
 
   it("returns bootstrap.ok=false with error 'schema-missing' when no schema is wired", async () => {
