@@ -10,6 +10,7 @@ import {
   getActiveRedisClient,
   getActiveRedisRuntimeClient,
   type ActiveTarget,
+  type RuntimeCategory,
 } from "./active-target.ts";
 import {
   getBootstrapStatus as getBootstrapPhaseStatus,
@@ -28,6 +29,7 @@ import { registerAdminRoutes } from "./routes/admin.ts";
 import { registerInternalTargetRoutes } from "./routes/internal-target.ts";
 import * as inflight from "./inflight-registry.ts";
 import { corsHeadersForRequest } from "./cors-headers.ts";
+import { registerBackpressure } from "./backpressure.ts";
 import type { ConnectionsStore as RealConnectionsStore } from "./store.ts";
 
 // Wave 5.14b.1 — bootstrap-status flag. Compose healthchecks already curl
@@ -79,7 +81,13 @@ export interface CreateServerOpts {
   // Wave 5.16t — explicit per-request accessor. Takes precedence over
   // `opts.redis`; production wires this to `() => getActiveRedisClient()` so
   // a profile switch retargets the very next route call without restarting.
-  getRedis?: () => RedisLike;
+  //
+  // Wave 6.21 — the accessor now takes an optional pool category. Routes that
+  // want light-pool isolation call `getRedis("light")`; everything else
+  // defaults to heavy. Tests that override `getRedis` may ignore the argument
+  // (returning the same fake for both categories is fine and intended for the
+  // existing FakeRedis-based suite).
+  getRedis?: (category?: RuntimeCategory) => RedisLike;
   activeTarget?: ActiveTarget;
   correlations?: Record<string, CorrelationSpec>;
   // Loaded once at boot from $SCHEMA_FILE (see index.ts). Threaded through so
@@ -153,6 +161,12 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
     allowedHeaders: ["Content-Type", "Authorization"],
   });
 
+  // Wave 6.23 — per-category concurrency limits. Registered before any
+  // route so the onRequest hook gates everything (the heavy/light split
+  // exempts /healthz, /readyz, /redis/active-target*, /inflight*, and SSE
+  // streams). Defaults from MAX_INFLIGHT_HEAVY / MAX_INFLIGHT_LIGHT.
+  registerBackpressure(app);
+
   if (opts.activeTarget) setActiveTarget(opts.activeTarget);
 
   // Wave 5.97D.1 — split health into k8s-style liveness + readiness probes.
@@ -203,10 +217,15 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
   //      commandTimeout) so the in-Redis FT_AGGREGATE TIMEOUT (30s) can fire
   //      first; the boot client (10s) remains reserved for `bootstrapFrtb` +
   //      `scheduleBootstrap` callers.
-  const getRedis = (): RedisLike => {
-    if (opts.getRedis) return opts.getRedis();
+  // Wave 6.21 — category defaults to `"heavy"` so a route that hasn't been
+  // explicitly migrated stays on the same safe runtime client it had before.
+  // `"light"` is opt-in via `getRedis("light")` from individual route handlers
+  // (observability, /admin/preflight, etc.) — see active-target.ts for the
+  // pool design and the route-level rationale.
+  const getRedis = (category: RuntimeCategory = "heavy"): RedisLike => {
+    if (opts.getRedis) return opts.getRedis(category);
     if (opts.redis) return opts.redis;
-    const active = getActiveRedisRuntimeClient();
+    const active = getActiveRedisRuntimeClient(category);
     if (active) return active as unknown as RedisLike;
     // Last-resort: surface a clear error when nothing resolved.
     throw new Error("no active redis client and no fallback opts.redis provided");

@@ -73,13 +73,70 @@ export async function readErrorBody(res: Response): Promise<unknown> {
   }
 }
 
+// Wave 6.23 — backpressure 503. The api returns
+//   503 {error:"too-many-inflight", category, inflight, limit, retry_after_ms}
+// when the per-category in-flight semaphore (heavy/light) is saturated. We
+// surface this as a distinct typed error so panels can render a transient
+// "server busy, retrying in Ns" hint instead of the existing empty-target
+// banner (the underlying target is fine — the api is just shedding load).
+export interface TooManyInflightPayload {
+  error?: string;
+  category?: "heavy" | "light";
+  inflight?: number;
+  limit?: number;
+  retry_after_ms?: number;
+}
+
+export class TooManyInflightError extends Error {
+  readonly kind = "too-many-inflight" as const;
+  readonly status: number;
+  readonly category?: "heavy" | "light";
+  readonly inflight?: number;
+  readonly limit?: number;
+  readonly retry_after_ms?: number;
+  readonly raw: TooManyInflightPayload;
+
+  constructor(status: number, body: TooManyInflightPayload) {
+    const cat = body.category ?? "heavy";
+    const wait = body.retry_after_ms ? ` retry in ${body.retry_after_ms}ms` : "";
+    super(`server is busy (${cat} ${body.inflight ?? "?"}/${body.limit ?? "?"} in-flight),${wait}`.trim());
+    this.name = "TooManyInflightError";
+    this.status = status;
+    this.category = body.category;
+    this.inflight = body.inflight;
+    this.limit = body.limit;
+    this.retry_after_ms = body.retry_after_ms;
+    this.raw = body;
+  }
+}
+
+export function isTooManyInflightShape(
+  status: number,
+  body: unknown,
+): body is TooManyInflightPayload {
+  if (status !== 503) return false;
+  if (!body || typeof body !== "object") return false;
+  return (body as { error?: unknown }).error === "too-many-inflight";
+}
+
+export function checkTooManyInflightError(
+  status: number,
+  body: unknown,
+): TooManyInflightError | null {
+  if (!isTooManyInflightShape(status, body)) return null;
+  return new TooManyInflightError(status, body as TooManyInflightPayload);
+}
+
 // Build the Error a lib client should throw for a non-2xx response. Prefers an
-// EmptyTargetError for the friendly 412/503 shapes; otherwise returns a plain
-// Error using `body.error` if present, falling back to `fallback`.
+// EmptyTargetError for the friendly 412/503 shapes, then a TooManyInflightError
+// for the Wave 6.23 backpressure 503; otherwise returns a plain Error using
+// `body.error` if present, falling back to `fallback`.
 export async function buildApiError(res: Response, fallback: string): Promise<Error> {
   const body = await readErrorBody(res);
   const friendly = checkEmptyTargetError(res.status, body);
   if (friendly) return friendly;
+  const busy = checkTooManyInflightError(res.status, body);
+  if (busy) return busy;
   if (body && typeof body === "object" && "error" in body) {
     const e = (body as { error?: unknown }).error;
     if (typeof e === "string" && e.length > 0) return new Error(e);
