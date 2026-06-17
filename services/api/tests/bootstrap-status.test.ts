@@ -20,6 +20,14 @@ import {
 } from "../src/bootstrap-status.ts";
 import { BootstrapPartialError } from "../src/bootstrap.ts";
 import type { ActiveTarget } from "../src/active-target.ts";
+// Wave 6.18k — verify scheduleBootstrap also flips /readyz (server.ts
+// owns the binary ok/!ok flag that /readyz reads). We read the flag via
+// server.ts's getBootstrapStatus rather than spying on the mark fns so
+// the assertion mirrors what /readyz would actually return.
+import {
+  getBootstrapStatus as getReadyzStatus,
+  resetBootstrapStatusForTests as resetReadyzStatusForTests,
+} from "../src/server.ts";
 
 const TARGET: ActiveTarget = {
   host: "10.0.0.1", port: 6379, tls: false, db: 0, label: "primary",
@@ -215,5 +223,114 @@ describe("bootstrap-status — scheduleBootstrap terminal transitions (Wave 6.18
       expect(snap.phase).toBe("ready");
       expect(snap.target_label).toBe("primary");
     });
+  });
+});
+
+// Wave 6.18k — pair every scheduleBootstrap terminal outcome with the
+// /readyz binary flag in server.ts. Before this wave, a stale boot-time
+// `bootstrap-failed` could coexist with a fresh listener-driven `ready`
+// phase (2026-06-17 VM observation). These tests pin that scheduleBootstrap
+// keeps /readyz and the bootstrap-status phase tracker in agreement.
+describe("bootstrap-status — scheduleBootstrap also flips /readyz (Wave 6.18k)", () => {
+  beforeEach(() => {
+    resetBootstrapStatusForTests();
+    resetReadyzStatusForTests();
+    setDebounceMsForTests(1);
+  });
+
+  it("scheduled-success-flips-readyz: runner resolves → /readyz flips to ok:true", async () => {
+    setBootstrapRunnerForTests(async () => undefined);
+    const fakeClient = {} as unknown as Parameters<typeof scheduleBootstrap>[1];
+    scheduleBootstrap(TARGET, fakeClient, {} as Parameters<typeof scheduleBootstrap>[2]);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(getReadyzStatus()).toEqual({ ok: true });
+  });
+
+  it("scheduled-timeout-flips-readyz: hung runner → /readyz flips to ok:false with timeout error", async () => {
+    const ORIGINAL = process.env.SCHEDULED_BOOTSTRAP_TIMEOUT_MS;
+    process.env.SCHEDULED_BOOTSTRAP_TIMEOUT_MS = "20";
+    try {
+      setBootstrapRunnerForTests(() => new Promise(() => { /* never resolves */ }));
+      const fakeClient = {} as unknown as Parameters<typeof scheduleBootstrap>[1];
+      scheduleBootstrap(TARGET, fakeClient, {} as Parameters<typeof scheduleBootstrap>[2]);
+      await new Promise((r) => setTimeout(r, 60));
+      const readyz = getReadyzStatus();
+      expect(readyz.ok).toBe(false);
+      if (!readyz.ok) {
+        expect(readyz.err).toContain("scheduled-bootstrap-timeout");
+        expect(readyz.err).toContain("20ms");
+      }
+    } finally {
+      if (ORIGINAL === undefined) {
+        delete process.env.SCHEDULED_BOOTSTRAP_TIMEOUT_MS;
+      } else {
+        process.env.SCHEDULED_BOOTSTRAP_TIMEOUT_MS = ORIGINAL;
+      }
+    }
+  });
+
+  it("scheduled-failure-flips-readyz: runner rejects → /readyz flips to ok:false with error", async () => {
+    setBootstrapRunnerForTests(async () => {
+      throw new Error("connection refused");
+    });
+    const fakeClient = {} as unknown as Parameters<typeof scheduleBootstrap>[1];
+    scheduleBootstrap(TARGET, fakeClient, {} as Parameters<typeof scheduleBootstrap>[2]);
+    await new Promise((r) => setTimeout(r, 20));
+    const readyz = getReadyzStatus();
+    expect(readyz.ok).toBe(false);
+    if (!readyz.ok) {
+      expect(readyz.err).toContain("connection refused");
+    }
+  });
+
+  it("scheduled-partial-flips-readyz: BootstrapPartialError → /readyz flips to ok:false (mirrors boot-time path)", async () => {
+    const failures = [
+      { step: "idx:sens", node_id: "node-0", error: "Unknown Index name" },
+    ];
+    setBootstrapRunnerForTests(async () => {
+      throw new BootstrapPartialError(failures);
+    });
+    const fakeClient = {} as unknown as Parameters<typeof scheduleBootstrap>[1];
+    scheduleBootstrap(TARGET, fakeClient, {} as Parameters<typeof scheduleBootstrap>[2]);
+    await new Promise((r) => setTimeout(r, 20));
+    const readyz = getReadyzStatus();
+    expect(readyz.ok).toBe(false);
+    // Phase tracker still distinguishes partial; /readyz is binary.
+    expect(getBootstrapStatus().phase).toBe("partial");
+  });
+
+  it("stale-generation-does-not-flip-readyz: superseded schedule's late resolution must not clobber /readyz", async () => {
+    // Schedule A hangs; schedule B resolves quickly. A's late resolution
+    // (success or failure) MUST be a no-op because myGen !== generation.
+    // After both settle, /readyz should reflect B's outcome (ok:true) and
+    // never have been flipped by A.
+    const ORIGINAL = process.env.SCHEDULED_BOOTSTRAP_TIMEOUT_MS;
+    process.env.SCHEDULED_BOOTSTRAP_TIMEOUT_MS = "20";
+    try {
+      let firstCall = true;
+      setBootstrapRunnerForTests(() => {
+        if (firstCall) {
+          firstCall = false;
+          return new Promise(() => { /* hang past B's resolve */ });
+        }
+        return Promise.resolve();
+      });
+      const fakeClient = {} as unknown as Parameters<typeof scheduleBootstrap>[1];
+      scheduleBootstrap(TARGET, fakeClient, {} as Parameters<typeof scheduleBootstrap>[2]);
+      // Wait past 1ms debounce so A's runner launches and its timeout is armed.
+      await new Promise((r) => setTimeout(r, 5));
+      scheduleBootstrap(TARGET, fakeClient, {} as Parameters<typeof scheduleBootstrap>[2]);
+      // Wait for B to resolve AND A's 20ms timeout to fire (which must no-op).
+      await new Promise((r) => setTimeout(r, 60));
+      // B's success flipped /readyz to ok:true; A's late timeout must NOT
+      // have clobbered it back to ok:false.
+      expect(getReadyzStatus()).toEqual({ ok: true });
+    } finally {
+      if (ORIGINAL === undefined) {
+        delete process.env.SCHEDULED_BOOTSTRAP_TIMEOUT_MS;
+      } else {
+        process.env.SCHEDULED_BOOTSTRAP_TIMEOUT_MS = ORIGINAL;
+      }
+    }
   });
 });

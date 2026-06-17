@@ -11,10 +11,14 @@ import {
 } from "../src/bootstrap.ts";
 import { computeSchemaHash } from "../src/lib/schema-hash.ts";
 import {
+  BASE_INDEX_NAME,
   clearSensIndexNameCache,
+  getSensIndexName,
+  LEGACY_HASH_PREFIX,
   schemaHashKey,
   versionedIndexName,
 } from "../src/lib/sens-index.ts";
+import type { RedisLike as NarrowRedisLike } from "../src/redis-like.ts";
 
 // Wave 5.6.3 unit suite. Drives bootstrapFrtb against an in-memory fake — no
 // real Redis, no docker. Verifies: standalone runs once; cluster fans out
@@ -647,3 +651,227 @@ describe("bootstrap — Wave 6.18i schema-hash skip + ASYNC drop", () => {
   });
 });
 
+
+// Wave 6.18j — fake cluster with selectable GET / SET / FT.INFO behaviours
+// keyed on whether the FT.INFO target is the legacy `idx:sens` or any
+// versioned name. `legacyDocs` drives the num_docs reply on the legacy probe
+// (null → throw "Unknown Index name"). The per-master nodes also honour
+// FT.INFO so the existing 6.18i indexPresentOnAll check stays satisfied for
+// the plain-hex skip branch when needed.
+interface AdoptClusterOpts {
+  oldHash: string | null;
+  legacyDocs: number | null;        // null → FT.INFO idx:sens throws
+  versionedPresent?: boolean;       // FT.INFO versioned name succeeds
+}
+function fakeClusterForAdopt(
+  nodeIds: string[],
+  recorded: RecordedCall[],
+  opts: AdoptClusterOpts,
+): RedisLike {
+  const setHash = { value: opts.oldHash };
+  const versionedPresent = opts.versionedPresent !== false;
+  const nodes = nodeIds.map((id) => ({
+    async call(command: string, ...args: unknown[]) {
+      const cmd = String(command).toUpperCase();
+      recorded.push({ node: id, command: cmd, args });
+      if (cmd === "FT.INFO") {
+        if (String(args[0]) === BASE_INDEX_NAME) {
+          if (opts.legacyDocs === null) throw new Error("Unknown Index name");
+          return ["index_name", BASE_INDEX_NAME, "num_docs", String(opts.legacyDocs)];
+        }
+        if (!versionedPresent) throw new Error("Unknown Index name");
+        return ["index_name", String(args[0])];
+      }
+      return "OK";
+    },
+  }));
+  return {
+    nodes: (_role: string) => nodes as unknown as RedisLike[],
+    async call(command: string, ...args: unknown[]) {
+      const cmd = String(command).toUpperCase();
+      recorded.push({ node: "cluster", command: cmd, args });
+      if (cmd === "GET") return setHash.value;
+      if (cmd === "SET") { setHash.value = String(args[1]); return "OK"; }
+      if (cmd === "FT.INFO") {
+        if (String(args[0]) === BASE_INDEX_NAME) {
+          if (opts.legacyDocs === null) throw new Error("Unknown Index name");
+          return ["index_name", BASE_INDEX_NAME, "num_docs", String(opts.legacyDocs)];
+        }
+        if (!versionedPresent) throw new Error("Unknown Index name");
+        return ["index_name", String(args[0])];
+      }
+      if (cmd === "FT.SUGLEN") return 1;
+      if (cmd === "FT.AGGREGATE") return [0];
+      return "OK";
+    },
+  } as unknown as RedisLike;
+}
+
+describe("bootstrap — Wave 6.18j adopt legacy idx:sens on first migration", () => {
+  it("adopt-legacy: no hash key + legacy num_docs>0 → SET legacy:{hash}, no FT.CREATE, logs bootstrap-adopt-legacy", async () => {
+    clearSensIndexNameCache();
+    const schema = loadSchema(SCHEMA_PATH);
+    const newHash = computeSchemaHash(schema);
+    const recorded: RecordedCall[] = [];
+    const c = fakeClusterForAdopt(["m1", "m2"], recorded, {
+      oldHash: null,
+      legacyDocs: 100,
+    });
+    const logs: Record<string, unknown>[] = [];
+    await bootstrapFrtb(c, schema, (e) => logs.push(e), { target_label: "tgt-J1" });
+
+    expect(recorded.some((r) => r.command === "FT.CREATE")).toBe(false);
+    expect(recorded.some((r) => r.command === "FT.DROPINDEX")).toBe(false);
+    const sets = recorded.filter(
+      (r) => r.command === "SET" && r.args[0] === schemaHashKey("tgt-J1"),
+    );
+    expect(sets).toHaveLength(1);
+    expect(sets[0]!.args[1]).toBe(`${LEGACY_HASH_PREFIX}${newHash}`);
+    const adopt = logs.find((l) => l.action === "bootstrap-adopt-legacy");
+    expect(adopt).toMatchObject({
+      bootstrap: "idx:sens",
+      action: "bootstrap-adopt-legacy",
+      num_docs: 100,
+      hash: `${LEGACY_HASH_PREFIX}${newHash}`,
+    });
+    // Adoption short-circuits Steps 2-4 just like the schema-unchanged skip.
+    expect(recorded.some((r) => r.command === "FUNCTION")).toBe(false);
+  });
+
+  it("adopt-legacy-skipped-on-empty: no hash key + legacy num_docs=0 → falls through to versioned-create path", async () => {
+    clearSensIndexNameCache();
+    const schema = loadSchema(SCHEMA_PATH);
+    const newHash = computeSchemaHash(schema);
+    const recorded: RecordedCall[] = [];
+    const c = fakeClusterForAdopt(["m1", "m2"], recorded, {
+      oldHash: null,
+      legacyDocs: 0,
+    });
+    const logs: Record<string, unknown>[] = [];
+    await bootstrapFrtb(c, schema, (e) => logs.push(e), { target_label: "tgt-J2" });
+
+    // No adoption — we fall through to the standard create-versioned branch.
+    expect(logs.some((l) => l.action === "bootstrap-adopt-legacy")).toBe(false);
+    const creates = recorded.filter((r) => r.command === "FT.CREATE");
+    expect(creates).toHaveLength(2);
+    for (const c2 of creates) expect(c2.args[0]).toBe(versionedIndexName(newHash));
+    const sets = recorded.filter(
+      (r) => r.command === "SET" && r.args[0] === schemaHashKey("tgt-J2"),
+    );
+    expect(sets).toHaveLength(1);
+    expect(sets[0]!.args[1]).toBe(newHash);  // plain, no legacy prefix
+  });
+
+  it("adopt-legacy-skipped-when-missing: no hash key + FT.INFO idx:sens throws → falls through to versioned-create path", async () => {
+    clearSensIndexNameCache();
+    const schema = loadSchema(SCHEMA_PATH);
+    const newHash = computeSchemaHash(schema);
+    const recorded: RecordedCall[] = [];
+    const c = fakeClusterForAdopt(["m1", "m2"], recorded, {
+      oldHash: null,
+      legacyDocs: null,
+    });
+    const logs: Record<string, unknown>[] = [];
+    await bootstrapFrtb(c, schema, (e) => logs.push(e), { target_label: "tgt-J3" });
+
+    expect(logs.some((l) => l.action === "bootstrap-adopt-legacy")).toBe(false);
+    const creates = recorded.filter((r) => r.command === "FT.CREATE");
+    expect(creates).toHaveLength(2);
+    for (const c2 of creates) expect(c2.args[0]).toBe(versionedIndexName(newHash));
+  });
+
+  it("legacy-skip-unchanged: hash key = legacy:{currentHash} → no FT.CREATE/FT.DROPINDEX, logs legacy-schema-unchanged", async () => {
+    clearSensIndexNameCache();
+    const schema = loadSchema(SCHEMA_PATH);
+    const newHash = computeSchemaHash(schema);
+    const recorded: RecordedCall[] = [];
+    const c = fakeClusterForAdopt(["m1", "m2"], recorded, {
+      oldHash: `${LEGACY_HASH_PREFIX}${newHash}`,
+      legacyDocs: 100,
+    });
+    const logs: Record<string, unknown>[] = [];
+    await bootstrapFrtb(c, schema, (e) => logs.push(e), { target_label: "tgt-J4" });
+
+    expect(recorded.some((r) => r.command === "FT.CREATE")).toBe(false);
+    expect(recorded.some((r) => r.command === "FT.DROPINDEX")).toBe(false);
+    const skip = logs.find((l) => l.action === "bootstrap-skip");
+    expect(skip).toMatchObject({
+      bootstrap: "idx:sens",
+      action: "bootstrap-skip",
+      reason: "legacy-schema-unchanged",
+      index: BASE_INDEX_NAME,
+    });
+    // Steps 2-4 are skipped on the legacy-unchanged path just like 6.18i skip.
+    expect(recorded.some((r) => r.command === "FUNCTION")).toBe(false);
+  });
+
+  it("legacy-migrate-on-change: hash key = legacy:{old} with old≠newHash → DROPINDEX idx:sens ASYNC + CREATE versioned + SET plain newHash", async () => {
+    clearSensIndexNameCache();
+    const schema = loadSchema(SCHEMA_PATH);
+    const newHash = computeSchemaHash(schema);
+    const staleHash = "deadbeefdeadbeef";
+    const recorded: RecordedCall[] = [];
+    const c = fakeClusterForAdopt(["m1", "m2"], recorded, {
+      oldHash: `${LEGACY_HASH_PREFIX}${staleHash}`,
+      legacyDocs: 100,
+    });
+    const logs: Record<string, unknown>[] = [];
+    await bootstrapFrtb(c, schema, (e) => logs.push(e), { target_label: "tgt-J5" });
+
+    // Per-master DROPINDEX of the LITERAL legacy name (not a versioned one)
+    // with ASYNC flag.
+    const drops = recorded.filter((r) => r.command === "FT.DROPINDEX");
+    expect(drops).toHaveLength(2);
+    for (const d of drops) {
+      expect(d.args[0]).toBe(BASE_INDEX_NAME);
+      expect(d.args[1]).toBe("ASYNC");
+    }
+    // Per-master CREATE of the NEW versioned name.
+    const creates = recorded.filter((r) => r.command === "FT.CREATE");
+    expect(creates).toHaveLength(2);
+    for (const c2 of creates) expect(c2.args[0]).toBe(versionedIndexName(newHash));
+    // Hash key rewritten to plain newHash (no legacy prefix) so the next
+    // restart follows the standard 6.18i versioned-path semantics.
+    const sets = recorded.filter(
+      (r) => r.command === "SET" && r.args[0] === schemaHashKey("tgt-J5"),
+    );
+    expect(sets).toHaveLength(1);
+    expect(sets[0]!.args[1]).toBe(newHash);
+    expect((sets[0]!.args[1] as string).startsWith(LEGACY_HASH_PREFIX)).toBe(false);
+    // Migration log line is emitted (instead of "created" or "skip").
+    const mig = logs.find((l) => l.action === "bootstrap-migrate-legacy-to-versioned");
+    expect(mig).toMatchObject({
+      bootstrap: "idx:sens",
+      action: "bootstrap-migrate-legacy-to-versioned",
+      oldIndex: BASE_INDEX_NAME,
+      newIndex: versionedIndexName(newHash),
+    });
+  });
+
+  it("helper-returns-literal-for-legacy: getSensIndexName returns \"idx:sens\" when hash key starts with legacy:", async () => {
+    clearSensIndexNameCache();
+    const hash = "abcdef1234567890";
+    const fake = {
+      async call(command: string, ..._args: unknown[]) {
+        if (String(command).toUpperCase() === "GET") return `${LEGACY_HASH_PREFIX}${hash}`;
+        return "OK";
+      },
+    } as unknown as NarrowRedisLike;
+    const name = await getSensIndexName(fake, "tgt-J6");
+    expect(name).toBe(BASE_INDEX_NAME);
+  });
+
+  it("helper-returns-versioned-for-plain: getSensIndexName returns idx:sens:v{hash7} when hash key is plain hex", async () => {
+    clearSensIndexNameCache();
+    const hash = "abcdef1234567890";
+    const fake = {
+      async call(command: string, ..._args: unknown[]) {
+        if (String(command).toUpperCase() === "GET") return hash;
+        return "OK";
+      },
+    } as unknown as NarrowRedisLike;
+    const name = await getSensIndexName(fake, "tgt-J7");
+    expect(name).toBe(versionedIndexName(hash));
+    expect(name).toBe("idx:sens:vabcdef1");
+  });
+});

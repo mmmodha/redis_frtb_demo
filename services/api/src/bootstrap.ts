@@ -24,6 +24,7 @@ import { computeSchemaHash } from "./lib/schema-hash.ts";
 import {
   BASE_INDEX_NAME,
   clearSensIndexNameCache,
+  LEGACY_HASH_PREFIX,
   schemaHashKey,
   versionedIndexName,
 } from "./lib/sens-index.ts";
@@ -185,6 +186,29 @@ async function indexPresentOnAll(nodes: RedisLike[], indexName: string): Promise
   return true;
 }
 
+// Wave 6.18j — boot-client probe for the legacy unversioned `idx:sens` so the
+// first 6.18i migration over a populated pre-6.18i cluster can adopt the
+// existing index instead of creating an empty versioned shadow. Returns the
+// reported num_docs count when the index exists, null when FT.INFO errors
+// (missing index, transient cluster error) or the reply lacks num_docs. The
+// reply is the standard RediSearch flat [field, value, ...] array; num_docs
+// is reported as a string in most builds, cast through Number defensively.
+async function probeLegacyDocCount(client: RedisLike): Promise<number | null> {
+  try {
+    const reply = await client.call("FT.INFO", BASE_INDEX_NAME);
+    if (!Array.isArray(reply)) return null;
+    for (let i = 0; i + 1 < reply.length; i += 2) {
+      if (String(reply[i]) === "num_docs") {
+        const n = Number(reply[i + 1]);
+        return Number.isFinite(n) ? n : null;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 async function runIndexRebuild(
   nodes: RedisLike[],
   schema: Schema,
@@ -252,30 +276,32 @@ export async function bootstrapFrtb(
   // name), per-master FT.CREATE the new versioned name, and SET the new
   // hash key. The unversioned `idx:sens` fallback runs only when no
   // target_label is supplied (CLI / unit-test fakes without GET stubs).
+  //
+  // Wave 6.18j — extended decision tree for the first-migration gap on a
+  // populated pre-6.18i cluster. When the hash key is absent and the legacy
+  // unversioned `idx:sens` reports num_docs>0, adopt it in place by tagging
+  // the hash key with the `legacy:` sentinel prefix instead of creating an
+  // empty versioned shadow next to a 100M-doc index. A subsequent restart
+  // with the same schema short-circuits via the `legacy:`-prefix skip path.
+  // A schema change while still on the legacy tag migrates by dropping the
+  // literal `idx:sens` (not a versioned name) and re-creating under
+  // `idx:sens:v{hash7}`; the hash key is rewritten without the prefix so
+  // future runs follow the standard 6.18i versioned-path semantics.
   let resolvedIndexName = newIndexName;
   let skipped = false;
   if (opts.target_label) {
     const oldHash = await readOldHash(client, opts.target_label);
-    if (!opts.force && oldHash === newHash && await indexPresentOnAll(nodes, newIndexName)) {
-      skipped = true;
-      log({
-        service: "api",
-        bootstrap: "idx:sens",
-        action: "bootstrap-skip",
-        reason: "schema-unchanged",
-        index: newIndexName,
-        nodes: nodes.length,
-      });
-    } else {
-      const oldIndexName = oldHash ? versionedIndexName(oldHash) : null;
-      indexFailed.push(...await runIndexRebuild(nodes, schema, newIndexName, oldIndexName));
-      if (indexFailed.length === 0) {
+
+    // Wave 6.18j — adoption path. Only triggered when no hash key exists; the
+    // FT.INFO probe stays cheap (single boot-client call) on the steady-state
+    // hot path because subsequent boots see the `legacy:`-prefixed value.
+    if (oldHash === null) {
+      const legacyDocs = await probeLegacyDocCount(client);
+      if (legacyDocs !== null && legacyDocs > 0) {
+        const adoptedValue = `${LEGACY_HASH_PREFIX}${newHash}`;
         try {
-          await client.call("SET", schemaHashKey(opts.target_label), newHash);
+          await client.call("SET", schemaHashKey(opts.target_label), adoptedValue);
         } catch (err) {
-          // Hash-key SET failure means the next restart re-runs FT.CREATE
-          // (lands on "already exists" → no-op) rather than skipping —
-          // safe degradation, no per-node failure surfaced.
           log({
             service: "api",
             bootstrap: "idx:sens",
@@ -284,8 +310,95 @@ export async function bootstrapFrtb(
           });
         }
         clearSensIndexNameCache(opts.target_label);
+        log({
+          service: "api",
+          bootstrap: "idx:sens",
+          action: "bootstrap-adopt-legacy",
+          num_docs: legacyDocs,
+          hash: adoptedValue,
+          nodes: nodes.length,
+        });
+        resolvedIndexName = BASE_INDEX_NAME;
+        skipped = true;
       }
-      log({ service: "api", bootstrap: "idx:sens", action: "created", index: newIndexName, nodes: nodes.length });
+    }
+
+    if (!skipped && oldHash !== null && oldHash.startsWith(LEGACY_HASH_PREFIX)) {
+      // Wave 6.18j — legacy-tagged hash key. Suffix match means the schema is
+      // unchanged from the adoption point and the unversioned index is still
+      // valid — skip without touching the index. Suffix mismatch means a
+      // genuine schema change since adoption; migrate by dropping the literal
+      // `idx:sens` (the LEGACY name, never a versioned one) and creating the
+      // new versioned name, then rewrite the hash key to the plain newHash so
+      // we exit the legacy regime permanently.
+      const legacySuffix = oldHash.slice(LEGACY_HASH_PREFIX.length);
+      if (!opts.force && legacySuffix === newHash) {
+        skipped = true;
+        resolvedIndexName = BASE_INDEX_NAME;
+        log({
+          service: "api",
+          bootstrap: "idx:sens",
+          action: "bootstrap-skip",
+          reason: "legacy-schema-unchanged",
+          index: BASE_INDEX_NAME,
+          nodes: nodes.length,
+        });
+      } else {
+        indexFailed.push(...await runIndexRebuild(nodes, schema, newIndexName, BASE_INDEX_NAME));
+        if (indexFailed.length === 0) {
+          try {
+            await client.call("SET", schemaHashKey(opts.target_label), newHash);
+          } catch (err) {
+            log({
+              service: "api",
+              bootstrap: "idx:sens",
+              action: "hash-set-failed",
+              err: err instanceof Error ? err.message : String(err),
+            });
+          }
+          clearSensIndexNameCache(opts.target_label);
+        }
+        log({
+          service: "api",
+          bootstrap: "idx:sens",
+          action: "bootstrap-migrate-legacy-to-versioned",
+          oldIndex: BASE_INDEX_NAME,
+          newIndex: newIndexName,
+          nodes: nodes.length,
+        });
+      }
+    } else if (!skipped) {
+      if (!opts.force && oldHash === newHash && await indexPresentOnAll(nodes, newIndexName)) {
+        skipped = true;
+        log({
+          service: "api",
+          bootstrap: "idx:sens",
+          action: "bootstrap-skip",
+          reason: "schema-unchanged",
+          index: newIndexName,
+          nodes: nodes.length,
+        });
+      } else {
+        const oldIndexName = oldHash ? versionedIndexName(oldHash) : null;
+        indexFailed.push(...await runIndexRebuild(nodes, schema, newIndexName, oldIndexName));
+        if (indexFailed.length === 0) {
+          try {
+            await client.call("SET", schemaHashKey(opts.target_label), newHash);
+          } catch (err) {
+            // Hash-key SET failure means the next restart re-runs FT.CREATE
+            // (lands on "already exists" → no-op) rather than skipping —
+            // safe degradation, no per-node failure surfaced.
+            log({
+              service: "api",
+              bootstrap: "idx:sens",
+              action: "hash-set-failed",
+              err: err instanceof Error ? err.message : String(err),
+            });
+          }
+          clearSensIndexNameCache(opts.target_label);
+        }
+        log({ service: "api", bootstrap: "idx:sens", action: "created", index: newIndexName, nodes: nodes.length });
+      }
     }
   } else {
     // Legacy/test path — no target_label means no hash-key plumbing. Use the

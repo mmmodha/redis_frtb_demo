@@ -14,6 +14,10 @@
 import type { RedisLike } from "../redis-like.ts";
 
 export const BASE_INDEX_NAME = "idx:sens";
+// Wave 6.18j — sentinel prefix marking that the persisted hash key refers to
+// the unversioned `idx:sens` we adopted on first migration over a populated
+// pre-6.18i cluster. Plain string prefix so `redis-cli GET` reveals state.
+export const LEGACY_HASH_PREFIX = "legacy:";
 const HASH_PREFIX_LEN = 7;
 const CACHE_TTL_MS = 30_000;
 
@@ -43,8 +47,15 @@ export async function getSensIndexName(
   let name = BASE_INDEX_NAME;
   try {
     const reply = await client.call("GET", schemaHashKey(target_label));
-    if (typeof reply === "string" && reply.length >= HASH_PREFIX_LEN) {
-      name = versionedIndexName(reply);
+    if (typeof reply === "string") {
+      if (reply.startsWith(LEGACY_HASH_PREFIX)) {
+        // Wave 6.18j — adopted legacy index: bootstrap left the docs under the
+        // unversioned `idx:sens` and tagged the hash key with a `legacy:`
+        // prefix. Routes keep targeting the literal base name.
+        name = BASE_INDEX_NAME;
+      } else if (reply.length >= HASH_PREFIX_LEN) {
+        name = versionedIndexName(reply);
+      }
     }
   } catch {
     // GET failure (key missing, transient cluster error, fake without a
