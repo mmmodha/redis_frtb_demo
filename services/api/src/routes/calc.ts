@@ -428,7 +428,7 @@ async function computeSbmCharge(
           error: "no-data-or-index",
           risk_class,
           measure: leg,
-          hint: "ensure idx:sens exists on all masters and stream has been ingested",
+          hint: `ensure ${indexName} exists on all masters and stream has been ingested`,
         },
       };
     }
@@ -441,7 +441,7 @@ async function computeSbmCharge(
       body: {
         error: "discovery-failed",
         reason: discoveryError,
-        hint: "FT.AGGREGATE on idx:sens failed — see api warn log",
+        hint: `FT.AGGREGATE on ${indexName} failed — see api warn log`,
       },
     };
   }

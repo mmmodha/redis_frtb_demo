@@ -52,9 +52,10 @@ export interface AggregateBucketsOpts {
   // classes (Equity / FX) require a second FT.AGGREGATE grouped by risk_factor.
   components?: ComponentsOpts;
   // Wave 6.18i — versioned `idx:sens:v{hash7}` resolved by the route via
-  // getSensIndexName. Optional for back-compat (CLI smoke, unit-test
-  // callers without an active target) — defaults to the legacy base name.
-  indexName?: string;
+  // getSensIndexName. Wave 6.30.B2 — required so a caller can no longer
+  // silently fall back to the literal `idx:sens` on a cluster where only
+  // the versioned name exists (the 412 "idx:sens not found" reproducer).
+  indexName: string;
 }
 
 // Wave 5.41 — same explicit per-call timeout the legacy discovery FT.AGGREGATE
@@ -224,8 +225,8 @@ export function formatRedisCommand(name: string, argv: ReadonlyArray<unknown>): 
 export function buildFastPathAggregateArgs(
   query: string,
   fields: LegFields,
-  perTenor: boolean = false,
-  indexName: string = "idx:sens",
+  perTenor: boolean,
+  indexName: string,
 ): unknown[] {
   void perTenor;
   const args: unknown[] = [indexName, query];
@@ -285,7 +286,7 @@ export function buildFastPathAggregateArgs(
 export function buildComponentsAggregateArgs(
   query: string,
   fields: LegFields,
-  indexName: string = "idx:sens",
+  indexName: string,
 ): unknown[] {
   const args: unknown[] = [indexName, query];
   const applyClauses: Array<[string, string]> = [];
@@ -866,9 +867,10 @@ export async function aggregateBucketsViaIndex(opts: AggregateBucketsOpts): Prom
   const rho = resolveRho(opts.schema, riskClass, opts.leg);
   const perTenor = PER_TENOR_CLASSES.has(riskClass) && (opts.schema.risk_classes[riskClass]?.tenor?.nodes?.length ?? 0) > 0;
   const query = buildFastPathQuery(riskClass, fields.sensitivityType, opts.filters);
-  // Wave 6.18i — route plumbs the resolved versioned index name; default
-  // to the legacy base name so CLI / unit-test callers keep working.
-  const indexName = opts.indexName ?? "idx:sens";
+  // Wave 6.30.B2 — `indexName` is required on AggregateBucketsOpts so a
+  // missed plumbing step now fails at compile time instead of silently
+  // hitting the literal `idx:sens` against a versioned-only cluster.
+  const indexName = opts.indexName;
   const argv = buildFastPathAggregateArgs(query, fields, perTenor, indexName);
   const nodes = resolveQueryNodes(opts.redis);
   const merged = new Map<string, Record<string, string>>();
