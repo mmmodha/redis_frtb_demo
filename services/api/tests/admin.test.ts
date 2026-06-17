@@ -7,6 +7,7 @@
 
 import { describe, it, expect, afterEach, vi } from "vitest";
 import type { Schema } from "@frtb/schema";
+import { rollupKey } from "@frtb/calc-shared/rollup-keys";
 import { createServer } from "../src/server.ts";
 import { fakeRedis } from "./helpers/fake-redis.ts";
 import { resetActiveTarget } from "../src/active-target.ts";
@@ -123,9 +124,10 @@ describe("POST /admin/flush", () => {
   // identity-keyed 30 s cache (Wave 5.67) would serve the pre-flush body for
   // up to TTL, requiring `?nocache=true` as a workaround.
   //
-  // Wave 6.25 — /facets now derives counts from per-tag FT.SEARCH calls;
-  // the mock targets FT.SEARCH and a one-class fixture schema keeps the
-  // expected fan-out small (1 rc + 3 st + 1 bucket = 5 calls per request).
+  // Wave 6.28 — /facets now reads pre-aggregated row counts from
+  // `rollup:{rc:bkt}:<sens>` hashes (the `count` field). The mock targets
+  // HGET on those keys and a one-class fixture schema keeps the expected
+  // fan-out small (1 rc × 1 bucket × 3 sens = 3 HGETs per request).
   it("invalidates the /facets cache so a subsequent GET /facets reflects post-flush state immediately", async () => {
     const facetsSchema = {
       version: 1,
@@ -153,13 +155,14 @@ describe("POST /admin/flush", () => {
 
     const fr = fakeRedis();
     let counts: Record<string, number> = {
-      "@risk_class:{GIRR}": 10,
-      "@sensitivity_type:{Delta}": 10,
-      "@risk_class:{GIRR} @bucket:{USD}": 10,
+      [rollupKey("GIRR", "USD", "Delta")]: 10,
     };
-    fr.setResponse("FT.SEARCH", (args: unknown[]) => {
-      const q = String(args[1] ?? "");
-      return [counts[q] ?? 0];
+    fr.setResponse("HGET", (args: unknown[]) => {
+      const key = String(args[0]);
+      const field = String(args[1]);
+      if (field !== "count") return null;
+      const v = counts[key];
+      return v == null ? null : String(v);
     });
 
     const runBootstrap = vi.fn(async () => ({}));
@@ -182,11 +185,9 @@ describe("POST /admin/flush", () => {
     const r1Cached = await app.inject({ method: "GET", url: "/facets" });
     expect(r1Cached.json().cached).toBe(true);
 
-    // Swap the FT.SEARCH responses to simulate the post-flush index state.
+    // Swap the rollup counts to simulate the post-flush index state.
     counts = {
-      "@risk_class:{GIRR}": 7,
-      "@sensitivity_type:{Vega}": 7,
-      "@risk_class:{GIRR} @bucket:{USD}": 7,
+      [rollupKey("GIRR", "USD", "Vega")]: 7,
     };
 
     const flushRes = await app.inject({ method: "POST", url: "/admin/flush" });
@@ -194,7 +195,7 @@ describe("POST /admin/flush", () => {
     const flushBody = flushRes.json();
     expect(flushBody.bootstrap).toMatchObject({ ok: true, cache_invalidated: true });
 
-    // /facets without ?nocache must re-issue FT.SEARCH, not serve the stale
+    // /facets without ?nocache must re-issue HGET, not serve the stale
     // pre-flush body that was cached above.
     const r2 = await app.inject({ method: "GET", url: "/facets" });
     expect(r2.statusCode).toBe(200);

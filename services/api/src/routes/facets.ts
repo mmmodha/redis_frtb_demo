@@ -3,10 +3,10 @@ import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadSchema, type Schema } from "@frtb/schema";
+import { rollupKey } from "@frtb/calc-shared/rollup-keys";
 import type { RedisLike } from "../redis-like.ts";
 import { getActiveTarget, onActiveTargetChange } from "../active-target.ts";
 import { getBootstrapStatus } from "../bootstrap-status.ts";
-import { getSensIndexName } from "../lib/sens-index.ts";
 import { translateRedisError } from "../redis-errors.ts";
 
 // Wave 5.56 / 5.66 — facet counts backing the Search / Calc / JSON Explorer
@@ -19,23 +19,27 @@ import { translateRedisError } from "../redis-errors.ts";
 // invalidate the cache. `setActiveTarget` fires `onActiveTargetChange`, which
 // clears the cache immediately.
 //
-// Wave 6.25 — FT.AGGREGATE GROUPBY against the clustered Redis proxy returned
-// 0 rows even with DIALECT 1/2/3/4 and WITHCURSOR; the cluster simply does not
-// drain grouped rows reliably for us. We now derive the facet counts by
-// issuing one `FT.SEARCH <idx> "<tag-filter>" LIMIT 0 0` per known tag value
-// in the active schema and reading the total-count head of the reply. The
-// route's external FacetsResponseOk / FacetsResponseEmpty shape is unchanged.
+// Wave 6.28 — uncached /facets latency was dominated by the per-tag FT.SEARCH
+// server-side cost (~150ms × ~95 queries against 100M-row idx:sens, ~15s
+// regardless of pipeline batching — 6.27's verifier confirmed the bottleneck
+// was server-side serialization, not RTT). We now read the pre-aggregated
+// counters maintained by ingest in `rollup:{rc:bkt}:<sens>` hashes (Wave
+// 6.14a). Each rollup hash already has a `count` field (one HINCRBY per
+// row), so the route just pipelines `HGET … count` for every (rc, bkt, sens)
+// triple from the schema and sums in JS:
+//   bucket_by_risk_class[rc][bk] = Σ_st count(rc,bk,st)
+//   risk_class[rc]               = Σ_bk,st count(rc,bk,st)
+//   sensitivity_type[st]         = Σ_rc,bk count(rc,bk,st)
+//   total_rows                   = Σ_rc risk_class[rc]
+// HGET against a 3-field hash is microseconds server-side, so uncached
+// latency drops from ~15s to a single round trip + JS arithmetic. The
+// FacetsResponseOk / FacetsResponseEmpty shape is unchanged.
 //
-// Wave 6.27 — the ~95 per-tag FT.SEARCH calls now ship in a single ioredis
-// non-transactional `.pipeline()` instead of independent Promise.all() round-
-// trips. On bigcluster (~150 ms RTT to the DMC proxy) this collapses 95 × RTT
-// to ~1 × RTT and cuts uncached /facets from 15.2 s to sub-second. We use
-// `.pipeline()` rather than `.multi()` because RediSearch rejects FT.SEARCH
-// inside a transactional MULTI/EXEC block ("Cannot perform FT.SEARCH: Cannot
-// block"); the non-transactional pipeline batches commands into one round
-// trip without wrapping them in MULTI/EXEC. Production clients (ioredis
-// Redis | Cluster) expose `.pipeline()`; the per-call fallback below is kept
-// for any RedisLike implementation that does not (currently none in tree).
+// We pipeline the HGETs (rather than Promise.all) for the same RTT reason
+// as 6.27 — the ioredis Cluster pipeline routes each command to the slot
+// computed from the `{rc:bkt}` hash tag, so cross-shard fan-out happens
+// inside one driver-level batch. A Promise.all fallback is retained for
+// any RedisLike implementation without `.pipeline()` (currently none).
 
 const CACHE_TTL_MS = 30_000;
 const SENSITIVITY_TYPES = ["Delta", "Vega", "Curvature"] as const;
@@ -89,18 +93,6 @@ export function invalidateFacetsCache(): void {
   cache = null;
 }
 
-function isUnknownIndexError(err: unknown): boolean {
-  const msg = String(err instanceof Error ? err.message : err).toLowerCase();
-  // Redis 8.x reports the missing-index condition as
-  // "SEARCH_INDEX_NOT_FOUND Index not found: …" — accept it alongside the
-  // legacy RediSearch phrasings.
-  return (
-    msg.includes("unknown index name") ||
-    msg.includes("no such index") ||
-    msg.includes("index not found")
-  );
-}
-
 function emptyResponse(target_label: string, ms: number): FacetsResponseEmpty {
   return {
     ok: false,
@@ -119,21 +111,12 @@ function elapsedMs(t0: bigint): number {
   return Math.round((Number(process.hrtime.bigint() - t0) / 1e6) * 1000) / 1000;
 }
 
-// RediSearch TAG queries require backslash-escaping of punctuation. The
-// default schema's bucket values are alphanumeric, but the schema is
-// hot-swappable so we escape defensively.
-function escapeTag(v: string): string {
-  return v.replace(/[\\,.<>{}[\]"':;!@#$%^&*()\-+=~/ \t]/g, "\\$&");
-}
-
-// FT.SEARCH ... LIMIT 0 0 returns RESP2 `[total_count]` (only the count head;
-// no document payload). Extract it defensively.
-function searchCountReply(reply: unknown): number {
-  if (Array.isArray(reply) && reply.length > 0) {
-    const n = Number(reply[0]);
-    return Number.isFinite(n) && n >= 0 ? n : 0;
-  }
-  return 0;
+// HGET on a rollup hash returns RESP2 `string | null` — null when the field
+// (or hash) is absent. Parse defensively to a finite non-negative integer.
+function parseCountReply(reply: unknown): number {
+  if (reply == null) return 0;
+  const n = Number(reply);
+  return Number.isFinite(n) && n >= 0 ? n : 0;
 }
 
 // Schema loader fallback — production wires `opts.schema` through from
@@ -158,10 +141,6 @@ function loadFacetsSchema(): Schema | null {
 // `.exec()` resolves to the `[err, reply]` tuple array. Widened here rather
 // than added to RedisLike so the narrow interface stays minimal (same
 // pattern as PipelineClient in generator.ts).
-//
-// NOTE: must be `.pipeline()` (non-transactional), not `.multi()`.
-// RediSearch rejects FT.SEARCH inside a MULTI/EXEC block with
-// "Cannot perform FT.SEARCH: Cannot block".
 type PipelineClient = {
   pipeline(): {
     call(command: string, ...args: unknown[]): unknown;
@@ -173,29 +152,28 @@ function hasPipeline(r: RedisLike): r is RedisLike & PipelineClient {
   return typeof (r as unknown as Partial<PipelineClient>).pipeline === "function";
 }
 
-// Run the ordered list of FT.SEARCH count queries against `indexName`. When
-// the client supports `.pipeline()` (production: ioredis Redis|Cluster) we
-// pack them into a single non-transactional pipeline — the win is amortizing
-// RTT, which dominates on the cloud DMC proxy. The fallback path keeps a
-// parallel Promise.all so minimal stubs without `.pipeline()` (none
-// currently in tree) still work. The LIMIT 0 0 (count-only) trick is
-// preserved in both paths.
-async function runFacetSearches(
+// Run the ordered list of `HGET <key> count` reads against the rollup hashes.
+// When the client supports `.pipeline()` (production: ioredis Redis|Cluster)
+// we pack them into a single non-transactional pipeline — `Cluster.pipeline`
+// routes each command to the slot computed from the `{rc:bkt}` hash tag and
+// fans out across shards inside one driver-level batch. The fallback path
+// keeps a parallel Promise.all so minimal stubs without `.pipeline()` (none
+// currently in tree) still work.
+async function runRollupCountReads(
   redis: RedisLike,
-  indexName: string,
-  queries: string[],
+  keys: string[],
 ): Promise<unknown[]> {
   if (hasPipeline(redis)) {
     const pipeline = redis.pipeline();
-    for (const q of queries) {
-      pipeline.call("FT.SEARCH", indexName, q, "LIMIT", "0", "0");
+    for (const k of keys) {
+      pipeline.call("HGET", k, "count");
     }
     const results = await pipeline.exec();
     if (!results) {
       // ioredis returns null when the pipeline is unexpectedly empty or
       // aborted before exec. Surface a recognisable error rather than
       // silently returning empty counts.
-      throw new Error("FT.SEARCH pipeline returned null");
+      throw new Error("HGET rollup pipeline returned null");
     }
     const replies: unknown[] = new Array(results.length);
     for (let i = 0; i < results.length; i++) {
@@ -206,11 +184,7 @@ async function runFacetSearches(
     }
     return replies;
   }
-  return Promise.all(
-    queries.map((q) =>
-      redis.call("FT.SEARCH", indexName, q, "LIMIT", "0", "0"),
-    ),
-  );
+  return Promise.all(keys.map((k) => redis.call("HGET", k, "count")));
 }
 
 export function registerFacetsRoute(
@@ -229,8 +203,6 @@ export function registerFacetsRoute(
 
     const redis = getRedis();
     const target_label = getActiveTarget().label;
-    // Wave 6.18i — resolve the live versioned index name (cached 30 s).
-    const indexName = await getSensIndexName(redis, target_label);
 
     const schema = opts.schema ?? loadFacetsSchema();
     if (!schema) {
@@ -243,44 +215,27 @@ export function registerFacetsRoute(
     }
 
     const riskClasses = Object.keys(schema.risk_classes);
-    const sensitivityTypes = SENSITIVITY_TYPES;
-    const bucketTuples: Array<[string, string]> = [];
+    // Enumerate every (rc, bucket, sensitivity_type) triple the schema
+    // permits. Each triple maps to a rollup hash key (Wave 6.14a) whose
+    // `count` field holds the contributing-row count — ingest HINCRBYs
+    // it once per ingested doc. The route reads them all in one
+    // non-transactional pipeline and sums in JS.
+    type Lookup = { rc: string; bk: string; st: string; key: string };
+    const lookups: Lookup[] = [];
     for (const rc of riskClasses) {
       const cfg = schema.risk_classes[rc];
       const buckets = cfg?.buckets?.values ?? [];
-      for (const bk of buckets) bucketTuples.push([rc, bk]);
+      for (const bk of buckets) {
+        for (const st of SENSITIVITY_TYPES) {
+          lookups.push({ rc, bk, st, key: rollupKey(rc, bk, st) });
+        }
+      }
     }
 
-    // FT.SEARCH count fan-out. Each call returns `[N, ...docs]`; with LIMIT
-    // 0 0 there are no docs — just N. We build one ordered list of queries
-    // (risk_class, sensitivity_type, (rc, bucket)) and ship them through a
-    // single non-transactional pipeline so all ~95 commands amortize one RTT
-    // (Wave 6.27). The reply array is sliced back into the three groupings
-    // in the same order they were enqueued.
-    const rcQueries = riskClasses.map(
-      (rc) => `@risk_class:{${escapeTag(rc)}}`,
-    );
-    const stQueries = sensitivityTypes.map(
-      (st) => `@sensitivity_type:{${escapeTag(st)}}`,
-    );
-    const bkQueries = bucketTuples.map(
-      ([rc, bk]) =>
-        `@risk_class:{${escapeTag(rc)}} @bucket:{${escapeTag(bk)}}`,
-    );
-    const allQueries = [...rcQueries, ...stQueries, ...bkQueries];
-
-    let allReplies: unknown[];
+    let replies: unknown[];
     try {
-      allReplies = await runFacetSearches(redis, indexName, allQueries);
+      replies = await runRollupCountReads(redis, lookups.map((l) => l.key));
     } catch (err) {
-      const ms = elapsedMs(t0);
-      // The spec asks for a 200 empty-index shape when idx:sens is missing,
-      // overriding the 412 translateRedisError would otherwise return.
-      if (isUnknownIndexError(err)) {
-        const body = emptyResponse(target_label, ms);
-        cache = { key, body, expiresAt: Date.now() + CACHE_TTL_MS };
-        return body;
-      }
       // Transient / translatable errors must NOT be cached — a 412 during
       // bootstrap should not stick around for 30 s after the index comes up.
       const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
@@ -293,30 +248,25 @@ export function registerFacetsRoute(
 
     const ms = elapsedMs(t0);
 
-    const rcEnd = rcQueries.length;
-    const stEnd = rcEnd + stQueries.length;
-    const rcReplies = allReplies.slice(0, rcEnd);
-    const stReplies = allReplies.slice(rcEnd, stEnd);
-    const bkReplies = allReplies.slice(stEnd);
-
     const risk_class: Record<string, number> = {};
     const sensitivity_type: Record<string, number> = {};
     const bucket_by_risk_class: Record<string, Record<string, number>> = {};
 
-    riskClasses.forEach((rc, i) => {
-      const n = searchCountReply(rcReplies[i]);
-      if (n > 0) risk_class[rc] = n;
-    });
-    sensitivityTypes.forEach((st, i) => {
-      const n = searchCountReply(stReplies[i]);
-      if (n > 0) sensitivity_type[st] = n;
-    });
-    bucketTuples.forEach(([rc, bk], i) => {
-      const n = searchCountReply(bkReplies[i]);
-      if (n <= 0) return;
+    // Aggregate per-triple counts into the three facet groupings:
+    //   risk_class[rc]               = Σ_{bk,st} count(rc,bk,st)
+    //   sensitivity_type[st]         = Σ_{rc,bk} count(rc,bk,st)
+    //   bucket_by_risk_class[rc][bk] = Σ_{st}    count(rc,bk,st)
+    // Missing / null HGET replies (e.g. (rc, bk, Curvature) with no data)
+    // contribute 0 and are silently skipped.
+    for (let i = 0; i < lookups.length; i++) {
+      const n = parseCountReply(replies[i]);
+      if (n <= 0) continue;
+      const { rc, bk, st } = lookups[i]!;
+      risk_class[rc] = (risk_class[rc] ?? 0) + n;
+      sensitivity_type[st] = (sensitivity_type[st] ?? 0) + n;
       const inner = bucket_by_risk_class[rc] ?? (bucket_by_risk_class[rc] = {});
-      inner[bk] = n;
-    });
+      inner[bk] = (inner[bk] ?? 0) + n;
+    }
 
     // total_rows is the doc count (sum of per-class counts), NOT triple-
     // counted across the three facet groupings — matches existing semantics.
