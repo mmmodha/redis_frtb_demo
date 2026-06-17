@@ -68,12 +68,49 @@ const listeners = new Set<ActiveTargetListener>();
 // key). Per-member recycle (see `wrapWithRecycle`) marks individual pool
 // members stale on command timeouts / ETIMEDOUT / ECONNRESET / EPIPE so a
 // poisoned socket self-heals without taking down its peers.
+//
+// Wave 6.22 — each member additionally carries a small circuit breaker on
+// top of the recycle hook. The breaker counts CONSECUTIVE failures (a
+// successful command resets the counter); reaching `POOL_MEMBER_FAILURE_
+// THRESHOLD` flips the circuit `closed → open` and disconnects the socket.
+// `acquireFromPool` skips open members during round-robin and returns the
+// next live one. When every member in a pool is open, the oldest one
+// transitions to `half-open` after `CIRCUIT_BACKOFF_MS`, gets a fresh
+// `buildClient(...)`, and either closes (on the first successful command)
+// or re-opens (on the next failure) for another backoff window. State
+// transitions are emitted as structured `pool-circuit-*` logs so a future
+// observability dashboard can wire in without re-instrumenting the pool.
 let cachedBootClient: Redis | null = null;
 let cachedBootClientKey = "";
 
 const BOOT_COMMAND_TIMEOUT_MS = 10_000;
 const RUNTIME_COMMAND_TIMEOUT_DEFAULT_MS = 35_000;
 const RUNTIME_POOL_SIZE_DEFAULT = 4;
+
+// Wave 6.22 — per-member circuit breaker thresholds. `failureThreshold` is the
+// consecutive-failure count that flips a member from `closed` → `open`; a
+// successful command anywhere along the way resets the counter (it must be
+// CONSECUTIVE failures, not cumulative). `backoffMs` is the minimum wall-clock
+// window an open circuit stays open before the round-robin will consider it
+// for a half-open probe rebuild. Defaults match the 6.22 spec; both are
+// env-overridable so an operator can shorten / lengthen the window without
+// shipping new code.
+const POOL_MEMBER_FAILURE_THRESHOLD_DEFAULT = 3;
+const CIRCUIT_BACKOFF_DEFAULT_MS = 5_000;
+
+function getFailureThreshold(): number {
+  const raw = process.env.POOL_MEMBER_FAILURE_THRESHOLD;
+  if (raw === undefined || raw === "") return POOL_MEMBER_FAILURE_THRESHOLD_DEFAULT;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : POOL_MEMBER_FAILURE_THRESHOLD_DEFAULT;
+}
+
+function getCircuitBackoffMs(): number {
+  const raw = process.env.CIRCUIT_BACKOFF_MS;
+  if (raw === undefined || raw === "") return CIRCUIT_BACKOFF_DEFAULT_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : CIRCUIT_BACKOFF_DEFAULT_MS;
+}
 
 // Public category label for the runtime pools. `"heavy"` is the safe default —
 // any route that hasn't explicitly opted in stays on the heavy pool so a
@@ -92,6 +129,13 @@ export interface PoolMemberInfo {
   createdAt: number;
   generation: number;
 }
+
+// Wave 6.22 — per-member circuit breaker state.
+//   * `closed`    → normal operation; failures increment `consecutiveFailures`
+//   * `open`      → member skipped by round-robin; commands route elsewhere
+//   * `half-open` → probe rebuild in flight; the next command's outcome
+//                   decides closed (success) or open (failure)
+export type CircuitState = "closed" | "open" | "half-open";
 
 interface PoolMember {
   // Stable per-slot identifier. Set once at slot creation and reused across
@@ -119,6 +163,16 @@ interface PoolMember {
   // increments on each lazy rebuild (key mismatch, recycle, drain swap).
   // Pairs with `id` to form a globally unique log key `${id}#${generation}`.
   generation: number;
+  // Wave 6.22 — circuit breaker state machine. `consecutiveFailures` resets
+  // on the first successful command; reaching the threshold flips
+  // `circuitState` to `open` and records `openedAt`. Round-robin treats
+  // `open` and `half-open` as "skip when alternatives exist". After
+  // `CIRCUIT_BACKOFF_MS` elapses, the oldest open member is eligible for a
+  // half-open probe rebuild (`acquireFromPool` handles this when every other
+  // member is also open).
+  consecutiveFailures: number;
+  circuitState: CircuitState;
+  openedAt: number;
 }
 
 interface Pool {
@@ -267,6 +321,14 @@ function detachPoolMembersForSwap(): void {
       m.client = null;
       m.wrapper = null;
       m.key = "";
+      // Wave 6.22 — a target swap implies a fresh Redis identity; carrying
+      // the prior socket's circuit state across the swap would mark the
+      // first command against the new target as "still recovering" even
+      // when the new target is healthy. Reset to closed/0 so the next
+      // acquisition starts clean.
+      m.circuitState = "closed";
+      m.consecutiveFailures = 0;
+      m.openedAt = 0;
       if (old) {
         drainingClients.add(old);
         const timer = setTimeout(() => {
@@ -317,6 +379,13 @@ export function resetActiveTarget(): void {
       m.client = null;
       m.wrapper = null;
       m.key = "";
+      // Wave 6.22 — full teardown clears circuit state alongside the socket;
+      // pool.members is truncated below anyway, but keeping the reset
+      // explicit guards against future code paths that hold a reference
+      // to the old member object.
+      m.circuitState = "closed";
+      m.consecutiveFailures = 0;
+      m.openedAt = 0;
     }
     pool.members.length = 0;
     pool.rrIndex = 0;
@@ -490,6 +559,9 @@ function ensurePoolSized(pool: Pool, size: number): void {
         key: "",
         createdAt: 0,
         generation: 0,
+        consecutiveFailures: 0,
+        circuitState: "closed",
+        openedAt: 0,
       });
     }
     return;
@@ -503,11 +575,13 @@ function ensurePoolSized(pool: Pool, size: number): void {
   if (pool.rrIndex >= size) pool.rrIndex = 0;
 }
 
-// Round-robin acquisition. Picks the next slot, rebuilds if its `key`
-// disagrees with the current `targetKey(...)` (setActiveTarget rotation) OR
-// if the slot was previously marked stale by the recycle hook. Returns the
-// recycle-aware Proxy wrapper, NOT the raw ioredis client, so callers
-// automatically participate in the per-member self-heal flow.
+// Round-robin acquisition. Picks the next non-open slot, rebuilds if its
+// `key` disagrees with the current `targetKey(...)` (setActiveTarget
+// rotation) OR if the slot was previously marked stale by the recycle hook.
+// Wave 6.22 — open members are skipped; when every member is open, the
+// oldest one is transitioned to `half-open` and rebuilt to probe recovery.
+// Returns the recycle-aware Proxy wrapper, NOT the raw ioredis client, so
+// callers automatically participate in the per-member self-heal flow.
 function acquireFromPool(pool: Pool, sizeEnvName: string): Redis | null {
   const t = getActiveTarget();
   const c = overrideCreds;
@@ -515,9 +589,25 @@ function acquireFromPool(pool: Pool, sizeEnvName: string): Redis | null {
   ensurePoolSized(pool, getPoolSize(sizeEnvName));
   if (pool.members.length === 0) return null;
 
-  const idx = pool.rrIndex;
-  pool.rrIndex = (pool.rrIndex + 1) % pool.members.length;
-  const member = pool.members[idx]!;
+  // Wave 6.22 — find the next member whose circuit is NOT open. Walk at
+  // most pool.length slots from the current rrIndex; if every slot is open
+  // we drop into the half-open promotion path below.
+  const total = pool.members.length;
+  let chosenIdx = -1;
+  for (let step = 0; step < total; step++) {
+    const i = (pool.rrIndex + step) % total;
+    if (pool.members[i]!.circuitState !== "open") {
+      chosenIdx = i;
+      break;
+    }
+  }
+  if (chosenIdx === -1) {
+    chosenIdx = promoteOldestToHalfOpen(pool);
+  }
+  // Advance rrIndex past the chosen slot so the next acquisition starts at
+  // the slot after this one, preserving the existing round-robin contract.
+  pool.rrIndex = (chosenIdx + 1) % total;
+  const member = pool.members[chosenIdx]!;
 
   if (member.client && member.wrapper && member.key === key) {
     return member.wrapper;
@@ -542,13 +632,54 @@ function acquireFromPool(pool: Pool, sizeEnvName: string): Redis | null {
   member.client = built;
   member.wrapper = wrapWithRecycle(built, member);
   member.key = key;
+  // Wave 6.22 — `consecutiveFailures` is intentionally NOT reset here. A
+  // sub-threshold failure recycles the socket (see noteFailure) and the
+  // very next acquisition rebuilds; if the rebuild reset the counter,
+  // three consecutive failures spread across three socket rebuilds would
+  // never trip the circuit. Only `noteSuccess` clears the counter.
+  emitPoolEvent("pool-member-built", member, pool, { generation: member.generation });
   return member.wrapper;
 }
 
+// Wave 6.22 — when every member is open, promote the one whose circuit
+// opened the longest ago (and at least `CIRCUIT_BACKOFF_MS` ago when any
+// member qualifies) to `half-open`. Returns the chosen index. The chosen
+// member's `client` slot is blanked so the acquisition path rebuilds it.
+function promoteOldestToHalfOpen(pool: Pool): number {
+  const backoff = getCircuitBackoffMs();
+  const now = Date.now();
+  let oldestIdx = 0;
+  let oldestAt = Number.POSITIVE_INFINITY;
+  for (let i = 0; i < pool.members.length; i++) {
+    const m = pool.members[i]!;
+    if (m.openedAt < oldestAt) {
+      oldestAt = m.openedAt;
+      oldestIdx = i;
+    }
+  }
+  const m = pool.members[oldestIdx]!;
+  if (now - m.openedAt < backoff) {
+    // Backoff window not yet elapsed for any member — promote the oldest
+    // anyway (the alternative is rejecting acquisition entirely, which
+    // makes the pool useless during an outage). The probe still
+    // fast-fails via Wave 6.23's `maxRetriesPerRequest: 1` if Redis is
+    // genuinely down, so this just gates how often we burn a rebuild.
+  }
+  transitionCircuit(m, "half-open", pool, "all-open-promotion");
+  if (m.client) {
+    try { m.client.disconnect(); } catch { /* ignore */ }
+  }
+  m.client = null;
+  m.wrapper = null;
+  m.key = "";
+  return oldestIdx;
+}
+
 // Inspect an error and decide whether the member that surfaced it should be
-// torn down. Matches the connection-level codes that almost always indicate a
-// poisoned socket, plus the ioredis `commandTimeout`-induced "Command timed
-// out" message that signals the in-Redis budget was exhausted on this socket.
+// counted toward the circuit-breaker threshold. Matches the connection-level
+// codes that almost always indicate a poisoned socket, plus the ioredis
+// `commandTimeout`-induced "Command timed out" message that signals the
+// in-Redis budget was exhausted on this socket.
 function shouldRecycle(err: unknown): boolean {
   if (!err) return false;
   const e = err as { code?: unknown; message?: unknown };
@@ -557,38 +688,170 @@ function shouldRecycle(err: unknown): boolean {
   return msg.includes("Command timed out");
 }
 
-// Mark `member` stale so the next round-robin pick rebuilds it. Idempotent
-// across the two recycle entry points (the `on('error')` socket hook AND the
-// Proxy-wrapper rejection hook) — both compare `member.client === client`
-// before tearing down so a slot that's already been rotated to a fresh client
-// is not accidentally re-cleared.
-function recyclePoolMember(member: PoolMember, client: Redis): void {
+// Tear down the underlying socket for `member` so the next acquisition
+// rebuilds. Idempotent across the two recycle entry points (the `on('error')`
+// socket hook AND the Proxy-wrapper rejection hook) — both compare
+// `member.client === client` before tearing down so a slot that's already
+// been rotated to a fresh client is not accidentally re-cleared.
+function recyclePoolMember(member: PoolMember, pool: Pool, client: Redis): void {
   if (member.client !== client) return;
   member.client = null;
   member.wrapper = null;
   member.key = "";
   try { client.disconnect(); } catch { /* ignore */ }
+  emitPoolEvent("pool-member-recycled", member, pool, { generation: member.generation });
+}
+
+// Wave 6.22 — record a failure against `member`. Increments the consecutive
+// counter and, when it reaches the threshold, transitions the circuit to
+// `open` and tears the socket down. A `half-open` member that fails is
+// immediately re-opened regardless of the counter (a probe needs to prove
+// recovery; one stumble is enough to send it back to penalty).
+function noteFailure(member: PoolMember, pool: Pool, client: Redis, err: unknown): void {
+  member.consecutiveFailures += 1;
+  if (member.circuitState === "half-open") {
+    transitionCircuit(member, "open", pool, "half-open-failed", err);
+    recyclePoolMember(member, pool, client);
+    return;
+  }
+  if (member.consecutiveFailures >= getFailureThreshold()) {
+    transitionCircuit(member, "open", pool, "failure-threshold", err);
+    recyclePoolMember(member, pool, client);
+    return;
+  }
+  // Below threshold but still a poisoned-socket error code — recycle the
+  // socket so the next acquisition rebuilds, while leaving the circuit
+  // `closed` so traffic continues to land on this slot once rebuilt.
+  recyclePoolMember(member, pool, client);
+}
+
+// Wave 6.22 — record a successful command. Closes a half-open circuit and
+// resets the consecutive-failure counter so the next failure starts a fresh
+// count toward the threshold.
+function noteSuccess(member: PoolMember, pool: Pool): void {
+  if (member.circuitState === "half-open") {
+    transitionCircuit(member, "closed", pool, "half-open-recovered");
+  }
+  member.consecutiveFailures = 0;
+}
+
+function transitionCircuit(
+  member: PoolMember,
+  next: CircuitState,
+  pool: Pool,
+  cause: string,
+  err?: unknown,
+): void {
+  const prev = member.circuitState;
+  if (prev === next) return;
+  member.circuitState = next;
+  if (next === "open") {
+    member.openedAt = Date.now();
+  } else if (next === "closed") {
+    member.openedAt = 0;
+  }
+  // `half-open` keeps the existing openedAt so an immediate re-open uses
+  // the original window for the next backoff calculation.
+  emitPoolEvent("pool-circuit-transition", member, pool, {
+    from: prev,
+    to: next,
+    cause,
+    err: err === undefined ? undefined : formatErr(err),
+  });
+}
+
+// Structured pool event emitted on every state transition. Production wires
+// this through Fastify's logger by default; tests can override via
+// `__setPoolEventSinkForTests` to capture the stream without a Fastify
+// instance. Field set is deliberately narrow — no passwords, no URLs.
+type PoolEvent =
+  | "pool-circuit-transition"
+  | "pool-member-recycled"
+  | "pool-member-built";
+
+export interface PoolEventPayload {
+  evt: PoolEvent;
+  category: RuntimeCategory;
+  member_id: string;
+  consecutive_failures: number;
+  circuit_state: CircuitState;
+  generation: number;
+  from?: CircuitState;
+  to?: CircuitState;
+  cause?: string;
+  err?: string;
+}
+
+type PoolEventSink = (payload: PoolEventPayload) => void;
+
+const defaultPoolEventSink: PoolEventSink = (p) => {
+  // Single structured line, kept off stdout when running under vitest to
+  // avoid flooding test output. JSON.stringify so a log scraper can grep
+  // for `"evt":"pool-circuit-transition"` directly.
+  if (process.env.NODE_ENV === "test") return;
+  try {
+    // eslint-disable-next-line no-console
+    console.log(JSON.stringify(p));
+  } catch { /* ignore */ }
+};
+
+let poolEventSink: PoolEventSink = defaultPoolEventSink;
+
+function emitPoolEvent(
+  evt: PoolEvent,
+  member: PoolMember,
+  pool: Pool,
+  extras: Partial<Pick<PoolEventPayload, "from" | "to" | "cause" | "err" | "generation">> = {},
+): void {
+  try {
+    poolEventSink({
+      evt,
+      category: pool.category,
+      member_id: member.id,
+      consecutive_failures: member.consecutiveFailures,
+      circuit_state: member.circuitState,
+      generation: extras.generation ?? member.generation,
+      ...(extras.from ? { from: extras.from } : {}),
+      ...(extras.to ? { to: extras.to } : {}),
+      ...(extras.cause ? { cause: extras.cause } : {}),
+      ...(extras.err ? { err: extras.err } : {}),
+    });
+  } catch { /* sink must never break the pool path */ }
+}
+
+function formatErr(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  try { return JSON.stringify(err); } catch { return String(err); }
 }
 
 // Subscribe to ioredis's connection-level `error` channel so a socket that
 // transitions to ETIMEDOUT/ECONNRESET/EPIPE outside of an in-flight command
-// (mid-reconnect bursts, idle keepalive failures) still trips the recycle
+// (mid-reconnect bursts, idle keepalive failures) still trips the failure
 // path. Wave 6.23's `enableOfflineQueue:false` keeps these errors loud
 // instead of silently queued, so we MUST install a listener — without one,
 // node would treat the emitted error as unhandled.
 function attachErrorRecycle(client: Redis, member: PoolMember): void {
+  const pool = poolForCategory(member);
   client.on("error", (err: unknown) => {
-    if (shouldRecycle(err)) recyclePoolMember(member, client);
+    if (shouldRecycle(err)) noteFailure(member, pool, client, err);
   });
 }
 
+// Resolve the `Pool` a member belongs to from its stable id prefix
+// (`${category}:${index}`). Cheap enough — every member id is parsed once
+// per error event, and pools never move members between categories.
+function poolForCategory(member: PoolMember): Pool {
+  return member.id.startsWith("light:") ? lightPool : heavyPool;
+}
+
 // Wrap the ioredis client in a Proxy that mirrors every property access but
-// intercepts the promise returned by each method call. When a command
-// rejects with a recycle-worthy error, the pool slot is marked stale BEFORE
-// the rejection propagates to the route handler — so the very next request
-// for this slot rebuilds rather than re-using the poisoned socket. The
-// rejection still reaches the caller unchanged (we re-throw via `throw err`).
+// intercepts the promise returned by each method call. Successful commands
+// reset the per-member failure counter; rejected commands feed the circuit
+// breaker. The rejection still reaches the caller unchanged (we re-throw
+// via `throw err`).
 function wrapWithRecycle(client: Redis, member: PoolMember): Redis {
+  const pool = poolForCategory(member);
   return new Proxy(client, {
     get(target, prop, receiver) {
       const value = Reflect.get(target, prop, receiver);
@@ -597,9 +860,9 @@ function wrapWithRecycle(client: Redis, member: PoolMember): Redis {
         const out = (value as (...a: unknown[]) => unknown).apply(target, args);
         if (out && typeof (out as Promise<unknown>).then === "function") {
           return (out as Promise<unknown>).then(
-            (v) => v,
+            (v) => { noteSuccess(member, pool); return v; },
             (err) => {
-              if (shouldRecycle(err)) recyclePoolMember(member, client);
+              if (shouldRecycle(err)) noteFailure(member, pool, client, err);
               throw err;
             },
           );
@@ -608,6 +871,13 @@ function wrapWithRecycle(client: Redis, member: PoolMember): Redis {
       };
     },
   }) as Redis;
+}
+
+// Test seam — override the pool event sink so unit tests can capture the
+// structured transition stream without a Fastify logger. Pass `null` to
+// restore the production console sink.
+export function __setPoolEventSinkForTests(fn: PoolEventSink | null): void {
+  poolEventSink = fn ?? defaultPoolEventSink;
 }
 
 // Test seam — install a fake client factory so unit tests in
@@ -634,6 +904,9 @@ export function __getRuntimePoolForTests(category: RuntimeCategory): {
     key: string;
     createdAt: number;
     generation: number;
+    consecutiveFailures: number;
+    circuitState: CircuitState;
+    openedAt: number;
   }[];
   rrIndex: number;
 } {
@@ -646,6 +919,9 @@ export function __getRuntimePoolForTests(category: RuntimeCategory): {
       key: m.key,
       createdAt: m.createdAt,
       generation: m.generation,
+      consecutiveFailures: m.consecutiveFailures,
+      circuitState: m.circuitState,
+      openedAt: m.openedAt,
     })),
     rrIndex: pool.rrIndex,
   };

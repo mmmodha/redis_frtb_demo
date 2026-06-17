@@ -13,6 +13,7 @@ import {
   buildDoc,
   enrichDoc,
   emitRollupHincrs,
+  emitSeenSadds,
   CALIBRATION_TAG,
   ensureGroup,
   processBatch,
@@ -21,7 +22,12 @@ import {
 import { backfill } from "../src/backfill-weighted.ts";
 import { backfillRollups, accumulateRollup } from "../src/backfill-rollups.ts";
 import { loadSchema, type Schema } from "@frtb/schema";
-import { rollupKey } from "@frtb/calc-shared";
+import {
+  rollupKey,
+  SEEN_RISK_CLASS_KEY,
+  seenBucketKey,
+  seenSensTypeKey,
+} from "@frtb/calc-shared";
 
 // Wave 5.83B — schema loaded from the locked default YAML so the
 // enrichDoc tests assert against the committed risk_weights values
@@ -1028,6 +1034,101 @@ describe("backfillRollups — Wave 6.14c", () => {
     for (const [k, want] of expected.entries()) {
       const got = await redis.hgetall(k);
       expect(Number(got.count)).toBe(Number(want.count));
+    }
+  });
+});
+
+// Wave 6.24 — materialized discovery sets. Verifies emitSeenSadds emits the
+// expected SADD triplet per applied row (no rollup HINCRBYFLOATs here — that
+// path is exercised separately above). Uses the pipelineStub recorder so we
+// can assert the exact command shape without booting Redis.
+describe("emitSeenSadds — Wave 6.24", () => {
+  it("emits SADD seen:risk_class + seen:bucket:{<rc>} + seen:sens_type:{<rc>:<bkt>} for a complete (rc, bkt, sens) row", () => {
+    const record: RecordedPipelineCall[] = [];
+    const stub = pipelineStub(record);
+    emitSeenSadds(
+      stub as unknown as { call: (cmd: string, ...args: unknown[]) => unknown },
+      { risk_class: "GIRR", bucket: "USD-IRS", sensitivity_type: "Delta" },
+    );
+    const sadds = record.filter((r) => r.command === "SADD");
+    expect(sadds).toHaveLength(3);
+    expect(sadds[0]).toEqual({ command: "SADD", args: [SEEN_RISK_CLASS_KEY, "GIRR"] });
+    expect(sadds[1]).toEqual({ command: "SADD", args: [seenBucketKey("GIRR"), "USD-IRS"] });
+    expect(sadds[2]).toEqual({
+      command: "SADD",
+      args: [seenSensTypeKey("GIRR", "USD-IRS"), "Delta"],
+    });
+  });
+
+  it("hash-tags co-locate seen:bucket and seen:sens_type with the matching rollup hash key", () => {
+    // The hash-tag of `rollup:{GIRR:USD-IRS}:Delta` is `GIRR:USD-IRS`, which
+    // must match the tag inside `seen:sens_type:{GIRR:USD-IRS}` so both keys
+    // land on the same Redis Cluster slot. `seen:bucket:{GIRR}` shares only
+    // the `GIRR` prefix, intentionally — it indexes ALL buckets for the
+    // risk class and lives on whichever slot owns `{GIRR}`.
+    const rk = rollupKey("GIRR", "USD-IRS", "Delta");
+    const sensTypeKey = seenSensTypeKey("GIRR", "USD-IRS");
+    expect(rk).toContain("{GIRR:USD-IRS}");
+    expect(sensTypeKey).toContain("{GIRR:USD-IRS}");
+    const bucketKey = seenBucketKey("GIRR");
+    expect(bucketKey).toContain("{GIRR}");
+  });
+
+  it("rows missing risk_class / bucket / sensitivity_type emit no SADDs", () => {
+    const record: RecordedPipelineCall[] = [];
+    const stub = pipelineStub(record);
+    emitSeenSadds(
+      stub as unknown as { call: (cmd: string, ...args: unknown[]) => unknown },
+      { risk_class: "GIRR", bucket: "USD" }, // no sensitivity_type
+    );
+    expect(record.filter((r) => r.command === "SADD")).toHaveLength(0);
+  });
+});
+
+// Wave 6.24 — end-to-end integration: a processBatch run against a live
+// Redis Stack populates the three seen:* sets such that SMEMBERS reflects
+// exactly the (rc, bkt, sens_type) tuples observed in the ingested fixture.
+describe("processBatch seen:* SADD integration [Wave 6.24]", () => {
+  integration("mixed 3-combo fixture → SMEMBERS reflects the ingested (rc, bkt, sens) tuples", async () => {
+    await ensureGroup(redis, "sensitivities:in", "ingest");
+    // Three distinct (rc, bkt, sens) combinations; multiple rows per combo
+    // to verify SADD is idempotent (the SMEMBERS reply is deduped).
+    const combos = [
+      { rc: "GIRR", bkt: "USD-IRS", sens: "Delta" },
+      { rc: "EQUITY", bkt: "1", sens: "Delta" },
+      { rc: "FX", bkt: "EURUSD", sens: "Vega" },
+    ];
+    const ulid = monotonicFactory();
+    for (const c of combos) {
+      for (let i = 0; i < 3; i++) {
+        await redis.xadd(
+          "sensitivities:in", "*",
+          "risk_class", c.rc,
+          "bucket", c.bkt,
+          "_hash_tag", `${c.rc}:${c.bkt}`,
+          "_id", ulid(),
+          "payload", JSON.stringify({
+            sensitivity_type: c.sens,
+            risk_value: c.sens === "Vega" ? { "1Y": 0.1 } : { spot: 0.1 },
+          }),
+        );
+      }
+    }
+    await processBatch(redis, {
+      stream: "sensitivities:in",
+      group: "ingest",
+      consumerName: "test",
+      batchSize: 100,
+      schema: SCHEMA,
+    });
+    // SMEMBERS of the three seen:* keys MUST equal the expected sets.
+    const riskClasses = (await redis.smembers(SEEN_RISK_CLASS_KEY)).sort();
+    expect(riskClasses).toEqual(["EQUITY", "FX", "GIRR"]);
+    for (const c of combos) {
+      const buckets = (await redis.smembers(seenBucketKey(c.rc))).sort();
+      expect(buckets).toContain(c.bkt);
+      const sensTypes = (await redis.smembers(seenSensTypeKey(c.rc, c.bkt))).sort();
+      expect(sensTypes).toContain(c.sens);
     }
   });
 });

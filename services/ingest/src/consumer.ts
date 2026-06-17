@@ -1,6 +1,11 @@
 import type { Redis, Cluster } from "ioredis";
 import type { Schema, RiskWeightTable } from "@frtb/schema";
-import { rollupKey } from "@frtb/calc-shared";
+import {
+  rollupKey,
+  SEEN_RISK_CLASS_KEY,
+  seenBucketKey,
+  seenSensTypeKey,
+} from "@frtb/calc-shared";
 import type { RunnerProfile } from "./profile.ts";
 
 // Stream consumer for the FRTB ingest service.
@@ -279,6 +284,36 @@ export function enrichDoc(
 // a different envelope and will double-count — same as the SUGADD path.)
 type PipelineLike = { call: (cmd: string, ...args: unknown[]) => unknown };
 
+// Wave 6.24 — materialized discovery sets. Three SADDs per applied row
+// (deduped server-side by Redis Set semantics, so steady-state ingest emits
+// the same three commands every batch but only the first apply per
+// (rc, bkt, sens_type) tuple actually grows the set). Pipelined alongside
+// JSON.SET + emitRollupHincrs so the apply remains one round-trip per row.
+//
+// Hash-tag placement matches `shared/calc/src/rollup-keys.ts`:
+//   * `seen:risk_class`              — global key, single slot in cluster
+//                                      mode. Hot enough that calc / facets
+//                                      can hit it directly without a fan-
+//                                      out.
+//   * `seen:bucket:{<rc>}`           — slot-affinity with the per-class
+//                                      rollup hashes (`rollup:{<rc>:<bkt>}`),
+//                                      so a future `SINTERSTORE`-style
+//                                      bucket discovery routes to the same
+//                                      shard as the data it inspects.
+//   * `seen:sens_type:{<rc>:<bkt>}`  — co-located with the per-bucket
+//                                      rollup hashes / sens keys; SMEMBERS
+//                                      here drives the facets sensitivity-
+//                                      type listing without fan-out.
+export function emitSeenSadds(pipeline: PipelineLike, doc: Record<string, unknown>): void {
+  const rc = typeof doc.risk_class === "string" ? doc.risk_class : undefined;
+  const bkt = typeof doc.bucket === "string" ? doc.bucket : undefined;
+  const sens = typeof doc.sensitivity_type === "string" ? doc.sensitivity_type : undefined;
+  if (!rc || !bkt || !sens) return;
+  pipeline.call("SADD", SEEN_RISK_CLASS_KEY, rc);
+  pipeline.call("SADD", seenBucketKey(rc), bkt);
+  pipeline.call("SADD", seenSensTypeKey(rc, bkt), sens);
+}
+
 export function emitRollupHincrs(pipeline: PipelineLike, doc: Record<string, unknown>): void {
   const rc = typeof doc.risk_class === "string" ? doc.risk_class : undefined;
   const bkt = typeof doc.bucket === "string" ? doc.bucket : undefined;
@@ -424,6 +459,12 @@ export async function processBatch(
       // before XACK so a HINCRBYFLOAT pipeline-level failure rolls back the
       // ack and the row is redelivered.
       emitRollupHincrs(pipeline as unknown as PipelineLike, doc);
+      // Wave 6.24 — also SADD this row's (rc, bkt, sens_type) into the
+      // materialized discovery sets so calc / facets can answer "which
+      // (rc, bkt) tuples have data?" without an FT.AGGREGATE on idx:sens.
+      // Same pipeline as JSON.SET / HINCRBYFLOAT so a SADD failure rolls
+      // back the ack alongside its peers.
+      emitSeenSadds(pipeline as unknown as PipelineLike, doc);
       // Wave 5.30a — autocomplete suggester live-populate. INCR bumps the
       // score on duplicate values so frequent terms rank higher in FT.SUGGET.
       // Pipelined alongside JSON.SET (and before XACK) so a SUGADD failure

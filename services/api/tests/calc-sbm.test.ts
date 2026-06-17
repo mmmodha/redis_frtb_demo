@@ -77,12 +77,13 @@ describe("POST /calc/sbm — MVP endpoint", () => {
       expect(key).toMatch(/^sens:\{GIRR:[^}]+\}:_route$/);
       expect(c.args[3]).toBe("GIRR");
     }
-    // discover query was for the requested risk_class
-    const agg = fr.calls.find((c) => c.command === "FT.AGGREGATE");
-    expect(agg).toBeDefined();
-    expect(agg!.args[0]).toBe("idx:sens");
-    expect(String(agg!.args[1])).toContain("@risk_class:{GIRR}");
-    expect(agg!.args).toContain("GROUPBY");
+    // Wave 6.24 — discovery is now SMEMBERS on `seen:bucket:{<rc>}` instead
+    // of FT.AGGREGATE; the resolved-command echo (commands.discovery) still
+    // carries the equivalent FT.AGGREGATE shape under `legacy_query` for the
+    // UI drilldown, but no FT.AGGREGATE is actually dispatched for discovery.
+    const sm = fr.calls.find((c) => c.command === "SMEMBERS");
+    expect(sm).toBeDefined();
+    expect(sm!.args[0]).toBe("seen:bucket:{GIRR}");
   });
 
   it("Vega routes to sbm_vega_bucket and accepts case-insensitive sensitivity_type", async () => {
@@ -367,11 +368,13 @@ describe("POST /calc/sbm — MVP endpoint", () => {
   });
 
 
-  // Wave 5.41: explicit per-call TIMEOUT on the discovery FT.AGGREGATE so a
-  // slow cluster surfaces as a captured 502 instead of an indefinite hang
-  // behind the module's implicit default. Locked in the call-args mirror so
-  // any future refactor that drops the TIMEOUT pair regresses this test.
-  it("Wave 5.41: discovery FT.AGGREGATE carries TIMEOUT 30000 in its arg list", async () => {
+  // Wave 6.24 — discovery moved off FT.AGGREGATE to a single SMEMBERS on
+  // `seen:bucket:{<rc>}`. The explicit per-call TIMEOUT that Wave 5.41
+  // protected the FT.AGGREGATE discovery with no longer applies: SMEMBERS
+  // on a small materialized set is O(N) of the set size (typically <100
+  // entries) and bounded by the runtime ioredis commandTimeout (35s, Wave
+  // 6.18f). This test now locks the SMEMBERS dispatch + key shape instead.
+  it("Wave 6.24: discovery dispatches SMEMBERS on seen:bucket:{<rc>}", async () => {
     const fr = fakeRedis();
     fr.setResponse("FT.AGGREGATE", ftAggregateReply(["USD-IRS"]));
     fr.setResponse("FCALL", ["K_b", "1", "S_b", "1", "count", "1", "ms", "1"]);
@@ -382,12 +385,9 @@ describe("POST /calc/sbm — MVP endpoint", () => {
       payload: { risk_class: "GIRR", sensitivity_type: "Delta" },
     });
     expect(res.statusCode).toBe(200);
-    const agg = fr.calls.find((c) => c.command === "FT.AGGREGATE");
-    expect(agg).toBeDefined();
-    const args = agg!.args;
-    const ti = args.indexOf("TIMEOUT");
-    expect(ti).toBeGreaterThan(-1);
-    expect(args[ti + 1]).toBe("30000");
+    const sm = fr.calls.find((c) => c.command === "SMEMBERS");
+    expect(sm).toBeDefined();
+    expect(sm!.args[0]).toBe("seen:bucket:{GIRR}");
   });
 
   // Wave 5.41: when FT.AGGREGATE throws but FT.INFO reports a populated
@@ -456,16 +456,13 @@ describe("POST /calc/sbm — MVP endpoint", () => {
   // bucket sets in TS. This test wires a fake cluster client with two node
   // fakes that each own a disjoint slice of buckets and asserts the route
   // sees the union and FCALLs every bucket.
-  it("cluster mode: fans FT.AGGREGATE per master and unions disjoint bucket sets", async () => {
-    const nodeA = fakeRedis();
-    const nodeB = fakeRedis();
-    nodeA.setResponse("FT.AGGREGATE", ftAggregateReply(["USD-IRS"]));
-    nodeB.setResponse("FT.AGGREGATE", ftAggregateReply(["EUR-IRS"]));
-
-    // Coordinator-level fake serves cluster-aggregated commands (FT.INFO) and
-    // routed commands (FCALL). The cluster client exposes .nodes("master") so
-    // the route's per-master fanout discovers nodeA + nodeB.
+  it("cluster mode: SMEMBERS dispatches on the coordinator (single-slot) and the union of buckets is FCALLed", async () => {
+    // Wave 6.24 — discovery is a single SMEMBERS routed to the slot that
+    // owns `seen:bucket:{<rc>}`. The route no longer per-master fan-outs:
+    // ioredis Cluster.call(SMEMBERS, key) is a single command. The
+    // coordinator-level fake must therefore return the union directly.
     const coord = fakeRedis();
+    coord.setResponse("SMEMBERS", ["USD-IRS", "EUR-IRS"]);
     coord.setResponse("FCALL", (args: unknown[]) => {
       const bucket = args[4] as string;
       if (bucket === "USD-IRS") return ["K_b", "3", "S_b", "3", "count", "10", "ms", "1"];
@@ -473,7 +470,9 @@ describe("POST /calc/sbm — MVP endpoint", () => {
     });
     const cluster = {
       ...coord,
-      nodes: (_role: string) => [nodeA, nodeB],
+      // Kept for any downstream code that still wants per-master access
+      // (e.g. ingest backfill). Discovery no longer touches it.
+      nodes: (_role: string) => [coord],
     };
 
     app = await createServer({
@@ -487,34 +486,28 @@ describe("POST /calc/sbm — MVP endpoint", () => {
     });
     expect(res.statusCode).toBe(200);
     const body = res.json();
-    // Both masters' buckets must be present — union, not single-shard view.
     expect(body.per_bucket).toHaveLength(2);
     const seenBuckets = body.per_bucket.map((b: { bucket: string }) => b.bucket).sort();
     expect(seenBuckets).toEqual(["EUR-IRS", "USD-IRS"]);
-
-    // Each node-level fake recorded exactly one FT.AGGREGATE.
-    expect(nodeA.calls.filter((c) => c.command === "FT.AGGREGATE")).toHaveLength(1);
-    expect(nodeB.calls.filter((c) => c.command === "FT.AGGREGATE")).toHaveLength(1);
-    // FT.INFO was NOT called — buckets were non-empty so the probe short-circuited.
+    // Exactly one SMEMBERS dispatched on the coordinator; no per-master fan-out.
+    expect(coord.calls.filter((c) => c.command === "SMEMBERS")).toHaveLength(1);
+    expect(coord.calls.find((c) => c.command === "FT.AGGREGATE")).toBeUndefined();
+    // FT.INFO was NOT called — SMEMBERS returned non-empty so the probe short-circuited.
     expect(coord.calls.find((c) => c.command === "FT.INFO")).toBeUndefined();
-    // FCALL ran on the coordinator (real ioredis routes by hash-tag).
     expect(coord.calls.filter((c) => c.command === "FCALL")).toHaveLength(2);
   });
 
-  it("cluster mode: empty per-shard FT.AGGREGATE + FT.INFO num_docs > 0 → 200 with charge=0", async () => {
-    // The precondition probe uses FT.INFO (cluster-aggregated num_docs). When
-    // num_docs > 0 but the requested risk_class has no rows across either
-    // master, the route returns 200 with an empty per_bucket — NOT 503,
-    // because the index is populated for other risk classes.
-    const nodeA = fakeRedis();
-    const nodeB = fakeRedis();
-    nodeA.setResponse("FT.AGGREGATE", ftAggregateReply([]));
-    nodeB.setResponse("FT.AGGREGATE", ftAggregateReply([]));
+  it("cluster mode: empty SMEMBERS + FT.INFO num_docs > 0 → 200 with charge=0", async () => {
+    // SMEMBERS returns an empty set when the risk class has no rows; the
+    // precondition probe (FT.INFO num_docs) confirms the index itself is
+    // populated for other classes, so the route returns 200 + empty
+    // per_bucket rather than 503 no-data-or-index.
     const coord = fakeRedis();
+    coord.setResponse("SMEMBERS", []);
     coord.setResponse("FT.INFO", ["index_name", "idx:sens", "num_docs", "27000"]);
     const cluster = {
       ...coord,
-      nodes: (_role: string) => [nodeA, nodeB],
+      nodes: (_role: string) => [coord],
     };
     app = await createServer({
       redis: cluster as unknown as Parameters<typeof createServer>[0]["redis"],
@@ -527,7 +520,6 @@ describe("POST /calc/sbm — MVP endpoint", () => {
     });
     expect(res.statusCode).toBe(200);
     expect(res.json().per_bucket).toHaveLength(0);
-    // The probe was issued once on the coordinator (cluster-aggregated).
     expect(coord.calls.filter((c) => c.command === "FT.INFO")).toHaveLength(1);
   });
 
@@ -585,15 +577,16 @@ describe("POST /calc/sbm — MVP endpoint", () => {
     expect(fc).toBeDefined();
     expect(fc!.args[3]).toBe("GIRR");
     expect(String(fc!.args[2])).toMatch(/^sens:\{GIRR:[^}]+\}:_route$/);
-    const agg = fr.calls.find((c) => c.command === "FT.AGGREGATE");
-    expect(agg).toBeDefined();
-    expect(String(agg!.args[1])).toContain("@risk_class:{GIRR}");
+    const sm = fr.calls.find((c) => c.command === "SMEMBERS");
+    expect(sm).toBeDefined();
+    expect(sm!.args[0]).toBe("seen:bucket:{GIRR}");
   });
 
-  it("standalone mode: bucket discovery still issues a single FT.AGGREGATE (no regression)", async () => {
-    // Asserts the resolveQueryNodes feature-check correctly falls back to
-    // [client] when .nodes() is absent (standalone Redis), so the call count
-    // matches the pre-5.15d.1 behaviour.
+  it("standalone mode: bucket discovery issues a single SMEMBERS (Wave 6.24)", async () => {
+    // Wave 6.24 — discovery is a single SMEMBERS regardless of cluster vs.
+    // standalone topology; the per-master fan-out the old FT.AGGREGATE
+    // discovery did is gone (the seen:bucket:{<rc>} key is hash-tagged so
+    // it owns a single slot).
     const fr = fakeRedis();
     fr.setResponse("FT.AGGREGATE", ftAggregateReply(["B1"]));
     fr.setResponse("FCALL", ["K_b", "1", "S_b", "1", "count", "1", "ms", "1"]);
@@ -604,7 +597,8 @@ describe("POST /calc/sbm — MVP endpoint", () => {
       payload: { risk_class: "GIRR", sensitivity_type: "Delta" },
     });
     expect(res.statusCode).toBe(200);
-    expect(fr.calls.filter((c) => c.command === "FT.AGGREGATE")).toHaveLength(1);
+    expect(fr.calls.filter((c) => c.command === "SMEMBERS")).toHaveLength(1);
+    expect(fr.calls.find((c) => c.command === "FT.AGGREGATE")).toBeUndefined();
   });
 
   // Wave 5.16m: observability — the response surfaces the FT.AGGREGATE
@@ -626,9 +620,14 @@ describe("POST /calc/sbm — MVP endpoint", () => {
     expect(res.statusCode).toBe(200);
     const body = res.json();
     expect(body.commands).toBeDefined();
-    expect(body.commands.discovery.command).toBe("FT.AGGREGATE");
-    expect(body.commands.discovery.index).toBe("idx:sens");
-    expect(body.commands.discovery.query).toContain("@risk_class:{GIRR}");
+    // Wave 6.24 — discovery surfaces SMEMBERS as the dispatched command;
+    // the FT.AGGREGATE equivalent is preserved as `legacy_*` echoes so the
+    // UI drilldown can still render the index query operators can copy.
+    expect(body.commands.discovery.command).toBe("SMEMBERS");
+    expect(body.commands.discovery.key).toBe("seen:bucket:{GIRR}");
+    expect(body.commands.discovery.legacy_command).toBe("FT.AGGREGATE");
+    expect(body.commands.discovery.legacy_index).toBe("idx:sens");
+    expect(body.commands.discovery.legacy_query).toContain("@risk_class:{GIRR}");
     expect(body.commands.discovery.groupby).toEqual(["@bucket"]);
     expect(Array.isArray(body.commands.discovery.reducers)).toBe(true);
     expect(body.commands.fcall.command).toBe("FCALL");
@@ -667,13 +666,17 @@ describe("POST /calc/sbm — MVP endpoint", () => {
         },
       });
       expect(res.statusCode).toBe(200);
-      const agg = fr.calls.find((c) => c.command === "FT.AGGREGATE");
-      expect(agg).toBeDefined();
-      const q = String(agg!.args[1]);
-      expect(q).toContain("@risk_class:{GIRR}");
-      expect(q).toContain("@bucket:{USD|EUR|GBP}");
-      // commands.discovery.query mirrors the dispatched string verbatim.
-      expect(res.json().commands.discovery.query).toContain("@bucket:{USD|EUR|GBP}");
+      // Wave 6.24 — the legacy FT.AGGREGATE discovery query is no longer
+      // dispatched, but its narrowed shape is still echoed under
+      // commands.discovery.legacy_query for the UI drilldown. The actual
+      // dispatched command is SMEMBERS on `seen:bucket:{<rc>}`; the
+      // subset filter is applied client-side via Set intersection.
+      const sm = fr.calls.find((c) => c.command === "SMEMBERS");
+      expect(sm).toBeDefined();
+      expect(sm!.args[0]).toBe("seen:bucket:{GIRR}");
+      const lq = String(res.json().commands.discovery.legacy_query);
+      expect(lq).toContain("@risk_class:{GIRR}");
+      expect(lq).toContain("@bucket:{USD|EUR|GBP}");
     });
 
     it("subset that intersects with populated data → math runs only over the surviving buckets", async () => {
@@ -778,9 +781,10 @@ describe("POST /calc/sbm — MVP endpoint", () => {
         },
       });
       expect(res.statusCode).toBe(200);
-      const agg = fr.calls.find((c) => c.command === "FT.AGGREGATE");
-      expect(String(agg!.args[1])).toBe("@risk_class:{GIRR}");
-      expect(res.json().commands.discovery.query).toBe("@risk_class:{GIRR}");
+      // Wave 6.24 — empty subset == no subset still produces the
+      // pre-narrowed legacy query echo (no @bucket:{...} predicate).
+      expect(res.json().commands.discovery.legacy_query).toBe("@risk_class:{GIRR}");
+      expect(res.json().commands.discovery.command).toBe("SMEMBERS");
     });
 
     it("rejects bucket_subset containing a non-string element with 400", async () => {
@@ -829,10 +833,11 @@ describe("POST /calc/sbm — MVP endpoint", () => {
       });
       expect(res.statusCode).toBe(200);
       const body = res.json();
-      // Discovery query is the pre-5.31a single-predicate form.
-      expect(body.commands.discovery.query).toBe("@risk_class:{GIRR}");
-      const agg = fr.calls.find((c) => c.command === "FT.AGGREGATE");
-      expect(String(agg!.args[1])).toBe("@risk_class:{GIRR}");
+      // Wave 6.24 — legacy_query echoes the pre-5.31a single-predicate
+      // form; actual dispatch is SMEMBERS on seen:bucket:{GIRR}.
+      expect(body.commands.discovery.legacy_query).toBe("@risk_class:{GIRR}");
+      expect(body.commands.discovery.command).toBe("SMEMBERS");
+      expect(body.commands.discovery.key).toBe("seen:bucket:{GIRR}");
       // Known response keys are still all present, no surprise additions tied
       // to subset handling (note/ok stay absent on the happy path).
       expect(body).not.toHaveProperty("note");
@@ -857,10 +862,11 @@ describe("POST /calc/sbm — MVP endpoint", () => {
         },
       });
       expect(res.statusCode).toBe(200);
-      const agg = fr.calls.find((c) => c.command === "FT.AGGREGATE");
-      const q = String(agg!.args[1]);
-      // de-duplicated to USD,EUR and uppercased; order preserved by Set insertion.
-      expect(q).toContain("@bucket:{USD|EUR}");
+      // Wave 6.24 — narrowing now happens client-side after SMEMBERS;
+      // the legacy_query echo still carries the deduped/uppercased shape
+      // so the UI drilldown is byte-identical to pre-6.24.
+      const lq = String(res.json().commands.discovery.legacy_query);
+      expect(lq).toContain("@bucket:{USD|EUR}");
     });
   });
 
@@ -1267,8 +1273,9 @@ describe("POST /calc/sbm — MVP endpoint", () => {
       });
       expect(res.statusCode).toBe(200);
       const body = res.json();
-      // F1: discovery query narrowed to the subset.
-      expect(String(body.commands.discovery.query)).toContain("@bucket:{USD|EUR}");
+      // F1: discovery query narrowed to the subset (echoed via legacy_query
+      // post-Wave-6.24; dispatch is SMEMBERS + client-side intersection).
+      expect(String(body.commands.discovery.legacy_query)).toContain("@bucket:{USD|EUR}");
       // F2: regime echoed back at the chosen value.
       expect(body.correlation_regime).toBe("high");
       expect(body.commands.regime).toMatchObject({ name: "high", factor: 1.25 });

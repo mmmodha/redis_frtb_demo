@@ -39,3 +39,33 @@ export const ROLLUP_FIELDS_CURVATURE = [
   "count",
 ] as const;
 export type RollupFieldCurvature = (typeof ROLLUP_FIELDS_CURVATURE)[number];
+
+// Wave 6.24 — materialized discovery sets. Ingest maintains three nested
+// Redis Sets in lock-step with the rollup hashes so calc / facets can answer
+// "which risk_classes / buckets / sensitivity_types have data?" in a single
+// SMEMBERS round-trip instead of an FT.AGGREGATE over `idx:sens`.
+//
+// Key hierarchy:
+//   * `seen:risk_class`               — set of risk classes with data. Global
+//                                       (no hash tag). Single SMEMBERS for
+//                                       the facets / discovery top level.
+//   * `seen:bucket:{<rc>}`            — set of buckets within `<rc>`. Hash-
+//                                       tagged on `<rc>` so it lives on the
+//                                       slot that owns that risk class's
+//                                       data. Replaces the per-class FT.
+//                                       AGGREGATE discovery query in calc.
+//   * `seen:sens_type:{<rc>:<bkt>}`   — set of sensitivity_types within a
+//                                       (rc, bucket) bucket. Hash-tagged to
+//                                       MATCH the `rollup:{<rc>:<bkt>}:…`
+//                                       and `sens:{<rc>:<bkt>}:…` keys so a
+//                                       single slot owns everything related
+//                                       to that bucket.
+export const SEEN_RISK_CLASS_KEY = "seen:risk_class";
+
+export function seenBucketKey(rc: string): string {
+  return `seen:bucket:{${rc}}`;
+}
+
+export function seenSensTypeKey(rc: string, bkt: string): string {
+  return `seen:sens_type:{${rc}:${bkt}}`;
+}

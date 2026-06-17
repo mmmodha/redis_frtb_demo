@@ -44,6 +44,27 @@ export interface FakeRedis {
 
 type Responder = unknown | ((args: unknown[]) => unknown);
 
+// Wave 6.24 — extract the bucket list from a fakeRedis FT.AGGREGATE
+// fixture so the auto-SMEMBERS shim in `setResponse` can replay the same
+// buckets without per-test rewires. The FT.AGGREGATE shape used by
+// `ftAggregateReply(buckets)` across the calc tests is:
+//   [ <total>, ["bucket", "USD-IRS"], ["bucket", "EUR-IRS"], ... ]
+// Anything that doesn't match falls back to an empty list (which matches
+// the "no buckets discovered → 503 no-data-or-index" branch the tests use
+// for the empty case).
+function derivedSmembersFromAggregate(reply: unknown): string[] {
+  if (!Array.isArray(reply)) return [];
+  const out: string[] = [];
+  for (let i = 1; i < reply.length; i++) {
+    const row = reply[i];
+    if (!Array.isArray(row)) continue;
+    for (let j = 0; j + 1 < row.length; j += 2) {
+      if (String(row[j]) === "bucket") out.push(String(row[j + 1]));
+    }
+  }
+  return out;
+}
+
 export function fakeRedis(): FakeRedis {
   const calls: FakeCall[] = [];
   const responses = new Map<string, Responder>();
@@ -88,7 +109,26 @@ export function fakeRedis(): FakeRedis {
       return buildPipeline(calls, responses);
     },
     setResponse(command, response) {
-      responses.set(command.toUpperCase(), response);
+      const upper = command.toUpperCase();
+      responses.set(upper, response);
+      // Wave 6.24 — bucket discovery in calc.ts switched from FT.AGGREGATE
+      // (GROUPBY @bucket) to SMEMBERS on `seen:bucket:{<rc>}`. The existing
+      // calc / total / cache tests register their bucket fixture by
+      // `setResponse("FT.AGGREGATE", ftAggregateReply([...]))`; auto-mirror
+      // that fixture as an SMEMBERS responder so the tests keep passing
+      // without per-case rewrites. Real production discovery never hits
+      // the FT.AGGREGATE path anymore — this is purely a test-fixture
+      // back-compat shim.
+      if (upper === "FT.AGGREGATE" && !responses.has("SMEMBERS")) {
+        responses.set("SMEMBERS", async (smemberArgs: unknown[]) => {
+          const value = typeof response === "function"
+            ? (response as (a: unknown[]) => unknown)(smemberArgs)
+            : response;
+          // Async responders return a Promise — await before parsing.
+          const resolved = value instanceof Promise ? await value : value;
+          return derivedSmembersFromAggregate(resolved);
+        });
+      }
     },
     setScan(cursor, keys) {
       scans.set(cursor, ["0", keys]);

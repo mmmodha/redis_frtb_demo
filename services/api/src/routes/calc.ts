@@ -1,5 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import type { Schema } from "@frtb/schema";
+import { seenBucketKey } from "@frtb/calc-shared/rollup-keys";
 import type { RedisLike } from "../redis-like.ts";
 import { getActiveTarget } from "../active-target.ts";
 import { getBootstrapStatus } from "../bootstrap-status.ts";
@@ -361,32 +362,35 @@ async function computeSbmCharge(
     }
   }
 
+  // Wave 6.24 — bucket discovery is now a single SMEMBERS on
+  // `seen:bucket:{<rc>}` instead of an FT.AGGREGATE-with-GROUPBY against
+  // `idx:sens`. The set is maintained by ingest's apply path (see
+  // services/ingest/src/consumer.ts:emitSeenSadds) and hash-tagged on
+  // `<rc>` so it lives on the slot that owns the rollup hashes for this
+  // risk class — a single command, no cluster fan-out. When the caller
+  // narrows via `bucket_subset`, we intersect with the seen set so a typo
+  // bucket name doesn't drive a downstream HGETALL miss.
+  //
+  // The "discoveryQuery" / FT.AGGREGATE shape is preserved as the
+  // resolved-command echo for the UI's drilldown card (commands.discovery
+  // below) — it's now purely informational, no longer executed.
   const discoveryQuery = bucket_subset.length > 0
     ? `@risk_class:{${risk_class}} @bucket:{${bucket_subset.map(escapeTag).join("|")}}`
     : `@risk_class:{${risk_class}}`;
 
-  // 1) Discover buckets present for this risk_class — per-master fan-out.
-  const queryNodes = resolveQueryNodes(redis);
   const bucketSet = new Set<string>();
   let discoveryError: string | null = null;
   try {
-    for (const node of queryNodes) {
-      const aggReply = await node.call(
-        "FT.AGGREGATE",
-        indexName,
-        discoveryQuery,
-        "GROUPBY",
-        "1",
-        "@bucket",
-        "LIMIT",
-        "0",
-        "10000",
-        "DIALECT",
-        "2",
-        "TIMEOUT",
-        "30000",
-      );
-      for (const b of parseBucketsFromAggregate(aggReply)) bucketSet.add(b);
+    const seenReply = await redis.call("SMEMBERS", seenBucketKey(risk_class));
+    if (Array.isArray(seenReply)) {
+      for (const b of seenReply) if (typeof b === "string") bucketSet.add(b);
+    }
+    if (bucket_subset.length > 0) {
+      // Intersect: keep only subset entries that are actually populated.
+      const subset = new Set(bucket_subset);
+      for (const b of Array.from(bucketSet)) {
+        if (!subset.has(b)) bucketSet.delete(b);
+      }
     }
   } catch (err) {
     const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
@@ -579,9 +583,16 @@ async function computeSbmCharge(
       : "γ × 1.0 (no-op)";
   const commands = {
     discovery: {
-      command: "FT.AGGREGATE" as const,
-      index: indexName,
-      query: discoveryQuery,
+      // Wave 6.24 — discovery is now SMEMBERS against the materialized
+      // `seen:bucket:{<rc>}` set (maintained by ingest). The legacy
+      // FT.AGGREGATE shape is preserved as the `legacy_query` echo so the
+      // UI drilldown can still surface the equivalent index query for
+      // operator copy-paste.
+      command: "SMEMBERS" as const,
+      key: seenBucketKey(risk_class),
+      legacy_command: "FT.AGGREGATE" as const,
+      legacy_index: indexName,
+      legacy_query: discoveryQuery,
       groupby: ["@bucket"],
       reducers: ["COUNT 0 AS n"],
     },

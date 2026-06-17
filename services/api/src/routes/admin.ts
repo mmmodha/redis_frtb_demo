@@ -74,6 +74,11 @@ export function registerAdminRoutes(
     const redis = getRedis();
     const t0 = process.hrtime.bigint();
     try {
+      // Wave 6.24 — FLUSHDB clears every key in the active DB, including
+      // the materialized discovery sets (`seen:risk_class`,
+      // `seen:bucket:{<rc>}`, `seen:sens_type:{<rc>:<bkt>}`) maintained
+      // by ingest. No additional DEL needed: the next ingest batch
+      // repopulates them in lock-step with the rollup hashes.
       await redis.flushdb();
     } catch (err) {
       const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
