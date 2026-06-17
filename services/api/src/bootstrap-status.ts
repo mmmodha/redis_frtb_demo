@@ -16,6 +16,7 @@ import {
   bootstrapFrtb,
   BootstrapPartialError,
   type BootstrapFailure,
+  type BootstrapOpts,
   type RedisLike as BootstrapRedis,
 } from "./bootstrap.ts";
 import { withBootTimeout } from "./lib/with-timeout.ts";
@@ -120,7 +121,16 @@ export function markBootstrapStatusPartial(
   };
 }
 
-type BootstrapRunner = (client: BootstrapRedis, schema: Schema) => Promise<unknown>;
+// Wave 6.18i — runner type carries the BootstrapOpts third arg so
+// scheduleBootstrap can plumb `target_label` through to the
+// skip-when-unchanged path. Existing test seams that ignore opts still
+// satisfy the type (TS permits dropping trailing optional params).
+type BootstrapRunner = (
+  client: BootstrapRedis,
+  schema: Schema,
+  log?: (entry: Record<string, unknown>) => void,
+  opts?: BootstrapOpts,
+) => Promise<unknown>;
 let runner: BootstrapRunner = bootstrapFrtb;
 export function setBootstrapRunnerForTests(fn: BootstrapRunner | null): void {
   runner = fn ?? bootstrapFrtb;
@@ -159,7 +169,11 @@ export function scheduleBootstrap(
     // boot-time twin — boot-time blocks app.listen so it MUST stay short.
     const ms = getScheduledBootstrapTimeoutMs();
     let runnerSettled = false;
-    const wrapped = runner(client, schema).finally(() => { runnerSettled = true; });
+    // Wave 6.18i — pass target_label so bootstrapFrtb takes the
+    // versioned-index skip path; an unchanged schema short-circuits
+    // without firing the ~22-minute DROPINDEX cycle.
+    const wrapped = runner(client, schema, undefined, { target_label: target.label })
+      .finally(() => { runnerSettled = true; });
     withBootTimeout(wrapped, ms, "scheduled-bootstrap")
       .then(() => {
         if (myGen !== generation) return;

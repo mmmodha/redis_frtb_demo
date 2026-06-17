@@ -180,7 +180,10 @@ async function main(): Promise<void> {
       // in production; this is the belt-and-suspenders backstop for any
       // edge case where the driver itself stalls.
       await withBootTimeout(
-        bootstrapFrtb(redis, schema),
+        // Wave 6.18i — opt boot-time into the skip-when-unchanged path so
+        // an unchanged schema short-circuits past FT.DROPINDEX/FT.CREATE
+        // and clears the BOOT_BOOTSTRAP_TIMEOUT_MS window comfortably.
+        bootstrapFrtb(redis, schema, undefined, { target_label: target.label }),
         BOOT_BOOTSTRAP_TIMEOUT_MS,
         "bootstrapFrtb",
       );

@@ -26,8 +26,10 @@ import {
   bootstrapFrtb,
   BootstrapPartialError,
   resolveMasterNodes,
+  type BootstrapOpts,
   type RedisLike as BootstrapRedis,
 } from "../bootstrap.ts";
+import { getSensIndexName } from "../lib/sens-index.ts";
 import { translateRedisError } from "../redis-errors.ts";
 import { bumpDataVersion } from "../sbm/calc-cache.ts";
 import { invalidateFacetsCache } from "./facets.ts";
@@ -39,7 +41,15 @@ export interface AdminRoutesOpts {
   schema?: Schema;
   // Test seam — replaces bootstrapFrtb so unit tests can spy on the redis
   // client passed in and inject throw/ok behaviour without booting RediSearch.
-  bootstrap?: (client: BootstrapRedis, schema: Schema) => Promise<unknown>;
+  // Wave 6.18i — opts carry the optional `{ target_label, force }` so admin
+  // routes can plumb the active label + a ?force=true override through to
+  // the skip-when-unchanged path.
+  bootstrap?: (
+    client: BootstrapRedis,
+    schema: Schema,
+    log?: (entry: Record<string, unknown>) => void,
+    opts?: BootstrapOpts,
+  ) => Promise<unknown>;
 }
 
 export function registerAdminRoutes(
@@ -86,7 +96,16 @@ export function registerAdminRoutes(
     } else {
       markBootstrapStatusRunning(target_label);
       try {
-        await runBootstrap(redis as unknown as BootstrapRedis, opts.schema);
+        // Wave 6.18i — flush wipes idx:sens and the schema-hash key
+        // alongside the data, so the very next bootstrap must rebuild.
+        // Forcing the rebuild keeps that contract explicit even though
+        // the missing hash key would also force a rebuild on its own.
+        await runBootstrap(
+          redis as unknown as BootstrapRedis,
+          opts.schema,
+          undefined,
+          { target_label, force: true },
+        );
         markBootstrapStatusReady(target_label);
         bootstrap = { ok: true };
         // Wave 5.86C — drop the /facets in-process cache so the UI sees
@@ -135,10 +154,18 @@ export function registerAdminRoutes(
     const redis = getRedis();
     const masters = resolveMasterNodes(redis as unknown as BootstrapRedis);
 
+    // Wave 6.18i — probe the versioned `idx:sens:v{hash7}` name when the
+    // active target has a persisted schema hash; fall back to the legacy
+    // base name otherwise so pre-6.18i targets still preflight cleanly.
+    let probeIndex = "idx:sens";
+    try {
+      const lbl = getActiveTarget().label;
+      probeIndex = await getSensIndexName(redis, lbl);
+    } catch { /* no active target — keep base name */ }
     const missing: string[] = [];
     for (let i = 0; i < masters.length; i++) {
       try {
-        await masters[i]!.call("FT.INFO", "idx:sens");
+        await masters[i]!.call("FT.INFO", probeIndex);
       } catch {
         missing.push(`node-${i}`);
       }
@@ -232,10 +259,22 @@ export function registerAdminRoutes(
     // outcome rather than the prior phase so re-runs are idempotent.
     let target_label = "";
     try { target_label = getActiveTarget().label; } catch { /* no active target */ }
+    // Wave 6.18i — `?force=true` bypasses the skip-when-unchanged check so
+    // operators can force a versioned-index rebuild even when the
+    // persisted schema-hash key matches (recovery from index corruption,
+    // post-incident sanity rebuilds, etc.). Default false → fast skip
+    // when nothing changed.
+    const query = (req.query ?? {}) as Record<string, unknown>;
+    const force = String(query.force ?? "").toLowerCase() === "true";
     const t0 = process.hrtime.bigint();
     let bootstrap: { ok: boolean; error?: string };
     try {
-      await runBootstrap(redis as unknown as BootstrapRedis, opts.schema);
+      await runBootstrap(
+        redis as unknown as BootstrapRedis,
+        opts.schema,
+        undefined,
+        target_label ? { target_label, force } : { force },
+      );
       bootstrap = { ok: true };
       // Wave 6.16a — successful rebuild transitions partial → ready (or
       // any-prior-state → ready). Only fired when target_label is known

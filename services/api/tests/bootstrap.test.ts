@@ -9,6 +9,12 @@ import {
   resolveMasterNodes,
   type RedisLike,
 } from "../src/bootstrap.ts";
+import { computeSchemaHash } from "../src/lib/schema-hash.ts";
+import {
+  clearSensIndexNameCache,
+  schemaHashKey,
+  versionedIndexName,
+} from "../src/lib/sens-index.ts";
 
 // Wave 5.6.3 unit suite. Drives bootstrapFrtb against an in-memory fake — no
 // real Redis, no docker. Verifies: standalone runs once; cluster fans out
@@ -498,6 +504,146 @@ describe("bootstrap — Wave 6.14c rollup completeness WARN", () => {
     const logs: Record<string, unknown>[] = [];
     await bootstrapFrtb(r, schema, (e) => logs.push(e));
     expect(logs.some((l) => l.bootstrap === "rollups")).toBe(false);
+  });
+});
+
+// Wave 6.18i — fake cluster with selectable GET (schema-hash key) + FT.INFO
+// behaviours so the skip / drop / missing-index recovery paths can be
+// exercised without booting RediSearch. Returns "OK" for everything else so
+// Steps 2-4 keep their existing per-master loop semantics.
+interface HashClusterOpts {
+  oldHash: string | null;          // canned GET reply for schemaHashKey
+  indexPresent: boolean;            // FT.INFO succeeds (true) or throws (false)
+}
+function fakeClusterWithHash(
+  nodeIds: string[],
+  recorded: RecordedCall[],
+  opts: HashClusterOpts,
+): RedisLike {
+  const setHash = { value: opts.oldHash };
+  const nodes = nodeIds.map((id) => ({
+    async call(command: string, ...args: unknown[]) {
+      const cmd = String(command).toUpperCase();
+      recorded.push({ node: id, command: cmd, args });
+      if (cmd === "FT.INFO") {
+        if (!opts.indexPresent) throw new Error("Unknown Index name");
+        return ["index_name", String(args[0])];
+      }
+      return "OK";
+    },
+  }));
+  return {
+    nodes: (_role: string) => nodes as unknown as RedisLike[],
+    async call(command: string, ...args: unknown[]) {
+      const cmd = String(command).toUpperCase();
+      recorded.push({ node: "cluster", command: cmd, args });
+      if (cmd === "GET") return setHash.value;
+      if (cmd === "SET") { setHash.value = String(args[1]); return "OK"; }
+      // Step 3 SUGLEN — return >0 so the suggester backfill short-circuits
+      // and the recorded-call assertions stay focused on Step 1.
+      if (cmd === "FT.SUGLEN") return 1;
+      if (cmd === "FT.AGGREGATE") return [0];
+      return "OK";
+    },
+  } as unknown as RedisLike;
+}
+
+describe("bootstrap — Wave 6.18i schema-hash skip + ASYNC drop", () => {
+  it("skip path: matching hash + index present on every master → no FT.CREATE / FT.DROPINDEX, logs bootstrap-skip", async () => {
+    clearSensIndexNameCache();
+    const schema = loadSchema(SCHEMA_PATH);
+    const newHash = computeSchemaHash(schema);
+    const recorded: RecordedCall[] = [];
+    const c = fakeClusterWithHash(["m1", "m2"], recorded, {
+      oldHash: newHash,
+      indexPresent: true,
+    });
+    const logs: Record<string, unknown>[] = [];
+    await bootstrapFrtb(c, schema, (e) => logs.push(e), { target_label: "tgt-A" });
+
+    expect(recorded.some((r) => r.command === "FT.CREATE")).toBe(false);
+    expect(recorded.some((r) => r.command === "FT.DROPINDEX")).toBe(false);
+    const skip = logs.find((l) => l.action === "bootstrap-skip");
+    expect(skip).toMatchObject({
+      bootstrap: "idx:sens",
+      action: "bootstrap-skip",
+      reason: "schema-unchanged",
+      index: versionedIndexName(newHash),
+      nodes: 2,
+    });
+    // Skip path returns early — Step 2 (frtb library) is not run.
+    expect(recorded.some((r) => r.command === "FUNCTION")).toBe(false);
+  });
+
+  it("drop path: hash mismatch → FT.DROPINDEX ASYNC on old name + FT.CREATE on new versioned name + SET hash key", async () => {
+    clearSensIndexNameCache();
+    const schema = loadSchema(SCHEMA_PATH);
+    const newHash = computeSchemaHash(schema);
+    const oldHash = "deadbeefdeadbeef";
+    const recorded: RecordedCall[] = [];
+    const c = fakeClusterWithHash(["m1", "m2"], recorded, {
+      oldHash,
+      indexPresent: true,
+    });
+    await bootstrapFrtb(c, schema, () => undefined, { target_label: "tgt-B" });
+
+    // Per-master DROPINDEX of the OLD versioned name, with ASYNC flag.
+    const drops = recorded.filter((r) => r.command === "FT.DROPINDEX");
+    expect(drops).toHaveLength(2);
+    for (const d of drops) {
+      expect(d.args[0]).toBe(versionedIndexName(oldHash));
+      expect(d.args[1]).toBe("ASYNC");
+    }
+    // Per-master CREATE of the NEW versioned name.
+    const creates = recorded.filter((r) => r.command === "FT.CREATE");
+    expect(creates).toHaveLength(2);
+    for (const c2 of creates) {
+      expect(c2.args[0]).toBe(versionedIndexName(newHash));
+    }
+    // Hash key is SET to the new hash on the cluster client.
+    const sets = recorded.filter((r) => r.command === "SET" && r.args[0] === schemaHashKey("tgt-B"));
+    expect(sets).toHaveLength(1);
+    expect(sets[0]!.args[1]).toBe(newHash);
+  });
+
+  it("missing-index recovery: hash matches but FT.INFO throws → falls back to full rebuild", async () => {
+    clearSensIndexNameCache();
+    const schema = loadSchema(SCHEMA_PATH);
+    const newHash = computeSchemaHash(schema);
+    const recorded: RecordedCall[] = [];
+    const c = fakeClusterWithHash(["m1", "m2"], recorded, {
+      oldHash: newHash,            // hash matches
+      indexPresent: false,         // …but FT.INFO probe fails
+    });
+    const logs: Record<string, unknown>[] = [];
+    await bootstrapFrtb(c, schema, (e) => logs.push(e), { target_label: "tgt-C" });
+
+    // No skip log — fell through to the rebuild branch.
+    expect(logs.some((l) => l.action === "bootstrap-skip")).toBe(false);
+    // FT.CREATE issued on every master under the versioned name.
+    const creates = recorded.filter((r) => r.command === "FT.CREATE");
+    expect(creates).toHaveLength(2);
+    for (const c2 of creates) {
+      expect(c2.args[0]).toBe(versionedIndexName(newHash));
+    }
+    // Old==new versioned name → DROPINDEX is suppressed to avoid wiping
+    // the index we are about to (re)create.
+    expect(recorded.some((r) => r.command === "FT.DROPINDEX")).toBe(false);
+  });
+
+  it("hash stability: reordering top-level + nested keys yields the same fingerprint", () => {
+    const baseSchema = loadSchema(SCHEMA_PATH);
+    const reordered: Record<string, unknown> = {};
+    const keys = Object.keys(baseSchema as unknown as Record<string, unknown>);
+    // Insert in reverse order so the JSON serialisation differs byte-wise
+    // from the canonical-sorted form until computeSchemaHash deep-sorts it.
+    for (const k of keys.reverse()) {
+      reordered[k] = (baseSchema as unknown as Record<string, unknown>)[k];
+    }
+    expect(computeSchemaHash(reordered)).toBe(computeSchemaHash(baseSchema));
+    // And a literal structural change still flips the hash.
+    const mutated = { ...(baseSchema as unknown as Record<string, unknown>), __extra: "x" };
+    expect(computeSchemaHash(mutated)).not.toBe(computeSchemaHash(baseSchema));
   });
 });
 

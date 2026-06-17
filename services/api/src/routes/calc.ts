@@ -3,6 +3,7 @@ import type { Schema } from "@frtb/schema";
 import type { RedisLike } from "../redis-like.ts";
 import { getActiveTarget } from "../active-target.ts";
 import { getBootstrapStatus } from "../bootstrap-status.ts";
+import { getSensIndexName } from "../lib/sens-index.ts";
 import { translateRedisError } from "../redis-errors.ts";
 import {
   CORRELATION_REGIME_FACTOR,
@@ -319,6 +320,10 @@ async function computeSbmCharge(
   // which is the correct Basel interpretation.
   const scaledCorr = scaleCorrelationSpec(corr, regimeFactor, 1.0);
   const target_label = getActiveTarget().label;
+  // Wave 6.18i — resolve the live versioned `idx:sens:v{hash7}` once per
+  // request and reuse for discovery FT.AGGREGATE, the FT.INFO probe, the
+  // fast-path aggregate fan-out, and the resolved-command echo. Cached 30s.
+  const indexName = await getSensIndexName(redis, target_label);
   const t0 = process.hrtime.bigint();
 
   // Wave 5.83C-2 — short-TTL response cache lookup.
@@ -368,7 +373,7 @@ async function computeSbmCharge(
     for (const node of queryNodes) {
       const aggReply = await node.call(
         "FT.AGGREGATE",
-        "idx:sens",
+        indexName,
         discoveryQuery,
         "GROUPBY",
         "1",
@@ -405,7 +410,7 @@ async function computeSbmCharge(
   if (buckets.length === 0 || discoveryError) {
     let probed = 0;
     try {
-      const infoReply = await redis.call("FT.INFO", "idx:sens");
+      const infoReply = await redis.call("FT.INFO", indexName);
       probed = parseFtInfoNumDocs(infoReply);
     } catch {
       probed = 0;
@@ -470,7 +475,7 @@ async function computeSbmCharge(
           bucketSubset: [b],
           exclude: excludeFilter,
         });
-        const perBucketArgv = buildFastPathAggregateArgs(perBucketQuery, legFields, perTenor);
+        const perBucketArgv = buildFastPathAggregateArgs(perBucketQuery, legFields, perTenor, indexName);
         return formatRedisCommand("FT.AGGREGATE", perBucketArgv);
       };
       let rollup: BucketResult[] | null = null;
@@ -508,6 +513,7 @@ async function computeSbmCharge(
             exclude: excludeFilter,
           },
           components: { crossTopN: 10 },
+          indexName,
         });
         const byBucket = new Map(fast.map((r) => [r.bucket, r]));
         results = buckets.map((b) => {
@@ -574,7 +580,7 @@ async function computeSbmCharge(
   const commands = {
     discovery: {
       command: "FT.AGGREGATE" as const,
-      index: "idx:sens",
+      index: indexName,
       query: discoveryQuery,
       groupby: ["@bucket"],
       reducers: ["COUNT 0 AS n"],
@@ -1415,6 +1421,9 @@ export function registerCalcRoute(
       }
       const redis = getRedis();
       const target_label = getActiveTarget().label;
+      // Wave 6.18i — same versioned-index resolution as /calc/sbm so the
+      // bucket-cross-detail endpoint targets the live `idx:sens:v{hash7}`.
+      const indexName = await getSensIndexName(redis, target_label);
       try {
         const results = await aggregateBucketsViaIndex({
           redis,
@@ -1423,6 +1432,7 @@ export function registerCalcRoute(
           leg: leg as Leg,
           filters: { bucketSubset: [bucket], exclude: excludeArr },
           components: { crossTopN: null },
+          indexName,
         });
         const hit = results.find((r) => r.bucket === bucket);
         if (!hit) {

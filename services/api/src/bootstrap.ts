@@ -1,18 +1,32 @@
 // FRTB SBM PoV — api startup bootstrap.
 //
-// Wave 5.6.3: idempotently ensure the RediSearch index `idx:sens` exists and
-// the Redis Functions library `frtb` is loaded with all nine per-bucket
-// functions ({girr,equity,fx} x {delta,vega,curvature}). Fans out across
-// master shards in cluster mode because both FT.CREATE (RediSearch) and
-// FUNCTION LOAD are per-shard in ioredis Cluster — a single .call() only
-// hits one node.
+// Wave 5.6.3: idempotently ensure the RediSearch index exists and the Redis
+// Functions library `frtb` is loaded with all nine per-bucket functions
+// ({girr,equity,fx} x {delta,vega,curvature}). Fans out across master shards
+// in cluster mode because both FT.CREATE (RediSearch) and FUNCTION LOAD are
+// per-shard in ioredis Cluster — a single .call() only hits one node.
 //
 // Wave 5.16f1: extended buildFrtbSnippets to register the three *_curvature
 // snippets at startup (previously a docs-scoped runtime helper).
+//
+// Wave 6.18i: replaced the unconditional drop-then-recreate of "idx:sens"
+// with a skip-when-unchanged + versioned-index flow. The index name carries
+// a hash7 suffix derived from the resolved schema; the canonical hash is
+// SET to `bootstrap:schema-hash:{target_label}` after each successful
+// rebuild. On restart, an unchanged schema short-circuits to a fast
+// `bootstrap-skip` log line, eliminating the ~22-minute FT.DROPINDEX window
+// that previously blocked every restart on a large index.
 
 import type { Cluster, Redis } from "ioredis";
-import { dropSensIndex, ensureSensIndex } from "@frtb/rqe";
+import { buildCreateArgs } from "@frtb/rqe";
 import type { Schema } from "@frtb/schema";
+import { computeSchemaHash } from "./lib/schema-hash.ts";
+import {
+  BASE_INDEX_NAME,
+  clearSensIndexNameCache,
+  schemaHashKey,
+  versionedIndexName,
+} from "./lib/sens-index.ts";
 import {
   loadFrtbLibrary,
   type FrtbLibrarySnippet,
@@ -131,38 +145,169 @@ export function resolveMasterNodes(client: RedisLike): RedisLike[] {
   return [client];
 }
 
-export async function bootstrapFrtb(
-  client: RedisLike,
-  schema: Schema,
-  log: (entry: Record<string, unknown>) => void = (e) => console.log(JSON.stringify(e)),
-): Promise<BootstrapResult> {
-  const nodes = resolveMasterNodes(client);
-  // Wave 6.16a — track per-node failures for Steps 1 + 2 instead of letting
-  // the first throw abort the whole loop. node-${i} matches the indexing
-  // used by /admin/preflight so the two surfaces line up by eye.
-  const indexFailed: BootstrapFailure[] = [];
-  const funcFailed: BootstrapFailure[] = [];
+// Wave 6.18i — bootstrap options. `target_label` opts the call into the
+// skip-when-unchanged + versioned-index flow (reads/writes
+// `bootstrap:schema-hash:{target_label}`). Omit it for legacy demo paths
+// (CLI smoke, unit-test fakes without a hash-key responder) — bootstrap
+// then falls back to the unversioned `idx:sens` rebuild semantics that
+// pre-6.18i callers expect. `force=true` bypasses the skip check even
+// when the hash matches (powers `/admin/rebuild-indexes?force=true`).
+export interface BootstrapOpts {
+  target_label?: string;
+  force?: boolean;
+}
 
-  // Step 1: idx:sens on every master. Wave 5.83A — drop-then-recreate so the
-  // index picks up the per-class per-tenor pre-weighted NUMERIC SORTABLE
-  // fields when the schema evolves. FT.DROPINDEX is called without DD so
-  // existing JSON docs are preserved; the index is rebuilt from them on
-  // re-create. dropSensIndex is idempotent against a missing index (cold
-  // start) so this is safe on first boot too.
+function isUnknownIndex(err: unknown): boolean {
+  const msg = String(err instanceof Error ? err.message : err).toLowerCase();
+  return msg.includes("unknown index") || msg.includes("no such index") || msg.includes("index not found");
+}
+
+// Wave 6.18i — Step 1 sub-helpers. The hash-key read + FT.INFO probe drives
+// the skip path; `runIndexRebuild` issues the per-master FT.DROPINDEX (old
+// versioned name, ASYNC, best-effort) + FT.CREATE (new versioned name).
+async function readOldHash(client: RedisLike, target_label: string): Promise<string | null> {
+  try {
+    const reply = await client.call("GET", schemaHashKey(target_label));
+    return typeof reply === "string" && reply.length > 0 ? reply : null;
+  } catch {
+    return null;
+  }
+}
+
+async function indexPresentOnAll(nodes: RedisLike[], indexName: string): Promise<boolean> {
+  for (const node of nodes) {
+    try {
+      await node.call("FT.INFO", indexName);
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+async function runIndexRebuild(
+  nodes: RedisLike[],
+  schema: Schema,
+  newIndexName: string,
+  oldIndexName: string | null,
+): Promise<BootstrapFailure[]> {
+  const failed: BootstrapFailure[] = [];
+  const createArgs = buildCreateArgs(schema);
+  // First positional arg from buildCreateArgs is BASE_INDEX_NAME — replace
+  // with the versioned name so FT.CREATE lands under `idx:sens:v{hash7}`.
+  createArgs[0] = newIndexName;
   for (let i = 0; i < nodes.length; i++) {
     const node = nodes[i]!;
+    if (oldIndexName && oldIndexName !== newIndexName) {
+      try {
+        // ASYNC so the GC of a multi-million-doc index runs in the
+        // background instead of blocking the boot client. Versioned names
+        // mean the old + new indexes coexist safely during the GC window.
+        await node.call("FT.DROPINDEX", oldIndexName, "ASYNC");
+      } catch (err) {
+        if (!isUnknownIndex(err)) {
+          failed.push({
+            step: "idx:sens",
+            node_id: `node-${i}`,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          continue;
+        }
+      }
+    }
     try {
-      await dropSensIndex(node);
-      await ensureSensIndex(node, schema);
+      await node.call("FT.CREATE", ...createArgs);
     } catch (err) {
-      indexFailed.push({
+      const msg = String(err instanceof Error ? err.message : err).toLowerCase();
+      if (msg.includes("already exists")) continue;
+      failed.push({
         step: "idx:sens",
         node_id: `node-${i}`,
         error: err instanceof Error ? err.message : String(err),
       });
     }
   }
-  log({ service: "api", bootstrap: "idx:sens", action: "created", nodes: nodes.length });
+  return failed;
+}
+
+export async function bootstrapFrtb(
+  client: RedisLike,
+  schema: Schema,
+  log: (entry: Record<string, unknown>) => void = (e) => console.log(JSON.stringify(e)),
+  opts: BootstrapOpts = {},
+): Promise<BootstrapResult> {
+  const nodes = resolveMasterNodes(client);
+  const newHash = computeSchemaHash(schema);
+  const newIndexName = versionedIndexName(newHash);
+  // Wave 6.16a — track per-node failures for Steps 1 + 2 instead of letting
+  // the first throw abort the whole loop. node-${i} matches the indexing
+  // used by /admin/preflight so the two surfaces line up by eye.
+  const indexFailed: BootstrapFailure[] = [];
+  const funcFailed: BootstrapFailure[] = [];
+
+  // Wave 6.18i — Step 1: hash-gated rebuild. When called with a target_label
+  // and the persisted hash matches AND the versioned index already exists
+  // on every master, return early with a `bootstrap-skip` log line.
+  // Otherwise read the OLD hash (for ASYNC DROPINDEX of the prior versioned
+  // name), per-master FT.CREATE the new versioned name, and SET the new
+  // hash key. The unversioned `idx:sens` fallback runs only when no
+  // target_label is supplied (CLI / unit-test fakes without GET stubs).
+  let resolvedIndexName = newIndexName;
+  let skipped = false;
+  if (opts.target_label) {
+    const oldHash = await readOldHash(client, opts.target_label);
+    if (!opts.force && oldHash === newHash && await indexPresentOnAll(nodes, newIndexName)) {
+      skipped = true;
+      log({
+        service: "api",
+        bootstrap: "idx:sens",
+        action: "bootstrap-skip",
+        reason: "schema-unchanged",
+        index: newIndexName,
+        nodes: nodes.length,
+      });
+    } else {
+      const oldIndexName = oldHash ? versionedIndexName(oldHash) : null;
+      indexFailed.push(...await runIndexRebuild(nodes, schema, newIndexName, oldIndexName));
+      if (indexFailed.length === 0) {
+        try {
+          await client.call("SET", schemaHashKey(opts.target_label), newHash);
+        } catch (err) {
+          // Hash-key SET failure means the next restart re-runs FT.CREATE
+          // (lands on "already exists" → no-op) rather than skipping —
+          // safe degradation, no per-node failure surfaced.
+          log({
+            service: "api",
+            bootstrap: "idx:sens",
+            action: "hash-set-failed",
+            err: err instanceof Error ? err.message : String(err),
+          });
+        }
+        clearSensIndexNameCache(opts.target_label);
+      }
+      log({ service: "api", bootstrap: "idx:sens", action: "created", index: newIndexName, nodes: nodes.length });
+    }
+  } else {
+    // Legacy/test path — no target_label means no hash-key plumbing. Use the
+    // unversioned base name to preserve the pre-6.18i call shape (single
+    // FT.CREATE per master, idempotent against "already exists").
+    resolvedIndexName = BASE_INDEX_NAME;
+    indexFailed.push(...await runIndexRebuild(nodes, schema, BASE_INDEX_NAME, BASE_INDEX_NAME));
+    log({ service: "api", bootstrap: "idx:sens", action: "created", nodes: nodes.length });
+  }
+  if (skipped) {
+    // Wave 6.18i — fast path: schema unchanged + index present on every
+    // master. Skip Steps 2-4 because the frtb library and suggesters are
+    // already loaded from the previous boot (FUNCTION LOAD is idempotent
+    // anyway; suggesters are guarded by FT.SUGLEN and the rollup probe
+    // is a non-fatal warning). Return a happy result so callers see the
+    // same shape they get on a full rebuild.
+    return {
+      index: { nodes: nodes.length, ok: nodes.length, failed: [] },
+      functions: { nodes: nodes.length, ok: nodes.length, failed: [], functions: [] },
+      suggesters: { nodes: nodes.length, ok: nodes.length, failed: [], counts: { book: 0, trade_id: 0, risk_factor: 0 } },
+    };
+  }
 
   // Step 2: frtb library on every master.
   const snippets = buildFrtbSnippets(schema);
@@ -217,7 +362,7 @@ export async function bootstrapFrtb(
     for (const node of nodes) {
       try {
         const aggReply = (await node.call(
-          "FT.AGGREGATE", "idx:sens", "*",
+          "FT.AGGREGATE", resolvedIndexName, "*",
           "GROUPBY", "1", `@${fieldName}`,
           "LIMIT", "0", "100000",
           "DIALECT", "2",
@@ -265,7 +410,7 @@ export async function bootstrapFrtb(
   for (const node of nodes) {
     try {
       const aggReply = (await node.call(
-        "FT.AGGREGATE", "idx:sens", "*",
+        "FT.AGGREGATE", resolvedIndexName, "*",
         "GROUPBY", "2", "@risk_class", "@bucket",
         "LIMIT", "0", "100000",
         "DIALECT", "2",

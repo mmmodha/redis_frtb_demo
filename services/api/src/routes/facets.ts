@@ -2,6 +2,7 @@ import type { FastifyInstance } from "fastify";
 import type { RedisLike } from "../redis-like.ts";
 import { getActiveTarget, onActiveTargetChange } from "../active-target.ts";
 import { getBootstrapStatus } from "../bootstrap-status.ts";
+import { getSensIndexName } from "../lib/sens-index.ts";
 import { translateRedisError } from "../redis-errors.ts";
 
 // Wave 5.56 / 5.66 — facet counts backing the Search / Calc / JSON Explorer
@@ -145,6 +146,9 @@ export function registerFacetsRoute(
 
     const redis = getRedis();
     const target_label = getActiveTarget().label;
+    // Wave 6.18i — resolve the live versioned index name (cached 30 s) so
+    // the aggregate lands on the same name bootstrap last created.
+    const indexName = await getSensIndexName(redis, target_label);
 
     let rows: Array<Record<string, string>> = [];
     try {
@@ -153,7 +157,7 @@ export function registerFacetsRoute(
       // cluster-routing failure modes of the follow-up cursor reads.
       const reply = await redis.call(
         "FT.AGGREGATE",
-        "idx:sens",
+        indexName,
         "*",
         "GROUPBY",
         "3",

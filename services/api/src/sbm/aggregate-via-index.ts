@@ -51,6 +51,10 @@ export interface AggregateBucketsOpts {
   // (GIRR) components are derived from the main aggregate; non-perTenor
   // classes (Equity / FX) require a second FT.AGGREGATE grouped by risk_factor.
   components?: ComponentsOpts;
+  // Wave 6.18i — versioned `idx:sens:v{hash7}` resolved by the route via
+  // getSensIndexName. Optional for back-compat (CLI smoke, unit-test
+  // callers without an active target) — defaults to the legacy base name.
+  indexName?: string;
 }
 
 // Wave 5.41 — same explicit per-call timeout the legacy discovery FT.AGGREGATE
@@ -221,9 +225,10 @@ export function buildFastPathAggregateArgs(
   query: string,
   fields: LegFields,
   perTenor: boolean = false,
+  indexName: string = "idx:sens",
 ): unknown[] {
   void perTenor;
-  const args: unknown[] = ["idx:sens", query];
+  const args: unknown[] = [indexName, query];
   const applyClauses: Array<[string, string]> = [];
   const sumReducers: Array<[string, string]> = [];
   const safeRef = (f: string): string => {
@@ -277,8 +282,12 @@ export function buildFastPathAggregateArgs(
 // reducer can surface per-risk-factor WS (and CVR up/down) sums alongside the
 // per-bucket totals the main aggregate produces. Reused by both /calc/sbm
 // (top-N pairs) and the bucket-cross-detail endpoint (all pairs).
-export function buildComponentsAggregateArgs(query: string, fields: LegFields): unknown[] {
-  const args: unknown[] = ["idx:sens", query];
+export function buildComponentsAggregateArgs(
+  query: string,
+  fields: LegFields,
+  indexName: string = "idx:sens",
+): unknown[] {
+  const args: unknown[] = [indexName, query];
   const applyClauses: Array<[string, string]> = [];
   const sumReducers: Array<[string, string]> = [];
   const safeRef = (f: string): string => {
@@ -857,14 +866,17 @@ export async function aggregateBucketsViaIndex(opts: AggregateBucketsOpts): Prom
   const rho = resolveRho(opts.schema, riskClass, opts.leg);
   const perTenor = PER_TENOR_CLASSES.has(riskClass) && (opts.schema.risk_classes[riskClass]?.tenor?.nodes?.length ?? 0) > 0;
   const query = buildFastPathQuery(riskClass, fields.sensitivityType, opts.filters);
-  const argv = buildFastPathAggregateArgs(query, fields, perTenor);
+  // Wave 6.18i — route plumbs the resolved versioned index name; default
+  // to the legacy base name so CLI / unit-test callers keep working.
+  const indexName = opts.indexName ?? "idx:sens";
+  const argv = buildFastPathAggregateArgs(query, fields, perTenor, indexName);
   const nodes = resolveQueryNodes(opts.redis);
   const merged = new Map<string, Record<string, string>>();
   // Wave 5.96A.1 — scalar (non-perTenor) classes need a second FT.AGGREGATE
   // grouped by (@bucket, @risk_factor) to recover per-RF components; perTenor
   // (GIRR) already exposes per-tenor sums via the main aggregate.
   const needsPerRf = opts.components !== undefined && !perTenor;
-  const perRfArgv = needsPerRf ? buildComponentsAggregateArgs(query, fields) : null;
+  const perRfArgv = needsPerRf ? buildComponentsAggregateArgs(query, fields, indexName) : null;
   const perRfMerged = new Map<string, Map<string, Record<string, string>>>();
   for (const node of nodes) {
     const reply = await node.call("FT.AGGREGATE", ...argv);

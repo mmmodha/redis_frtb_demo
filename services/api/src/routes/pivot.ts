@@ -2,6 +2,7 @@ import type { FastifyInstance } from "fastify";
 import type { RedisLike } from "../redis-like.ts";
 import { getActiveTarget } from "../active-target.ts";
 import { getBootstrapStatus } from "../bootstrap-status.ts";
+import { getSensIndexName } from "../lib/sens-index.ts";
 import { translateRedisError } from "../redis-errors.ts";
 
 // Escape RediSearch TAG punctuation per dialect 2 — colon, dash, brace, etc.
@@ -48,13 +49,16 @@ export function registerPivotRoute(
     // picked up on the very next /pivot call.
     const redis = getRedis();
     const target_label = getActiveTarget().label;
+    // Wave 6.18i — resolve to the live versioned `idx:sens:v{hash7}` so
+    // FT.SEARCH targets the same index name bootstrap last created.
+    const indexName = await getSensIndexName(redis, target_label);
 
     const t0 = process.hrtime.bigint();
     let raw: unknown[];
     try {
       raw = (await redis.call(
         "FT.SEARCH",
-        "idx:sens",
+        indexName,
         query,
         "LIMIT",
         String(offset),
