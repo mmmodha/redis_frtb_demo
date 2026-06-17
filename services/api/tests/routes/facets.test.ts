@@ -10,6 +10,8 @@ import {
 
 // FT.AGGREGATE RESP2 shape for GROUPBY ... REDUCE COUNT 0 AS n:
 //   [ num_groups, [field, val, field, val, ...], [field, val, ...] ]
+// Wave 6.18g — /facets no longer uses WITHCURSOR, so replies come back as the
+// raw aggregate payload (no [result, cursor_id] wrapper).
 function aggReply(rows: Array<Record<string, string | number>>) {
   const out: unknown[] = [rows.length];
   for (const r of rows) {
@@ -20,12 +22,6 @@ function aggReply(rows: Array<Record<string, string | number>>) {
     out.push(flat);
   }
   return out;
-}
-
-// FT.AGGREGATE ... WITHCURSOR / FT.CURSOR READ wrap the aggregate payload as
-// [result, cursor_id]. cursor_id === 0 signals the cursor is exhausted.
-function cursorReply(rows: Array<Record<string, string | number>>, cursorId: number) {
-  return [aggReply(rows), cursorId];
 }
 
 describe("GET /facets", () => {
@@ -49,15 +45,12 @@ describe("GET /facets", () => {
     const fr = fakeRedis();
     fr.setResponse(
       "FT.AGGREGATE",
-      cursorReply(
-        [
-          { risk_class: "GIRR", bucket: "USD-IRS", sensitivity_type: "Delta", n: 10 },
-          { risk_class: "GIRR", bucket: "USD-IRS", sensitivity_type: "Vega", n: 3 },
-          { risk_class: "GIRR", bucket: "EUR-IRS", sensitivity_type: "Delta", n: 4 },
-          { risk_class: "CSR_NS", bucket: "1", sensitivity_type: "Delta", n: 5 },
-        ],
-        0,
-      ),
+      aggReply([
+        { risk_class: "GIRR", bucket: "USD-IRS", sensitivity_type: "Delta", n: 10 },
+        { risk_class: "GIRR", bucket: "USD-IRS", sensitivity_type: "Vega", n: 3 },
+        { risk_class: "GIRR", bucket: "EUR-IRS", sensitivity_type: "Delta", n: 4 },
+        { risk_class: "CSR_NS", bucket: "1", sensitivity_type: "Delta", n: 5 },
+      ]),
     );
     app = await createServer({ redis: fr });
 
@@ -85,88 +78,64 @@ describe("GET /facets", () => {
     expect(agg!.args).toContain("@sensitivity_type");
     expect(agg!.args).toContain("REDUCE");
     expect(agg!.args).toContain("COUNT");
-    expect(agg!.args).toContain("WITHCURSOR");
+    // Wave 6.18g — single-shot bounded aggregate (no cursor lifecycle).
+    expect(agg!.args).toContain("LIMIT");
+    const limitIdx = agg!.args.indexOf("LIMIT");
+    expect(agg!.args[limitIdx + 1]).toBe("0");
+    // MAX_GROUPS is a numeric string >0; any non-zero positive guards against
+    // accidentally degenerating to LIMIT 0 0 (which returns zero rows).
+    expect(Number(agg!.args[limitIdx + 2])).toBeGreaterThan(0);
+    expect(agg!.args).not.toContain("WITHCURSOR");
   });
 
-  it("drains FT.CURSOR READs when FT.AGGREGATE returns the [N]-only bug shape on Redis Search 8", async () => {
-    // Search 8 first page: cursor wrapper around just [N] (no rows); all
-    // grouped rows arrive on the FT.CURSOR READ that follows.
+  // Wave 6.18g — the single-shot aggregate uses LIMIT 0 MAX_GROUPS as the cap.
+  // The bounded cap from the previous cursor-drain logic must be preserved: if
+  // Redis returns more rows than MAX_GROUPS (impossible in practice given the
+  // LIMIT clause, but we assert the route's own MAX_GROUPS argument is what
+  // bounds the response by reading the LIMIT count back from the call args).
+  it("passes a LIMIT 0 <MAX_GROUPS> to FT.AGGREGATE so the result set stays bounded", async () => {
     const fr = fakeRedis();
-    fr.setResponse("FT.AGGREGATE", [[0], 42]);
-    fr.setResponse("FT.CURSOR", (args) => {
-      expect(args[0]).toBe("READ");
-      expect(args[1]).toBe("idx:sens");
-      expect(args[2]).toBe("42");
-      return cursorReply(
-        [
-          { risk_class: "GIRR", bucket: "USD-IRS", sensitivity_type: "Delta", n: 100 },
-          { risk_class: "FX", bucket: "USD", sensitivity_type: "Delta", n: 50 },
-          { risk_class: "EQUITY", bucket: "1", sensitivity_type: "Vega", n: 7 },
-        ],
-        0,
-      );
-    });
+    // Reply with a single row — the assertion is on the LIMIT argument the
+    // route SENT, which is the contract with Redis for the cap.
+    fr.setResponse(
+      "FT.AGGREGATE",
+      aggReply([{ risk_class: "GIRR", bucket: "USD-IRS", sensitivity_type: "Delta", n: 1 }]),
+    );
+    app = await createServer({ redis: fr });
+
+    const res = await app.inject({ method: "GET", url: "/facets" });
+    expect(res.statusCode).toBe(200);
+
+    const agg = fr.calls.find((c) => c.command === "FT.AGGREGATE");
+    expect(agg).toBeDefined();
+    const limitIdx = agg!.args.indexOf("LIMIT");
+    expect(limitIdx).toBeGreaterThan(-1);
+    expect(agg!.args[limitIdx + 1]).toBe("0");
+    // Cap value is the in-file MAX_GROUPS constant. It must be a positive
+    // integer; if it ever silently drifts to 0 or NaN the route would return
+    // no rows at all and the UI dropdowns would empty.
+    const cap = Number(agg!.args[limitIdx + 2]);
+    expect(Number.isInteger(cap)).toBe(true);
+    expect(cap).toBeGreaterThanOrEqual(10_000);
+  });
+
+  // Wave 6.18g — empty groups must NEVER 500. Distinct from the
+  // index-missing case below (which throws); here Redis is healthy but
+  // idx:sens has zero matching rows.
+  it("returns 200 with the empty-body shape (no 500) when FT.AGGREGATE returns zero groups", async () => {
+    const fr = fakeRedis();
+    fr.setResponse("FT.AGGREGATE", aggReply([]));
     app = await createServer({ redis: fr });
 
     const res = await app.inject({ method: "GET", url: "/facets" });
     expect(res.statusCode).toBe(200);
     const body = res.json();
-    expect(body.ok).toBe(true);
-    expect(body.total_rows).toBe(157);
-    expect(body.risk_class).toEqual({ GIRR: 100, FX: 50, EQUITY: 7 });
-    expect(body.sensitivity_type).toEqual({ Delta: 150, Vega: 7 });
-    expect(body.bucket_by_risk_class).toEqual({
-      GIRR: { "USD-IRS": 100 },
-      FX: { USD: 50 },
-      EQUITY: { "1": 7 },
-    });
-
-    // One FT.CURSOR READ, no DEL needed once cursor returned 0.
-    const cursorCalls = fr.calls.filter((c) => c.command === "FT.CURSOR");
-    expect(cursorCalls.length).toBe(1);
-    expect(cursorCalls[0]!.args[0]).toBe("READ");
-  });
-
-  it("drains multiple FT.CURSOR READ pages until cursor_id returns 0", async () => {
-    const fr = fakeRedis();
-    fr.setResponse("FT.AGGREGATE", cursorReply(
-      [{ risk_class: "GIRR", bucket: "USD", sensitivity_type: "Delta", n: 10 }],
-      111,
-    ));
-    let readCount = 0;
-    fr.setResponse("FT.CURSOR", (args) => {
-      expect(args[0]).toBe("READ");
-      readCount += 1;
-      if (readCount === 1) {
-        expect(args[2]).toBe("111");
-        return cursorReply(
-          [{ risk_class: "FX", bucket: "EUR", sensitivity_type: "Delta", n: 20 }],
-          222,
-        );
-      }
-      expect(args[2]).toBe("222");
-      return cursorReply(
-        [{ risk_class: "EQUITY", bucket: "1", sensitivity_type: "Vega", n: 30 }],
-        0,
-      );
-    });
-    app = await createServer({ redis: fr });
-
-    const res = await app.inject({ method: "GET", url: "/facets" });
-    expect(res.statusCode).toBe(200);
-    const body = res.json();
-    expect(body.ok).toBe(true);
-    expect(body.total_rows).toBe(60);
-    expect(body.risk_class).toEqual({ GIRR: 10, FX: 20, EQUITY: 30 });
-    expect(body.bucket_by_risk_class).toEqual({
-      GIRR: { USD: 10 },
-      FX: { EUR: 20 },
-      EQUITY: { "1": 30 },
-    });
-
-    expect(readCount).toBe(2);
-    // No DEL since the final read drained the cursor (returned 0).
-    expect(fr.calls.some((c) => c.command === "FT.CURSOR" && c.args[0] === "DEL")).toBe(false);
+    expect(body.ok).toBe(false);
+    expect(body.reason).toBe("empty-index");
+    expect(body.total_rows).toBe(0);
+    expect(body.risk_class).toEqual({});
+    expect(body.sensitivity_type).toEqual({});
+    expect(body.bucket_by_risk_class).toEqual({});
   });
 
   it("returns ok=false reason='empty-index' (200) when idx:sens does not exist on the target", async () => {
@@ -208,7 +177,7 @@ describe("GET /facets", () => {
 
   it("returns ok=false reason='empty-index' (200) when the index exists but is empty (0 groups)", async () => {
     const fr = fakeRedis();
-    fr.setResponse("FT.AGGREGATE", cursorReply([], 0));
+    fr.setResponse("FT.AGGREGATE", aggReply([]));
     app = await createServer({ redis: fr });
 
     const res = await app.inject({ method: "GET", url: "/facets" });
@@ -216,7 +185,11 @@ describe("GET /facets", () => {
     const body = res.json();
     expect(body.ok).toBe(false);
     expect(body.reason).toBe("empty-index");
-    // No FT.CURSOR calls when the first reply already returns cursor_id=0.
+    expect(body.total_rows).toBe(0);
+    expect(body.risk_class).toEqual({});
+    expect(body.sensitivity_type).toEqual({});
+    expect(body.bucket_by_risk_class).toEqual({});
+    // Wave 6.18g — cursor lifecycle is gone; no FT.CURSOR commands at all.
     expect(fr.calls.some((c) => c.command === "FT.CURSOR")).toBe(false);
   });
 
@@ -252,10 +225,7 @@ describe("GET /facets", () => {
     const fr = fakeRedis();
     fr.setResponse(
       "FT.AGGREGATE",
-      cursorReply(
-        [{ risk_class: "GIRR", bucket: "USD-IRS", sensitivity_type: "Delta", n: 10 }],
-        0,
-      ),
+      aggReply([{ risk_class: "GIRR", bucket: "USD-IRS", sensitivity_type: "Delta", n: 10 }]),
     );
     app = await createServer({ redis: fr });
 
@@ -282,10 +252,7 @@ describe("GET /facets", () => {
     const fr = fakeRedis();
     fr.setResponse(
       "FT.AGGREGATE",
-      cursorReply(
-        [{ risk_class: "GIRR", bucket: "USD-IRS", sensitivity_type: "Delta", n: 1 }],
-        0,
-      ),
+      aggReply([{ risk_class: "GIRR", bucket: "USD-IRS", sensitivity_type: "Delta", n: 1 }]),
     );
     app = await createServer({ redis: fr });
 
@@ -323,10 +290,7 @@ describe("GET /facets", () => {
     const fr = fakeRedis();
     fr.setResponse(
       "FT.AGGREGATE",
-      cursorReply(
-        [{ risk_class: "FX", bucket: "USD", sensitivity_type: "Delta", n: 7 }],
-        0,
-      ),
+      aggReply([{ risk_class: "FX", bucket: "USD", sensitivity_type: "Delta", n: 7 }]),
     );
     app = await createServer({ redis: fr });
 
@@ -352,10 +316,7 @@ describe("GET /facets", () => {
     const fr = fakeRedis();
     fr.setResponse(
       "FT.AGGREGATE",
-      cursorReply(
-        [{ risk_class: "EQUITY", bucket: "1", sensitivity_type: "Vega", n: 3 }],
-        0,
-      ),
+      aggReply([{ risk_class: "EQUITY", bucket: "1", sensitivity_type: "Vega", n: 3 }]),
     );
     app = await createServer({ redis: fr });
 

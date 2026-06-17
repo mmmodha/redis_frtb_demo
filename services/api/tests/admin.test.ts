@@ -132,14 +132,12 @@ describe("POST /admin/flush", () => {
       }
       return out;
     }
-    const cursorReply = (rows: Array<Record<string, string | number>>, cursorId: number) =>
-      [aggReply(rows), cursorId];
-
+    // Wave 6.18g — /facets no longer wraps FT.AGGREGATE replies in a cursor
+    // envelope; the route reads the raw aggregate payload directly.
     const fr = fakeRedis();
-    let nextAgg: unknown = cursorReply(
-      [{ risk_class: "GIRR", bucket: "USD", sensitivity_type: "Delta", n: 10 }],
-      0,
-    );
+    let nextAgg: unknown = aggReply([
+      { risk_class: "GIRR", bucket: "USD", sensitivity_type: "Delta", n: 10 },
+    ]);
     fr.setResponse("FT.AGGREGATE", () => nextAgg);
 
     const runBootstrap = vi.fn(async () => ({}));
@@ -163,10 +161,9 @@ describe("POST /admin/flush", () => {
     expect(r1Cached.json().cached).toBe(true);
 
     // Swap the FT.AGGREGATE response to simulate the post-flush index state.
-    nextAgg = cursorReply(
-      [{ risk_class: "FX", bucket: "EUR", sensitivity_type: "Vega", n: 7 }],
-      0,
-    );
+    nextAgg = aggReply([
+      { risk_class: "FX", bucket: "EUR", sensitivity_type: "Vega", n: 7 },
+    ]);
 
     const flushRes = await app.inject({ method: "POST", url: "/admin/flush" });
     expect(flushRes.statusCode).toBe(200);

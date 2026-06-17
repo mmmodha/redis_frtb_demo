@@ -5,14 +5,12 @@ import { getBootstrapStatus } from "../bootstrap-status.ts";
 import { translateRedisError } from "../redis-errors.ts";
 
 // Wave 5.56 / 5.66 — facet counts backing the Search / Calc / JSON Explorer
-// dropdowns. FT.AGGREGATE ... GROUPBY on Redis Search 8 only returns the input
-// count when WITHCURSOR is not specified, so we drive a cursor and drain pages
-// of grouped (risk_class, bucket, sensitivity_type) counts before tallying.
-// UI hides classes/buckets/sens-types that report zero rows in the active
-// index instead of presenting all 7×16×3 hardcoded combinations.
+// dropdowns. We aggregate grouped (risk_class, bucket, sensitivity_type)
+// counts so the UI can hide classes/buckets/sens-types that report zero rows
+// in the active index instead of presenting all 7×16×3 hardcoded combinations.
 //
 // Wave 5.67 — Short-TTL (30 s) in-process cache. Re-opening Search / Calc /
-// JSON Explorer in quick succession used to pay the full cursor drain
+// JSON Explorer in quick succession used to pay the full aggregate cost
 // (~2-3 s on 220k rows) each time. We cache the response body keyed by the
 // active-target IDENTITY tuple (host/port/db/tls/clusterMode) — label is
 // intentionally excluded so a rename of the currently-active profile does
@@ -20,8 +18,16 @@ import { translateRedisError } from "../redis-errors.ts";
 // fires `onActiveTargetChange`, which clears the cache immediately. No
 // generator-finish event exists today; a fresh ingest will be picked up by
 // the next call after TTL expiry.
+//
+// Wave 6.18g — Previously this route used a cursor-driven aggregate to drain
+// grouped rows. Against a clustered Redis fronted by a proxy, the cursor
+// opened on one shard frequently failed on subsequent reads ("Cursor not
+// found, id: …") because the proxy could route the follow-up to a different
+// node, the idle TTL could reap the cursor between calls, or cursor ids could
+// collide across shards. The bounded result set (≤ MAX_GROUPS) is exactly
+// what FT.AGGREGATE ... LIMIT 0 N is designed for, so we now issue a single-
+// shot aggregate with no cursor lifecycle.
 
-const CURSOR_PAGE = 1000;
 const MAX_GROUPS = 50000;
 const CACHE_TTL_MS = 30_000;
 
@@ -79,19 +85,8 @@ export function invalidateFacetsCache(): void {
   cache = null;
 }
 
-// FT.AGGREGATE ... WITHCURSOR / FT.CURSOR READ each return [result, cursor_id].
-// result is the standard aggregate payload [N, row1, row2, ...] where each row
-// is a flat [field, val, ...] array. Older builds occasionally elide the
-// cursor wrapper when no rows exist; we then treat the raw payload as the
-// result with cursor_id=0. Search 8 also occasionally returns just [N] on the
-// first page (no rows) and only emits rows through subsequent FT.CURSOR READs.
-function parseCursorReply(raw: unknown): { result: unknown; cursorId: number } {
-  if (Array.isArray(raw) && raw.length === 2) {
-    return { result: raw[0], cursorId: Number(raw[1]) || 0 };
-  }
-  return { result: raw, cursorId: 0 };
-}
-
+// FT.AGGREGATE returns the standard payload [N, row1, row2, ...] where each
+// row is a flat [field, val, ...] array.
 function parseAggregateRows(raw: unknown): Array<Record<string, string>> {
   if (!Array.isArray(raw) || raw.length < 2) return [];
   const out: Array<Record<string, string>> = [];
@@ -107,15 +102,6 @@ function parseAggregateRows(raw: unknown): Array<Record<string, string>> {
     out.push(m);
   }
   return out;
-}
-
-async function deleteCursor(redis: RedisLike, cursorId: number): Promise<void> {
-  if (cursorId === 0) return;
-  try {
-    await redis.call("FT.CURSOR", "DEL", "idx:sens", String(cursorId));
-  } catch {
-    /* best-effort cleanup */
-  }
 }
 
 function isUnknownIndexError(err: unknown): boolean {
@@ -160,10 +146,12 @@ export function registerFacetsRoute(
     const redis = getRedis();
     const target_label = getActiveTarget().label;
 
-    const rows: Array<Record<string, string>> = [];
-    let cursorId = 0;
+    let rows: Array<Record<string, string>> = [];
     try {
-      const first = await redis.call(
+      // Single-shot bounded aggregate. MAX_GROUPS caps the result set the
+      // same way the previous cursor-drain did, but without the proxy /
+      // cluster-routing failure modes of the follow-up cursor reads.
+      const reply = await redis.call(
         "FT.AGGREGATE",
         "idx:sens",
         "*",
@@ -177,32 +165,14 @@ export function registerFacetsRoute(
         "0",
         "AS",
         "n",
-        "WITHCURSOR",
-        "COUNT",
-        String(CURSOR_PAGE),
+        "LIMIT",
+        "0",
+        String(MAX_GROUPS),
         "DIALECT",
         "2",
       );
-      const parsed = parseCursorReply(first);
-      cursorId = parsed.cursorId;
-      for (const r of parseAggregateRows(parsed.result)) rows.push(r);
-
-      while (cursorId !== 0 && rows.length < MAX_GROUPS) {
-        const next = await redis.call(
-          "FT.CURSOR",
-          "READ",
-          "idx:sens",
-          String(cursorId),
-          "COUNT",
-          String(CURSOR_PAGE),
-        );
-        const np = parseCursorReply(next);
-        cursorId = np.cursorId;
-        for (const r of parseAggregateRows(np.result)) rows.push(r);
-      }
+      rows = parseAggregateRows(reply);
     } catch (err) {
-      await deleteCursor(redis, cursorId);
-      cursorId = 0;
       const ms = Math.round((Number(process.hrtime.bigint() - t0) / 1e6) * 1000) / 1000;
       // The spec asks for a 200 empty-index shape when idx:sens is missing,
       // overriding the 412 translateRedisError would otherwise return.
@@ -220,10 +190,6 @@ export function registerFacetsRoute(
       }
       throw err;
     }
-
-    // Drained successfully; close out a still-open cursor when we bailed on
-    // the MAX_GROUPS guard rather than reading to completion.
-    await deleteCursor(redis, cursorId);
 
     const ms = Math.round((Number(process.hrtime.bigint() - t0) / 1e6) * 1000) / 1000;
 
