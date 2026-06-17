@@ -110,6 +110,71 @@ describe("GET /readyz — bootstrap-gated (formerly /healthz, Wave 5.14b.1)", ()
   });
 });
 
+// Wave 6.26 — /readyz must ALSO refuse to flip green until the runtime
+// pool's sockets are writable. Pre-6.26 the boot-protection client was the
+// only gate; the runtime pool is built lazily (lazyConnect + offlineQueue
+// off) so the first 3-5 calls after a restart raced the TLS handshake and
+// surfaced `ReplyError: Stream isn't writeable`. The probe runs a cheap
+// PING per slot, cached 250ms; /readyz returns 503 with
+// `runtime-pool-not-ready` until every probe resolves ok.
+describe("GET /readyz — runtime-pool readiness probe (Wave 6.26)", () => {
+  let app: Awaited<ReturnType<typeof createServer>>;
+
+  beforeEach(() => {
+    resetBootstrapStatusForTests();
+    markBootstrapReady();
+  });
+
+  afterEach(async () => {
+    if (app) await app.close();
+    resetBootstrapStatusForTests();
+  });
+
+  it("returns 503 + runtime-pool-not-ready when the probe rejects (even with bootstrap ready)", async () => {
+    app = await createServer({
+      readinessProbe: async () => ({ ok: false, err: "Stream isn't writeable" }),
+    });
+    const res = await app.inject({ method: "GET", url: "/readyz" });
+    expect(res.statusCode).toBe(503);
+    const body = res.json();
+    expect(body.status).toBe("runtime-pool-not-ready");
+    expect(body.err).toContain("Stream isn't writeable");
+  });
+
+  it("returns 200 once the runtime probe resolves ok", async () => {
+    app = await createServer({
+      readinessProbe: async () => ({ ok: true }),
+    });
+    const res = await app.inject({ method: "GET", url: "/readyz" });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ service: "api", status: "ok", bootstrap: "ready" });
+  });
+
+  it("still surfaces bootstrap-failed before reaching the runtime probe (probe must not run when boot isn't ok)", async () => {
+    let probeCalled = false;
+    resetBootstrapStatusForTests();
+    app = await createServer({
+      readinessProbe: async () => { probeCalled = true; return { ok: true }; },
+    });
+    const res = await app.inject({ method: "GET", url: "/readyz" });
+    expect(res.statusCode).toBe(503);
+    expect(res.json()).toEqual({ status: "bootstrap-failed" });
+    expect(probeCalled).toBe(false);
+  });
+
+  it("skips the runtime probe when opts.redis (fake redis) is wired so the legacy contract holds", async () => {
+    // opts.redis means the routes use a fake Redis, not the real runtime
+    // pool — pinging the real pool would talk to a Redis the test isn't
+    // running. The /readyz gate must therefore be boot-status-only when
+    // a fake is injected. Regression guard for the existing health.test
+    // suite invariants (b)/(c)/(d).
+    app = await createServer({ redis: fakeRedis() });
+    const res = await app.inject({ method: "GET", url: "/readyz" });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ service: "api", status: "ok", bootstrap: "ready" });
+  });
+});
+
 describe("GET /redis/active-target", () => {
   let app: Awaited<ReturnType<typeof createServer>>;
 

@@ -152,6 +152,26 @@ function getPoolDrainGraceMs(): number {
 // window elapses.
 const drainingClients = new Set<Redis>();
 
+// Wave 6.26 — `/readyz` runtime-pool readiness probe state.
+//
+// Background: the boot-protection client (`cachedBootClient`) finishes its
+// handshake during `bootstrapFrtb()`, and `markBootstrapReady()` flips the
+// `/readyz` gate on that signal. The runtime pool members below, however,
+// are built lazily on first `acquireFromPool(...)` and use
+// `enableOfflineQueue:false` + `maxRetriesPerRequest:1` — so the very first
+// request after `/readyz` reports ready can land on a member whose TCP/TLS
+// handshake (or cluster topology discovery) hasn't completed and surface as
+// `ReplyError: Stream isn't writeable`. The probe below issues a single
+// `PING` per slot in each pool, caches the verdict for 250ms (so /readyz
+// polling at >4Hz cannot hammer Redis), and de-dups concurrent invocations
+// behind a single in-flight Promise. `setActiveTarget` / `resetActiveTarget`
+// clear the cache so a profile switch can't keep a stale `ok:true` alive.
+const RUNTIME_READINESS_CACHE_MS = 250;
+interface RuntimeReadinessVerdict { ok: boolean; err?: string; }
+interface RuntimeReadinessCache extends RuntimeReadinessVerdict { ts: number; }
+let runtimeReadinessCache: RuntimeReadinessCache | null = null;
+let runtimeReadinessInFlight: Promise<RuntimeReadinessVerdict> | null = null;
+
 // Test seam: replaces the per-member `Redis` factory so unit tests can drive
 // pool behaviour (round-robin distribution, recycle on simulated timeout,
 // independent pools) without opening real sockets. Production keeps this null
@@ -220,6 +240,12 @@ export function setActiveTarget(t: ActiveTarget, creds?: ActiveTargetCreds): voi
   // immediately so the very next acquisition routes to a freshly built client
   // against the new target — no traffic lands on the draining socket.
   detachPoolMembersForSwap();
+  // Wave 6.26 — a profile switch tears down every pool slot's socket; the
+  // last cached PING verdict refers to those now-gone clients and would let
+  // /readyz lie green during the brief window before the new sockets finish
+  // their TLS handshake / cluster-topology discovery on the new target.
+  runtimeReadinessCache = null;
+  runtimeReadinessInFlight = null;
   for (const fn of listeners) {
     try { fn(override); } catch { /* listener errors must not break the setter */ }
   }
@@ -275,6 +301,10 @@ export function resetActiveTarget(): void {
   }
   cachedBootClient = null;
   cachedBootClientKey = "";
+  // Wave 6.26 — discard any cached runtime-pool readiness verdict so the
+  // next /readyz probe issues fresh PINGs against the rebuilt pools.
+  runtimeReadinessCache = null;
+  runtimeReadinessInFlight = null;
   // Wave 6.21 — tear down every pool member; subsequent acquisitions rebuild
   // lazily against the (now-default) target. No drain grace here: this path
   // is test-teardown / process shutdown, where prompt cleanup matters more
@@ -636,6 +666,54 @@ export function getPoolMemberInfo(
   const m = pool.members[index];
   if (!m) return null;
   return { id: m.id, createdAt: m.createdAt, generation: m.generation };
+}
+
+// Wave 6.26 — probe every runtime-pool member with a cheap `PING` so /readyz
+// can refuse to flip green until the pool sockets are actually writable
+// (handshake complete, cluster topology discovered). `acquireFromPool`
+// rotates `rrIndex` per call, so issuing `poolSize` acquisitions in
+// sequence hits each slot once; the lazy `client.connect()` triggered by
+// the first PING is what surfaces the "Stream isn't writeable" the runtime
+// pool was raising on the first 3-5 calls after a fresh restart. The
+// verdict is cached for `RUNTIME_READINESS_CACHE_MS` and concurrent calls
+// share a single in-flight Promise so /readyz polling cannot stampede.
+export async function probeRuntimeRedisReadiness(): Promise<RuntimeReadinessVerdict> {
+  const now = Date.now();
+  if (runtimeReadinessCache && now - runtimeReadinessCache.ts < RUNTIME_READINESS_CACHE_MS) {
+    return runtimeReadinessCache.err !== undefined
+      ? { ok: runtimeReadinessCache.ok, err: runtimeReadinessCache.err }
+      : { ok: runtimeReadinessCache.ok };
+  }
+  if (runtimeReadinessInFlight) return runtimeReadinessInFlight;
+  runtimeReadinessInFlight = (async () => {
+    try {
+      for (const category of ["heavy", "light"] as const) {
+        const size = getRuntimePoolSize(category);
+        for (let i = 0; i < size; i++) {
+          const c = getActiveRedisRuntimeClient(category);
+          if (!c) throw new Error(`no active runtime client (${category})`);
+          await c.ping();
+        }
+      }
+      runtimeReadinessCache = { ts: Date.now(), ok: true };
+      return { ok: true };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      runtimeReadinessCache = { ts: Date.now(), ok: false, err: msg };
+      return { ok: false, err: msg };
+    } finally {
+      runtimeReadinessInFlight = null;
+    }
+  })();
+  return runtimeReadinessInFlight;
+}
+
+// Test seam — drop the cached readiness verdict so the next probe runs
+// fresh PINGs. Used by /readyz unit tests that flip mocked outcomes
+// between cases.
+export function __resetRuntimeReadinessCacheForTests(): void {
+  runtimeReadinessCache = null;
+  runtimeReadinessInFlight = null;
 }
 
 export function getActiveTarget(): ActiveTarget {

@@ -9,6 +9,7 @@ import {
   onActiveTargetChange,
   getActiveRedisClient,
   getActiveRedisRuntimeClient,
+  probeRuntimeRedisReadiness,
   type ActiveTarget,
   type RuntimeCategory,
 } from "./active-target.ts";
@@ -128,6 +129,14 @@ export interface CreateServerOpts {
   // ui container's host-mapped port. Threaded as an option so tests can
   // exercise restrictive and permissive lists without poking process.env.
   allowedOrigins?: string;
+  // Wave 6.26 — override the runtime-pool readiness probe used by /readyz.
+  // Production leaves this unset and the handler defaults to the real
+  // `probeRuntimeRedisReadiness()` from active-target.ts (PING-based, 250ms
+  // cached). When a test injects `opts.redis` or `opts.getRedis` the runtime
+  // pool is bypassed entirely, so the probe is skipped to preserve the
+  // legacy /readyz contract (boot-status-only) those tests assert against.
+  // Tests that want to exercise the new probe gate pass a fake here.
+  readinessProbe?: () => Promise<{ ok: boolean; err?: string }>;
 }
 
 // Wave 5.16g — parse the ALLOWED_ORIGINS env-var pattern used by the demo
@@ -205,6 +214,18 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
   app.get("/healthz", { config: { category: "light" } }, async () => {
     return { service: "api", status: "alive" };
   });
+  // Wave 6.26 — pick the readiness probe used by /readyz below.
+  //   * Explicit `opts.readinessProbe` always wins (tests of the gate).
+  //   * Tests that wire `opts.redis` or `opts.getRedis` route around the
+  //     real runtime pool, so the probe would attempt PINGs against a real
+  //     Redis that the test isn't running. Skip in that case — the
+  //     pre-6.26 boot-status-only behaviour stays the test contract.
+  //   * Production: default to the real runtime-pool probe so /readyz
+  //     refuses to flip green until heavy + light pool sockets are
+  //     writable (see the diagnosis comment on `probeRuntimeRedisReadiness`).
+  const readinessProbe: (() => Promise<{ ok: boolean; err?: string }>) | null =
+    opts.readinessProbe
+      ?? ((opts.redis || opts.getRedis) ? null : probeRuntimeRedisReadiness);
   app.get("/readyz", { config: { category: "light" } }, async (_req, reply) => {
     const s = getBootstrapStatus();
     if (!s.ok) {
@@ -213,6 +234,15 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
       if (s.err) body.err = s.err;
       if (s.reason) body.reason = s.reason;
       return body;
+    }
+    if (readinessProbe) {
+      const r = await readinessProbe();
+      if (!r.ok) {
+        reply.code(503);
+        const body: Record<string, string> = { status: "runtime-pool-not-ready" };
+        if (r.err) body.err = r.err;
+        return body;
+      }
     }
     return { service: "api", status: "ok", bootstrap: "ready" };
   });
