@@ -60,6 +60,8 @@ COMMAND=""
 # forwarded to one-shot tools (e.g. `start generator -- --rows 50`).
 START_TARGET=""
 EXTRA_ARGS=()
+# Wave 6.18d — optional single-target for `reconcile` (empty = all services).
+RECONCILE_TARGET=""
 
 # ---------------------------------------------------------------------------
 # Colour primitives (mirrors deploy-bare-metal.sh init_colours).
@@ -199,6 +201,50 @@ pid_age() {
   out="$(ps -o etime= -p "${pid}" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
   [[ -z "${out}" ]] && out='-'
   echo "${out}"
+}
+
+# Wave 6.18d — classify the operational state of one service by reconciling
+# pidfile ↔ live PID ↔ port owner. Echoes exactly one token:
+#   running:<pid>   pidfile PID alive and the port is bound (by it or a child).
+#   hung:<pid>      pidfile PID alive but the port is NOT bound (wedged before listen()).
+#   orphan:<lpid>   pidfile PID dead, port held by a different live PID.
+#   foreign:<lpid>  no pidfile at all, port held by a foreign live PID.
+#   dead:<pid>      pidfile PID dead AND port free (truly stale pidfile).
+#   stopped         no pidfile and port free.
+# Callers parse with ${state%%:*} / ${state##*:}. Centralising this here keeps
+# pid_cell / age_cell / spawn_service / stop_service / reconcile in lockstep.
+svc_state() {
+  local svc="$1" port="${2:-}"
+  local pidf pid lpid=''
+  pidf="$(pid_file "${svc}")"
+  pid=''
+  if [[ -f "${pidf}" ]]; then
+    pid="$(tr -d '[:space:]' < "${pidf}" 2>/dev/null || echo '')"
+  fi
+  if [[ -n "${port}" ]]; then
+    lpid="$(listening_pid_on "${port}")"
+  fi
+  if [[ -n "${pid}" ]] && pid_alive "${pid}"; then
+    if [[ -n "${lpid}" ]]; then
+      echo "running:${pid}"
+    else
+      echo "hung:${pid}"
+    fi
+    return 0
+  fi
+  if [[ -n "${lpid}" ]]; then
+    if [[ -n "${pid}" ]]; then
+      echo "orphan:${lpid}"
+    else
+      echo "foreign:${lpid}"
+    fi
+    return 0
+  fi
+  if [[ -n "${pid}" ]]; then
+    echo "dead:${pid}"
+  else
+    echo "stopped"
+  fi
 }
 
 
@@ -414,6 +460,14 @@ spawn_service() {
     fi
     rm -f "${pidf}"
   fi
+  # Wave 6.18d — refuse to spawn into a port already held by a foreign PID.
+  # Without this we'd spawn a child that fails to bind and silently exits,
+  # leaving the operator staring at dead:PID while the orphan keeps the port.
+  local fpid; fpid="$(listening_pid_on "${port}")"
+  if [[ -n "${fpid}" ]]; then
+    fail "${svc}: port ${port} held by foreign pid ${fpid}; run \`${SCRIPT_NAME} reconcile ${svc}\` first"
+    return 1
+  fi
   # Boot marker (append, never truncate).
   printf '\n[boot] %s svc=%s port=%s ppid=%s\n' \
     "$(date -u +%FT%TZ 2>/dev/null || date)" "${svc}" "${port}" "$$" >> "${logf}"
@@ -498,15 +552,49 @@ wait_for_health() {
 }
 
 # Stop one service. SIGTERM, wait STOP_GRACE_S, SIGKILL if needed. Idempotent.
+# Wave 6.18d — also kills the foreign listener when the pidfile is dead but
+# the port is still bound (so `stop` truly stops the service).
 stop_service() {
   local svc="$1"
   local pidf; pidf="$(pid_file "${svc}")"
+  local port=''
+  port="$(svc_port_for "${svc}" 2>/dev/null || echo '')"
+  local pid=''
+  if [[ -f "${pidf}" ]]; then
+    pid="$(tr -d '[:space:]' < "${pidf}" 2>/dev/null || echo '')"
+  fi
+  # Wave 6.18d — orphan path: pidfile is missing/dead AND something else is
+  # listening on this service's port. Tear down the orphan with TERM→KILL.
+  local fpid=''
+  if [[ -n "${port}" ]] && { [[ -z "${pid}" ]] || ! pid_alive "${pid}"; }; then
+    fpid="$(listening_pid_on "${port}")"
+  fi
+  if [[ -n "${fpid}" ]]; then
+    warn "  ${svc}: orphan listener pid ${fpid} on port ${port}; sending SIGTERM"
+    kill -TERM "${fpid}" 2>/dev/null || true
+    local k=0
+    while (( k < STOP_GRACE_S * 2 )) && pid_alive "${fpid}"; do
+      sleep 0.5
+      k=$(( k + 1 ))
+    done
+    if pid_alive "${fpid}"; then
+      warn "  ${svc}: orphan pid ${fpid} ignored SIGTERM, sending SIGKILL"
+      kill -KILL "${fpid}" 2>/dev/null || true
+      sleep 0.5
+    fi
+    if pid_alive "${fpid}"; then
+      fail "  ${svc}: orphan pid ${fpid} did not exit"
+      rm -f "${pidf}" 2>/dev/null || true
+      return 1
+    fi
+    ok "  ${svc}: killed orphan pid ${fpid}"
+    rm -f "${pidf}" 2>/dev/null || true
+    return 0
+  fi
   if [[ ! -f "${pidf}" ]]; then
     info "  ${svc}: no pidfile (already stopped)"
     return 0
   fi
-  local pid
-  pid="$(tr -d '[:space:]' < "${pidf}" 2>/dev/null || echo '')"
   if [[ -z "${pid}" ]] || ! pid_alive "${pid}"; then
     info "  ${svc}: stale pidfile (pid ${pid:-?} not alive), cleaning up"
     rm -f "${pidf}"
@@ -552,33 +640,31 @@ health_cell() {
   esac
 }
 
+# Wave 6.18d — pid_cell now reflects the reconciled svc_state so it can show
+# orphan:PID (red) and hung:PID (yellow) in addition to the existing
+# running:PID (green) and dead:PID (red, kept ONLY when port is also free).
 pid_cell() {
-  local svc="$1" pidf pid
-  pidf="$(pid_file "${svc}")"
-  if [[ ! -f "${pidf}" ]]; then
-    printf '%s%-11s%s' "${C_DIM}" "-" "${C_RESET}"
-    return 0
-  fi
-  pid="$(tr -d '[:space:]' < "${pidf}" 2>/dev/null || echo '')"
-  if [[ -z "${pid}" ]]; then
-    printf '%s%-11s%s' "${C_DIM}" "-" "${C_RESET}"
-  elif pid_alive "${pid}"; then
-    printf '%s%-11s%s' "${C_GREEN}" "${pid}" "${C_RESET}"
-  else
-    printf '%s%-11s%s' "${C_RED}" "dead:${pid}" "${C_RESET}"
-  fi
+  local svc="$1" port="${2:-}"
+  local state; state="$(svc_state "${svc}" "${port}")"
+  case "${state}" in
+    running:*) printf '%s%-11s%s' "${C_GREEN}"  "${state#running:}" "${C_RESET}" ;;
+    hung:*)    printf '%s%-11s%s' "${C_YELLOW}" "${state}"          "${C_RESET}" ;;
+    orphan:*)  printf '%s%-11s%s' "${C_RED}"    "${state}"          "${C_RESET}" ;;
+    dead:*)    printf '%s%-11s%s' "${C_RED}"    "${state}"          "${C_RESET}" ;;
+    foreign:*) printf '%s%-11s%s' "${C_RED}"    "${state}"          "${C_RESET}" ;;
+    *)         printf '%s%-11s%s' "${C_DIM}"    "-"                 "${C_RESET}" ;;
+  esac
 }
 
 age_cell() {
-  local svc="$1" pidf pid
-  pidf="$(pid_file "${svc}")"
-  [[ -f "${pidf}" ]] || { printf '%s%-11s%s' "${C_DIM}" "-" "${C_RESET}"; return 0; }
-  pid="$(tr -d '[:space:]' < "${pidf}" 2>/dev/null || echo '')"
-  if [[ -z "${pid}" ]] || ! pid_alive "${pid}"; then
-    printf '%s%-11s%s' "${C_DIM}" "-" "${C_RESET}"
-    return 0
-  fi
-  printf '%-11s' "$(pid_age "${pid}")"
+  local svc="$1" port="${2:-}"
+  local state; state="$(svc_state "${svc}" "${port}")"
+  case "${state}" in
+    running:*|hung:*|orphan:*|foreign:*)
+      printf '%-11s' "$(pid_age "${state##*:}")" ;;
+    *)
+      printf '%s%-11s%s' "${C_DIM}" "-" "${C_RESET}" ;;
+  esac
 }
 
 print_status_table() {
@@ -586,12 +672,14 @@ print_status_table() {
   header="${C_BOLD}Service     | PID         | Age         | Port  | /healthz${C_RESET}"
   sep='------------+-------------+-------------+-------+------------------'
   printf '%s\n%s\n' "${header}" "${sep}"
-  local i=0 all_healthy=1
+  local i=0 all_healthy=1 need_reconcile=0
   while [[ $i -lt ${#SERVICES[@]} ]]; do
     local svc="${SERVICES[$i]}" port="${PORTS[$i]}"
-    local pid_s age_s health_s
-    pid_s="$(pid_cell "${svc}")"
-    age_s="$(age_cell "${svc}")"
+    local pid_s age_s health_s state
+    state="$(svc_state "${svc}" "${port}")"
+    case "${state}" in hung:*|orphan:*) need_reconcile=1 ;; esac
+    pid_s="$(pid_cell "${svc}" "${port}")"
+    age_s="$(age_cell "${svc}" "${port}")"
     health_s="$(health_cell "${port}")"
     if ! health_probe "${port}"; then
       all_healthy=0
@@ -599,6 +687,11 @@ print_status_table() {
     printf '%-11s | %s | %s | %-5s | %s\n' "${svc}" "${pid_s}" "${age_s}" "${port}" "${health_s}"
     i=$(( i + 1 ))
   done
+  # Wave 6.18d — footer hint when at least one service is wedged or orphaned.
+  if [[ "${need_reconcile}" == "1" ]]; then
+    printf '\n%shung/orphan states detected — run: %s reconcile%s\n' \
+      "${C_YELLOW}" "${SCRIPT_NAME}" "${C_RESET}"
+  fi
   return $(( 1 - all_healthy ))
 }
 
@@ -786,10 +879,15 @@ doctor_check() {
 }
 
 # Return the PID currently listening on the given TCP port, or empty if free.
+# Wave 6.18d — prefer `lsof` (portable: macOS + Linux); fall back to `ss` only
+# when lsof is missing so the script keeps working on stripped-down Linux VMs.
 listening_pid_on() {
   local port="$1" out=''
   if command -v lsof >/dev/null 2>&1; then
     out="$(lsof -nP -iTCP:"${port}" -sTCP:LISTEN -t 2>/dev/null | head -n1)"
+  elif command -v ss >/dev/null 2>&1; then
+    out="$(ss -tlnpH "( sport = :${port} )" 2>/dev/null \
+      | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -n1)"
   fi
   echo "${out}"
 }
@@ -887,6 +985,21 @@ cmd_doctor() {
     fi
     i=$(( i + 1 ))
   done
+  # Wave 6.18d — flag hung/orphan states the per-port check above doesn't catch
+  # (hung = pidfile alive but port not bound; orphan check below complements the
+  # "foreign pid" message above with a clearer pointer to `reconcile`).
+  local h=0
+  while [[ $h -lt ${#SERVICES[@]} ]]; do
+    local hsvc="${SERVICES[$h]}" hport="${PORTS[$h]}"
+    local hstate; hstate="$(svc_state "${hsvc}" "${hport}")"
+    case "${hstate}" in
+      hung:*)
+        doctor_check "service ${hsvc} liveness"  fail "${hstate} — process alive but port ${hport} not bound; run \`${SCRIPT_NAME} reconcile ${hsvc}\`" ;;
+      orphan:*)
+        doctor_check "service ${hsvc} liveness"  fail "${hstate} — pidfile dead, port ${hport} held; run \`${SCRIPT_NAME} reconcile ${hsvc}\`" ;;
+    esac
+    h=$(( h + 1 ))
+  done
   # Wave 6.05 — informational: does the built UI bundle bypass the same-origin
   # /api proxy by hard-coding http://localhost:8080? Never fails; skipped when
   # the dist hasn't been built.
@@ -904,6 +1017,100 @@ cmd_doctor() {
   fi
   fail "doctor: one or more checks failed"
   exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Wave 6.18d — reconcile pidfile ↔ live PID ↔ port owner for one service.
+# Idempotent: safe to re-run. Returns 0 on success (incl. "nothing to do").
+# Side-effects per state:
+#   hung:<pid>      SIGTERM → wait STOP_GRACE_S → SIGKILL <pid>; clear pidfile.
+#   orphan:<lpid>   Same TERM→KILL pattern on the listening PID; clear pidfile.
+#   dead:<pid>      Clear stale pidfile (no PID to kill).
+#   running:*|stopped|foreign:*  Print "nothing to do".
+# ---------------------------------------------------------------------------
+reconcile_one() {
+  local svc="$1" port="${2:-}"
+  local state; state="$(svc_state "${svc}" "${port}")"
+  local pidf; pidf="$(pid_file "${svc}")"
+  local kind="${state%%:*}" target_pid="${state##*:}"
+  case "${state}" in
+    stopped|running:*)
+      info "  ${svc}: nothing to do (${state})"
+      return 0
+      ;;
+    foreign:*)
+      info "  ${svc}: nothing to do (${state}; no pidfile to clear)"
+      return 0
+      ;;
+    dead:*)
+      info "  ${svc}: cleared dead pidfile (was pid ${target_pid})"
+      rm -f "${pidf}" 2>/dev/null || true
+      return 0
+      ;;
+    hung:*|orphan:*)
+      : ;;
+    *)
+      info "  ${svc}: nothing to do (${state})"
+      return 0
+      ;;
+  esac
+  warn "  ${svc}: ${state} — sending SIGTERM to pid ${target_pid}"
+  kill -TERM "${target_pid}" 2>/dev/null || true
+  local i=0
+  while (( i < STOP_GRACE_S * 2 )) && pid_alive "${target_pid}"; do
+    sleep 0.5
+    i=$(( i + 1 ))
+  done
+  if pid_alive "${target_pid}"; then
+    warn "  ${svc}: pid ${target_pid} ignored SIGTERM, sending SIGKILL"
+    kill -KILL "${target_pid}" 2>/dev/null || true
+    sleep 0.5
+  fi
+  if pid_alive "${target_pid}"; then
+    fail "  ${svc}: pid ${target_pid} did not exit"
+    return 1
+  fi
+  ok "  ${svc}: killed ${kind} pid ${target_pid}"
+  rm -f "${pidf}" 2>/dev/null || true
+  return 0
+}
+
+cmd_reconcile() {
+  preflight_no_root
+  cd "${REPO_ROOT}" 2>/dev/null || true
+  load_env_quiet
+  resolve_ports_from_env
+  local target="${1:-all}"
+  hdr "Reconciling FRTB SBM stack (target: ${target})"
+  local any_fail=0
+  if [[ "${target}" == "all" ]]; then
+    local i=0
+    while [[ $i -lt ${#SERVICES[@]} ]]; do
+      reconcile_one "${SERVICES[$i]}" "${PORTS[$i]}" || any_fail=1
+      i=$(( i + 1 ))
+    done
+    local j=0
+    while [[ $j -lt ${#ONE_SHOT_TOOLS[@]} ]]; do
+      reconcile_one "${ONE_SHOT_TOOLS[$j]}" '' || any_fail=1
+      j=$(( j + 1 ))
+    done
+  else
+    if ! is_known_name "${target}"; then
+      fail "reconcile: unknown service '${target}'. Known: ${SERVICES[*]} ${ONE_SHOT_TOOLS[*]} all"
+      exit 2
+    fi
+    local port=''
+    if svc_index "${target}" >/dev/null 2>&1; then
+      port="$(svc_port_for "${target}")"
+    fi
+    reconcile_one "${target}" "${port}" || any_fail=1
+  fi
+  if [[ "${any_fail}" == "0" ]]; then
+    ok "reconcile: done"
+    return 0
+  fi
+  fail "reconcile: one or more services could not be reconciled"
+  return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -928,6 +1135,18 @@ Commands:
   logs <svc> [-f]    Tail .run/logs/<svc>.log. --follow / -f streams new lines.
                      Argless prints the list of known services + one-shot tools.
   doctor             Run diagnostics (Node version, env file, ports, .run/ writable).
+  reconcile [svc]    Wave 6.18d — reconcile pidfile ↔ live PID ↔ port owner.
+                     For each service in 'hung' (pidfile alive, port not bound)
+                     or 'orphan' (pidfile dead, port held by foreign PID) state:
+                     SIGTERM → SIGKILL the bad PID and clear the pidfile.
+                     'reconcile' with no arg (or 'reconcile all') reconciles all.
+                     Idempotent; safe to re-run.
+
+Status table state strings:
+  <pid>              green   — running normally (pidfile alive, port bound).
+  hung:<pid>         yellow  — pidfile alive but port NOT bound (wedged boot).
+  orphan:<pid>       red     — pidfile dead, port held by another live PID.
+  dead:<pid>         red     — pidfile dead AND port free (stale pidfile only).
 
 Options for start/restart:
   --force-install    Re-run 'npm install' even if node_modules/ exists.
@@ -986,6 +1205,26 @@ parse_args() {
         fi
         COMMAND="$1"; shift
         ;;
+      reconcile)
+        if [[ -n "${COMMAND}" ]]; then
+          fail "error: multiple commands ('${COMMAND}' and 'reconcile')"; exit 2
+        fi
+        COMMAND="reconcile"; shift
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            -h|--help) usage; exit 0 ;;
+            --)        shift; break ;;
+            -*)        fail "error: unknown option for reconcile: $1"; exit 2 ;;
+            *)
+              if [[ -z "${RECONCILE_TARGET}" ]]; then
+                RECONCILE_TARGET="$1"; shift
+              else
+                fail "error: unexpected arg for reconcile: $1"; exit 2
+              fi
+              ;;
+          esac
+        done
+        ;;
       logs)
         if [[ -n "${COMMAND}" ]]; then
           fail "error: multiple commands ('${COMMAND}' and 'logs')"; exit 2
@@ -1025,12 +1264,13 @@ main() {
     exit 2
   fi
   case "${COMMAND}" in
-    start)   cmd_start ;;
-    stop)    cmd_stop ;;
-    restart) cmd_restart ;;
-    status)  cmd_status ;;
-    logs)    cmd_logs ;;
-    doctor)  cmd_doctor ;;
+    start)     cmd_start ;;
+    stop)      cmd_stop ;;
+    restart)   cmd_restart ;;
+    status)    cmd_status ;;
+    logs)      cmd_logs ;;
+    doctor)    cmd_doctor ;;
+    reconcile) cmd_reconcile "${RECONCILE_TARGET:-all}" ;;
   esac
 }
 
