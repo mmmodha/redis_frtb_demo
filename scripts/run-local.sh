@@ -64,6 +64,13 @@ EXTRA_ARGS=()
 RECONCILE_TARGET=""
 # Wave 6.18e — optional single-target for `stop` (empty = all services).
 STOP_TARGET=""
+# Wave 6.18d/e hardening — optional single-target for `restart` (empty = all).
+RESTART_TARGET=""
+# Wave 6.18d/e hardening — SIGKILL escape hatch. Off by default; opt-in via
+# explicit `--force` flag on `stop`, `restart`, or `reconcile` (NOT on `start`).
+# When 0, stop/reconcile send SIGTERM only and report hang diagnostics instead
+# of escalating, matching the spec's no-SIGKILL operational rule.
+OPT_FORCE_KILL=0
 
 # ---------------------------------------------------------------------------
 # Colour primitives (mirrors deploy-bare-metal.sh init_colours).
@@ -192,6 +199,39 @@ pid_alive() {
   local pid="${1:-}"
   [[ -n "${pid}" ]] || return 1
   kill -0 "${pid}" 2>/dev/null
+}
+
+# Wave 6.18d/e hardening — when SIGTERM is ignored we MUST NOT escalate to
+# SIGKILL by default (spec rule). Instead, gather operator-actionable evidence
+# (ps line, port owner, log tail) and report so the human can decide whether
+# to re-run with the `--force` escape hatch.
+gather_hang_diagnostics() {
+  local svc="$1" pid="$2" port="${3:-}"
+  warn "  ${svc}: SIGTERM ignored after ${STOP_GRACE_S}s — gathering diagnostics:"
+  if command -v ps >/dev/null 2>&1; then
+    local psline
+    psline="$(ps -o pid=,ppid=,etime=,command= -p "${pid}" 2>/dev/null | sed 's/^[[:space:]]*//')"
+    if [[ -n "${psline}" ]]; then
+      info "    ps: ${psline}"
+    else
+      info "    ps: pid ${pid} not visible to ps"
+    fi
+  fi
+  if [[ -n "${port}" ]] && command -v lsof >/dev/null 2>&1; then
+    local lsofline
+    lsofline="$(lsof -nP -iTCP:"${port}" -sTCP:LISTEN 2>/dev/null | tail -n +2 | sed 's/^/    lsof: /')"
+    if [[ -n "${lsofline}" ]]; then
+      printf '%s\n' "${lsofline}"
+    else
+      info "    lsof: nothing listening on :${port}"
+    fi
+  fi
+  local lf; lf="$(log_file "${svc}")"
+  if [[ -r "${lf}" ]]; then
+    info "    log tail (${lf}):"
+    tail -n 10 "${lf}" 2>/dev/null | sed 's/^/      /' || true
+  fi
+  fail "  ${svc}: pid ${pid} did not exit after SIGTERM. Re-run with \`--force\` for manual recovery, or kill the process by hand."
 }
 
 # Process age string (mm:ss / hh:mm:ss / d-hh:mm:ss) for the status table.
@@ -553,9 +593,13 @@ wait_for_health() {
   return 1
 }
 
-# Stop one service. SIGTERM, wait STOP_GRACE_S, SIGKILL if needed. Idempotent.
+# Stop one service. SIGTERM, wait STOP_GRACE_S. Idempotent.
 # Wave 6.18d — also kills the foreign listener when the pidfile is dead but
 # the port is still bound (so `stop` truly stops the service).
+# Wave 6.18d/e hardening — SIGKILL escalation is gated behind OPT_FORCE_KILL
+# (the `--force` flag) so the default stop path is SIGTERM-only, matching the
+# spec's no-SIGKILL operational rule. Without --force a process that ignores
+# SIGTERM is reported (ps + lsof + log tail) and we return non-zero.
 stop_service() {
   local svc="$1"
   local pidf; pidf="$(pid_file "${svc}")"
@@ -566,7 +610,8 @@ stop_service() {
     pid="$(tr -d '[:space:]' < "${pidf}" 2>/dev/null || echo '')"
   fi
   # Wave 6.18d — orphan path: pidfile is missing/dead AND something else is
-  # listening on this service's port. Tear down the orphan with TERM→KILL.
+  # listening on this service's port. SIGTERM the foreign listener; with
+  # --force, follow with SIGKILL after grace.
   local fpid=''
   if [[ -n "${port}" ]] && { [[ -z "${pid}" ]] || ! pid_alive "${pid}"; }; then
     fpid="$(listening_pid_on "${port}")"
@@ -580,9 +625,14 @@ stop_service() {
       k=$(( k + 1 ))
     done
     if pid_alive "${fpid}"; then
-      warn "  ${svc}: orphan pid ${fpid} ignored SIGTERM, sending SIGKILL"
-      kill -KILL "${fpid}" 2>/dev/null || true
-      sleep 0.5
+      if [[ "${OPT_FORCE_KILL}" == "1" ]]; then
+        warn "  ${svc}: orphan pid ${fpid} ignored SIGTERM, --force set → sending SIGKILL"
+        kill -KILL "${fpid}" 2>/dev/null || true
+        sleep 0.5
+      else
+        gather_hang_diagnostics "${svc}" "${fpid}" "${port}"
+        return 1
+      fi
     fi
     if pid_alive "${fpid}"; then
       fail "  ${svc}: orphan pid ${fpid} did not exit"
@@ -609,9 +659,14 @@ stop_service() {
     i=$(( i + 1 ))
   done
   if pid_alive "${pid}"; then
-    warn "  ${svc}: SIGTERM ignored after ${STOP_GRACE_S}s, sending SIGKILL"
-    kill -KILL "${pid}" 2>/dev/null || true
-    sleep 0.5
+    if [[ "${OPT_FORCE_KILL}" == "1" ]]; then
+      warn "  ${svc}: SIGTERM ignored after ${STOP_GRACE_S}s, --force set → sending SIGKILL"
+      kill -KILL "${pid}" 2>/dev/null || true
+      sleep 0.5
+    else
+      gather_hang_diagnostics "${svc}" "${pid}" "${port}"
+      return 1
+    fi
   fi
   if pid_alive "${pid}"; then
     fail "  ${svc}: pid ${pid} did not exit"
@@ -871,6 +926,20 @@ cmd_stop_one() {
 }
 
 cmd_restart() {
+  # Wave 6.18d/e hardening — single-target restart (`restart <svc>`). Drives
+  # the existing single-target stop/start globals so the bulk path is unchanged
+  # when RESTART_TARGET is empty.
+  if [[ -n "${RESTART_TARGET}" ]]; then
+    if ! is_known_name "${RESTART_TARGET}"; then
+      fail "restart: unknown service '${RESTART_TARGET}'. Known: ${SERVICES[*]} ${ONE_SHOT_TOOLS[*]}"
+      exit 2
+    fi
+    STOP_TARGET="${RESTART_TARGET}"
+    START_TARGET="${RESTART_TARGET}"
+    cmd_stop || true
+    cmd_start
+    return $?
+  fi
   cmd_stop || true
   cmd_start
 }
@@ -1110,11 +1179,14 @@ cmd_doctor() {
 # pointed at, not just orphan/hung states left behind by our own boot.
 # Idempotent: safe to re-run. Returns 0 on success (incl. "nothing to do").
 # Side-effects per state:
-#   hung:<pid>      SIGTERM → wait STOP_GRACE_S → SIGKILL <pid>; clear pidfile.
-#   orphan:<lpid>   Same TERM→KILL pattern on the listening PID; clear pidfile.
-#   foreign:<lpid>  Same TERM→KILL pattern on the listening PID; no pidfile to clear.
+#   hung:<pid>      SIGTERM → wait STOP_GRACE_S; if still alive, report
+#                   diagnostics (re-run with --force for SIGKILL). Clear pidfile on success.
+#   orphan:<lpid>   Same SIGTERM-only pattern on the listening PID; clear pidfile.
+#   foreign:<lpid>  Same SIGTERM-only pattern on the listening PID; no pidfile to clear.
 #   dead:<pid>      Clear stale pidfile (no PID to kill).
 #   running:*|stopped  Print "nothing to do".
+# SIGKILL escalation is gated behind the explicit `--force` flag (OPT_FORCE_KILL)
+# per the spec's no-SIGKILL operational rule.
 # ---------------------------------------------------------------------------
 reconcile_one() {
   local svc="$1" port="${2:-}"
@@ -1145,10 +1217,17 @@ reconcile_one() {
     sleep 0.5
     i=$(( i + 1 ))
   done
+  # Wave 6.18d/e hardening — SIGKILL only with explicit `--force` flag. By
+  # default, hung processes get diagnostics + non-zero return (per spec rule).
   if pid_alive "${target_pid}"; then
-    warn "  ${svc}: pid ${target_pid} ignored SIGTERM, sending SIGKILL"
-    kill -KILL "${target_pid}" 2>/dev/null || true
-    sleep 0.5
+    if [[ "${OPT_FORCE_KILL}" == "1" ]]; then
+      warn "  ${svc}: pid ${target_pid} ignored SIGTERM, --force set → sending SIGKILL"
+      kill -KILL "${target_pid}" 2>/dev/null || true
+      sleep 0.5
+    else
+      gather_hang_diagnostics "${svc}" "${target_pid}" "${port}"
+      return 1
+    fi
   fi
   if pid_alive "${target_pid}"; then
     fail "  ${svc}: pid ${target_pid} did not exit"
@@ -1211,12 +1290,15 @@ Commands:
   start <svc>        Start one named service or one-shot tool. For the
                      one-shot 'generator', append '-- --rows N' to forward
                      CLI args (e.g. 'start generator -- --rows 50').
-  stop               SIGTERM each service + one-shot tool (5s grace, then
-                     SIGKILL). Idempotent.
-  stop <svc>         Stop one named service or one-shot tool. Same TERM→KILL
-                     grace as bulk stop; also clears a port held by a foreign
+  stop               SIGTERM each service + one-shot tool (5s grace). If a
+                     process ignores SIGTERM, prints diagnostics (ps, lsof,
+                     log tail) and returns non-zero — does NOT escalate to
+                     SIGKILL unless --force is passed. Idempotent.
+  stop <svc>         Stop one named service or one-shot tool. Same SIGTERM
+                     pattern as bulk stop; also clears a port held by a foreign
                      listener (orphan/foreign:PID) the same way.
   restart            stop, then start.
+  restart <svc>      Restart one named service or one-shot tool.
   status             Print the live status table for long-running services;
                      also lists one-shot tools with running/idle state.
   logs <svc> [-f]    Tail .run/logs/<svc>.log. --follow / -f streams new lines.
@@ -1226,7 +1308,9 @@ Commands:
                      For each service in 'hung' (pidfile alive, port not bound),
                      'orphan' (pidfile dead, port held by foreign PID), or
                      'foreign' (no pidfile, port held by foreign PID) state:
-                     SIGTERM → SIGKILL the bad PID and clear the pidfile.
+                     SIGTERM the bad PID and clear the pidfile. Without
+                     --force, processes that ignore SIGTERM are reported with
+                     diagnostics rather than escalated to SIGKILL.
                      'reconcile' with no arg (or 'reconcile all') reconciles all.
                      Idempotent; safe to re-run.
 
@@ -1234,11 +1318,19 @@ Status table state strings:
   <pid>              green   — running normally (pidfile alive, port bound).
   hung:<pid>         yellow  — pidfile alive but port NOT bound (wedged boot).
   orphan:<pid>       red     — pidfile dead, port held by another live PID.
+  foreign:<pid>      red     — no pidfile, port held by a foreign live PID.
   dead:<pid>         red     — pidfile dead AND port free (stale pidfile only).
 
 Options for start/restart:
   --force-install    Re-run 'npm install' even if node_modules/ exists.
   --force-build      Re-run the UI build even if services/ui/dist/ exists.
+
+Options for stop/restart/reconcile (SIGKILL escape hatch — opt-in only):
+  --force            Allow SIGKILL escalation if a process ignores SIGTERM
+                     after the ${STOP_GRACE_S}s grace. NOT part of the normal
+                     start/stop/restart path — only use for manual recovery
+                     when the operator has read the diagnostics and explicitly
+                     wants to hard-kill a hung process.
 
 One-shot tools (NOT started by bare 'start'; invoke explicitly):
   generator          Synthetic FRTB sensitivity producer; pushes rows into
@@ -1293,9 +1385,11 @@ parse_args() {
         fi
         COMMAND="stop"; shift
         # Wave 6.18e — `stop` accepts an optional positional <svc>.
+        # Wave 6.18d/e hardening — `--force` opt-in enables SIGKILL escalation.
         while [[ $# -gt 0 ]]; do
           case "$1" in
             -h|--help) usage; exit 0 ;;
+            --force)   OPT_FORCE_KILL=1; shift ;;
             --)        shift; break ;;
             -*)        fail "error: unknown option for stop: $1"; exit 2 ;;
             *)
@@ -1308,7 +1402,33 @@ parse_args() {
           esac
         done
         ;;
-      restart|status|doctor)
+      restart)
+        if [[ -n "${COMMAND}" ]]; then
+          fail "error: multiple commands ('${COMMAND}' and 'restart')"; exit 2
+        fi
+        COMMAND="restart"; shift
+        # Wave 6.18d/e hardening — `restart` accepts an optional positional
+        # <svc> (drives both the stop and start single-target paths) and the
+        # `--force` SIGKILL opt-in for the stop half.
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            -h|--help)       usage; exit 0 ;;
+            --force)         OPT_FORCE_KILL=1; shift ;;
+            --force-install) OPT_FORCE_INSTALL=1; shift ;;
+            --force-build)   OPT_FORCE_BUILD=1;   shift ;;
+            --)              shift; break ;;
+            -*)              fail "error: unknown option for restart: $1"; exit 2 ;;
+            *)
+              if [[ -z "${RESTART_TARGET}" ]]; then
+                RESTART_TARGET="$1"; shift
+              else
+                fail "error: unexpected arg for restart: $1"; exit 2
+              fi
+              ;;
+          esac
+        done
+        ;;
+      status|doctor)
         if [[ -n "${COMMAND}" ]]; then
           fail "error: multiple commands ('${COMMAND}' and '$1')"; exit 2
         fi
@@ -1319,9 +1439,12 @@ parse_args() {
           fail "error: multiple commands ('${COMMAND}' and 'reconcile')"; exit 2
         fi
         COMMAND="reconcile"; shift
+        # Wave 6.18d/e hardening — `--force` opt-in enables SIGKILL escalation
+        # for hung/orphan/foreign listeners that ignore SIGTERM.
         while [[ $# -gt 0 ]]; do
           case "$1" in
             -h|--help) usage; exit 0 ;;
+            --force)   OPT_FORCE_KILL=1; shift ;;
             --)        shift; break ;;
             -*)        fail "error: unknown option for reconcile: $1"; exit 2 ;;
             *)
