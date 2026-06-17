@@ -62,6 +62,8 @@ START_TARGET=""
 EXTRA_ARGS=()
 # Wave 6.18d — optional single-target for `reconcile` (empty = all services).
 RECONCILE_TARGET=""
+# Wave 6.18e — optional single-target for `stop` (empty = all services).
+STOP_TARGET=""
 
 # ---------------------------------------------------------------------------
 # Colour primitives (mirrors deploy-bare-metal.sh init_colours).
@@ -698,6 +700,60 @@ print_status_table() {
 # ---------------------------------------------------------------------------
 # Subcommands
 # ---------------------------------------------------------------------------
+# Wave 6.18e — single-target spawn for `start <svc>` and `start <tool>`. Runs
+# the same preflight/build gates as the bulk-start loop and reuses
+# spawn_service (which carries the foreign-pid boot guard from 6.18d) so the
+# single-target path stays in lockstep with the bulk path.
+cmd_start_one() {
+  local target="$1"; shift || true
+  if ! is_known_name "${target}"; then
+    fail "start: unknown service '${target}'. Known: ${SERVICES[*]} ${ONE_SHOT_TOOLS[*]}"
+    exit 2
+  fi
+  preflight
+  load_env
+  apply_defaults
+  resolve_ports_from_env
+  ensure_run_dirs
+  ensure_deps || exit 1
+  if [[ "${target}" == "ui" ]]; then
+    ensure_ui_build || exit 1
+  fi
+  if is_one_shot_tool "${target}"; then
+    hdr "Starting one-shot tool: ${target}"
+    if ! spawn_one_shot "${target}" "$@"; then
+      fail "  ${target}: spawn failed"
+      exit 1
+    fi
+    local tpidf; tpidf="$(pid_file "${target}")"
+    local tpid; tpid="$(tr -d '[:space:]' < "${tpidf}" 2>/dev/null || echo '?')"
+    ok "  ${target}: launched (pid ${tpid}); tail $(log_file "${target}") for progress"
+    exit 0
+  fi
+  local port; port="$(svc_port_for "${target}")"
+  hdr "Starting ${target} (port ${port})"
+  if ! spawn_service "${target}" "${port}"; then
+    fail "  ${target}: spawn failed"
+    exit 1
+  fi
+  local result; result="$(wait_for_health "${target}" "${port}")"
+  case "${result}" in
+    ok)
+      local pid; pid="$(tr -d '[:space:]' < "$(pid_file "${target}")" 2>/dev/null || echo '?')"
+      ok "  ${target}: healthy (pid ${pid})"
+      exit 0
+      ;;
+    timeout)
+      warn "  ${target}: /healthz not 200 after ${HEALTH_TIMEOUT_S}s — continuing; see $(log_file "${target}")"
+      exit 1
+      ;;
+    dead)
+      fail "  ${target}: process died before /healthz responded — see $(log_file "${target}")"
+      exit 1
+      ;;
+  esac
+}
+
 cmd_start() {
   # Wave 5.80 — single-target invocation (`start <svc>` or `start <tool>`)
   # dispatches to cmd_start_one and never touches the bulk-start loop.
@@ -758,6 +814,12 @@ cmd_start() {
 }
 
 cmd_stop() {
+  # Wave 6.18e — single-target invocation (`stop <svc>`) dispatches to
+  # cmd_stop_one and never touches the bulk-stop loop.
+  if [[ -n "${STOP_TARGET}" ]]; then
+    cmd_stop_one "${STOP_TARGET}"
+    return $?
+  fi
   preflight_no_root
   cd "${REPO_ROOT}" 2>/dev/null || true
   hdr "Stopping FRTB SBM stack"
@@ -781,6 +843,28 @@ cmd_stop() {
   done
   if [[ "${any_fail}" == "0" ]]; then
     ok "Stack stopped."
+    return 0
+  fi
+  return 1
+}
+
+# Wave 6.18e — single-target stop. Delegates to stop_service which already
+# carries the orphan/foreign-listener TERM→KILL pattern (same path the bulk
+# stop loop uses), so `stop <svc>` reclaims a port held by a foreign PID just
+# like `stop` with no args does for the catalogue as a whole.
+cmd_stop_one() {
+  local target="$1"
+  if ! is_known_name "${target}"; then
+    fail "stop: unknown service '${target}'. Known: ${SERVICES[*]} ${ONE_SHOT_TOOLS[*]}"
+    exit 2
+  fi
+  preflight_no_root
+  cd "${REPO_ROOT}" 2>/dev/null || true
+  load_env_quiet
+  resolve_ports_from_env
+  hdr "Stopping ${target}"
+  if stop_service "${target}"; then
+    ok "${target}: stop complete."
     return 0
   fi
   return 1
@@ -1021,12 +1105,16 @@ cmd_doctor() {
 
 # ---------------------------------------------------------------------------
 # Wave 6.18d — reconcile pidfile ↔ live PID ↔ port owner for one service.
+# Wave 6.18e — also act on foreign:<lpid> (no pidfile, port held by a foreign
+# live PID) so `reconcile <svc>` can clear a stray listener the operator never
+# pointed at, not just orphan/hung states left behind by our own boot.
 # Idempotent: safe to re-run. Returns 0 on success (incl. "nothing to do").
 # Side-effects per state:
 #   hung:<pid>      SIGTERM → wait STOP_GRACE_S → SIGKILL <pid>; clear pidfile.
 #   orphan:<lpid>   Same TERM→KILL pattern on the listening PID; clear pidfile.
+#   foreign:<lpid>  Same TERM→KILL pattern on the listening PID; no pidfile to clear.
 #   dead:<pid>      Clear stale pidfile (no PID to kill).
-#   running:*|stopped|foreign:*  Print "nothing to do".
+#   running:*|stopped  Print "nothing to do".
 # ---------------------------------------------------------------------------
 reconcile_one() {
   local svc="$1" port="${2:-}"
@@ -1038,16 +1126,12 @@ reconcile_one() {
       info "  ${svc}: nothing to do (${state})"
       return 0
       ;;
-    foreign:*)
-      info "  ${svc}: nothing to do (${state}; no pidfile to clear)"
-      return 0
-      ;;
     dead:*)
       info "  ${svc}: cleared dead pidfile (was pid ${target_pid})"
       rm -f "${pidf}" 2>/dev/null || true
       return 0
       ;;
-    hung:*|orphan:*)
+    hung:*|orphan:*|foreign:*)
       : ;;
     *)
       info "  ${svc}: nothing to do (${state})"
@@ -1129,6 +1213,9 @@ Commands:
                      CLI args (e.g. 'start generator -- --rows 50').
   stop               SIGTERM each service + one-shot tool (5s grace, then
                      SIGKILL). Idempotent.
+  stop <svc>         Stop one named service or one-shot tool. Same TERM→KILL
+                     grace as bulk stop; also clears a port held by a foreign
+                     listener (orphan/foreign:PID) the same way.
   restart            stop, then start.
   status             Print the live status table for long-running services;
                      also lists one-shot tools with running/idle state.
@@ -1136,8 +1223,9 @@ Commands:
                      Argless prints the list of known services + one-shot tools.
   doctor             Run diagnostics (Node version, env file, ports, .run/ writable).
   reconcile [svc]    Wave 6.18d — reconcile pidfile ↔ live PID ↔ port owner.
-                     For each service in 'hung' (pidfile alive, port not bound)
-                     or 'orphan' (pidfile dead, port held by foreign PID) state:
+                     For each service in 'hung' (pidfile alive, port not bound),
+                     'orphan' (pidfile dead, port held by foreign PID), or
+                     'foreign' (no pidfile, port held by foreign PID) state:
                      SIGTERM → SIGKILL the bad PID and clear the pidfile.
                      'reconcile' with no arg (or 'reconcile all') reconciles all.
                      Idempotent; safe to re-run.
@@ -1199,7 +1287,28 @@ parse_args() {
           esac
         done
         ;;
-      stop|restart|status|doctor)
+      stop)
+        if [[ -n "${COMMAND}" ]]; then
+          fail "error: multiple commands ('${COMMAND}' and 'stop')"; exit 2
+        fi
+        COMMAND="stop"; shift
+        # Wave 6.18e — `stop` accepts an optional positional <svc>.
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            -h|--help) usage; exit 0 ;;
+            --)        shift; break ;;
+            -*)        fail "error: unknown option for stop: $1"; exit 2 ;;
+            *)
+              if [[ -z "${STOP_TARGET}" ]]; then
+                STOP_TARGET="$1"; shift
+              else
+                fail "error: unexpected arg for stop: $1"; exit 2
+              fi
+              ;;
+          esac
+        done
+        ;;
+      restart|status|doctor)
         if [[ -n "${COMMAND}" ]]; then
           fail "error: multiple commands ('${COMMAND}' and '$1')"; exit 2
         fi
