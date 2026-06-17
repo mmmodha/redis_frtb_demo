@@ -132,10 +132,12 @@ export interface CreateServerOpts {
   // Wave 6.26 — override the runtime-pool readiness probe used by /readyz.
   // Production leaves this unset and the handler defaults to the real
   // `probeRuntimeRedisReadiness()` from active-target.ts (PING-based, 250ms
-  // cached). When a test injects `opts.redis` or `opts.getRedis` the runtime
-  // pool is bypassed entirely, so the probe is skipped to preserve the
-  // legacy /readyz contract (boot-status-only) those tests assert against.
-  // Tests that want to exercise the new probe gate pass a fake here.
+  // cached). When a test injects `opts.redis` (in-process fakeRedis) the
+  // runtime pool is bypassed entirely, so the probe is skipped to preserve
+  // the legacy /readyz contract (boot-status-only) those tests assert
+  // against. `opts.getRedis` does NOT skip the probe — that path is the
+  // production wiring the gate exists to protect. Tests that want to
+  // exercise the probe gate explicitly pass a fake here.
   readinessProbe?: () => Promise<{ ok: boolean; err?: string }>;
 }
 
@@ -216,16 +218,22 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
   });
   // Wave 6.26 — pick the readiness probe used by /readyz below.
   //   * Explicit `opts.readinessProbe` always wins (tests of the gate).
-  //   * Tests that wire `opts.redis` or `opts.getRedis` route around the
-  //     real runtime pool, so the probe would attempt PINGs against a real
-  //     Redis that the test isn't running. Skip in that case — the
-  //     pre-6.26 boot-status-only behaviour stays the test contract.
+  //   * `opts.redis` is the legacy in-process fake injection (e.g. fakeRedis):
+  //     routes use that fake directly, the real runtime pool is never built,
+  //     and the gate stays boot-status-only to preserve the pre-6.26 contract
+  //     those tests assert against.
+  //   * `opts.getRedis` is the production-style lazy accessor (index.ts wires
+  //     it to `getActiveRedisRuntimeClient`). It MUST NOT skip the probe —
+  //     this is the exact code path /readyz needs to gate. Skipping it here
+  //     was the original 6.26 bug: production wires `opts.getRedis`, so the
+  //     probe never ran and /readyz flipped green before the runtime pool's
+  //     sockets were writable, reproducing the "Stream isn't writeable" 500s.
   //   * Production: default to the real runtime-pool probe so /readyz
   //     refuses to flip green until heavy + light pool sockets are
   //     writable (see the diagnosis comment on `probeRuntimeRedisReadiness`).
   const readinessProbe: (() => Promise<{ ok: boolean; err?: string }>) | null =
     opts.readinessProbe
-      ?? ((opts.redis || opts.getRedis) ? null : probeRuntimeRedisReadiness);
+      ?? (opts.redis ? null : probeRuntimeRedisReadiness);
   app.get("/readyz", { config: { category: "light" } }, async (_req, reply) => {
     const s = getBootstrapStatus();
     if (!s.ok) {

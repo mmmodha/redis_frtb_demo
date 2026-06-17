@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach, beforeEach } from "vitest";
+import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import {
   createServer,
   markBootstrapFailed,
@@ -6,6 +6,12 @@ import {
   markBootstrapSkipped,
   resetBootstrapStatusForTests,
 } from "../src/server.ts";
+import {
+  __resetRuntimeReadinessCacheForTests,
+  __setRuntimeClientFactoryForTests,
+  resetActiveTarget,
+  setActiveTarget,
+} from "../src/active-target.ts";
 import { fakeRedis } from "./helpers/fake-redis.ts";
 
 describe("GET /healthz — liveness (Wave 5.97D.1)", () => {
@@ -128,6 +134,12 @@ describe("GET /readyz — runtime-pool readiness probe (Wave 6.26)", () => {
   afterEach(async () => {
     if (app) await app.close();
     resetBootstrapStatusForTests();
+    // Wave 6.26 — regression tests below install a runtime client factory
+    // and set an active target; tear both down so they don't leak across
+    // cases.
+    __setRuntimeClientFactoryForTests(null);
+    resetActiveTarget();
+    __resetRuntimeReadinessCacheForTests();
   });
 
   it("returns 503 + runtime-pool-not-ready when the probe rejects (even with bootstrap ready)", async () => {
@@ -169,6 +181,62 @@ describe("GET /readyz — runtime-pool readiness probe (Wave 6.26)", () => {
     // a fake is injected. Regression guard for the existing health.test
     // suite invariants (b)/(c)/(d).
     app = await createServer({ redis: fakeRedis() });
+    const res = await app.inject({ method: "GET", url: "/readyz" });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ service: "api", status: "ok", bootstrap: "ready" });
+  });
+
+  // Regression for the original 6.26 bug: index.ts always wires
+  // `opts.getRedis` (the production lazy accessor). The first probe-gate
+  // version skipped the runtime probe whenever EITHER `opts.redis` or
+  // `opts.getRedis` was set, so in production the probe was never invoked
+  // and /readyz flipped green before the runtime pool sockets were
+  // writable — reproducing the exact 500-storm the gate was meant to
+  // prevent. This test wires only `opts.getRedis` (no `opts.readinessProbe`
+  // override), installs a runtime client factory whose `ping()` rejects,
+  // and asserts /readyz returns 503/runtime-pool-not-ready — proving the
+  // production code path DOES run the probe.
+  it("does NOT skip the runtime probe when opts.getRedis (production accessor) is wired", async () => {
+    // Install a fake runtime client whose ping() rejects with the exact
+    // ioredis error the cold-start race surfaces in production.
+    const failingPing = vi.fn(() => Promise.reject(new Error("Stream isn't writeable")));
+    __setRuntimeClientFactoryForTests(() => ({
+      options: { commandTimeout: 0, host: "fake", db: 0 },
+      on(): unknown { return this; },
+      disconnect(): void { /* no-op */ },
+      ping: failingPing,
+    } as unknown as import("ioredis").Redis));
+    // Set an active target so the pool builds slots on first acquisition.
+    setActiveTarget({ host: "fake.example.com", port: 6379, tls: false, db: 0, label: "fake" });
+    __resetRuntimeReadinessCacheForTests();
+
+    app = await createServer({
+      // Production-style accessor; does not gate the probe.
+      getRedis: () => ({} as unknown as import("../src/redis-like.ts").RedisLike),
+    });
+    const res = await app.inject({ method: "GET", url: "/readyz" });
+    expect(res.statusCode).toBe(503);
+    const body = res.json();
+    expect(body.status).toBe("runtime-pool-not-ready");
+    expect(body.err).toContain("Stream isn't writeable");
+    expect(failingPing).toHaveBeenCalled();
+  });
+
+  it("returns 200 once the runtime probe succeeds when opts.getRedis is wired (production accessor)", async () => {
+    // Companion to the above: same production-style wiring, but the
+    // runtime client's ping() resolves — /readyz must flip green.
+    __setRuntimeClientFactoryForTests(() => ({
+      options: { commandTimeout: 0, host: "fake", db: 0 },
+      on(): unknown { return this; },
+      disconnect(): void { /* no-op */ },
+      ping: () => Promise.resolve("PONG"),
+    } as unknown as import("ioredis").Redis));
+    setActiveTarget({ host: "fake.example.com", port: 6379, tls: false, db: 0, label: "fake" });
+    __resetRuntimeReadinessCacheForTests();
+
+    app = await createServer({
+      getRedis: () => ({} as unknown as import("../src/redis-like.ts").RedisLike),
+    });
     const res = await app.inject({ method: "GET", url: "/readyz" });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual({ service: "api", status: "ok", bootstrap: "ready" });
