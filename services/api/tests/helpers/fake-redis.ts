@@ -8,6 +8,11 @@ export interface FakeCall {
   args: unknown[];
 }
 
+export interface FakeMulti {
+  call: (command: string, ...args: unknown[]) => FakeMulti;
+  exec: () => Promise<Array<[Error | null, unknown]> | null>;
+}
+
 export interface FakeRedis {
   calls: FakeCall[];
   call: (command: string, ...args: unknown[]) => Promise<unknown>;
@@ -18,6 +23,11 @@ export interface FakeRedis {
     ...args: unknown[]
   ) => Promise<[string, string[]]>;
   flushdb: () => Promise<string>;
+  // Wave 6.27 — minimal MULTI/EXEC surface so routes that batch via ioredis
+  // pipelines (e.g. /facets) exercise the same path in unit tests. Each
+  // queued `.call()` also lands in `fr.calls` so existing per-command
+  // assertions keep working.
+  multi: () => FakeMulti;
   // Response stubs the test sets up.
   setResponse: (command: string, response: unknown | ((args: unknown[]) => unknown)) => void;
   setScan: (cursor: string, keys: string[]) => void;
@@ -64,6 +74,39 @@ export function fakeRedis(): FakeRedis {
       calls.push({ command: "FLUSHDB", args: [] });
       if (flushdbErr) throw flushdbErr;
       return "OK";
+    },
+    multi() {
+      const queued: FakeCall[] = [];
+      const chain: FakeMulti = {
+        call(command: string, ...args: unknown[]) {
+          const entry: FakeCall = { command: command.toUpperCase(), args };
+          queued.push(entry);
+          // Mirror into the top-level call log so existing assertions on
+          // fr.calls (command name, args, LIMIT 0 0) keep working.
+          calls.push(entry);
+          return chain;
+        },
+        async exec() {
+          const out: Array<[Error | null, unknown]> = [];
+          for (const op of queued) {
+            const responder = responses.get(op.command);
+            if (!responder) {
+              out.push([new Error(`fakeRedis: no response set for ${op.command}`), null]);
+              continue;
+            }
+            try {
+              const r = typeof responder === "function"
+                ? (responder as (a: unknown[]) => unknown)(op.args)
+                : responder;
+              out.push([null, r]);
+            } catch (e) {
+              out.push([e instanceof Error ? e : new Error(String(e)), null]);
+            }
+          }
+          return out;
+        },
+      };
+      return chain;
     },
     setResponse(command, response) {
       responses.set(command.toUpperCase(), response);

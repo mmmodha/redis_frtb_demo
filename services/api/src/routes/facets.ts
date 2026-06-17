@@ -1,4 +1,8 @@
 import type { FastifyInstance } from "fastify";
+import { existsSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { loadSchema, type Schema } from "@frtb/schema";
 import type { RedisLike } from "../redis-like.ts";
 import { getActiveTarget, onActiveTargetChange } from "../active-target.ts";
 import { getBootstrapStatus } from "../bootstrap-status.ts";
@@ -6,31 +10,31 @@ import { getSensIndexName } from "../lib/sens-index.ts";
 import { translateRedisError } from "../redis-errors.ts";
 
 // Wave 5.56 / 5.66 — facet counts backing the Search / Calc / JSON Explorer
-// dropdowns. We aggregate grouped (risk_class, bucket, sensitivity_type)
-// counts so the UI can hide classes/buckets/sens-types that report zero rows
-// in the active index instead of presenting all 7×16×3 hardcoded combinations.
+// dropdowns. The UI uses these to hide classes/buckets/sens-types that report
+// zero rows in the active index instead of presenting all hardcoded
+// combinations.
 //
-// Wave 5.67 — Short-TTL (30 s) in-process cache. Re-opening Search / Calc /
-// JSON Explorer in quick succession used to pay the full aggregate cost
-// (~2-3 s on 220k rows) each time. We cache the response body keyed by the
-// active-target IDENTITY tuple (host/port/db/tls/clusterMode) — label is
-// intentionally excluded so a rename of the currently-active profile does
-// NOT invalidate the cache. `setActiveTarget` (identity / creds rotation)
-// fires `onActiveTargetChange`, which clears the cache immediately. No
-// generator-finish event exists today; a fresh ingest will be picked up by
-// the next call after TTL expiry.
+// Wave 5.67 — Short-TTL (30 s) in-process cache keyed by active-target
+// IDENTITY (host/port/db/tls/clusterMode). Label is excluded so renames don't
+// invalidate the cache. `setActiveTarget` fires `onActiveTargetChange`, which
+// clears the cache immediately.
 //
-// Wave 6.18g — Previously this route used a cursor-driven aggregate to drain
-// grouped rows. Against a clustered Redis fronted by a proxy, the cursor
-// opened on one shard frequently failed on subsequent reads ("Cursor not
-// found, id: …") because the proxy could route the follow-up to a different
-// node, the idle TTL could reap the cursor between calls, or cursor ids could
-// collide across shards. The bounded result set (≤ MAX_GROUPS) is exactly
-// what FT.AGGREGATE ... LIMIT 0 N is designed for, so we now issue a single-
-// shot aggregate with no cursor lifecycle.
+// Wave 6.25 — FT.AGGREGATE GROUPBY against the clustered Redis proxy returned
+// 0 rows even with DIALECT 1/2/3/4 and WITHCURSOR; the cluster simply does not
+// drain grouped rows reliably for us. We now derive the facet counts by
+// issuing one `FT.SEARCH <idx> "<tag-filter>" LIMIT 0 0` per known tag value
+// in the active schema and reading the total-count head of the reply. The
+// route's external FacetsResponseOk / FacetsResponseEmpty shape is unchanged.
+//
+// Wave 6.27 — the ~95 per-tag FT.SEARCH calls now ship in a single MULTI/EXEC
+// pipeline instead of independent Promise.all() round-trips. On bigcluster
+// (~150 ms RTT to the DMC proxy) this collapses 95 × RTT to ~1 × RTT and cuts
+// uncached /facets from 15.2 s to sub-second. Production clients (ioredis
+// Redis | Cluster) expose `.multi()`; the per-call fallback below is kept for
+// any RedisLike implementation that does not (currently none in tree).
 
-const MAX_GROUPS = 50000;
 const CACHE_TTL_MS = 30_000;
+const SENSITIVITY_TYPES = ["Delta", "Vega", "Curvature"] as const;
 
 interface FacetsResponseOk {
   ok: true;
@@ -65,44 +69,20 @@ function identityKey(): string {
 let cache: { key: string; body: FacetsBody; expiresAt: number } | null = null;
 
 // Identity / creds rotation fires onActiveTargetChange (setActiveTargetLabel
-// intentionally does NOT, so renames preserve the cache). Registered at
-// module load — listeners are stored in a Set so this is idempotent across
-// repeated server instantiations in tests.
+// intentionally does NOT, so renames preserve the cache).
 onActiveTargetChange(() => {
   cache = null;
 });
 
-// Exported for tests so module-global cache state can be reset between cases
-// without restarting the test runner.
 export function __resetFacetsCacheForTests(): void {
   cache = null;
 }
 
 // Wave 5.86C — POST /admin/flush invokes this after FLUSHDB + bootstrap so the
-// next /facets call drains the freshly-rebuilt index instead of serving the
-// pre-flush body for up to CACHE_TTL_MS. The active-target identity has not
-// changed, so onActiveTargetChange does not fire on its own.
+// next /facets call sees the freshly-rebuilt index instead of the pre-flush
+// body for up to CACHE_TTL_MS.
 export function invalidateFacetsCache(): void {
   cache = null;
-}
-
-// FT.AGGREGATE returns the standard payload [N, row1, row2, ...] where each
-// row is a flat [field, val, ...] array.
-function parseAggregateRows(raw: unknown): Array<Record<string, string>> {
-  if (!Array.isArray(raw) || raw.length < 2) return [];
-  const out: Array<Record<string, string>> = [];
-  for (let i = 1; i < raw.length; i++) {
-    const row = raw[i];
-    if (!Array.isArray(row)) continue;
-    const m: Record<string, string> = {};
-    for (let j = 0; j < row.length; j += 2) {
-      const k = row[j];
-      const v = row[j + 1];
-      if (typeof k === "string") m[k] = v === undefined || v === null ? "" : String(v);
-    }
-    out.push(m);
-  }
-  return out;
 }
 
 function isUnknownIndexError(err: unknown): boolean {
@@ -131,53 +111,160 @@ function emptyResponse(target_label: string, ms: number): FacetsResponseEmpty {
   };
 }
 
+function elapsedMs(t0: bigint): number {
+  return Math.round((Number(process.hrtime.bigint() - t0) / 1e6) * 1000) / 1000;
+}
+
+// RediSearch TAG queries require backslash-escaping of punctuation. The
+// default schema's bucket values are alphanumeric, but the schema is
+// hot-swappable so we escape defensively.
+function escapeTag(v: string): string {
+  return v.replace(/[\\,.<>{}[\]"':;!@#$%^&*()\-+=~/ \t]/g, "\\$&");
+}
+
+// FT.SEARCH ... LIMIT 0 0 returns RESP2 `[total_count]` (only the count head;
+// no document payload). Extract it defensively.
+function searchCountReply(reply: unknown): number {
+  if (Array.isArray(reply) && reply.length > 0) {
+    const n = Number(reply[0]);
+    return Number.isFinite(n) && n >= 0 ? n : 0;
+  }
+  return 0;
+}
+
+// Schema loader fallback — production wires `opts.schema` through from
+// index.ts; tests pass schema via createServer. This lazy loader covers the
+// edge case where neither happens (kept for defensive parity with the calc /
+// generator routes that also accept an optional schema).
+let lazySchemaCache: Schema | null = null;
+function repoRootGuess(): string {
+  return resolve(dirname(fileURLToPath(import.meta.url)), "../../../..");
+}
+function loadFacetsSchema(): Schema | null {
+  if (lazySchemaCache) return lazySchemaCache;
+  const path = process.env.SCHEMA_FILE
+    ?? join(repoRootGuess(), "config/schema/frtb-default.yaml");
+  if (!existsSync(path)) return null;
+  lazySchemaCache = loadSchema(path);
+  return lazySchemaCache;
+}
+
+// Structural type for the ioredis MULTI surface — both `Redis` and `Cluster`
+// expose `.multi()` returning a chainable pipeline whose `.exec()` resolves to
+// the `[err, reply]` tuple array. Widened here rather than added to RedisLike
+// so the narrow interface stays minimal (same pattern as PipelineClient in
+// generator.ts).
+type MultiClient = {
+  multi(): {
+    call(command: string, ...args: unknown[]): unknown;
+    exec(): Promise<Array<[Error | null, unknown]> | null>;
+  };
+};
+
+function hasMulti(r: RedisLike): r is RedisLike & MultiClient {
+  return typeof (r as unknown as Partial<MultiClient>).multi === "function";
+}
+
+// Run the ordered list of FT.SEARCH count queries against `indexName`. When
+// the client supports MULTI/EXEC (production: ioredis Redis|Cluster) we pack
+// them into a single pipeline — the win is amortizing RTT, which dominates on
+// the cloud DMC proxy. The fallback path keeps a parallel Promise.all so
+// minimal stubs without `.multi()` (none currently in tree) still work. The
+// LIMIT 0 0 (count-only) trick is preserved in both paths.
+async function runFacetSearches(
+  redis: RedisLike,
+  indexName: string,
+  queries: string[],
+): Promise<unknown[]> {
+  if (hasMulti(redis)) {
+    const pipeline = redis.multi();
+    for (const q of queries) {
+      pipeline.call("FT.SEARCH", indexName, q, "LIMIT", "0", "0");
+    }
+    const results = await pipeline.exec();
+    if (!results) {
+      // ioredis returns null when the transaction was discarded (e.g. WATCH
+      // aborted). We don't use WATCH here, but surface a recognisable error
+      // rather than silently returning empty counts.
+      throw new Error("FT.SEARCH MULTI/EXEC returned null");
+    }
+    const replies: unknown[] = new Array(results.length);
+    for (let i = 0; i < results.length; i++) {
+      const tuple = results[i]!;
+      const err = tuple[0];
+      if (err) throw err;
+      replies[i] = tuple[1];
+    }
+    return replies;
+  }
+  return Promise.all(
+    queries.map((q) =>
+      redis.call("FT.SEARCH", indexName, q, "LIMIT", "0", "0"),
+    ),
+  );
+}
+
 export function registerFacetsRoute(
   app: FastifyInstance,
   getRedis: () => RedisLike,
+  opts: { schema?: Schema } = {},
 ): void {
   app.get("/facets", async (_req, reply) => {
     const t0 = process.hrtime.bigint();
     const key = identityKey();
     const now = Date.now();
     if (cache && cache.key === key && cache.expiresAt > now) {
-      const ms = Math.round((Number(process.hrtime.bigint() - t0) / 1e6) * 1000) / 1000;
+      const ms = elapsedMs(t0);
       return { ...cache.body, ms, cached: true };
     }
 
     const redis = getRedis();
     const target_label = getActiveTarget().label;
-    // Wave 6.18i — resolve the live versioned index name (cached 30 s) so
-    // the aggregate lands on the same name bootstrap last created.
+    // Wave 6.18i — resolve the live versioned index name (cached 30 s).
     const indexName = await getSensIndexName(redis, target_label);
 
-    let rows: Array<Record<string, string>> = [];
+    const schema = opts.schema ?? loadFacetsSchema();
+    if (!schema) {
+      // No schema available — degrade to the empty-index shape rather than
+      // 500. Production always supplies a schema; this guards tests that
+      // forget to pass one.
+      const ms = elapsedMs(t0);
+      const body = emptyResponse(target_label, ms);
+      return body;
+    }
+
+    const riskClasses = Object.keys(schema.risk_classes);
+    const sensitivityTypes = SENSITIVITY_TYPES;
+    const bucketTuples: Array<[string, string]> = [];
+    for (const rc of riskClasses) {
+      const cfg = schema.risk_classes[rc];
+      const buckets = cfg?.buckets?.values ?? [];
+      for (const bk of buckets) bucketTuples.push([rc, bk]);
+    }
+
+    // FT.SEARCH count fan-out. Each call returns `[N, ...docs]`; with LIMIT
+    // 0 0 there are no docs — just N. We build one ordered list of queries
+    // (risk_class, sensitivity_type, (rc, bucket)) and ship them through a
+    // single MULTI/EXEC pipeline so all ~95 commands amortize one RTT (Wave
+    // 6.27). The reply array is sliced back into the three groupings in the
+    // same order they were enqueued.
+    const rcQueries = riskClasses.map(
+      (rc) => `@risk_class:{${escapeTag(rc)}}`,
+    );
+    const stQueries = sensitivityTypes.map(
+      (st) => `@sensitivity_type:{${escapeTag(st)}}`,
+    );
+    const bkQueries = bucketTuples.map(
+      ([rc, bk]) =>
+        `@risk_class:{${escapeTag(rc)}} @bucket:{${escapeTag(bk)}}`,
+    );
+    const allQueries = [...rcQueries, ...stQueries, ...bkQueries];
+
+    let allReplies: unknown[];
     try {
-      // Single-shot bounded aggregate. MAX_GROUPS caps the result set the
-      // same way the previous cursor-drain did, but without the proxy /
-      // cluster-routing failure modes of the follow-up cursor reads.
-      const reply = await redis.call(
-        "FT.AGGREGATE",
-        indexName,
-        "*",
-        "GROUPBY",
-        "3",
-        "@risk_class",
-        "@bucket",
-        "@sensitivity_type",
-        "REDUCE",
-        "COUNT",
-        "0",
-        "AS",
-        "n",
-        "LIMIT",
-        "0",
-        String(MAX_GROUPS),
-        "DIALECT",
-        "2",
-      );
-      rows = parseAggregateRows(reply);
+      allReplies = await runFacetSearches(redis, indexName, allQueries);
     } catch (err) {
-      const ms = Math.round((Number(process.hrtime.bigint() - t0) / 1e6) * 1000) / 1000;
+      const ms = elapsedMs(t0);
       // The spec asks for a 200 empty-index shape when idx:sens is missing,
       // overriding the 412 translateRedisError would otherwise return.
       if (isUnknownIndexError(err)) {
@@ -195,32 +282,41 @@ export function registerFacetsRoute(
       throw err;
     }
 
-    const ms = Math.round((Number(process.hrtime.bigint() - t0) / 1e6) * 1000) / 1000;
+    const ms = elapsedMs(t0);
 
-    if (rows.length === 0) {
-      const body = emptyResponse(target_label, ms);
-      cache = { key, body, expiresAt: Date.now() + CACHE_TTL_MS };
-      return body;
-    }
+    const rcEnd = rcQueries.length;
+    const stEnd = rcEnd + stQueries.length;
+    const rcReplies = allReplies.slice(0, rcEnd);
+    const stReplies = allReplies.slice(rcEnd, stEnd);
+    const bkReplies = allReplies.slice(stEnd);
 
     const risk_class: Record<string, number> = {};
     const sensitivity_type: Record<string, number> = {};
     const bucket_by_risk_class: Record<string, Record<string, number>> = {};
-    let total_rows = 0;
 
-    for (const row of rows) {
-      const rc = row.risk_class ?? "";
-      const bk = row.bucket ?? "";
-      const st = row.sensitivity_type ?? "";
-      const n = Number(row.n);
-      if (!Number.isFinite(n) || n <= 0) continue;
-      total_rows += n;
-      if (rc) risk_class[rc] = (risk_class[rc] ?? 0) + n;
-      if (st) sensitivity_type[st] = (sensitivity_type[st] ?? 0) + n;
-      if (rc && bk) {
-        const inner = bucket_by_risk_class[rc] ?? (bucket_by_risk_class[rc] = {});
-        inner[bk] = (inner[bk] ?? 0) + n;
-      }
+    riskClasses.forEach((rc, i) => {
+      const n = searchCountReply(rcReplies[i]);
+      if (n > 0) risk_class[rc] = n;
+    });
+    sensitivityTypes.forEach((st, i) => {
+      const n = searchCountReply(stReplies[i]);
+      if (n > 0) sensitivity_type[st] = n;
+    });
+    bucketTuples.forEach(([rc, bk], i) => {
+      const n = searchCountReply(bkReplies[i]);
+      if (n <= 0) return;
+      const inner = bucket_by_risk_class[rc] ?? (bucket_by_risk_class[rc] = {});
+      inner[bk] = n;
+    });
+
+    // total_rows is the doc count (sum of per-class counts), NOT triple-
+    // counted across the three facet groupings — matches existing semantics.
+    const total_rows = Object.values(risk_class).reduce((a, b) => a + b, 0);
+
+    if (total_rows === 0) {
+      const body = emptyResponse(target_label, ms);
+      cache = { key, body, expiresAt: Date.now() + CACHE_TTL_MS };
+      return body;
     }
 
     const body: FacetsResponseOk = {
