@@ -573,6 +573,95 @@ describe("<ConnectionsPanel/>", () => {
     expect(errEl).toHaveTextContent(/ingest-3/);
   });
 
+  describe("Wave 6.18b — Reconnect button on the active card", () => {
+    it("renders an enabled 'Reconnect' button on the active card (not 'Activated'/disabled)", async () => {
+      setRoutes(
+        routeJson(/\/redis\/active-target$/, "GET", { host: "redis-1.lab", port: 12000, tls: true, db: 0, label: "demo-cluster" }),
+        routeJson(/\/connections$/, "GET", [profile()]),
+        routeJson(/\/connections\/01J\/test$/, "POST", { ok: true, latency_ms: 4, modules: [], errors: [] }),
+      );
+      renderPanel();
+      const btn = await screen.findByRole("button", { name: /^Reconnect$/ }) as HTMLButtonElement;
+      expect(btn.disabled).toBe(false);
+      expect(btn.title).toMatch(/rebuild the redis connection/i);
+      // The legacy "Activated" disabled affordance must be gone.
+      expect(screen.queryByRole("button", { name: /^Activated$/ })).toBeNull();
+    });
+
+    it("clicking Reconnect calls activateConnection and dispatches connections:active-changed", async () => {
+      let activateCalled = false;
+      fetchMock.mockImplementation(async (input: RequestInfo, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        if (url.match(/\/redis\/active-target$/)) {
+          return new Response(JSON.stringify({ host: "redis-1.lab", port: 12000, tls: true, db: 0, label: "demo-cluster" }), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        if (url.match(/\/connections$/) && method === "GET") {
+          return new Response(JSON.stringify([profile()]), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        if (url.match(/\/connections\/01J\/test$/) && method === "POST") {
+          return new Response(JSON.stringify({ ok: true, latency_ms: 4, modules: [], errors: [] }), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        if (url.match(/\/connections\/01J\/activate$/) && method === "POST") {
+          activateCalled = true;
+          return new Response(JSON.stringify(profile()), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+      });
+
+      const events: Event[] = [];
+      const listener = (e: Event) => events.push(e);
+      window.addEventListener("connections:active-changed", listener);
+      try {
+        renderPanel();
+        const btn = await screen.findByRole("button", { name: /^Reconnect$/ }) as HTMLButtonElement;
+        await waitFor(() => expect(btn.disabled).toBe(false));
+        fireEvent.click(btn);
+        await waitFor(() => expect(activateCalled).toBe(true));
+        await waitFor(() => expect(events.length).toBeGreaterThan(0));
+        expect(events[0]!.type).toBe("connections:active-changed");
+      } finally {
+        window.removeEventListener("connections:active-changed", listener);
+      }
+    });
+
+    it("a 409 from Reconnect surfaces the same row-error shape as Activate", async () => {
+      fetchMock.mockImplementation(async (input: RequestInfo, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        if (url.match(/\/redis\/active-target$/)) {
+          return new Response(JSON.stringify({ host: "redis-1.lab", port: 12000, tls: true, db: 0, label: "demo-cluster" }), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        if (url.match(/\/connections$/) && method === "GET") {
+          return new Response(JSON.stringify([profile()]), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        if (url.match(/\/connections\/01J\/test$/) && method === "POST") {
+          return new Response(JSON.stringify({ ok: true, latency_ms: 4, modules: [], errors: [] }), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        if (url.match(/\/connections\/01J\/activate$/) && method === "POST") {
+          return new Response(JSON.stringify({
+            error: "in flight",
+            inflight: [
+              { id: "lg1", kind: "loadgen", label: "loadgen-1", started_at: 1 },
+              { id: "in3", kind: "ingest", label: "ingest-3", started_at: 2 },
+            ],
+            stale: [],
+          }), { status: 409, headers: { "content-type": "application/json" } });
+        }
+        return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+      });
+      renderPanel();
+      const btn = await screen.findByRole("button", { name: /^Reconnect$/ }) as HTMLButtonElement;
+      await waitFor(() => expect(btn.disabled).toBe(false));
+      fireEvent.click(btn);
+      const errEl = await screen.findByTestId("activate-error-01J");
+      expect(errEl).toHaveTextContent(/cannot activate/i);
+      expect(errEl).toHaveTextContent(/2 runs still in flight/i);
+      expect(errEl).toHaveTextContent(/loadgen-1/);
+      expect(errEl).toHaveTextContent(/ingest-3/);
+    });
+  });
+
   describe("Wave 5.60 — duplicate-endpoint guard + explicit-mode submit", () => {
     function dupResponse(existingId: string, existingName: string, host: string, port: number) {
       return new Response(

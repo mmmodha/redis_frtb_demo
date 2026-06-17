@@ -67,6 +67,7 @@ export function ConnectionsPanel() {
   const [testResults, setTestResults] = useState<Record<string, ConnectionTestResult | "pending">>({});
   const [actionBusy, setActionBusy] = useState<Record<string, boolean>>({});
   const [rowError, setRowError] = useState<Record<string, string | null>>({});
+  const [rowSuccess, setRowSuccess] = useState<Record<string, string | null>>({});
   // Wave 5.60 — inline duplicate-endpoint banner inside the dialog. Carries
   // the existing profile's id so the "Switch to Edit" button can reopen the
   // dialog on it. Cleared on every dialog open / mode switch.
@@ -213,6 +214,33 @@ export function ConnectionsPanel() {
     }
   }
 
+  // Wave 6.18b — Reconnect on the active card. Mirrors onActivate exactly
+  // (same backend POST /connections/:id/activate, same 409 lockout handling)
+  // and differs only in the busy-state label and a success banner.
+  async function onReconnect(id: string) {
+    setActionBusy((s) => ({ ...s, [id]: true }));
+    setRowError((s) => ({ ...s, [id]: null }));
+    setRowSuccess((s) => ({ ...s, [id]: null }));
+    try {
+      await activateConnection(id);
+      const t = await getActiveTarget().catch(() => null);
+      setTarget(t);
+      window.dispatchEvent(new CustomEvent("connections:active-changed"));
+      setRowSuccess((s) => ({ ...s, [id]: "Reconnected — bootstrap re-running" }));
+    } catch (e) {
+      if (e instanceof InflightConflictError) {
+        const labels = e.inflight.map((it) => it.label).join(", ");
+        const n = e.inflight.length;
+        const msg = `Cannot activate: ${n} run${n === 1 ? "" : "s"} still in flight${labels ? ` (${labels})` : ""}`;
+        setRowError((s) => ({ ...s, [id]: msg }));
+      } else {
+        setErrorMsg(`Reconnect failed: ${(e as Error).message}`);
+      }
+    } finally {
+      setActionBusy((s) => ({ ...s, [id]: false }));
+    }
+  }
+
   async function onDelete(id: string) {
     setActionBusy((s) => ({ ...s, [id]: true }));
     try {
@@ -346,23 +374,35 @@ export function ConnectionsPanel() {
                       Edit
                     </button>
                     {!active && isConfirmedUnreachable(tr) ? null : (() => {
-                      const unreachableReason = !active && !isReachable(tr)
+                      if (active) {
+                        const busy = !!actionBusy[p.id];
+                        return (
+                          <button
+                            type="button"
+                            onClick={() => void onReconnect(p.id)}
+                            disabled={busy}
+                            title="Rebuild the Redis connection and re-run bootstrap"
+                            data-testid={`reconnect-btn-${p.id}`}
+                          >
+                            {busy ? "Reconnecting…" : "Reconnect"}
+                          </button>
+                        );
+                      }
+                      const unreachableReason = !isReachable(tr)
                         ? (tr === "pending" ? "Testing connection…" : "Test the connection first")
                         : null;
-                      const titleText = !active && lockedOut
-                        ? LOCKOUT_TITLE
-                        : unreachableReason;
+                      const titleText = lockedOut ? LOCKOUT_TITLE : unreachableReason;
                       const hintId = titleText ? `activate-hint-${p.id}` : undefined;
                       return (
                         <>
                           <button
                             type="button"
                             onClick={() => void onActivate(p.id)}
-                            disabled={active || !!actionBusy[p.id] || !isReachable(tr) || (!active && lockedOut)}
-                            className={active ? "" : "btn--primary"}
+                            disabled={!!actionBusy[p.id] || !isReachable(tr) || lockedOut}
+                            className="btn--primary"
                             {...(titleText ? { title: titleText, "aria-describedby": hintId } : {})}
                           >
-                            {active ? "Activated" : "Activate"}
+                            Activate
                           </button>
                           {titleText ? (
                             <span id={hintId} className="visually-hidden">{titleText}</span>
@@ -386,6 +426,15 @@ export function ConnectionsPanel() {
                       data-testid={`activate-error-${p.id}`}
                     >
                       {rowError[p.id]}
+                    </p>
+                  ) : null}
+                  {rowSuccess[p.id] ? (
+                    <p
+                      className="profile-card__row-success"
+                      role="status"
+                      data-testid={`reconnect-success-${p.id}`}
+                    >
+                      {rowSuccess[p.id]}
                     </p>
                   ) : null}
                 </li>
