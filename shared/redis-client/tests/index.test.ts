@@ -107,4 +107,24 @@ describe("createRedisClient", () => {
     expect(redisOptions.lazyConnect).toBe(true);
     expect(redisOptions.maxRetriesPerRequest).toBe(3);
   });
+
+  // Wave 6.18a — sockets surviving long idle windows on Redis Enterprise
+  // proxies zombie into MaxRetriesPerRequestError unless keepAlive is set.
+  // The factory must emit keepAlive=30000 for BOTH the Cluster path (via
+  // clusterOptions.redisOptions) and the standalone Redis constructor.
+  it("emits keepAlive=30000 in redisOptions for cluster mode", () => {
+    process.env.REDIS_URL = "redis://:pw@host:6379";
+    createRedisClient();
+    const [, opts] = clusterCtor.mock.calls[0] as [unknown, Record<string, unknown>];
+    const redisOptions = (opts as { redisOptions?: Record<string, unknown> }).redisOptions ?? {};
+    expect(redisOptions.keepAlive).toBe(30000);
+  });
+
+  it("emits keepAlive=30000 in standalone Redis options", () => {
+    process.env.REDIS_URL = "redis://:pw@host:6379";
+    process.env.REDIS_CLUSTER = "false";
+    createRedisClient();
+    const [opts] = redisCtor.mock.calls[0] as [Record<string, unknown>];
+    expect(opts.keepAlive).toBe(30000);
+  });
 });

@@ -110,3 +110,53 @@ describe("bootstrap-status — scheduleBootstrap dispatch on BootstrapPartialErr
     expect(snap.err).toBe("connection refused");
   });
 });
+
+// Wave 6.18a — pin the full terminal-transition contract of the listener
+// path. The boot-time twin in services/api/src/index.ts:156-198 marks
+// running → {ready,partial,failed}; scheduleBootstrap is the on-switch
+// equivalent and MUST land on the same terminal phase so
+// /redis/active-target/bootstrap-status never sticks at `running`.
+describe("bootstrap-status — scheduleBootstrap terminal transitions (Wave 6.18a)", () => {
+  beforeEach(() => {
+    resetBootstrapStatusForTests();
+    setDebounceMsForTests(1);
+  });
+
+  it("success → ready: runner resolves, phase lands on 'ready' with target_label", async () => {
+    setBootstrapRunnerForTests(async () => undefined);
+    const fakeClient = {} as unknown as Parameters<typeof scheduleBootstrap>[1];
+    scheduleBootstrap(TARGET, fakeClient, {} as Parameters<typeof scheduleBootstrap>[2]);
+    await new Promise((r) => setTimeout(r, 20));
+    const snap = getBootstrapStatus();
+    expect(snap.phase).toBe("ready");
+    expect(snap.target_label).toBe("primary");
+    expect(snap.finished_at).toBeDefined();
+  });
+
+  it("partial → partial: runner throws BootstrapPartialError, phase lands on 'partial'", async () => {
+    const failures = [
+      { step: "frtb", node_id: "node-1", error: "OOM command not allowed" },
+    ];
+    setBootstrapRunnerForTests(async () => {
+      throw new BootstrapPartialError(failures);
+    });
+    const fakeClient = {} as unknown as Parameters<typeof scheduleBootstrap>[1];
+    scheduleBootstrap(TARGET, fakeClient, {} as Parameters<typeof scheduleBootstrap>[2]);
+    await new Promise((r) => setTimeout(r, 20));
+    const snap = getBootstrapStatus();
+    expect(snap.phase).toBe("partial");
+    expect(snap.failures).toEqual(failures);
+  });
+
+  it("throw → failed: runner throws generic Error, phase lands on 'failed'", async () => {
+    setBootstrapRunnerForTests(async () => {
+      throw new Error("MaxRetriesPerRequestError");
+    });
+    const fakeClient = {} as unknown as Parameters<typeof scheduleBootstrap>[1];
+    scheduleBootstrap(TARGET, fakeClient, {} as Parameters<typeof scheduleBootstrap>[2]);
+    await new Promise((r) => setTimeout(r, 20));
+    const snap = getBootstrapStatus();
+    expect(snap.phase).toBe("failed");
+    expect(snap.err).toBe("MaxRetriesPerRequestError");
+  });
+});

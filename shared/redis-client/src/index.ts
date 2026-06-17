@@ -73,6 +73,10 @@ export function createRedisClient(opts: CreateRedisClientOptions = {}): Redis | 
     ...(opts.lazyConnect !== undefined ? { lazyConnect: opts.lazyConnect } : {}),
     ...(opts.maxRetriesPerRequest !== undefined ? { maxRetriesPerRequest: opts.maxRetriesPerRequest } : {}),
     ...(opts.connectTimeout !== undefined ? { connectTimeout: opts.connectTimeout } : {}),
+    // Wave 6.18a — TCP keepAlive so long-idle sockets on Redis Enterprise
+    // proxies don't zombie into MaxRetriesPerRequestError. Inherited by the
+    // Cluster path via clusterOptions.redisOptions below.
+    keepAlive: 30_000,
   };
 
   if (clusterMode) {

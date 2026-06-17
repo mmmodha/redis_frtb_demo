@@ -23,6 +23,7 @@ import {
   markBootstrapStatusReady,
   markBootstrapStatusFailed,
   markBootstrapStatusPartial,
+  scheduleBootstrap,
 } from "./bootstrap-status.ts";
 
 // Wave 5.79: precedence for self-binding is API_HOST/PORT → HOST/PORT →
@@ -208,6 +209,25 @@ async function main(): Promise<void> {
     return (active ?? redis) as unknown as RedisLike;
   };
   const app = await createServer({ getRedis, correlations, schema, store, logger: true });
+
+  // Wave 6.18a — `setActiveTarget(...)` above (lines 87-99) runs BEFORE
+  // `createServer` registers the onActiveTargetChange listener that hangs
+  // scheduleBootstrap off profile-switches. A persisted active target
+  // therefore restored without firing scheduleBootstrap, leaving the
+  // listener path's phase tracker untouched on this restored target. Fire
+  // a single scheduleBootstrap here, AFTER listeners are attached, so the
+  // bootstrap-status phase reflects the listener-driven contract on the
+  // very target the operator persisted. Smaller-diff option chosen vs.
+  // moving setActiveTarget below createServer (which would force restructuring
+  // the boot-time `target`-dependent ioredis client construction above).
+  // scheduleBootstrap is idempotent: it short-circuits when phase is already
+  // "ready" for this target_label (the success path of the boot-time
+  // bootstrapFrtb above), and otherwise re-attempts against the active
+  // singleton's client.
+  if (activeRaw) {
+    scheduleBootstrap(target, getActiveRedisClient(), schema);
+  }
+
   await app.listen({ port: PORT, host: HOST });
   console.log(JSON.stringify({ service: "api", status: "ready", port: PORT, target: target.label }));
 

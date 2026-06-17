@@ -130,6 +130,10 @@ export function getActiveRedisClient(): Redis | null {
     ...(c.password ? { password: c.password } : {}),
     lazyConnect: true,
     maxRetriesPerRequest: 3,
+    // Wave 6.18a — TCP keepAlive so sockets surviving long idle windows on
+    // Redis Enterprise proxies do not zombie into MaxRetriesPerRequestError
+    // without recovering until the process restarts.
+    keepAlive: 30_000,
   });
   cachedClientKey = key;
   return cachedClient;
