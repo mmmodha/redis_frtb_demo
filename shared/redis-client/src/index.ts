@@ -72,6 +72,15 @@ export function createRedisClient(opts: CreateRedisClientOptions = {}): Redis | 
     ...(tlsEnabled ? { tls: {} } : {}),
     ...(opts.lazyConnect !== undefined ? { lazyConnect: opts.lazyConnect } : {}),
     ...(opts.maxRetriesPerRequest !== undefined ? { maxRetriesPerRequest: opts.maxRetriesPerRequest } : {}),
+    // Wave 6.18c — default bounded connect + per-command timeouts so a wedged
+    // Redis Enterprise proxy cannot hang the api boot path. Companion to
+    // Wave 6.18a's `keepAlive`: keepAlive recovers stalled long-idle sockets,
+    // but the very first command on a fresh socket has no probe history yet,
+    // so commandTimeout is what catches the boot-time hung-send-q case.
+    // `opts.connectTimeout` (if provided) still overrides; commandTimeout has
+    // no opts override because no caller has needed one to date.
+    connectTimeout: 5_000,
+    commandTimeout: 10_000,
     ...(opts.connectTimeout !== undefined ? { connectTimeout: opts.connectTimeout } : {}),
     // Wave 6.18a — TCP keepAlive so long-idle sockets on Redis Enterprise
     // proxies don't zombie into MaxRetriesPerRequestError. Inherited by the

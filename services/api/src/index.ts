@@ -44,6 +44,29 @@ const STORE_FILE = process.env.CONN_STORE_FILE
   ?? join(REPO_ROOT, ".run/data/connections.enc.json");
 const MASTER_KEY = process.env.FRTB_MASTER_KEY ?? process.env.CONN_STORE_KEY;
 
+// Wave 6.18c — bounded boot-time Redis-touching await. Companion to the
+// `connectTimeout` / `commandTimeout` added to the ioredis factories in
+// Wave 6.18a/6.18c: even if a hung socket somehow slips past the ioredis-
+// level limits (mocked client, future driver, etc.), this Promise.race
+// guarantees `app.listen(...)` is reached. Overridable via env so the
+// boot-timeout unit test can shrink the wait below the vitest budget.
+const BOOT_BOOTSTRAP_TIMEOUT_MS =
+  Number(process.env.API_BOOT_BOOTSTRAP_TIMEOUT_MS ?? 12_000);
+
+function withBootTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolveP, rejectP) => {
+    const timer = setTimeout(
+      () => rejectP(new Error(`boot-timeout: ${label} exceeded ${ms}ms`)),
+      ms,
+    );
+    if (typeof timer.unref === "function") timer.unref();
+    p.then(
+      (v) => { clearTimeout(timer); resolveP(v); },
+      (e) => { clearTimeout(timer); rejectP(e); },
+    );
+  });
+}
+
 async function main(): Promise<void> {
   if (!MASTER_KEY) {
     console.error(JSON.stringify({
@@ -156,7 +179,17 @@ async function main(): Promise<void> {
     // for a subsequent active-target switch.
     markBootstrapStatusRunning(target.label);
     try {
-      await bootstrapFrtb(redis, schema);
+      // Wave 6.18c — wrap the only Redis-touching boot-time await in a
+      // bounded race so a wedged proxy (see VM ep_poll/87B-send-q symptom)
+      // cannot block `app.listen(...)` from binding the port. The ioredis-
+      // level `commandTimeout` from the 6.18c factory edit should fire first
+      // in production; this is the belt-and-suspenders backstop for any
+      // edge case where the driver itself stalls.
+      await withBootTimeout(
+        bootstrapFrtb(redis, schema),
+        BOOT_BOOTSTRAP_TIMEOUT_MS,
+        "bootstrapFrtb",
+      );
       // Wave 5.14b.1 — flip /healthz from 503 → 200 only on success.
       markBootstrapReady();
       markBootstrapStatusReady(target.label);

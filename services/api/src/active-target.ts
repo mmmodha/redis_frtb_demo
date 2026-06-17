@@ -134,6 +134,14 @@ export function getActiveRedisClient(): Redis | null {
     // Redis Enterprise proxies do not zombie into MaxRetriesPerRequestError
     // without recovering until the process restarts.
     keepAlive: 30_000,
+    // Wave 6.18c — bounded connect + per-command timeouts. The 6.18a
+    // keepAlive cannot protect the very first command sent on a fresh
+    // socket (no probe interval has elapsed yet). A wedged Redis Enterprise
+    // proxy could therefore still hang `bootstrapFrtb()` and prevent
+    // `app.listen()` from binding. With these two limits, any hung command
+    // fails fast and the boot path completes.
+    connectTimeout: 5_000,
+    commandTimeout: 10_000,
   });
   cachedClientKey = key;
   return cachedClient;
