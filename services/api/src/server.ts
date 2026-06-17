@@ -8,6 +8,7 @@ import {
   setActiveTarget,
   onActiveTargetChange,
   getActiveRedisClient,
+  getActiveRedisRuntimeClient,
   type ActiveTarget,
 } from "./active-target.ts";
 import {
@@ -197,11 +198,15 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
   //      per-request retargeting with a mutable fake).
   //   2. opts.redis — back-compat test seam: existing unit tests inject a
   //      single fakeRedis instance and expect it for the whole server life.
-  //   3. getActiveRedisClient() — fall-back when nothing else is supplied.
+  //   3. getActiveRedisRuntimeClient() — fall-back when nothing else is
+  //      supplied. Wave 6.18f: routes resolve to the RUNTIME client (35s
+  //      commandTimeout) so the in-Redis FT_AGGREGATE TIMEOUT (30s) can fire
+  //      first; the boot client (10s) remains reserved for `bootstrapFrtb` +
+  //      `scheduleBootstrap` callers.
   const getRedis = (): RedisLike => {
     if (opts.getRedis) return opts.getRedis();
     if (opts.redis) return opts.redis;
-    const active = getActiveRedisClient();
+    const active = getActiveRedisRuntimeClient();
     if (active) return active as unknown as RedisLike;
     // Last-resort: surface a clear error when nothing resolved.
     throw new Error("no active redis client and no fallback opts.redis provided");

@@ -39,8 +39,37 @@ let overrideCreds: ActiveTargetCreds = {};
 // cache key string.
 let credsGeneration = 0;
 const listeners = new Set<ActiveTargetListener>();
-let cachedClient: Redis | null = null;
-let cachedClientKey = "";
+// Wave 6.18f — two cached clients, identical host/port/auth/keepalive but
+// with different per-command timeouts:
+//   * `cachedBootClient` — commandTimeout: 10_000 (Wave 6.18c). Used by the
+//     api boot path (`bootstrapFrtb` + post-listen `scheduleBootstrap`) so a
+//     wedged Redis Enterprise proxy fails fast and `app.listen(...)` is
+//     reached. Companion to `withBootTimeout(...)` in index.ts (12s).
+//   * `cachedRuntimeClient` — commandTimeout: 35_000 (Wave 6.18f). Used by
+//     per-request route handlers so the in-Redis TIMEOUT directive
+//     (`FT_AGGREGATE_TIMEOUT_MS = 30_000` in src/sbm/aggregate-via-index.ts)
+//     fires first and surfaces a clean error, instead of ioredis aborting at
+//     the boot-protection 10s and producing a generic command-timeout. The
+//     35s figure = 30s in-Redis budget + 5s grace; still capped so a
+//     genuinely hung command does not hang the request forever.
+// Both share the same `targetKey(...)` cache invalidation so `setActiveTarget`
+// rebuilds them in lockstep.
+let cachedBootClient: Redis | null = null;
+let cachedBootClientKey = "";
+let cachedRuntimeClient: Redis | null = null;
+let cachedRuntimeClientKey = "";
+
+const BOOT_COMMAND_TIMEOUT_MS = 10_000;
+const RUNTIME_COMMAND_TIMEOUT_DEFAULT_MS = 35_000;
+
+// Read on each runtime-client build so tests can flip the env without
+// reloading the module. Falsy / non-numeric values fall back to the default.
+function getRuntimeCommandTimeoutMs(): number {
+  const raw = process.env.RUNTIME_REDIS_COMMAND_TIMEOUT_MS;
+  if (raw === undefined || raw === "") return RUNTIME_COMMAND_TIMEOUT_DEFAULT_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : RUNTIME_COMMAND_TIMEOUT_DEFAULT_MS;
+}
 
 function targetKey(t: ActiveTarget): string {
   return `${t.host}|${t.port}|${t.tls ? 1 : 0}|${t.db}|${t.clusterMode ? 1 : 0}|${credsGeneration}`;
@@ -97,11 +126,16 @@ export function setActiveTargetLabel(label: string): void {
 export function resetActiveTarget(): void {
   override = undefined;
   overrideCreds = {};
-  if (cachedClient) {
-    try { cachedClient.disconnect(); } catch { /* ignore */ }
+  if (cachedBootClient) {
+    try { cachedBootClient.disconnect(); } catch { /* ignore */ }
   }
-  cachedClient = null;
-  cachedClientKey = "";
+  cachedBootClient = null;
+  cachedBootClientKey = "";
+  if (cachedRuntimeClient) {
+    try { cachedRuntimeClient.disconnect(); } catch { /* ignore */ }
+  }
+  cachedRuntimeClient = null;
+  cachedRuntimeClientKey = "";
 }
 
 export function onActiveTargetChange(fn: ActiveTargetListener): () => void {
@@ -109,19 +143,16 @@ export function onActiveTargetChange(fn: ActiveTargetListener): () => void {
   return () => { listeners.delete(fn); };
 }
 
-// Returns a lazyConnect ioredis client bound to the current active target.
-// Cached and rebuilt when the target identity (host/port/tls/db) OR the
-// stored credentials change so callers (router, observability) get a stable
-// instance between switches but authenticated targets don't trip NOAUTH.
-export function getActiveRedisClient(): Redis | null {
-  const t = getActiveTarget();
-  const c = overrideCreds;
-  const key = targetKey(t);
-  if (cachedClient && key === cachedClientKey) return cachedClient;
-  if (cachedClient) {
-    try { cachedClient.disconnect(); } catch { /* ignore */ }
-  }
-  cachedClient = new Redis({
+// Internal factory shared by the boot and runtime client accessors. The only
+// per-call difference is `commandTimeout`; everything else (host, port, db,
+// tls, creds, keepAlive, connectTimeout) is identical so a profile switch
+// rebuilds both caches in lockstep via `targetKey(...)`.
+function buildClient(
+  t: ActiveTarget,
+  c: ActiveTargetCreds,
+  commandTimeout: number,
+): Redis {
+  return new Redis({
     host: t.host,
     port: t.port,
     db: t.db,
@@ -134,17 +165,58 @@ export function getActiveRedisClient(): Redis | null {
     // Redis Enterprise proxies do not zombie into MaxRetriesPerRequestError
     // without recovering until the process restarts.
     keepAlive: 30_000,
-    // Wave 6.18c — bounded connect + per-command timeouts. The 6.18a
-    // keepAlive cannot protect the very first command sent on a fresh
-    // socket (no probe interval has elapsed yet). A wedged Redis Enterprise
-    // proxy could therefore still hang `bootstrapFrtb()` and prevent
-    // `app.listen()` from binding. With these two limits, any hung command
-    // fails fast and the boot path completes.
+    // Wave 6.18c — bounded connect timeout so a wedged proxy can't hang
+    // `bootstrapFrtb()` and prevent `app.listen()` from binding.
     connectTimeout: 5_000,
-    commandTimeout: 10_000,
+    commandTimeout,
   });
-  cachedClientKey = key;
-  return cachedClient;
+}
+
+// Returns a lazyConnect ioredis client bound to the current active target,
+// using the Wave 6.18c boot-protection commandTimeout (10s). Cached and
+// rebuilt when the target identity (host/port/tls/db) OR the stored
+// credentials change so callers (boot `bootstrapFrtb`, `scheduleBootstrap`)
+// get a stable instance between switches but authenticated targets don't
+// trip NOAUTH.
+//
+// Wave 6.18f — this remains the BOOT client. Route handlers should call
+// `getActiveRedisRuntimeClient()` so per-request calls can outlast the
+// in-Redis 30s TIMEOUT directive instead of being aborted at 10s.
+export function getActiveRedisClient(): Redis | null {
+  const t = getActiveTarget();
+  const c = overrideCreds;
+  const key = targetKey(t);
+  if (cachedBootClient && key === cachedBootClientKey) return cachedBootClient;
+  if (cachedBootClient) {
+    try { cachedBootClient.disconnect(); } catch { /* ignore */ }
+  }
+  cachedBootClient = buildClient(t, c, BOOT_COMMAND_TIMEOUT_MS);
+  cachedBootClientKey = key;
+  return cachedBootClient;
+}
+
+// Wave 6.18f — runtime variant of `getActiveRedisClient()` used by per-route
+// handlers. Identical to the boot client except `commandTimeout` is 35_000
+// (overridable via `RUNTIME_REDIS_COMMAND_TIMEOUT_MS`), which comfortably
+// exceeds the in-Redis FT_AGGREGATE TIMEOUT directive
+// (`FT_AGGREGATE_TIMEOUT_MS = 30_000` in src/sbm/aggregate-via-index.ts).
+// VM evidence on bigcluster (calc-discovery-failed × 24, all at exactly 10s)
+// showed routes being aborted by the boot-protection ioredis 10s timeout
+// before Redis itself had a chance to emit its 30s TIMEOUT error — clients
+// then saw a generic command-timeout instead of a clean recoverable error.
+// 35s = 30s in-Redis budget + 5s grace; still capped so genuinely hung
+// commands cannot wedge the request forever.
+export function getActiveRedisRuntimeClient(): Redis | null {
+  const t = getActiveTarget();
+  const c = overrideCreds;
+  const key = targetKey(t);
+  if (cachedRuntimeClient && key === cachedRuntimeClientKey) return cachedRuntimeClient;
+  if (cachedRuntimeClient) {
+    try { cachedRuntimeClient.disconnect(); } catch { /* ignore */ }
+  }
+  cachedRuntimeClient = buildClient(t, c, getRuntimeCommandTimeoutMs());
+  cachedRuntimeClientKey = key;
+  return cachedRuntimeClient;
 }
 
 export function getActiveTarget(): ActiveTarget {

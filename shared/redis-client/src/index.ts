@@ -30,6 +30,17 @@ export interface CreateRedisClientOptions {
   lazyConnect?: boolean;
   maxRetriesPerRequest?: number | null;
   connectTimeout?: number;
+  // Wave 6.18f — per-command timeout override. The factory defaults to
+  // 10_000ms (Wave 6.18c boot-protection: ensures the api boot path's
+  // bootstrapFrtb() call cannot hang `app.listen(...)`). Callers that issue
+  // long-running runtime commands (e.g. FT.AGGREGATE with TIMEOUT 30000)
+  // should pass `commandTimeout: 35_000` (30s in-Redis budget + 5s grace)
+  // so ioredis does not abort the call before Redis itself returns a clean
+  // TIMEOUT error. Use the api's `getActiveRedisRuntimeClient()` when
+  // operating inside the api process; this option is the equivalent escape
+  // hatch for ingest/generator/loadgen callers that build their own client
+  // via `createRedisClient(...)`.
+  commandTimeout?: number;
 }
 
 export function parseRedisUrl(raw: string): ParsedRedisUrl {
@@ -77,11 +88,13 @@ export function createRedisClient(opts: CreateRedisClientOptions = {}): Redis | 
     // Wave 6.18a's `keepAlive`: keepAlive recovers stalled long-idle sockets,
     // but the very first command on a fresh socket has no probe history yet,
     // so commandTimeout is what catches the boot-time hung-send-q case.
-    // `opts.connectTimeout` (if provided) still overrides; commandTimeout has
-    // no opts override because no caller has needed one to date.
+    // Wave 6.18f — `opts.commandTimeout` overrides this default for runtime
+    // callers that need to outlast the in-Redis FT_AGGREGATE TIMEOUT (30s).
+    // The api's `getActiveRedisRuntimeClient()` is the in-process equivalent.
     connectTimeout: 5_000,
     commandTimeout: 10_000,
     ...(opts.connectTimeout !== undefined ? { connectTimeout: opts.connectTimeout } : {}),
+    ...(opts.commandTimeout !== undefined ? { commandTimeout: opts.commandTimeout } : {}),
     // Wave 6.18a — TCP keepAlive so long-idle sockets on Redis Enterprise
     // proxies don't zombie into MaxRetriesPerRequestError. Inherited by the
     // Cluster path via clusterOptions.redisOptions below.

@@ -11,7 +11,7 @@ import { Cluster, type Redis } from "ioredis";
 import { createRedisClient } from "@frtb/redis-client";
 import { loadSchema } from "@frtb/schema";
 import { createServer, markBootstrapReady, markBootstrapFailed, markBootstrapSkipped } from "./server.ts";
-import { getActiveTarget, setActiveTarget, getActiveRedisClient } from "./active-target.ts";
+import { getActiveTarget, setActiveTarget, getActiveRedisClient, getActiveRedisRuntimeClient } from "./active-target.ts";
 import type { RedisLike } from "./redis-like.ts";
 import { buildCrossBucketCorrelations } from "./sbm/correlations.ts";
 import { createStore } from "./store.ts";
@@ -234,11 +234,17 @@ async function main(): Promise<void> {
 
   // Wave 5.16t — wire the per-request accessor so routes follow the
   // active-target singleton. setActiveTarget() at boot (lines 44-52) and any
-  // subsequent UI-driven profile switch flips getActiveRedisClient() to the
-  // new target; routes see it on the very next call. The boot-time `redis`
+  // subsequent UI-driven profile switch flips the cached clients to the new
+  // target; routes see it on the very next call. The boot-time `redis`
   // remains as a fallback for the brief window before the singleton resolves.
+  //
+  // Wave 6.18f — routes resolve to the RUNTIME client (35s commandTimeout)
+  // rather than the boot client (10s). The boot client is still used by
+  // `bootstrapFrtb` above and the post-listen `scheduleBootstrap` below so
+  // the Wave 6.18c boot-protection invariants (withBootTimeout 12s,
+  // commandTimeout 10s) are preserved.
   const getRedis = (): RedisLike => {
-    const active = getActiveRedisClient();
+    const active = getActiveRedisRuntimeClient();
     return (active ?? redis) as unknown as RedisLike;
   };
   const app = await createServer({ getRedis, correlations, schema, store, logger: true });
