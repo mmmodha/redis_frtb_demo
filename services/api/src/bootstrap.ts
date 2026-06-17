@@ -209,6 +209,34 @@ async function probeLegacyDocCount(client: RedisLike): Promise<number | null> {
   }
 }
 
+// Wave 6.18l — strict FT.INFO probe used by stranded-versioned-index recovery.
+// Distinguishes "expected missing" (RediSearch's "Unknown Index name") which
+// returns null, from unexpected errors (command timeout, network drop) which
+// rethrow so the outer withBootTimeout / bootstrap failure handling takes
+// over instead of silently treating the index as missing. parseDocCount peels
+// num_docs out of the flat [field, value, ...] reply (string in most builds).
+function parseDocCount(reply: unknown): number | null {
+  if (!Array.isArray(reply)) return null;
+  for (let i = 0; i + 1 < reply.length; i += 2) {
+    if (String(reply[i]) === "num_docs") {
+      const n = Number(reply[i + 1]);
+      return Number.isFinite(n) ? n : null;
+    }
+  }
+  return null;
+}
+
+async function probeDocCountStrict(client: RedisLike, indexName: string): Promise<number | null> {
+  let reply: unknown;
+  try {
+    reply = await client.call("FT.INFO", indexName);
+  } catch (err) {
+    if (isUnknownIndex(err)) return null;
+    throw err;
+  }
+  return parseDocCount(reply);
+}
+
 async function runIndexRebuild(
   nodes: RedisLike[],
   schema: Schema,
@@ -290,7 +318,57 @@ export async function bootstrapFrtb(
   let resolvedIndexName = newIndexName;
   let skipped = false;
   if (opts.target_label) {
-    const oldHash = await readOldHash(client, opts.target_label);
+    let oldHash = await readOldHash(client, opts.target_label);
+
+    // Wave 6.18l — self-healing stranded-versioned-index recovery. When the
+    // hash key points to a plain-hex versioned index but that index reports
+    // num_docs=0 while the legacy `idx:sens` still holds rows, we landed in
+    // the "6.18i deployed first over a populated cluster" trap: FT.CREATE
+    // succeeded against an empty versioned name in milliseconds, the real
+    // 100M docs sit untouched under the legacy index, and getSensIndexName
+    // now resolves every read to the empty shadow. DEL the hash key and let
+    // the 6.18j adopt-legacy branch below take over on this same boot.
+    // Only fires for plain hex hashes — legacy: prefixes already mean we're
+    // pointing at the unversioned index, so by definition not stranded. The
+    // outer withBootTimeout in index.ts bounds these FT.INFO calls; an
+    // unexpected error (e.g. command timeout, not "unknown index") rethrows
+    // and surfaces as the existing bootstrap-failed path rather than being
+    // silently treated as "not stranded".
+    if (oldHash !== null && !oldHash.startsWith(LEGACY_HASH_PREFIX)) {
+      const strandedVersioned = versionedIndexName(oldHash);
+      const versionedDocs = await probeDocCountStrict(client, strandedVersioned);
+      if (versionedDocs === 0) {
+        const legacyDocs = await probeDocCountStrict(client, BASE_INDEX_NAME);
+        if (legacyDocs !== null && legacyDocs > 0) {
+          log({
+            service: "api",
+            bootstrap: "idx:sens",
+            action: "bootstrap-recover-stranded",
+            target_label: opts.target_label,
+            stranded_versioned_index: strandedVersioned,
+            stranded_versioned_docs: 0,
+            legacy_index: BASE_INDEX_NAME,
+            legacy_docs: legacyDocs,
+          });
+          try {
+            await client.call("DEL", schemaHashKey(opts.target_label));
+          } catch (err) {
+            log({
+              service: "api",
+              bootstrap: "idx:sens",
+              action: "hash-del-failed",
+              err: err instanceof Error ? err.message : String(err),
+            });
+          }
+          clearSensIndexNameCache(opts.target_label);
+          // Falls through to the 6.18j adopt-legacy branch immediately below;
+          // re-probing legacy num_docs there is one extra FT.INFO and keeps
+          // the code paths uniform instead of duplicating the SET/log/cache
+          // dance here.
+          oldHash = null;
+        }
+      }
+    }
 
     // Wave 6.18j — adoption path. Only triggered when no hash key exists; the
     // FT.INFO probe stays cheap (single boot-client call) on the steady-state

@@ -875,3 +875,212 @@ describe("bootstrap — Wave 6.18j adopt legacy idx:sens on first migration", ()
     expect(name).toBe("idx:sens:vabcdef1");
   });
 });
+
+
+// Wave 6.18l — fake cluster with per-index FT.INFO control. Drives the
+// stranded-recovery decision tree:
+//   - `versionedDocs` maps versioned index name → num_docs reply (number)
+//     OR the sentinel "missing" → throws "Unknown Index name"
+//     OR the sentinel "timeout" → throws "Command timed out"
+//   - `legacyDocs` same shape for the legacy `idx:sens` probe.
+// Hash key SET/GET/DEL is tracked on a single mutable cell so a recovery DEL
+// followed by the 6.18j adopt-legacy SET round-trips correctly.
+type InfoReply = number | "missing" | "timeout";
+interface StrandedClusterOpts {
+  oldHash: string | null;
+  versionedDocs: InfoReply;
+  legacyDocs: InfoReply;
+}
+function ftInfoReply(indexName: string, kind: InfoReply): unknown {
+  if (kind === "missing") throw new Error("Unknown Index name");
+  if (kind === "timeout") throw new Error("Command timed out");
+  return ["index_name", indexName, "num_docs", String(kind)];
+}
+function fakeClusterForStranded(
+  nodeIds: string[],
+  recorded: RecordedCall[],
+  opts: StrandedClusterOpts,
+): RedisLike {
+  const hashCell = { value: opts.oldHash };
+  const nodes = nodeIds.map((id) => ({
+    async call(command: string, ...args: unknown[]) {
+      const cmd = String(command).toUpperCase();
+      recorded.push({ node: id, command: cmd, args });
+      if (cmd === "FT.INFO") {
+        const target = String(args[0]);
+        if (target === BASE_INDEX_NAME) return ftInfoReply(target, opts.legacyDocs);
+        return ftInfoReply(target, opts.versionedDocs);
+      }
+      return "OK";
+    },
+  }));
+  return {
+    nodes: (_role: string) => nodes as unknown as RedisLike[],
+    async call(command: string, ...args: unknown[]) {
+      const cmd = String(command).toUpperCase();
+      recorded.push({ node: "cluster", command: cmd, args });
+      if (cmd === "GET") return hashCell.value;
+      if (cmd === "SET") { hashCell.value = String(args[1]); return "OK"; }
+      if (cmd === "DEL") { hashCell.value = null; return 1; }
+      if (cmd === "FT.INFO") {
+        const target = String(args[0]);
+        if (target === BASE_INDEX_NAME) return ftInfoReply(target, opts.legacyDocs);
+        return ftInfoReply(target, opts.versionedDocs);
+      }
+      if (cmd === "FT.SUGLEN") return 1;
+      if (cmd === "FT.AGGREGATE") return [0];
+      return "OK";
+    },
+  } as unknown as RedisLike;
+}
+
+describe("bootstrap — Wave 6.18l self-healing stranded versioned index", () => {
+  it("recovers on stranded state: hash → empty versioned + populated legacy → DEL + adopt-legacy", async () => {
+    clearSensIndexNameCache();
+    const schema = loadSchema(SCHEMA_PATH);
+    const newHash = computeSchemaHash(schema);
+    const strandedHash = newHash;          // same schema, just stranded against an empty versioned name
+    const recorded: RecordedCall[] = [];
+    const c = fakeClusterForStranded(["m1", "m2"], recorded, {
+      oldHash: strandedHash,
+      versionedDocs: 0,
+      legacyDocs: 100_000_000,
+    });
+    const logs: Record<string, unknown>[] = [];
+    await bootstrapFrtb(c, schema, (e) => logs.push(e), { target_label: "tgt-L1" });
+
+    const recovery = logs.find((l) => l.action === "bootstrap-recover-stranded");
+    expect(recovery).toMatchObject({
+      service: "api",
+      bootstrap: "idx:sens",
+      action: "bootstrap-recover-stranded",
+      target_label: "tgt-L1",
+      stranded_versioned_index: versionedIndexName(strandedHash),
+      stranded_versioned_docs: 0,
+      legacy_index: BASE_INDEX_NAME,
+      legacy_docs: 100_000_000,
+    });
+    // Hash key was DELed before adoption.
+    const dels = recorded.filter((r) => r.command === "DEL" && r.args[0] === schemaHashKey("tgt-L1"));
+    expect(dels).toHaveLength(1);
+    // 6.18j adopt-legacy ran on the same boot: SET legacy:{newHash}, no FT.CREATE/FT.DROPINDEX.
+    expect(recorded.some((r) => r.command === "FT.CREATE")).toBe(false);
+    expect(recorded.some((r) => r.command === "FT.DROPINDEX")).toBe(false);
+    const sets = recorded.filter((r) => r.command === "SET" && r.args[0] === schemaHashKey("tgt-L1"));
+    expect(sets).toHaveLength(1);
+    expect(sets[0]!.args[1]).toBe(`${LEGACY_HASH_PREFIX}${newHash}`);
+    const adopt = logs.find((l) => l.action === "bootstrap-adopt-legacy");
+    expect(adopt).toMatchObject({ action: "bootstrap-adopt-legacy", num_docs: 100_000_000 });
+    // getSensIndexName resolves to legacy after recovery (cache cleared + legacy prefix written).
+    const resolved = await getSensIndexName(c as unknown as NarrowRedisLike, "tgt-L1");
+    expect(resolved).toBe(BASE_INDEX_NAME);
+  });
+
+  it("does NOT recover when versioned has docs (normal skip path fires instead)", async () => {
+    clearSensIndexNameCache();
+    const schema = loadSchema(SCHEMA_PATH);
+    const newHash = computeSchemaHash(schema);
+    const recorded: RecordedCall[] = [];
+    const c = fakeClusterForStranded(["m1", "m2"], recorded, {
+      oldHash: newHash,
+      versionedDocs: 5,                  // populated → not stranded
+      legacyDocs: 100,                   // legacy also populated (reverse direction is out of scope)
+    });
+    const logs: Record<string, unknown>[] = [];
+    await bootstrapFrtb(c, schema, (e) => logs.push(e), { target_label: "tgt-L2" });
+
+    expect(logs.some((l) => l.action === "bootstrap-recover-stranded")).toBe(false);
+    expect(recorded.some((r) => r.command === "DEL")).toBe(false);
+    const skip = logs.find((l) => l.action === "bootstrap-skip");
+    expect(skip).toMatchObject({ action: "bootstrap-skip", reason: "schema-unchanged", index: versionedIndexName(newHash) });
+    // Adopt-legacy must NOT fire — oldHash was non-null going into 6.18j.
+    expect(logs.some((l) => l.action === "bootstrap-adopt-legacy")).toBe(false);
+  });
+
+  it("does NOT recover when legacy is empty (versioned empty too → normal create path)", async () => {
+    clearSensIndexNameCache();
+    const schema = loadSchema(SCHEMA_PATH);
+    const staleHash = "deadbeefdeadbeef";
+    const recorded: RecordedCall[] = [];
+    const c = fakeClusterForStranded(["m1", "m2"], recorded, {
+      oldHash: staleHash,
+      versionedDocs: 0,
+      legacyDocs: 0,                     // empty → no recovery
+    });
+    const logs: Record<string, unknown>[] = [];
+    await bootstrapFrtb(c, schema, (e) => logs.push(e), { target_label: "tgt-L3" });
+
+    expect(logs.some((l) => l.action === "bootstrap-recover-stranded")).toBe(false);
+    expect(recorded.some((r) => r.command === "DEL")).toBe(false);
+    expect(logs.some((l) => l.action === "bootstrap-adopt-legacy")).toBe(false);
+    // Falls through to versioned-create.
+    const creates = recorded.filter((r) => r.command === "FT.CREATE");
+    expect(creates.length).toBeGreaterThan(0);
+  });
+
+  it("does NOT recover when legacy is missing (normal create path)", async () => {
+    clearSensIndexNameCache();
+    const schema = loadSchema(SCHEMA_PATH);
+    const staleHash = "deadbeefdeadbeef";
+    const recorded: RecordedCall[] = [];
+    const c = fakeClusterForStranded(["m1", "m2"], recorded, {
+      oldHash: staleHash,
+      versionedDocs: 0,
+      legacyDocs: "missing",
+    });
+    const logs: Record<string, unknown>[] = [];
+    await bootstrapFrtb(c, schema, (e) => logs.push(e), { target_label: "tgt-L4" });
+
+    expect(logs.some((l) => l.action === "bootstrap-recover-stranded")).toBe(false);
+    expect(recorded.some((r) => r.command === "DEL")).toBe(false);
+    expect(logs.some((l) => l.action === "bootstrap-adopt-legacy")).toBe(false);
+  });
+
+  it("FT.INFO timeout on the recovery probe bubbles up (does NOT silently skip)", async () => {
+    clearSensIndexNameCache();
+    const schema = loadSchema(SCHEMA_PATH);
+    const strandedHash = "deadbeefdeadbeef";
+    const recorded: RecordedCall[] = [];
+    const c = fakeClusterForStranded(["m1", "m2"], recorded, {
+      oldHash: strandedHash,
+      versionedDocs: "timeout",          // FT.INFO on versioned hangs / errors
+      legacyDocs: 0,
+    });
+    const logs: Record<string, unknown>[] = [];
+    await expect(
+      bootstrapFrtb(c, schema, (e) => logs.push(e), { target_label: "tgt-L5" }),
+    ).rejects.toThrow(/timed out/i);
+    expect(logs.some((l) => l.action === "bootstrap-recover-stranded")).toBe(false);
+    // No DEL, no SET, no fall-through to create — the error short-circuits.
+    expect(recorded.some((r) => r.command === "DEL")).toBe(false);
+    expect(recorded.some((r) => r.command === "FT.CREATE")).toBe(false);
+  });
+
+  it("idempotent on second boot: post-recovery state (no hash key + populated legacy) takes the normal 6.18j adopt-legacy path", async () => {
+    clearSensIndexNameCache();
+    const schema = loadSchema(SCHEMA_PATH);
+    const newHash = computeSchemaHash(schema);
+    const recorded: RecordedCall[] = [];
+    // Simulates the state IMMEDIATELY AFTER a 6.18l recovery completed and the
+    // process restarted: the recovery's adopt-legacy SET wrote `legacy:{hash}`,
+    // so on this boot the oldHash starts with the LEGACY_HASH_PREFIX and the
+    // 6.18j legacy-unchanged skip should fire. No recovery, no adoption, no
+    // index rebuild — exactly the steady-state restart shape.
+    const c = fakeClusterForStranded(["m1", "m2"], recorded, {
+      oldHash: `${LEGACY_HASH_PREFIX}${newHash}`,
+      versionedDocs: 0,
+      legacyDocs: 100,
+    });
+    const logs: Record<string, unknown>[] = [];
+    await bootstrapFrtb(c, schema, (e) => logs.push(e), { target_label: "tgt-L6" });
+
+    expect(logs.some((l) => l.action === "bootstrap-recover-stranded")).toBe(false);
+    expect(logs.some((l) => l.action === "bootstrap-adopt-legacy")).toBe(false);
+    expect(recorded.some((r) => r.command === "DEL")).toBe(false);
+    expect(recorded.some((r) => r.command === "FT.CREATE")).toBe(false);
+    expect(recorded.some((r) => r.command === "FT.DROPINDEX")).toBe(false);
+    const skip = logs.find((l) => l.action === "bootstrap-skip");
+    expect(skip).toMatchObject({ reason: "legacy-schema-unchanged", index: BASE_INDEX_NAME });
+  });
+});
+
