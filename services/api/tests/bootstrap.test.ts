@@ -805,6 +805,48 @@ describe("bootstrap — Wave 6.18j adopt legacy idx:sens on first migration", ()
     expect(recorded.some((r) => r.command === "FUNCTION")).toBe(false);
   });
 
+  it("legacy-skip-rebuilds-when-idx-missing: hash key = legacy:{currentHash} but idx:sens absent → falls through to rebuild path (does NOT skip)", async () => {
+    // Wave 6.18m — regression guard. Production hit a state where
+    // `bootstrap:schema-hash:<target>` was `legacy:<currentHash>` but the
+    // unversioned `idx:sens` had been dropped (module reload / manual op /
+    // snapshot restore). The pre-6.18m predicate fast-pathed on hash match
+    // alone, leaving the cluster indefinitely broken with /facets + /calc
+    // 500ing. Mirror the non-legacy skip path: verify the index exists on
+    // every master before taking the fast path.
+    clearSensIndexNameCache();
+    const schema = loadSchema(SCHEMA_PATH);
+    const newHash = computeSchemaHash(schema);
+    const recorded: RecordedCall[] = [];
+    const c = fakeClusterForAdopt(["m1", "m2"], recorded, {
+      oldHash: `${LEGACY_HASH_PREFIX}${newHash}`,
+      legacyDocs: null,             // FT.INFO idx:sens throws "Unknown Index name"
+    });
+    const logs: Record<string, unknown>[] = [];
+    await bootstrapFrtb(c, schema, (e) => logs.push(e), { target_label: "tgt-M1" });
+
+    // MUST NOT take the legacy-skip fast path.
+    const skip = logs.find(
+      (l) => l.action === "bootstrap-skip" && l.reason === "legacy-schema-unchanged",
+    );
+    expect(skip).toBeUndefined();
+    // MUST rebuild — migrate-legacy-to-versioned log fires, FT.CREATE runs
+    // against the versioned name on every master, hash key rewritten to
+    // plain newHash so future restarts follow the standard 6.18i path.
+    const mig = logs.find((l) => l.action === "bootstrap-migrate-legacy-to-versioned");
+    expect(mig).toMatchObject({
+      action: "bootstrap-migrate-legacy-to-versioned",
+      newIndex: versionedIndexName(newHash),
+    });
+    const creates = recorded.filter((r) => r.command === "FT.CREATE");
+    expect(creates).toHaveLength(2);
+    for (const c2 of creates) expect(c2.args[0]).toBe(versionedIndexName(newHash));
+    const sets = recorded.filter(
+      (r) => r.command === "SET" && r.args[0] === schemaHashKey("tgt-M1"),
+    );
+    expect(sets).toHaveLength(1);
+    expect(sets[0]!.args[1]).toBe(newHash);
+  });
+
   it("legacy-migrate-on-change: hash key = legacy:{old} with old≠newHash → DROPINDEX idx:sens ASYNC + CREATE versioned + SET plain newHash", async () => {
     clearSensIndexNameCache();
     const schema = loadSchema(SCHEMA_PATH);

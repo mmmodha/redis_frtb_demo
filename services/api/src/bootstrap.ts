@@ -410,7 +410,11 @@ export async function bootstrapFrtb(
       // new versioned name, then rewrite the hash key to the plain newHash so
       // we exit the legacy regime permanently.
       const legacySuffix = oldHash.slice(LEGACY_HASH_PREFIX.length);
-      if (!opts.force && legacySuffix === newHash) {
+      // Wave 6.18m — mirror the non-legacy skip path below: hash match alone
+      // is not enough — if `idx:sens` was dropped out from under us (module
+      // reload, manual DROPINDEX, snapshot restore), fall through to the
+      // rebuild branch instead of fast-pathing into a broken steady state.
+      if (!opts.force && legacySuffix === newHash && await indexPresentOnAll(nodes, BASE_INDEX_NAME)) {
         skipped = true;
         resolvedIndexName = BASE_INDEX_NAME;
         log({
