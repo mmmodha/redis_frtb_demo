@@ -18,6 +18,21 @@ import {
   type BootstrapFailure,
   type RedisLike as BootstrapRedis,
 } from "./bootstrap.ts";
+import { withBootTimeout } from "./lib/with-timeout.ts";
+
+// Wave 6.18h — scheduled-path timeout shares the boot-time helper but uses
+// a longer default. The boot path (index.ts, 12s) blocks `app.listen` so
+// it has to stay short; this listener-driven path runs post-listen and only
+// protects against the bootstrap-status snapshot leaking `running`. FT.DROPINDEX
+// on a 100M-row index can legitimately take 30-60s, so 12s here would cause
+// spurious failures during the demo. Override with SCHEDULED_BOOTSTRAP_TIMEOUT_MS.
+const DEFAULT_SCHEDULED_BOOTSTRAP_TIMEOUT_MS = 90_000;
+function getScheduledBootstrapTimeoutMs(): number {
+  const raw = process.env.SCHEDULED_BOOTSTRAP_TIMEOUT_MS;
+  if (raw === undefined || raw === "") return DEFAULT_SCHEDULED_BOOTSTRAP_TIMEOUT_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_SCHEDULED_BOOTSTRAP_TIMEOUT_MS;
+}
 
 // Wave 6.16a — `partial` slots between `ready` and `failed`: at least one
 // per-node step (idx:sens, frtb library) refused to come up, but the
@@ -135,13 +150,39 @@ export function scheduleBootstrap(
     debounceTimer = null;
     // Skip if a newer schedule call superseded us during debounce.
     if (myGen !== generation) return;
-    runner(client, schema)
+    // Wave 6.18h — bound the runner with the shared withBootTimeout helper
+    // so a hung bootstrapFrtb (e.g. FT.DROPINDEX wedged on a large index,
+    // network partition mid-fan-out) can't leak the snapshot stuck at
+    // `running`. Default 90s gives FT.DROPINDEX on a 100M-row index room
+    // to legitimately complete; override via SCHEDULED_BOOTSTRAP_TIMEOUT_MS.
+    // See index.ts BOOT_BOOTSTRAP_TIMEOUT_MS (12s) for the asymmetric
+    // boot-time twin — boot-time blocks app.listen so it MUST stay short.
+    const ms = getScheduledBootstrapTimeoutMs();
+    let runnerSettled = false;
+    const wrapped = runner(client, schema).finally(() => { runnerSettled = true; });
+    withBootTimeout(wrapped, ms, "scheduled-bootstrap")
       .then(() => {
         if (myGen !== generation) return;
         markBootstrapStatusReady(target.label);
       })
       .catch((err: unknown) => {
         if (myGen !== generation) return;
+        // Wave 6.18h — distinguish a withBootTimeout firing (runner still
+        // pending) from a genuine runner rejection. The flag flips inside
+        // .finally so by the time the runner's rejection propagates to
+        // withBootTimeout's catch, runnerSettled is already true.
+        if (!runnerSettled) {
+          const timeoutErr = new Error(`scheduled-bootstrap-timeout: exceeded ${ms}ms`);
+          console.log(JSON.stringify({
+            service: "api",
+            bootstrap: "frtb",
+            action: "scheduled-bootstrap-timeout",
+            target_label: target.label,
+            ms,
+          }));
+          markBootstrapStatusFailed(target.label, timeoutErr);
+          return;
+        }
         // Wave 6.16a — separate the partial-fan-out case from generic
         // failures so the UI / operators can distinguish "rebuild this
         // node" from "the whole target is unreachable".

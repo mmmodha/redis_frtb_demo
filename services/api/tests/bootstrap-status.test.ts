@@ -6,7 +6,7 @@
 // array so /admin/preflight and the UI can surface per-step per-node
 // remediation info.
 
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   getBootstrapStatus,
   markBootstrapStatusRunning,
@@ -158,5 +158,62 @@ describe("bootstrap-status — scheduleBootstrap terminal transitions (Wave 6.18
     const snap = getBootstrapStatus();
     expect(snap.phase).toBe("failed");
     expect(snap.err).toBe("MaxRetriesPerRequestError");
+  });
+
+  // Wave 6.18h — hung runner must not leak `running`. The shared
+  // withBootTimeout helper races runner(client, schema) against
+  // SCHEDULED_BOOTSTRAP_TIMEOUT_MS and on timeout marks `failed` with the
+  // documented error string.
+  describe("timeout → failed (Wave 6.18h)", () => {
+    const ORIGINAL_TIMEOUT_MS = process.env.SCHEDULED_BOOTSTRAP_TIMEOUT_MS;
+
+    beforeEach(() => {
+      process.env.SCHEDULED_BOOTSTRAP_TIMEOUT_MS = "20";
+    });
+
+    afterEach(() => {
+      if (ORIGINAL_TIMEOUT_MS === undefined) {
+        delete process.env.SCHEDULED_BOOTSTRAP_TIMEOUT_MS;
+      } else {
+        process.env.SCHEDULED_BOOTSTRAP_TIMEOUT_MS = ORIGINAL_TIMEOUT_MS;
+      }
+    });
+
+    it("hang → failed: runner never resolves → phase lands on 'failed' with scheduled-bootstrap-timeout error", async () => {
+      setBootstrapRunnerForTests(() => new Promise(() => { /* never resolves */ }));
+      const fakeClient = {} as unknown as Parameters<typeof scheduleBootstrap>[1];
+      scheduleBootstrap(TARGET, fakeClient, {} as Parameters<typeof scheduleBootstrap>[2]);
+      await new Promise((r) => setTimeout(r, 60));
+      const snap = getBootstrapStatus();
+      expect(snap.phase).toBe("failed");
+      expect(snap.target_label).toBe("primary");
+      expect(snap.err).toBe("scheduled-bootstrap-timeout: exceeded 20ms");
+    });
+
+    it("generation gating: late timeout from a superseded schedule does NOT overwrite a newer ready snapshot", async () => {
+      // Schedule A hangs forever; AFTER A's debounce fires and its runner
+      // begins, schedule B resolves quickly and lands on ready. A's later
+      // timeout MUST be a no-op (myGen !== generation).
+      let firstCall = true;
+      setBootstrapRunnerForTests(() => {
+        if (firstCall) {
+          firstCall = false;
+          return new Promise(() => { /* hang */ });
+        }
+        return Promise.resolve();
+      });
+      const fakeClient = {} as unknown as Parameters<typeof scheduleBootstrap>[1];
+      scheduleBootstrap(TARGET, fakeClient, {} as Parameters<typeof scheduleBootstrap>[2]);
+      // Wait past the 1ms debounce so A's runner actually launches and its
+      // withBootTimeout starts ticking. Without this, B's scheduleBootstrap
+      // clears A's pending debounce timer and A's runner never runs.
+      await new Promise((r) => setTimeout(r, 5));
+      scheduleBootstrap(TARGET, fakeClient, {} as Parameters<typeof scheduleBootstrap>[2]);
+      // Wait long enough for B's runner to resolve AND A's 20ms timeout to fire.
+      await new Promise((r) => setTimeout(r, 60));
+      const snap = getBootstrapStatus();
+      expect(snap.phase).toBe("ready");
+      expect(snap.target_label).toBe("primary");
+    });
   });
 });

@@ -25,6 +25,7 @@ import {
   markBootstrapStatusPartial,
   scheduleBootstrap,
 } from "./bootstrap-status.ts";
+import { withBootTimeout } from "./lib/with-timeout.ts";
 
 // Wave 5.79: precedence for self-binding is API_HOST/PORT → HOST/PORT →
 // HEALTH_PORT → hardcoded default. Lets operators remap or restrict the
@@ -50,22 +51,15 @@ const MASTER_KEY = process.env.FRTB_MASTER_KEY ?? process.env.CONN_STORE_KEY;
 // level limits (mocked client, future driver, etc.), this Promise.race
 // guarantees `app.listen(...)` is reached. Overridable via env so the
 // boot-timeout unit test can shrink the wait below the vitest budget.
+//
+// Wave 6.18h — helper hoisted to ./lib/with-timeout.ts so scheduleBootstrap
+// (90s default; FT.DROPINDEX on a 100M-row index can legitimately take
+// 30-60s, so the boot value is too tight) can reuse the same semantics.
+// Defaults are intentionally asymmetric: boot-time blocks `app.listen` so
+// it MUST stay short (12s); the scheduled path runs post-listen and protects
+// only the bootstrap-status snapshot from sticking at `running`.
 const BOOT_BOOTSTRAP_TIMEOUT_MS =
   Number(process.env.API_BOOT_BOOTSTRAP_TIMEOUT_MS ?? 12_000);
-
-function withBootTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
-  return new Promise<T>((resolveP, rejectP) => {
-    const timer = setTimeout(
-      () => rejectP(new Error(`boot-timeout: ${label} exceeded ${ms}ms`)),
-      ms,
-    );
-    if (typeof timer.unref === "function") timer.unref();
-    p.then(
-      (v) => { clearTimeout(timer); resolveP(v); },
-      (e) => { clearTimeout(timer); rejectP(e); },
-    );
-  });
-}
 
 async function main(): Promise<void> {
   if (!MASTER_KEY) {
