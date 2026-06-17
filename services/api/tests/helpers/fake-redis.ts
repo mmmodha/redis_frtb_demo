@@ -8,10 +8,13 @@ export interface FakeCall {
   args: unknown[];
 }
 
-export interface FakeMulti {
-  call: (command: string, ...args: unknown[]) => FakeMulti;
+export interface FakePipeline {
+  call: (command: string, ...args: unknown[]) => FakePipeline;
   exec: () => Promise<Array<[Error | null, unknown]> | null>;
 }
+
+// Back-compat alias — earlier 6.27 used `FakeMulti` for the same shape.
+export type FakeMulti = FakePipeline;
 
 export interface FakeRedis {
   calls: FakeCall[];
@@ -23,11 +26,14 @@ export interface FakeRedis {
     ...args: unknown[]
   ) => Promise<[string, string[]]>;
   flushdb: () => Promise<string>;
-  // Wave 6.27 — minimal MULTI/EXEC surface so routes that batch via ioredis
+  // Wave 6.27 — minimal pipeline surface so routes that batch via ioredis
   // pipelines (e.g. /facets) exercise the same path in unit tests. Each
   // queued `.call()` also lands in `fr.calls` so existing per-command
-  // assertions keep working.
-  multi: () => FakeMulti;
+  // assertions keep working. We expose both `.pipeline()` (non-transactional,
+  // what /facets uses to avoid the RediSearch "Cannot block" rejection) and
+  // `.multi()` (alias, for any caller that still uses MULTI/EXEC).
+  pipeline: () => FakePipeline;
+  multi: () => FakePipeline;
   // Response stubs the test sets up.
   setResponse: (command: string, response: unknown | ((args: unknown[]) => unknown)) => void;
   setScan: (cursor: string, keys: string[]) => void;
@@ -75,38 +81,11 @@ export function fakeRedis(): FakeRedis {
       if (flushdbErr) throw flushdbErr;
       return "OK";
     },
+    pipeline() {
+      return buildPipeline(calls, responses);
+    },
     multi() {
-      const queued: FakeCall[] = [];
-      const chain: FakeMulti = {
-        call(command: string, ...args: unknown[]) {
-          const entry: FakeCall = { command: command.toUpperCase(), args };
-          queued.push(entry);
-          // Mirror into the top-level call log so existing assertions on
-          // fr.calls (command name, args, LIMIT 0 0) keep working.
-          calls.push(entry);
-          return chain;
-        },
-        async exec() {
-          const out: Array<[Error | null, unknown]> = [];
-          for (const op of queued) {
-            const responder = responses.get(op.command);
-            if (!responder) {
-              out.push([new Error(`fakeRedis: no response set for ${op.command}`), null]);
-              continue;
-            }
-            try {
-              const r = typeof responder === "function"
-                ? (responder as (a: unknown[]) => unknown)(op.args)
-                : responder;
-              out.push([null, r]);
-            } catch (e) {
-              out.push([e instanceof Error ? e : new Error(String(e)), null]);
-            }
-          }
-          return out;
-        },
-      };
-      return chain;
+      return buildPipeline(calls, responses);
     },
     setResponse(command, response) {
       responses.set(command.toUpperCase(), response);
@@ -125,4 +104,45 @@ export function fakeRedis(): FakeRedis {
     },
   };
   return fr;
+}
+
+// Build a shared queued-command chain used by both `.pipeline()` (non-
+// transactional) and `.multi()` (MULTI/EXEC). Both expose the same surface
+// in ioredis when invoked via `.call()` — `.exec()` resolves to the
+// `[err, reply]` tuple array — so the test stub uses one implementation for
+// both. Each queued `.call()` is mirrored into the top-level `calls` log so
+// existing per-command assertions on `fr.calls` keep working unchanged.
+function buildPipeline(
+  calls: FakeCall[],
+  responses: Map<string, Responder>,
+): FakePipeline {
+  const queued: FakeCall[] = [];
+  const chain: FakePipeline = {
+    call(command: string, ...args: unknown[]) {
+      const entry: FakeCall = { command: command.toUpperCase(), args };
+      queued.push(entry);
+      calls.push(entry);
+      return chain;
+    },
+    async exec() {
+      const out: Array<[Error | null, unknown]> = [];
+      for (const op of queued) {
+        const responder = responses.get(op.command);
+        if (!responder) {
+          out.push([new Error(`fakeRedis: no response set for ${op.command}`), null]);
+          continue;
+        }
+        try {
+          const r = typeof responder === "function"
+            ? (responder as (a: unknown[]) => unknown)(op.args)
+            : responder;
+          out.push([null, r]);
+        } catch (e) {
+          out.push([e instanceof Error ? e : new Error(String(e)), null]);
+        }
+      }
+      return out;
+    },
+  };
+  return chain;
 }

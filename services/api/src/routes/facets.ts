@@ -26,12 +26,16 @@ import { translateRedisError } from "../redis-errors.ts";
 // in the active schema and reading the total-count head of the reply. The
 // route's external FacetsResponseOk / FacetsResponseEmpty shape is unchanged.
 //
-// Wave 6.27 — the ~95 per-tag FT.SEARCH calls now ship in a single MULTI/EXEC
-// pipeline instead of independent Promise.all() round-trips. On bigcluster
-// (~150 ms RTT to the DMC proxy) this collapses 95 × RTT to ~1 × RTT and cuts
-// uncached /facets from 15.2 s to sub-second. Production clients (ioredis
-// Redis | Cluster) expose `.multi()`; the per-call fallback below is kept for
-// any RedisLike implementation that does not (currently none in tree).
+// Wave 6.27 — the ~95 per-tag FT.SEARCH calls now ship in a single ioredis
+// non-transactional `.pipeline()` instead of independent Promise.all() round-
+// trips. On bigcluster (~150 ms RTT to the DMC proxy) this collapses 95 × RTT
+// to ~1 × RTT and cuts uncached /facets from 15.2 s to sub-second. We use
+// `.pipeline()` rather than `.multi()` because RediSearch rejects FT.SEARCH
+// inside a transactional MULTI/EXEC block ("Cannot perform FT.SEARCH: Cannot
+// block"); the non-transactional pipeline batches commands into one round
+// trip without wrapping them in MULTI/EXEC. Production clients (ioredis
+// Redis | Cluster) expose `.pipeline()`; the per-call fallback below is kept
+// for any RedisLike implementation that does not (currently none in tree).
 
 const CACHE_TTL_MS = 30_000;
 const SENSITIVITY_TYPES = ["Delta", "Vega", "Curvature"] as const;
@@ -149,44 +153,49 @@ function loadFacetsSchema(): Schema | null {
   return lazySchemaCache;
 }
 
-// Structural type for the ioredis MULTI surface — both `Redis` and `Cluster`
-// expose `.multi()` returning a chainable pipeline whose `.exec()` resolves to
-// the `[err, reply]` tuple array. Widened here rather than added to RedisLike
-// so the narrow interface stays minimal (same pattern as PipelineClient in
-// generator.ts).
-type MultiClient = {
-  multi(): {
+// Structural type for the ioredis pipeline surface — both `Redis` and
+// `Cluster` expose `.pipeline()` returning a chainable batcher whose
+// `.exec()` resolves to the `[err, reply]` tuple array. Widened here rather
+// than added to RedisLike so the narrow interface stays minimal (same
+// pattern as PipelineClient in generator.ts).
+//
+// NOTE: must be `.pipeline()` (non-transactional), not `.multi()`.
+// RediSearch rejects FT.SEARCH inside a MULTI/EXEC block with
+// "Cannot perform FT.SEARCH: Cannot block".
+type PipelineClient = {
+  pipeline(): {
     call(command: string, ...args: unknown[]): unknown;
     exec(): Promise<Array<[Error | null, unknown]> | null>;
   };
 };
 
-function hasMulti(r: RedisLike): r is RedisLike & MultiClient {
-  return typeof (r as unknown as Partial<MultiClient>).multi === "function";
+function hasPipeline(r: RedisLike): r is RedisLike & PipelineClient {
+  return typeof (r as unknown as Partial<PipelineClient>).pipeline === "function";
 }
 
 // Run the ordered list of FT.SEARCH count queries against `indexName`. When
-// the client supports MULTI/EXEC (production: ioredis Redis|Cluster) we pack
-// them into a single pipeline — the win is amortizing RTT, which dominates on
-// the cloud DMC proxy. The fallback path keeps a parallel Promise.all so
-// minimal stubs without `.multi()` (none currently in tree) still work. The
-// LIMIT 0 0 (count-only) trick is preserved in both paths.
+// the client supports `.pipeline()` (production: ioredis Redis|Cluster) we
+// pack them into a single non-transactional pipeline — the win is amortizing
+// RTT, which dominates on the cloud DMC proxy. The fallback path keeps a
+// parallel Promise.all so minimal stubs without `.pipeline()` (none
+// currently in tree) still work. The LIMIT 0 0 (count-only) trick is
+// preserved in both paths.
 async function runFacetSearches(
   redis: RedisLike,
   indexName: string,
   queries: string[],
 ): Promise<unknown[]> {
-  if (hasMulti(redis)) {
-    const pipeline = redis.multi();
+  if (hasPipeline(redis)) {
+    const pipeline = redis.pipeline();
     for (const q of queries) {
       pipeline.call("FT.SEARCH", indexName, q, "LIMIT", "0", "0");
     }
     const results = await pipeline.exec();
     if (!results) {
-      // ioredis returns null when the transaction was discarded (e.g. WATCH
-      // aborted). We don't use WATCH here, but surface a recognisable error
-      // rather than silently returning empty counts.
-      throw new Error("FT.SEARCH MULTI/EXEC returned null");
+      // ioredis returns null when the pipeline is unexpectedly empty or
+      // aborted before exec. Surface a recognisable error rather than
+      // silently returning empty counts.
+      throw new Error("FT.SEARCH pipeline returned null");
     }
     const replies: unknown[] = new Array(results.length);
     for (let i = 0; i < results.length; i++) {
@@ -245,9 +254,9 @@ export function registerFacetsRoute(
     // FT.SEARCH count fan-out. Each call returns `[N, ...docs]`; with LIMIT
     // 0 0 there are no docs — just N. We build one ordered list of queries
     // (risk_class, sensitivity_type, (rc, bucket)) and ship them through a
-    // single MULTI/EXEC pipeline so all ~95 commands amortize one RTT (Wave
-    // 6.27). The reply array is sliced back into the three groupings in the
-    // same order they were enqueued.
+    // single non-transactional pipeline so all ~95 commands amortize one RTT
+    // (Wave 6.27). The reply array is sliced back into the three groupings
+    // in the same order they were enqueued.
     const rcQueries = riskClasses.map(
       (rc) => `@risk_class:{${escapeTag(rc)}}`,
     );
