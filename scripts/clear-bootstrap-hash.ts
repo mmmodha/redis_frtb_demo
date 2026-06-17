@@ -89,8 +89,8 @@ async function main(): Promise<void> {
   }
 
   try {
-    const existing = await client.hgetall(key);
-    const present = Object.keys(existing).length > 0;
+    const existing = await client.get(key);
+    const present = existing !== null;
     log("bootstrap_hash_inspected", {
       label,
       target_label_source: args.targetLabel ? "flag" : "active-target",
