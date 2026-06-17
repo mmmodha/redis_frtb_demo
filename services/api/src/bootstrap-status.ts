@@ -20,6 +20,16 @@ import {
   type RedisLike as BootstrapRedis,
 } from "./bootstrap.ts";
 import { withBootTimeout } from "./lib/with-timeout.ts";
+// Wave 6.18k — pair every phase-tracker terminal write with a /readyz flip
+// so /readyz and /redis/active-target/bootstrap-status can never disagree
+// (the boot-time path in index.ts:191-214 already does this; the listener
+// path was missing it, so a stale boot-time `failed` could coexist with
+// a fresh `ready` phase). Circular import is safe: both modules only use
+// the imported bindings inside function bodies, not at module init.
+import {
+  markBootstrapReady,
+  markBootstrapFailed,
+} from "./server.ts";
 
 // Wave 6.18h — scheduled-path timeout shares the boot-time helper but uses
 // a longer default. The boot path (index.ts, 12s) blocks `app.listen` so
@@ -178,6 +188,8 @@ export function scheduleBootstrap(
       .then(() => {
         if (myGen !== generation) return;
         markBootstrapStatusReady(target.label);
+        // Wave 6.18k — also flip /readyz to match phase tracker
+        markBootstrapReady();
       })
       .catch((err: unknown) => {
         if (myGen !== generation) return;
@@ -195,6 +207,8 @@ export function scheduleBootstrap(
             ms,
           }));
           markBootstrapStatusFailed(target.label, timeoutErr);
+          // Wave 6.18k — also flip /readyz to match phase tracker
+          markBootstrapFailed(timeoutErr);
           return;
         }
         // Wave 6.16a — separate the partial-fan-out case from generic
@@ -202,9 +216,16 @@ export function scheduleBootstrap(
         // node" from "the whole target is unreachable".
         if (err instanceof BootstrapPartialError) {
           markBootstrapStatusPartial(target.label, err.failures);
+          // Wave 6.18k — also flip /readyz to match phase tracker
+          // (mirrors index.ts:209-214: boot path calls markBootstrapFailed
+          // for partial too — /readyz is binary, partial is exposed via
+          // the bootstrap-status snapshot for operator drill-down).
+          markBootstrapFailed(err);
           return;
         }
         markBootstrapStatusFailed(target.label, err);
+        // Wave 6.18k — also flip /readyz to match phase tracker
+        markBootstrapFailed(err);
       });
   }, debounceMs);
 }
