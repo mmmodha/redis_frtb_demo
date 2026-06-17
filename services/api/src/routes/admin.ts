@@ -14,7 +14,7 @@
 import type { FastifyInstance } from "fastify";
 import type { Schema } from "@frtb/schema";
 import type { RedisLike } from "../redis-like.ts";
-import { getActiveTarget } from "../active-target.ts";
+import { getActiveTarget, type RuntimeCategory } from "../active-target.ts";
 import {
   getBootstrapStatus,
   markBootstrapStatusRunning,
@@ -54,7 +54,7 @@ export interface AdminRoutesOpts {
 
 export function registerAdminRoutes(
   app: FastifyInstance,
-  getRedis: () => RedisLike,
+  getRedis: (category?: RuntimeCategory) => RedisLike,
   opts: AdminRoutesOpts = {},
 ): void {
   const runBootstrap = opts.bootstrap ?? bootstrapFrtb;
@@ -150,8 +150,11 @@ export function registerAdminRoutes(
   // OUTPUT of the generator, not a precondition for it. Gating the generator
   // on its existence created a chicken-and-egg deadlock on fresh Redis
   // targets. Only idx_sens + frtb_library participate in the ok gate now.
-  app.get("/admin/preflight", async () => {
-    const redis = getRedis();
+  // Wave 6.21 — /admin/preflight is a fast read-only check (FT.INFO + a few
+  // EVALSHA probes); migrate to the light pool so a degraded heavy member
+  // (slow calc) cannot stall the UI's pre-Calculate sanity check.
+  app.get("/admin/preflight", { config: { category: "light" } }, async (req) => {
+    const redis = getRedis(req.poolCategory);
     const masters = resolveMasterNodes(redis as unknown as BootstrapRedis);
 
     // Wave 6.18i — probe the versioned `idx:sens:v{hash7}` name when the

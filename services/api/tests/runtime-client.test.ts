@@ -10,6 +10,15 @@
 // comfortably exceeds 30s so Redis itself returns a clean recoverable error
 // on slow aggregations. The boot client (10s) is preserved so a wedged
 // socket still cannot block `app.listen(...)`.
+//
+// Wave 6.21 — the runtime client is now backed by a small ROUND-ROBIN POOL
+// rather than a singleton. The boot client stays a singleton (the boot path
+// is a single infrequent call). The assertions here are updated to:
+//   * acknowledge that successive `getActiveRedisRuntimeClient()` calls
+//     return DIFFERENT pool members (round-robin), and
+//   * preserve the original invariants: every member's `commandTimeout` is
+//     35s, the boot client's is 10s, both authenticate, and a credentials
+//     rotation invalidates BOTH caches in lockstep.
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
@@ -55,10 +64,21 @@ describe("Wave 6.18f — runtime Redis client (35s) separate from boot client (1
     expect(runtime.options.host).toBe("rs.example.com");
     expect(runtime.options.password).toBe("PW-PASS");
 
-    // Stability: re-fetching returns the same cached instance until a
-    // setActiveTarget rotation bumps credsGeneration.
-    expect(getActiveRedisRuntimeClient()).toBe(runtime as unknown as ReturnType<typeof getActiveRedisRuntimeClient>);
+    // Wave 6.21 — boot client stability: the boot client stays a singleton,
+    // so re-fetching returns the same instance until a setActiveTarget
+    // rotation bumps credsGeneration.
     expect(getActiveRedisClient()).toBe(boot as unknown as ReturnType<typeof getActiveRedisClient>);
+
+    // Wave 6.21 — runtime client invariant: every pool member carries the
+    // 35s commandTimeout and authenticates against the active target. The
+    // pool rotates per acquisition so subsequent calls may return different
+    // members, but every returned member must honour the timeout.
+    for (let i = 0; i < 8; i++) {
+      const m = getActiveRedisRuntimeClient() as unknown as ClientWithOptions;
+      expect(m.options.commandTimeout).toBe(35_000);
+      expect(m.options.host).toBe("rs.example.com");
+      expect(m.options.password).toBe("PW-PASS");
+    }
 
     // A credentials rotation invalidates BOTH caches in lockstep.
     setActiveTarget(
@@ -68,6 +88,8 @@ describe("Wave 6.18f — runtime Redis client (35s) separate from boot client (1
     const bootAfter = getActiveRedisClient() as unknown as ClientWithOptions;
     const runtimeAfter = getActiveRedisRuntimeClient() as unknown as ClientWithOptions;
     expect(bootAfter).not.toBe(boot);
+    // Post-rotation the pool members are also rebuilt (lazy on next
+    // acquisition); whatever pool slot we land on holds a fresh client.
     expect(runtimeAfter).not.toBe(runtime);
     expect(runtimeAfter.options.commandTimeout).toBe(35_000);
     expect(bootAfter.options.commandTimeout).toBe(10_000);

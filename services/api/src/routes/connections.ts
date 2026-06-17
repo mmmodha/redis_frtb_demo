@@ -87,19 +87,28 @@ export function registerConnectionsRoutes(
     }
   });
 
-  app.get("/connections", async () => (await store.list()).map(publicProfile));
+  // Wave 6.21 — connection-store reads are in-memory (the store keeps a
+  // snapshot) but tag them `light` for consistency: the small subset of
+  // routes here that hit Redis (the source-of-truth load on cold start) all
+  // do short GETs/HGETs, never FT.AGGREGATE/FCALL. Heavy stays reserved for
+  // /calc and friends.
+  app.get("/connections", { config: { category: "light" } }, async () => (await store.list()).map(publicProfile));
 
-  app.get("/connections/active", async (_req, reply) => {
+  app.get("/connections/active", { config: { category: "light" } }, async (_req, reply) => {
     const p = store.getActive();
     if (!p) { reply.code(404); return { error: "no active connection" }; }
     return publicProfile(p);
   });
 
-  app.get<{ Params: { id: string } }>("/connections/:id", async (req, reply) => {
-    const p = await store.get(req.params.id);
-    if (!p) { reply.code(404); return { error: "not found" }; }
-    return publicProfile(p);
-  });
+  app.get<{ Params: { id: string } }>(
+    "/connections/:id",
+    { config: { category: "light" } },
+    async (req, reply) => {
+      const p = await store.get(req.params.id);
+      if (!p) { reply.code(404); return { error: "not found" }; }
+      return publicProfile(p);
+    },
+  );
 
   // Wave 5.59 — edit-while-active: when the edited id matches the active
   // profile, push the updated values into the active-target singleton so the

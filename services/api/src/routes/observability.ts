@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { Cluster } from "ioredis";
 import type { RedisLike } from "../redis-like.ts";
-import { getActiveTarget } from "../active-target.ts";
+import { getActiveTarget, type RuntimeCategory } from "../active-target.ts";
 import { getBootstrapStatus } from "../bootstrap-status.ts";
 import { translateRedisError } from "../redis-errors.ts";
 import { corsHeadersForRequest } from "../cors-headers.ts";
@@ -336,16 +336,28 @@ export interface RegisterObservabilityOpts {
 
 export function registerObservabilityRoutes(
   app: FastifyInstance,
-  getRedis: () => RedisLike,
+  getRedis: (category?: RuntimeCategory) => RedisLike,
   opts: RegisterObservabilityOpts = {},
 ): void {
   const sseIntervalMs = opts.sseIntervalMs ?? 1000;
   const corsAllowed = opts.corsAllowed ?? "http://localhost:3000";
-  app.get<{ Querystring: KeysQuery }>("/observability/keys", async (req, reply) => {
+  // Wave 6.21 (B1) — every route in this file is small-payload read/stream
+  // work (INFO, SCAN sample, CLUSTER NODES, TS.RANGE, shards roll-up); each
+  // declares `config: { category: "light" }` so the onRequest hook in
+  // server.ts sets `req.poolCategory = "light"` BEFORE the handler runs.
+  // Handlers MUST resolve the category from `req` (not hardcode "light") so
+  // 6.23's preHandler semaphore reads it from the route metadata. VM evidence
+  // from 2026-06-17 showed a single slow calc query pushing all observability
+  // calls to multi-second latencies — keeping these on the light pool is
+  // what eliminates that head-of-line blocking.
+  app.get<{ Querystring: KeysQuery }>(
+    "/observability/keys",
+    { config: { category: "light" } },
+    async (req, reply) => {
     const prefix = req.query.prefix ?? "sens:";
     // Wave 5.16t — resolve active redis per-request so a profile switch is
     // picked up on the very next observability call.
-    const redis = getRedis();
+    const redis = getRedis(req.poolCategory);
     const target_label = getActiveTarget().label;
     const t0 = process.hrtime.bigint();
     try {
@@ -373,8 +385,8 @@ export function registerObservabilityRoutes(
     }
   });
 
-  app.get("/observability/memory", async (_req, reply) => {
-    const redis = getRedis();
+  app.get("/observability/memory", { config: { category: "light" } }, async (req, reply) => {
+    const redis = getRedis(req.poolCategory);
     const target_label = getActiveTarget().label;
     const t0 = process.hrtime.bigint();
     try {
@@ -409,8 +421,8 @@ export function registerObservabilityRoutes(
     }
   });
 
-  app.get("/observability/shards", async (req, reply) => {
-    const redis = getRedis();
+  app.get("/observability/shards", { config: { category: "light" } }, async (req, reply) => {
+    const redis = getRedis(req.poolCategory);
     const target_label = getActiveTarget().label;
     try {
       const shards = await readShards(redis, req.log);
@@ -431,8 +443,8 @@ export function registerObservabilityRoutes(
   // Wave 5.85 — debug aid: surface the parsed CLUSTER NODES + per-node INFO
   // summary so an operator can answer "is the api seeing my cluster?". Read
   // only, no metric writes. Standalone targets return empty arrays/maps.
-  app.get("/observability/topology", async (req, reply) => {
-    const redis = getRedis();
+  app.get("/observability/topology", { config: { category: "light" } }, async (req, reply) => {
+    const redis = getRedis(req.poolCategory);
     const target_label = getActiveTarget().label;
     try {
       const topology = await readTopology(redis, req.log);
@@ -452,6 +464,7 @@ export function registerObservabilityRoutes(
   // buffer when source === "unavailable".
   app.get<{ Querystring: { metric?: string; windowMs?: string } }>(
     "/observability/history",
+    { config: { category: "light" } },
     async (req, reply) => {
       const metricRaw = String(req.query.metric ?? "");
       const target_label = getActiveTarget().label;
@@ -463,7 +476,7 @@ export function registerObservabilityRoutes(
         reply.code(400);
         return { error: "invalid metric", target_label };
       }
-      const result = await readHistory(getRedis(), metricRaw, windowMs, target_label);
+      const result = await readHistory(getRedis(req.poolCategory), metricRaw, windowMs, target_label);
       return {
         source: result.source,
         metric: metricRaw,
@@ -478,7 +491,7 @@ export function registerObservabilityRoutes(
   // SSE: write one frame immediately, then every `sseIntervalMs` until the
   // client disconnects. We hijack the reply so Fastify doesn't try to send a
   // JSON body around it.
-  app.get("/observability/shards/stream", async (req, reply) => {
+  app.get("/observability/shards/stream", { config: { category: "light" } }, async (req, reply) => {
     const cors = corsHeadersForRequest(req, corsAllowed);
     reply.raw.writeHead(200, {
       ...cors,
@@ -493,7 +506,7 @@ export function registerObservabilityRoutes(
       if (stopped) return;
       try {
         // Re-resolve per tick so an in-flight stream retargets on profile switch.
-        const shards = await readShards(getRedis(), req.log);
+        const shards = await readShards(getRedis(req.poolCategory), req.log);
         reply.raw.write(`data: ${JSON.stringify(shards)}\n\n`);
       } catch {
         // Swallow transient errors; the next tick may recover.

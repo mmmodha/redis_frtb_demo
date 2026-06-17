@@ -31,6 +31,10 @@ import * as inflight from "./inflight-registry.ts";
 import { corsHeadersForRequest } from "./cors-headers.ts";
 import { registerBackpressure } from "./backpressure.ts";
 import type { ConnectionsStore as RealConnectionsStore } from "./store.ts";
+// Wave 6.21 (B1) — side-effect import: brings the FastifyContextConfig.category
+// + FastifyRequest.poolCategory module augmentation into scope so route files
+// can declare `config: { category: "light" }` and read `req.poolCategory`.
+import "./fastify-augmentations.ts";
 
 // Wave 5.14b.1 — bootstrap-status flag. Compose healthchecks already curl
 // /healthz; flipping this from {ok:false} → {ok:true} only after
@@ -161,6 +165,19 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
     allowedHeaders: ["Content-Type", "Authorization"],
   });
 
+  // Wave 6.21 (B1) — resolve the route-level pool category onto the request
+  // BEFORE any preHandler / handler body runs. Routes declare `config:
+  // { category: "light" }`; everything else stays on heavy. Registered ahead
+  // of `registerBackpressure` so the 6.23 semaphore middleware can read
+  // `req.poolCategory` rather than re-deriving the category from the URL.
+  // `decorateRequest` gives every request a default value so the property
+  // access is monomorphic; the hook then overwrites it from route config.
+  app.decorateRequest("poolCategory", "heavy");
+  app.addHook("onRequest", async (req) => {
+    const cfg = req.routeOptions?.config as { category?: RuntimeCategory } | undefined;
+    req.poolCategory = cfg?.category ?? "heavy";
+  });
+
   // Wave 6.23 — per-category concurrency limits. Registered before any
   // route so the onRequest hook gates everything (the heavy/light split
   // exempts /healthz, /readyz, /redis/active-target*, /inflight*, and SSE
@@ -181,10 +198,14 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
   // happy path: the compose healthcheck (process-alive) can pass before any
   // Redis is configured, and downstream services no longer wedge themselves
   // believing the api is down when only Redis is missing.
-  app.get("/healthz", async () => {
+  // Wave 6.21 — `/healthz` and `/readyz` are Redis-free probes but get
+  // `light` category so any future change that adds a Redis read (e.g.
+  // surfacing `INFO server` in `/healthz`) lands on the light pool by
+  // default, never on a heavy slot that might be saturated by a slow calc.
+  app.get("/healthz", { config: { category: "light" } }, async () => {
     return { service: "api", status: "alive" };
   });
-  app.get("/readyz", async (_req, reply) => {
+  app.get("/readyz", { config: { category: "light" } }, async (_req, reply) => {
     const s = getBootstrapStatus();
     if (!s.ok) {
       reply.code(503);
@@ -195,14 +216,21 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
     }
     return { service: "api", status: "ok", bootstrap: "ready" };
   });
-  app.get("/redis/active-target", async () => getActiveTarget());
+  // Wave 6.21 — `/redis/active-target` is a tiny in-memory read (no Redis
+  // call) but the GET is exempted from heavy/light backpressure already; mark
+  // it `light` for symmetry with the rest of the read endpoints.
+  app.get("/redis/active-target", { config: { category: "light" } }, async () => getActiveTarget());
   registerInternalTargetRoutes(app, opts.store as RealConnectionsStore | undefined);
 
   // Wave 5.16t — surface bootstrap progress to the UI so a freshly-activated
   // profile that's still loading idx:sens / the frtb library renders a
   // friendly "bootstrapping…" badge instead of opaque 500s on the first
   // calc/pivot call.
-  app.get("/redis/active-target/bootstrap-status", async () => getBootstrapPhaseStatus());
+  app.get(
+    "/redis/active-target/bootstrap-status",
+    { config: { category: "light" } },
+    async () => getBootstrapPhaseStatus(),
+  );
 
   // Wave 5.16t — per-request accessor.
   //
@@ -219,9 +247,10 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
   //      `scheduleBootstrap` callers.
   // Wave 6.21 — category defaults to `"heavy"` so a route that hasn't been
   // explicitly migrated stays on the same safe runtime client it had before.
-  // `"light"` is opt-in via `getRedis("light")` from individual route handlers
-  // (observability, /admin/preflight, etc.) — see active-target.ts for the
-  // pool design and the route-level rationale.
+  // Routes opt in to `"light"` by declaring `config: { category: "light" }`
+  // on the route definition (see B1); the handler then calls
+  // `getRedis(req.poolCategory)` — never a hardcoded literal — so the choice
+  // is visible at hook time for 6.23's semaphore middleware.
   const getRedis = (category: RuntimeCategory = "heavy"): RedisLike => {
     if (opts.getRedis) return opts.getRedis(category);
     if (opts.redis) return opts.redis;

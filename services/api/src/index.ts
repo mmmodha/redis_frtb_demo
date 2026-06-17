@@ -11,7 +11,13 @@ import { Cluster, type Redis } from "ioredis";
 import { createRedisClient } from "@frtb/redis-client";
 import { loadSchema } from "@frtb/schema";
 import { createServer, markBootstrapReady, markBootstrapFailed, markBootstrapSkipped } from "./server.ts";
-import { getActiveTarget, setActiveTarget, getActiveRedisClient, getActiveRedisRuntimeClient } from "./active-target.ts";
+import {
+  getActiveTarget,
+  setActiveTarget,
+  getActiveRedisClient,
+  getActiveRedisRuntimeClient,
+  type RuntimeCategory,
+} from "./active-target.ts";
 import type { RedisLike } from "./redis-like.ts";
 import { buildCrossBucketCorrelations } from "./sbm/correlations.ts";
 import { createStore } from "./store.ts";
@@ -240,8 +246,15 @@ async function main(): Promise<void> {
   // `bootstrapFrtb` above and the post-listen `scheduleBootstrap` below so
   // the Wave 6.18c boot-protection invariants (withBootTimeout 12s,
   // commandTimeout 10s) are preserved.
-  const getRedis = (): RedisLike => {
-    const active = getActiveRedisRuntimeClient();
+  // Wave 6.21 — thread the pool category through. Default "heavy" keeps any
+  // unmigrated route on the safe pool; routes that opt in to "light" via
+  // `config: { category: "light" }` land on the independent light pool so a
+  // slow FT.AGGREGATE on heavy cannot stall observability/healthz. The
+  // boot-time `redis` fallback applies to both categories — it exists only
+  // for the brief window before the active-target singleton resolves, where
+  // pool isolation is not a concern.
+  const getRedis = (category: RuntimeCategory = "heavy"): RedisLike => {
+    const active = getActiveRedisRuntimeClient(category);
     return (active ?? redis) as unknown as RedisLike;
   };
   const app = await createServer({ getRedis, correlations, schema, store, logger: true });
