@@ -7,9 +7,11 @@
 //      a Retry-After header
 //   4. releasing a slot (request completes) admits the next request
 //   5. exempt routes (/healthz) bypass the gate entirely
+//   6. category resolved from `config.category` (route-level, not URL sniffing)
+//   7. routes missing `config.category` default to heavy + log a warning
 import { describe, it, expect, afterEach } from "vitest";
 import Fastify, { type FastifyInstance } from "fastify";
-import { registerBackpressure, classifyRoute } from "../src/backpressure.ts";
+import { registerBackpressure, isExemptUrl, readRouteCategory } from "../src/backpressure.ts";
 
 interface Holder { resolve: () => void }
 
@@ -26,11 +28,12 @@ function buildApp(opts: { heavyLimit?: number; lightLimit?: number; retryAfterMs
   });
   const heavyHolders: Holder[] = [];
   const lightHolders: Holder[] = [];
-  app.get("/calc/sbm", async () => {
+  // Wave 6.23 B1 — classification is driven by `config.category`, not URL.
+  app.get("/calc/sbm", { config: { category: "heavy" } }, async () => {
     await new Promise<void>((resolve) => { heavyHolders.push({ resolve }); });
     return { ok: true };
   });
-  app.get("/admin/preflight", async () => {
+  app.get("/admin/preflight", { config: { category: "light" } }, async () => {
     await new Promise<void>((resolve) => { lightHolders.push({ resolve }); });
     return { ok: true };
   });
@@ -132,20 +135,67 @@ describe("Wave 6.23 — concurrency limits + 503 too-many-inflight", () => {
     await p;
   });
 
-  it("classifyRoute: prefixes + SSE + active-target exemptions", () => {
-    expect(classifyRoute("/calc/sbm")).toBe("heavy");
-    expect(classifyRoute("/calc/sbm/total")).toBe("heavy");
-    expect(classifyRoute("/pivot?foo=bar")).toBe("heavy");
-    expect(classifyRoute("/facets")).toBe("heavy");
-    expect(classifyRoute("/healthz")).toBe("exempt");
-    expect(classifyRoute("/readyz")).toBe("exempt");
-    expect(classifyRoute("/redis/active-target")).toBe("exempt");
-    expect(classifyRoute("/redis/active-target/bootstrap-status")).toBe("exempt");
-    expect(classifyRoute("/inflight")).toBe("exempt");
-    expect(classifyRoute("/inflight/stream")).toBe("exempt");
-    expect(classifyRoute("/observability/shards/stream")).toBe("exempt");
-    expect(classifyRoute("/admin/preflight")).toBe("light");
-    expect(classifyRoute("/connections")).toBe("light");
-    expect(classifyRoute("/observability/keys")).toBe("light");
+  it("isExemptUrl: liveness/readiness, /redis/active-target, /inflight, SSE", () => {
+    expect(isExemptUrl("/healthz")).toBe(true);
+    expect(isExemptUrl("/readyz")).toBe(true);
+    expect(isExemptUrl("/redis/active-target")).toBe(true);
+    expect(isExemptUrl("/redis/active-target/bootstrap-status")).toBe(true);
+    expect(isExemptUrl("/internal/redis/active-target")).toBe(true);
+    expect(isExemptUrl("/inflight")).toBe(true);
+    expect(isExemptUrl("/inflight/stream")).toBe(true);
+    expect(isExemptUrl("/observability/shards/stream")).toBe(true);
+    // Non-exempt: classified by route config at admission time.
+    expect(isExemptUrl("/calc/sbm")).toBe(false);
+    expect(isExemptUrl("/admin/preflight")).toBe(false);
+    expect(isExemptUrl("/observability/keys")).toBe(false);
+  });
+
+  it("readRouteCategory: reads from req.routeOptions.config.category", async () => {
+    const app2 = Fastify();
+    let seenHeavy: ReturnType<typeof readRouteCategory> | undefined;
+    let seenLight: ReturnType<typeof readRouteCategory> | undefined;
+    let seenUndeclared: ReturnType<typeof readRouteCategory> | undefined;
+    app2.addHook("preHandler", async (req) => {
+      if (req.url === "/h") seenHeavy = readRouteCategory(req);
+      else if (req.url === "/l") seenLight = readRouteCategory(req);
+      else if (req.url === "/u") seenUndeclared = readRouteCategory(req);
+    });
+    app2.get("/h", { config: { category: "heavy" } }, async () => ({ ok: true }));
+    app2.get("/l", { config: { category: "light" } }, async () => ({ ok: true }));
+    app2.get("/u", async () => ({ ok: true }));
+    try {
+      await app2.inject({ method: "GET", url: "/h" });
+      await app2.inject({ method: "GET", url: "/l" });
+      await app2.inject({ method: "GET", url: "/u" });
+      expect(seenHeavy).toBe("heavy");
+      expect(seenLight).toBe("light");
+      expect(seenUndeclared).toBeNull();
+    } finally {
+      await app2.close();
+    }
+  });
+
+  it("routes missing config.category default to heavy and consume the heavy budget", async () => {
+    const app2 = Fastify();
+    registerBackpressure(app2, { heavyLimit: 1, lightLimit: 32 });
+    const holders: Holder[] = [];
+    // No `config.category` on this route — must default to heavy.
+    app2.get("/legacy", async () => {
+      await new Promise<void>((resolve) => { holders.push({ resolve }); });
+      return { ok: true };
+    });
+    try {
+      await app2.ready();
+      const p1 = app2.inject({ method: "GET", url: "/legacy" });
+      await new Promise((r) => setImmediate(r));
+      // Heavy budget is 1 — second concurrent request must be rejected.
+      const reject = await app2.inject({ method: "GET", url: "/legacy" });
+      expect(reject.statusCode).toBe(503);
+      expect(reject.json().category).toBe("heavy");
+      holders[0]?.resolve();
+      await p1;
+    } finally {
+      await app2.close();
+    }
   });
 });

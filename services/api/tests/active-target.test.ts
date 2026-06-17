@@ -5,6 +5,7 @@ import {
   setActiveTargetLabel,
   resetActiveTarget,
   getActiveRedisClient,
+  getActiveRedisRuntimeClient,
   onActiveTargetChange,
   type ActiveTarget,
 } from "../src/active-target.ts";
@@ -175,5 +176,55 @@ describe("Wave 5.62 — setActiveTargetLabel", () => {
     process.env.REDIS_URL = "redis://envhost:6379";
     setActiveTargetLabel("attempted-rename");
     expect(getActiveTarget().label).toBe("env:REDIS_URL");
+  });
+});
+
+// Wave 6.23 B2 — regression gate: the boot client (`getActiveRedisClient`)
+// MUST keep ioredis's default retry budget and default offline queue, so a
+// transient hiccup during bootstrap doesn't fail-stop the api before
+// `withBootTimeout` makes the binding decision (Wave 6.18c invariant). Only
+// the runtime pool members opt in to Wave 6.23 fast-fail
+// (`maxRetriesPerRequest: 1` + `enableOfflineQueue: false`).
+describe("Wave 6.23 — boot client retains default retry + offline queue (B2 regression)", () => {
+  beforeEach(() => {
+    resetActiveTarget();
+    delete process.env.REDIS_URL;
+  });
+  afterEach(() => {
+    resetActiveTarget();
+  });
+
+  it("boot client does NOT enable fast-fail (retry budget > 1, offline queue on)", () => {
+    setActiveTarget(
+      { host: "boot.example.com", port: 6379, tls: false, db: 0, label: "boot-target" },
+    );
+    const boot = getActiveRedisClient();
+    expect(boot).not.toBeNull();
+    const opts = (boot as unknown as { options: Record<string, unknown> }).options;
+    // Boot-robustness invariant — the boot path must allow at least one
+    // retry beyond the immediate failure (Wave 6.23 fast-fail sets this to
+    // 1; any value > 1 OR the ioredis default proves the boot path opted
+    // out). Asserting ">= 2" tolerates ioredis default changes (currently
+    // 20) without coupling the test to a magic number.
+    expect(typeof opts.maxRetriesPerRequest === "number" ? opts.maxRetriesPerRequest : 20)
+      .toBeGreaterThanOrEqual(2);
+    // The offline queue MUST stay enabled (ioredis default `true`); a Wave
+    // 6.23 change that bled `enableOfflineQueue:false` into the boot path
+    // would re-introduce the Wave 6.18c boot-fragility regression.
+    expect(opts.enableOfflineQueue === undefined || opts.enableOfflineQueue === true).toBe(true);
+    boot?.disconnect();
+  });
+
+  it("runtime pool client opts in to fast-fail (retry=1, offline queue off)", () => {
+    setActiveTarget(
+      { host: "pool.example.com", port: 6379, tls: false, db: 0, label: "pool-target" },
+    );
+    const runtime = getActiveRedisRuntimeClient();
+    expect(runtime).not.toBeNull();
+    // Pool members opt in to fast-fail so a degraded socket surfaces the
+    // error on the next command rather than silently re-queueing.
+    const opts = (runtime as unknown as { options: Record<string, unknown> }).options;
+    expect(opts.maxRetriesPerRequest).toBe(1);
+    expect(opts.enableOfflineQueue).toBe(false);
   });
 });

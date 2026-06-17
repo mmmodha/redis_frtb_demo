@@ -80,7 +80,24 @@ const RUNTIME_POOL_SIZE_DEFAULT = 4;
 // missing migration cannot accidentally downgrade timeout protection.
 export type RuntimeCategory = "heavy" | "light";
 
+// Wave 6.21 (M1) — stable identity surface for pool members. Format is
+// `${category}:${index}` (e.g. `heavy:0`, `light:3`); the index is the slot
+// number and stays stable across rebuilds so structured logs emitted in
+// future waves (6.22 auto-recycle observability) can correlate "the
+// connection that timed out twice" across rebuilds. `createdAt` and
+// `generation` change on every rebuild so an operator can tell whether the
+// `heavy:0` they're looking at is the original or a self-healed instance.
+export interface PoolMemberInfo {
+  id: string;
+  createdAt: number;
+  generation: number;
+}
+
 interface PoolMember {
+  // Stable per-slot identifier. Set once at slot creation and reused across
+  // every rebuild of the underlying client so log lines stay correlatable
+  // even as the socket is swapped out underneath.
+  readonly id: string;
   // Underlying ioredis client. `null` when the slot is unbuilt OR has been
   // marked stale by an error event / wrapper rejection hook; rebuilt lazily
   // on the next round-robin acquisition.
@@ -94,22 +111,53 @@ interface PoolMember {
   // current `targetKey(...)` is the lockstep invalidation hook — `setActive
   // Target` rebuilds via key bump, not by walking the pool.
   key: string;
+  // Wall-clock instant the current `client` was constructed. Reset on every
+  // rebuild; useful when 6.22's auto-recycle logger wants to surface "this
+  // socket was created N ms ago and already timed out".
+  createdAt: number;
+  // Monotonic per-slot rebuild counter. Starts at 0 (no build yet),
+  // increments on each lazy rebuild (key mismatch, recycle, drain swap).
+  // Pairs with `id` to form a globally unique log key `${id}#${generation}`.
+  generation: number;
 }
 
 interface Pool {
+  readonly category: RuntimeCategory;
   members: PoolMember[];
   rrIndex: number;
 }
 
-const heavyPool: Pool = { members: [], rrIndex: 0 };
-const lightPool: Pool = { members: [], rrIndex: 0 };
+const heavyPool: Pool = { category: "heavy", members: [], rrIndex: 0 };
+const lightPool: Pool = { category: "light", members: [], rrIndex: 0 };
+
+// Wave 6.21 (M6) — grace window during which an old pool member keeps
+// serving in-flight commands after a `setActiveTarget` swap. Default 500ms,
+// env-overridable. The OLD client is detached from the pool immediately
+// (every NEW acquisition routes to a freshly built client against the new
+// target) but `disconnect()` is deferred so a calc mid-flight is not aborted
+// when the operator clicks "Reconnect". `resetActiveTarget()` (test
+// teardown) bypasses the grace — see the resetActiveTarget body for why.
+const POOL_DRAIN_GRACE_DEFAULT_MS = 500;
+
+function getPoolDrainGraceMs(): number {
+  const raw = process.env.RUNTIME_REDIS_POOL_DRAIN_GRACE_MS;
+  if (raw === undefined || raw === "") return POOL_DRAIN_GRACE_DEFAULT_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : POOL_DRAIN_GRACE_DEFAULT_MS;
+}
+
+// Clients detached by `setActiveTarget` but not yet disconnected. Kept in a
+// set so `resetActiveTarget()` (and tests) can drain them immediately on
+// teardown rather than leaving timers + sockets hanging until the grace
+// window elapses.
+const drainingClients = new Set<Redis>();
 
 // Test seam: replaces the per-member `Redis` factory so unit tests can drive
 // pool behaviour (round-robin distribution, recycle on simulated timeout,
 // independent pools) without opening real sockets. Production keeps this null
 // and `buildClient(...)` is used.
 let runtimeClientFactoryForTests:
-  | ((t: ActiveTarget, c: ActiveTargetCreds, commandTimeout: number) => Redis)
+  | ((t: ActiveTarget, c: ActiveTargetCreds, opts: BuildClientOpts) => Redis)
   | null = null;
 
 // Read on each runtime-client build so tests can flip the env without
@@ -166,8 +214,43 @@ export function setActiveTarget(t: ActiveTarget, creds?: ActiveTargetCreds): voi
   // get an empty record and the client is built without username/password.
   overrideCreds = creds ? { username: creds.username, password: creds.password } : {};
   credsGeneration += 1;
+  // Wave 6.21 (M6) — detach every pool member from its current client and
+  // schedule a deferred `disconnect()` so any command issued in the last few
+  // hundred ms gets a chance to complete. The pool slot itself is reset
+  // immediately so the very next acquisition routes to a freshly built client
+  // against the new target — no traffic lands on the draining socket.
+  detachPoolMembersForSwap();
   for (const fn of listeners) {
     try { fn(override); } catch { /* listener errors must not break the setter */ }
+  }
+}
+
+// Wave 6.21 (M6) — runs on `setActiveTarget` profile-switch / creds rotation.
+// Walks both pools; for each member that holds an in-flight client, hands
+// the client off to the drain set with a `POOL_DRAIN_GRACE_MS` timer before
+// calling `disconnect()`. The pool member's `client` / `wrapper` / `key`
+// slots are blanked synchronously so subsequent acquisitions rebuild against
+// the new target. The next `acquireFromPool(...)` will bump `generation` so
+// 6.22's logger can distinguish the pre-swap client from the post-swap
+// rebuild on the same slot id.
+function detachPoolMembersForSwap(): void {
+  const graceMs = getPoolDrainGraceMs();
+  for (const pool of [heavyPool, lightPool]) {
+    for (const m of pool.members) {
+      const old = m.client;
+      m.client = null;
+      m.wrapper = null;
+      m.key = "";
+      if (old) {
+        drainingClients.add(old);
+        const timer = setTimeout(() => {
+          drainingClients.delete(old);
+          try { old.disconnect(); } catch { /* ignore */ }
+        }, graceMs);
+        // Avoid keeping the event loop alive purely to drain an idle client.
+        if (typeof timer.unref === "function") timer.unref();
+      }
+    }
   }
 }
 
@@ -193,7 +276,9 @@ export function resetActiveTarget(): void {
   cachedBootClient = null;
   cachedBootClientKey = "";
   // Wave 6.21 — tear down every pool member; subsequent acquisitions rebuild
-  // lazily against the (now-default) target.
+  // lazily against the (now-default) target. No drain grace here: this path
+  // is test-teardown / process shutdown, where prompt cleanup matters more
+  // than letting in-flight commands finish.
   for (const pool of [heavyPool, lightPool]) {
     for (const m of pool.members) {
       if (m.client) {
@@ -206,6 +291,12 @@ export function resetActiveTarget(): void {
     pool.members.length = 0;
     pool.rrIndex = 0;
   }
+  // Disconnect any clients still mid-drain so test runners do not see
+  // zombie sockets / setTimeout handles between cases.
+  for (const c of drainingClients) {
+    try { c.disconnect(); } catch { /* ignore */ }
+  }
+  drainingClients.clear();
 }
 
 export function onActiveTargetChange(fn: ActiveTargetListener): () => void {
@@ -213,15 +304,31 @@ export function onActiveTargetChange(fn: ActiveTargetListener): () => void {
   return () => { listeners.delete(fn); };
 }
 
-// Internal factory shared by the boot and runtime client accessors. The only
-// per-call difference is `commandTimeout`; everything else (host, port, db,
-// tls, creds, keepAlive, connectTimeout) is identical so a profile switch
-// rebuilds both caches in lockstep via `targetKey(...)`.
+// Internal factory shared by the boot and runtime client accessors. The
+// per-call differences are `commandTimeout` (boot 10s / pool 35s) AND the
+// Wave 6.23 `fastFail` opt-in — everything else (host, port, db, tls, creds,
+// keepAlive, connectTimeout) is identical so a profile switch rebuilds every
+// cache in lockstep via `targetKey(...)`.
+//
+// Wave 6.23 — `fastFail` MUST default to false. The boot path (see Wave 6.18c)
+// relies on ioredis's default retry budget (3) + default offline queue to
+// survive transient hiccups during `bootstrapFrtb()` long enough for
+// `withBootTimeout` to make the binding decision. Only the runtime pool
+// members opt in to `fastFail: true`.
+interface BuildClientOpts {
+  commandTimeout: number;
+  // When true: `maxRetriesPerRequest: 1` + `enableOfflineQueue: false`. Pool
+  // members only; the boot singleton MUST keep ioredis defaults so a flaky
+  // first connect doesn't permanently fail bootstrap.
+  fastFail?: boolean;
+}
+
 function buildClient(
   t: ActiveTarget,
   c: ActiveTargetCreds,
-  commandTimeout: number,
+  opts: BuildClientOpts,
 ): Redis {
+  const { commandTimeout, fastFail = false } = opts;
   return new Redis({
     host: t.host,
     port: t.port,
@@ -230,20 +337,24 @@ function buildClient(
     ...(c.username ? { username: c.username } : {}),
     ...(c.password ? { password: c.password } : {}),
     lazyConnect: true,
-    // Wave 6.23 — fast-fail rather than silently retry. ioredis's default
-    // (20) re-queues commands behind the scenes while a member is degraded,
-    // hiding the failure from the route handler until the cumulative latency
-    // explodes. Dropping to 1 surfaces the error on the very next command so
-    // the route returns a clean recoverable status (and the future 6.22
-    // circuit breaker can trip without waiting for a retry storm).
-    maxRetriesPerRequest: 1,
-    // Wave 6.23 — disable ioredis's unbounded offline queue. With the queue
-    // on (default true), commands issued while the connection is down or
-    // reconnecting accumulate in memory and all dispatch when it returns,
-    // amplifying the recovery spike. enableOfflineQueue:false makes those
-    // commands reject immediately — the route surfaces a fast 5xx instead
-    // of holding the request open until a delayed flush drains.
-    enableOfflineQueue: false,
+    // Wave 6.23 — pool members opt in to fast-fail so a degraded socket
+    // surfaces the error on the very next command instead of silently
+    // re-queueing commands behind the scenes (ioredis default: 20 retries).
+    // The boot singleton DOES NOT set these: bootstrap needs ioredis's
+    // default retry + offline-queue behaviour so a transient hiccup at
+    // process start doesn't fail-stop `bootstrapFrtb` before
+    // `withBootTimeout` gets a chance to gate the binding decision
+    // (Wave 6.18c invariant).
+    ...(fastFail
+      ? {
+          maxRetriesPerRequest: 1,
+          // ioredis's offline queue (default on) buffers commands while the
+          // socket is down/reconnecting and dispatches the whole backlog on
+          // recovery — amplifying the spike. Off => commands reject
+          // immediately => routes surface a fast 5xx and shed load.
+          enableOfflineQueue: false,
+        }
+      : {}),
     // Wave 6.18a — TCP keepAlive so sockets surviving long idle windows on
     // Redis Enterprise proxies do not zombie into MaxRetriesPerRequestError
     // without recovering until the process restarts.
@@ -278,7 +389,10 @@ export function getActiveRedisClient(): Redis | null {
   if (cachedBootClient) {
     try { cachedBootClient.disconnect(); } catch { /* ignore */ }
   }
-  cachedBootClient = buildClient(t, c, BOOT_COMMAND_TIMEOUT_MS);
+  // Wave 6.23 — boot client must NOT enable fast-fail. Bootstrap relies on
+  // ioredis's default retry budget + offline queue to ride out transient
+  // hiccups long enough for `withBootTimeout` to make the binding decision.
+  cachedBootClient = buildClient(t, c, { commandTimeout: BOOT_COMMAND_TIMEOUT_MS });
   cachedBootClientKey = key;
   return cachedBootClient;
 }
@@ -308,21 +422,45 @@ export function getActiveRedisClient(): Redis | null {
 // member, the other three keep the snapshot UI responsive.
 export function getActiveRedisRuntimeClient(category: RuntimeCategory = "heavy"): Redis | null {
   const pool = category === "light" ? lightPool : heavyPool;
-  const envName = category === "light"
+  return acquireFromPool(pool, poolSizeEnvName(category));
+}
+
+// Env name carrying the configured pool size for `category`. Single source of
+// truth so the backpressure plugin can derive its per-category in-flight
+// budget from the same number the pool itself sizes against.
+function poolSizeEnvName(category: RuntimeCategory): string {
+  return category === "light"
     ? "RUNTIME_REDIS_POOL_SIZE_LIGHT"
     : "RUNTIME_REDIS_POOL_SIZE_HEAVY";
-  return acquireFromPool(pool, envName);
+}
+
+// Wave 6.23 — read the effective pool size for `category` (env override or
+// `RUNTIME_POOL_SIZE_DEFAULT`). Exported so the backpressure plugin can default
+// its concurrency limit to a small multiple of the pool size, keeping the two
+// dials linked without re-implementing the env parsing here.
+export function getRuntimePoolSize(category: RuntimeCategory): number {
+  return getPoolSize(poolSizeEnvName(category));
 }
 
 // Resize the pool's slot array to `size`. Grows by appending empty slots
 // (lazy-built on first acquisition); shrinks by disconnecting and dropping
 // surplus members so a runtime env tweak that lowers the pool size releases
-// the extra sockets next time around.
+// the extra sockets next time around. Wave 6.21 (M1) — each new slot is
+// stamped with a stable `${category}:${index}` id; the id is `readonly` on
+// PoolMember so it survives every rebuild on the slot.
 function ensurePoolSized(pool: Pool, size: number): void {
   if (pool.members.length === size) return;
   if (pool.members.length < size) {
     while (pool.members.length < size) {
-      pool.members.push({ client: null, wrapper: null, key: "" });
+      const index = pool.members.length;
+      pool.members.push({
+        id: `${pool.category}:${index}`,
+        client: null,
+        wrapper: null,
+        key: "",
+        createdAt: 0,
+        generation: 0,
+      });
     }
     return;
   }
@@ -357,9 +495,19 @@ function acquireFromPool(pool: Pool, sizeEnvName: string): Redis | null {
   if (member.client) {
     try { member.client.disconnect(); } catch { /* ignore */ }
   }
+  // Wave 6.21 (M1) — bump generation BEFORE constructing the new client so
+  // any 6.22 structured log line agrees on which build attempt this is.
+  member.generation += 1;
+  member.createdAt = Date.now();
+  // Wave 6.23 — pool members opt in to fast-fail so a degraded socket
+  // surfaces the error immediately instead of holding the request open.
+  const runtimeOpts: BuildClientOpts = {
+    commandTimeout: getRuntimeCommandTimeoutMs(),
+    fastFail: true,
+  };
   const built = runtimeClientFactoryForTests
-    ? runtimeClientFactoryForTests(t, c, getRuntimeCommandTimeoutMs())
-    : buildClient(t, c, getRuntimeCommandTimeoutMs());
+    ? runtimeClientFactoryForTests(t, c, runtimeOpts)
+    : buildClient(t, c, runtimeOpts);
   attachErrorRecycle(built, member);
   member.client = built;
   member.wrapper = wrapWithRecycle(built, member);
@@ -438,7 +586,7 @@ function wrapWithRecycle(client: Redis, member: PoolMember): Redis {
 // behaviour. Pass `null` to restore the production `buildClient(...)` path.
 export function __setRuntimeClientFactoryForTests(
   fn:
-    | ((t: ActiveTarget, c: ActiveTargetCreds, commandTimeout: number) => Redis)
+    | ((t: ActiveTarget, c: ActiveTargetCreds, opts: BuildClientOpts) => Redis)
     | null,
 ): void {
   runtimeClientFactoryForTests = fn;
@@ -449,14 +597,45 @@ export function __setRuntimeClientFactoryForTests(
 // module-internal state. Returns a snapshot; mutation is intentionally
 // disabled (slots are spread into a fresh array of value copies).
 export function __getRuntimePoolForTests(category: RuntimeCategory): {
-  members: { client: Redis | null; wrapper: Redis | null; key: string }[];
+  members: {
+    id: string;
+    client: Redis | null;
+    wrapper: Redis | null;
+    key: string;
+    createdAt: number;
+    generation: number;
+  }[];
   rrIndex: number;
 } {
   const pool = category === "light" ? lightPool : heavyPool;
   return {
-    members: pool.members.map((m) => ({ client: m.client, wrapper: m.wrapper, key: m.key })),
+    members: pool.members.map((m) => ({
+      id: m.id,
+      client: m.client,
+      wrapper: m.wrapper,
+      key: m.key,
+      createdAt: m.createdAt,
+      generation: m.generation,
+    })),
     rrIndex: pool.rrIndex,
   };
+}
+
+// Wave 6.21 (M1) — public accessor returning the stable identity surface for
+// a pool slot. Returns `null` when the requested index has not been
+// materialised yet (pool not sized to include `index`). Callers (6.22's
+// structured logger, future ops dashboards) MUST tolerate the null because
+// pools size lazily on first acquisition. The returned object is a snapshot;
+// `generation` and `createdAt` may have advanced by the time the caller
+// observes them.
+export function getPoolMemberInfo(
+  category: RuntimeCategory,
+  index: number,
+): PoolMemberInfo | null {
+  const pool = category === "light" ? lightPool : heavyPool;
+  const m = pool.members[index];
+  if (!m) return null;
+  return { id: m.id, createdAt: m.createdAt, generation: m.generation };
 }
 
 export function getActiveTarget(): ActiveTarget {
