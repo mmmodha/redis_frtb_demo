@@ -21,6 +21,7 @@ import {
   buildFastPathQuery,
   FAST_PATH_ENGINE,
   formatRedisCommand,
+  FtAggregateFallbackDisabledError,
   LUA_PATH_ENGINE,
   resolveLegFields,
   ROLLUP_PATH_ENGINE,
@@ -590,6 +591,27 @@ async function computeSbmCharge(
       );
     }
   } catch (err) {
+    // Wave 6.39.B — fallback gate: when CALC_ALLOW_FT_AGGREGATE is off the
+    // rollup-readout returns null (missing rollup) and the FT.AGGREGATE
+    // path throws FtAggregateFallbackDisabledError instead of issuing the
+    // query. Surface as 412 with a /admin/calc-coverage pointer so the
+    // operator can fix the missing tuple rather than re-enable the
+    // expensive fallback blindly.
+    if (err instanceof FtAggregateFallbackDisabledError) {
+      return {
+        ok: false,
+        statusCode: 412,
+        body: {
+          error: "fallback-disabled",
+          risk_class,
+          measure: leg,
+          hint:
+            "FT.AGGREGATE fallback is disabled (CALC_ALLOW_FT_AGGREGATE!=true). " +
+            "See /admin/calc-coverage for the missing rollup tuple, or set " +
+            "CALC_ALLOW_FT_AGGREGATE=true to re-enable the fallback.",
+        },
+      };
+    }
     const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
     if (translated) {
       return { ok: false, statusCode: translated.status, body: translated.body };

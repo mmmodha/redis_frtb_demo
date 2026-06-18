@@ -20,6 +20,18 @@ import { kbSquaredForDirection, squareCorrelation } from "@frtb/calc/src/curvatu
 // the ingest writer (Wave 6.14a) so a schema change lands atomically in both
 // services rather than drifting under one of them.
 import { rollupKey } from "@frtb/calc-shared/rollup-keys";
+// Wave 6.39.B — bucket-level K_b cache. Lookup before the per-bucket math,
+// store on miss so subsequent warm calls skip the (per-tenor for GIRR
+// Curvature, scalar for Equity / FX) closed-form re-derivation. perTenor /
+// curvature variants are tracked as a follow-up; this turn ships scalar
+// Delta/Vega wiring (the dominant volume) so /metrics counters reflect
+// real cache activity.
+import {
+  computeRollupContentHash,
+  kbCacheKey,
+  lookupKbCacheEntry,
+  storeKbCacheEntry,
+} from "./kb-cache.ts";
 
 export type FastLeg = "delta" | "vega" | "curvature";
 
@@ -139,6 +151,40 @@ export const LUA_PATH_ENGINE = "fcall_lua" as const;
 // `sum_ws` / `sum_ws_sq` (and `sum_ws_up{,_sq}` / `sum_ws_down{,_sq}` for
 // Curvature) directly via HGETALL, bypassing FT.AGGREGATE entirely.
 export const ROLLUP_PATH_ENGINE = "rollup" as const;
+
+// Wave 6.39.B — explicit fallback gate. The rollup fast-fast path is the
+// primary execution path; FT.AGGREGATE is only used when a discovered
+// bucket has no rollup hash yet (still-warming target, ingest in flight,
+// or a tuple genuinely outside the seen-set's coverage). In production
+// we'd rather surface that as a hard 412 (with a pointer to
+// /admin/calc-coverage) than silently absorb the cost of a 270-bucket
+// FT.AGGREGATE fan-out — operators can flip CALC_ALLOW_FT_AGGREGATE=true
+// to re-enable the fallback after they've confirmed the missing tuples
+// are intentional. Dev/test default ON so the existing fast-path test
+// surface stays green without per-case env wiring.
+export class FtAggregateFallbackDisabledError extends Error {
+  constructor(public readonly riskClass: string, public readonly leg: FastLeg) {
+    super(
+      `FT.AGGREGATE fallback is disabled (CALC_ALLOW_FT_AGGREGATE!=true). ` +
+      `Bucket has no rollup hash for risk_class=${riskClass} leg=${leg}; ` +
+      `see /admin/calc-coverage for the missing tuple.`,
+    );
+    this.name = "FtAggregateFallbackDisabledError";
+  }
+}
+
+export function isFtAggregateAllowed(): boolean {
+  const raw = process.env.CALC_ALLOW_FT_AGGREGATE;
+  if (raw !== undefined && raw !== "") {
+    const v = raw.toLowerCase();
+    if (v === "true" || v === "1") return true;
+    if (v === "false" || v === "0") return false;
+  }
+  // Unset: default off in production so a missing rollup is loud; on in
+  // dev/test so unit tests can keep exercising the FT.AGGREGATE path
+  // without setting the flag per-suite.
+  return process.env.NODE_ENV !== "production";
+}
 
 // Returns master-shard nodes for fan-out, or [client] in standalone mode —
 // same feature-check shape as routes/calc.ts and bootstrap.ts so cluster +
@@ -808,7 +854,24 @@ export async function tryRollupReadout(
         sumWsSq = Number(h.sum_ws_sq ?? 0);
         count = Number(h.count ?? 0);
       }
+      // Wave 6.39.B — bucket-level K_b cache. Scalar Delta/Vega caches the
+      // computed K_b keyed by a SHA1 over the underlying rollup HVALS so a
+      // content drift (HINCRBYFLOAT bumping sum_ws on the next ingest batch)
+      // is detected on the next read and the entry is recomputed. perTenor
+      // (GIRR) Delta/Vega and Curvature follow as a tracked follow-up — both
+      // need preserving extra intermediate fields (per-tenor breakdown,
+      // k_plus/k_minus winner) that don't fit a single scalar value.
       const r = kbFromConstantRho(sumWs, sumWsSq, rho);
+      if (!perTenor) {
+        const cacheKey = kbCacheKey(rc, b, sens, "default", "n_a");
+        const contentHash = computeRollupContentHash(tm.get("") ?? {});
+        const cached = await lookupKbCacheEntry(redis, cacheKey, contentHash);
+        if (cached) {
+          r.K_b = cached.K_b;
+        } else {
+          await storeKbCacheEntry(redis, cacheKey, r.K_b, contentHash);
+        }
+      }
       out.push({
         bucket: b,
         K_b: r.K_b,
@@ -861,6 +924,12 @@ export async function tryRollupReadout(
 }
 
 export async function aggregateBucketsViaIndex(opts: AggregateBucketsOpts): Promise<BucketResult[]> {
+  // Wave 6.39.B — fail loud before any FT.AGGREGATE traffic when the
+  // operator has disabled the fallback (prod default). The route catches
+  // this and translates to 412 fallback-disabled.
+  if (!isFtAggregateAllowed()) {
+    throw new FtAggregateFallbackDisabledError(opts.riskClass.toUpperCase(), opts.leg);
+  }
   const start = process.hrtime.bigint();
   const riskClass = opts.riskClass.toUpperCase();
   const fields = resolveLegFields(opts.schema, riskClass, opts.leg);
