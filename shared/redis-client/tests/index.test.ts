@@ -59,8 +59,33 @@ describe("createRedisClient", () => {
     delete process.env.REDIS_TLS;
   });
 
-  it("defaults to Cluster mode (per Wave 5 target topology)", () => {
+  // Wave 6.39.E — Enterprise-first default. The Enterprise proxy endpoint
+  // blocks `CLUSTER SLOTS`, so the factory defaults to standalone and OSS
+  // operators must opt in explicitly via REDIS_CLUSTER=true.
+  it("defaults to standalone Redis when REDIS_CLUSTER is unset (Enterprise-first)", () => {
     process.env.REDIS_URL = "redis://:pw@seed.example.com:10395";
+    createRedisClient();
+    expect(redisCtor).toHaveBeenCalledTimes(1);
+    expect(clusterCtor).not.toHaveBeenCalled();
+    const [opts] = redisCtor.mock.calls[0] as [Record<string, unknown>];
+    expect(opts.host).toBe("seed.example.com");
+    expect(opts.port).toBe(10395);
+    expect(opts.password).toBe("pw");
+  });
+
+  it("uses standalone Redis when REDIS_CLUSTER=false (explicit opt-out)", () => {
+    process.env.REDIS_URL = "redis://:pw@host:6379";
+    process.env.REDIS_CLUSTER = "false";
+    createRedisClient();
+    expect(redisCtor).toHaveBeenCalledTimes(1);
+    expect(clusterCtor).not.toHaveBeenCalled();
+  });
+
+  // Wave 6.39.E regression guard — explicit opt-in must still select cluster
+  // mode for OSS-cluster operators that were relying on the old default.
+  it("uses Cluster mode when REDIS_CLUSTER=true (explicit opt-in)", () => {
+    process.env.REDIS_URL = "redis://:pw@seed.example.com:10395";
+    process.env.REDIS_CLUSTER = "true";
     createRedisClient();
     expect(clusterCtor).toHaveBeenCalledTimes(1);
     expect(redisCtor).not.toHaveBeenCalled();
@@ -70,17 +95,10 @@ describe("createRedisClient", () => {
     expect(redisOptions.password).toBe("pw");
   });
 
-  it("uses standalone Redis when REDIS_CLUSTER=false", () => {
-    process.env.REDIS_URL = "redis://:pw@host:6379";
-    process.env.REDIS_CLUSTER = "false";
-    createRedisClient();
-    expect(redisCtor).toHaveBeenCalledTimes(1);
-    expect(clusterCtor).not.toHaveBeenCalled();
-  });
-
   it("passes tls option when REDIS_TLS=true even on redis:// scheme", () => {
     process.env.REDIS_URL = "redis://:pw@host:6379";
     process.env.REDIS_TLS = "true";
+    process.env.REDIS_CLUSTER = "true";
     createRedisClient();
     const [, opts] = clusterCtor.mock.calls[0] as [unknown, Record<string, unknown>];
     const redisOptions = (opts as { redisOptions?: Record<string, unknown> }).redisOptions ?? {};
@@ -89,6 +107,7 @@ describe("createRedisClient", () => {
 
   it("accepts an explicit url argument overriding env", () => {
     process.env.REDIS_URL = "redis://:env@envhost:6379";
+    process.env.REDIS_CLUSTER = "true";
     createRedisClient({ url: "redis://:arg@arghost:7000" });
     const [nodes] = clusterCtor.mock.calls[0] as [Array<{ host: string; port: number }>];
     expect(nodes[0]?.host).toBe("arghost");
@@ -101,6 +120,7 @@ describe("createRedisClient", () => {
 
   it("passes through lazyConnect + maxRetriesPerRequest defaults to redisOptions", () => {
     process.env.REDIS_URL = "redis://:pw@host:6379";
+    process.env.REDIS_CLUSTER = "true";
     createRedisClient({ lazyConnect: true, maxRetriesPerRequest: 3 });
     const [, opts] = clusterCtor.mock.calls[0] as [unknown, Record<string, unknown>];
     const redisOptions = (opts as { redisOptions?: Record<string, unknown> }).redisOptions ?? {};
@@ -114,6 +134,7 @@ describe("createRedisClient", () => {
   // clusterOptions.redisOptions) and the standalone Redis constructor.
   it("emits keepAlive=30000 in redisOptions for cluster mode", () => {
     process.env.REDIS_URL = "redis://:pw@host:6379";
+    process.env.REDIS_CLUSTER = "true";
     createRedisClient();
     const [, opts] = clusterCtor.mock.calls[0] as [unknown, Record<string, unknown>];
     const redisOptions = (opts as { redisOptions?: Record<string, unknown> }).redisOptions ?? {};

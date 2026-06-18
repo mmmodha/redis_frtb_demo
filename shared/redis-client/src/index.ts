@@ -1,9 +1,12 @@
 // FRTB SBM PoV — shared ioredis client factory.
 //
-// Wave 5.2 target: the user's Redis Enterprise cluster (2 master shards) at
-// the seed endpoint embedded in REDIS_URL. Cluster mode is the default
-// because the production topology is sharded; explicit REDIS_CLUSTER=false
-// drops back to standalone for local/dev fixtures.
+// Wave 6.39.E — Enterprise-first default. Redis Enterprise (the production
+// target) presents a single proxy endpoint with internal rebalancing across
+// shards; clients connect as standalone and the proxy hides the topology,
+// blocking `CLUSTER SLOTS` discovery from the outside. Cluster mode is now
+// off by default so ioredis does not attempt that discovery on the wrong
+// endpoint shape. OSS-cluster operators opt in explicitly via
+// `REDIS_CLUSTER=true` (or `createRedisClient({ cluster: true })`).
 //
 // Secrets-safety: the password is read from the URL and never logged here.
 // Callers must never echo the URL or password into logs or commit messages.
@@ -22,7 +25,7 @@ export interface ParsedRedisUrl {
 export interface CreateRedisClientOptions {
   // Explicit URL override; falls back to process.env.REDIS_URL.
   url?: string;
-  // Explicit cluster toggle; falls back to process.env.REDIS_CLUSTER (default true).
+  // Explicit cluster toggle; falls back to process.env.REDIS_CLUSTER (default false).
   cluster?: boolean;
   // Explicit TLS toggle; falls back to process.env.REDIS_TLS, then to URL scheme.
   tls?: boolean;
@@ -74,7 +77,7 @@ export function createRedisClient(opts: CreateRedisClientOptions = {}): Redis | 
     throw new Error("createRedisClient: REDIS_URL is required (pass opts.url or set env var)");
   }
   const parsed = parseRedisUrl(url);
-  const clusterMode = opts.cluster ?? envBool(process.env.REDIS_CLUSTER, true);
+  const clusterMode = opts.cluster ?? envBool(process.env.REDIS_CLUSTER, false);
   const tlsEnabled = opts.tls ?? envBool(process.env.REDIS_TLS, parsed.tls);
 
   const redisOptions: RedisOptions = {
