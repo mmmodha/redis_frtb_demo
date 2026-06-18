@@ -22,6 +22,7 @@
 - [ ] **Smoke check the api process is up:** `curl -fsS http://localhost:8080/healthz` returns `{"service":"api","status":"alive"}`.
 - [ ] **Smoke check the api is Redis-ready:** `curl -fsS http://localhost:8080/readyz` returns `{"service":"api","status":"ok","bootstrap":"ready"}` (503 with `bootstrap-failed` until an active Redis connection is wired via the Connections panel).
 - [ ] **Smoke check `GET /redis/active-target`** — returns `demo-cluster` host/port/tls (no password leak).
+- [ ] **Confirm warm-restart fast-path** (if `demo-cluster` was bootstrapped earlier today): `curl -fsS http://localhost:8080/redis/active-target/bootstrap-status` returns `{"phase":"ready",...}` within ~2 s of the api coming up, and the api logs show a `"action":"bootstrap-skip","reason":"schema-unchanged"` line — no re-ingest required. If you see a fresh `FT.CREATE` instead, see the README **Connecting to Redis → Troubleshooting** section.
 - [ ] **Open the UI:** `http://localhost:5173`. Confirm:
   - Active-target pill in header shows green `demo-cluster`.
   - Left rail renders all 6 sections (Connections, Sources, Ingest, Search, Calc, Observability) + Loadgen (Wave 4.2 once live).

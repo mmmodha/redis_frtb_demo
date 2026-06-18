@@ -110,6 +110,128 @@ npm test            # runs the monorepo + per-package vitest suites
 npm run -w @frtb/ui start    # boot a single service stub
 ```
 
+## Connecting to Redis
+
+The api never picks its own Redis. It waits for the UI Connections panel
+(or a pre-seeded `REDIS_URL`) to nominate an **active target**, then
+auto-bootstraps the FRTB index + Redis Functions library against that
+target. Two flows; the api detects which one it's in and behaves
+accordingly.
+
+### First-time connection (cold target)
+
+A fresh Redis instance with no `idx:sens:v*` index and no `frtb` library
+loaded.
+
+What happens when you click **Set active** in the Connections panel (or
+on boot when `REDIS_URL` is pre-seeded):
+
+1. Active-target changes → bootstrap runs in the background.
+2. Bootstrap issues **one** `FT.CREATE idx:sens:v{hash}` and **one**
+   `FUNCTION LOAD` for the `frtb` library (9 functions), then persists
+   the schema hash under `bootstrap:schema-hash:<target_label>`.
+3. `/readyz` flips to 200 in roughly **2-3 s** end-to-end.
+4. `/calc/sbm` returns `503 no-data-or-index` until you ingest data —
+   this is correct, not an error. The index exists but holds zero docs.
+5. Go to **Sources** (or **Ingest**) to populate the index; calc
+   responses become numeric as soon as docs land.
+
+Expected api log lines (one per master node):
+
+```text
+{"service":"api","bootstrap":"idx:sens","action":"create","index":"idx:sens:v<hash7>","nodes":N}
+{"service":"api","bootstrap":"frtb","action":"function-load","library":"frtb","functions":9}
+```
+
+### Reconnecting / app restart (warm target)
+
+The same Redis instance after the api has been bootstrapped against it
+at least once (typical case: `docker compose restart api`, redeploy, or
+re-activating the same connection profile after a switch).
+
+What happens:
+
+1. Active-target changes → bootstrap runs, sees the persisted
+   `bootstrap:schema-hash:<target_label>` matches the current schema
+   hash AND the versioned index is present on every master.
+2. Bootstrap **short-circuits** — zero `FT.CREATE`, zero `FT.DROPINDEX`,
+   zero `FUNCTION LOAD` writes. The skip path itself completes in
+   ~250 ms.
+3. `/readyz` flips to 200 in roughly **1-2 s** end-to-end (the rest is
+   runtime-pool warm-up).
+4. `/calc/sbm` is immediately usable — returns numeric charges if data
+   is present, or `503 no-data-or-index` only if the data was wiped
+   separately (the index itself was preserved).
+5. **No re-ingest needed.** The data, the index, and the library all
+   survive the api restart because they live inside Redis.
+
+Expected api log line:
+
+```text
+{"service":"api","bootstrap":"idx:sens","action":"bootstrap-skip","reason":"schema-unchanged","index":"idx:sens:v<hash7>","nodes":N}
+```
+
+### How to verify it worked
+
+Two curls against the api (port 8080 by default, or
+`http://localhost:3000/api/...` through the UI proxy):
+
+```bash
+# 1. Readiness probe — 200 once bootstrap resolves.
+curl -fsS http://localhost:8080/readyz
+# → {"service":"api","status":"ok","bootstrap":"ready"}
+
+# 2. Bootstrap phase snapshot — same source of truth as the UI badge.
+curl -fsS http://localhost:8080/redis/active-target/bootstrap-status
+# Cold target, mid-bootstrap:
+# → {"phase":"running","target_label":"demo-cluster","started_at":"..."}
+# Either flow, settled:
+# → {"phase":"ready","target_label":"demo-cluster","started_at":"...","finished_at":"..."}
+```
+
+`phase` is one of `idle | running | ready | partial | failed`. `ready`
+is the only terminal value that lets read endpoints (`/calc/sbm`,
+`/pivot`, `/facets`, `/suggest`) serve traffic.
+
+### Troubleshooting
+
+**`/readyz` stuck on 503 with `bootstrap-running` (or `bootstrap-status`
+phase stuck at `running` for >30 s)**
+
+1. Curl `/redis/active-target/bootstrap-status` and read `target_label`
+   — confirm it's the target you expected.
+2. On a cluster target, an `FT.DROPINDEX` against a populated legacy
+   index can legitimately take 30-60 s; the scheduled-bootstrap timeout
+   is 90 s. Wait that out before declaring it stuck.
+3. If it's a fresh target and bootstrap still won't complete, check the
+   api logs for `bootstrap-failed` entries — the most common cause is
+   missing modules (`ReJSON`, `RediSearch`, or `RedisGears`) on the
+   target. Re-provision the cluster with the full module bundle.
+4. As a last resort, click **Set active** again on the same profile in
+   the Connections panel — the active-target listener re-fires
+   bootstrap, which is idempotent.
+
+**`/calc/sbm` returns `412` (or any pre-condition error) immediately
+after a restart against a previously-working target**
+
+This would indicate the warm-target skip path regressed and bootstrap
+re-created the index empty instead of adopting it. The verification
+harness lives in task 6.34.A: it asserts that restart against a
+populated target issues zero `FT.CREATE` / `FT.DROPINDEX` / `FUNCTION
+LOAD` writes and that `/calc/sbm` returns numeric charges within ~2 s.
+Run that harness against the affected target to confirm whether the
+skip path fired; if it did not, capture the api logs around the
+restart and file against bootstrap (`services/api/src/bootstrap.ts`).
+
+**`ClusterAllFailedError` stack traces in api boot logs against a
+standalone (non-clustered) target**
+
+Cosmetic. The api probes for cluster topology on boot; on a standalone
+target the probe fails loudly but does not affect correctness — the
+bootstrap and runtime paths both fall back to the single-node client.
+Quieting these stack traces is tracked separately in wave 6.35; in the
+meantime they can be ignored as long as `/readyz` reaches 200.
+
 ## Local-developer launcher (no Docker)
 
 ```bash
