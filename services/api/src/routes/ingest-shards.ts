@@ -1,11 +1,12 @@
 // Wave 6.12a — proxy plugin for the api's /ingest/* shard-control surface.
 //
 // Mirrors loadgen-proxy.ts: the api fronts ingest so the UI only ever talks
-// to one host. Three endpoints pass through verbatim to the ingest service
+// to one host. The endpoints pass through verbatim to the ingest service
 // (default http://localhost:8083, override via INGEST_URL):
-//   GET  /ingest/shards   (read current state)
-//   POST /ingest/shards   (rebuild on the ingest runtime)
-//   GET  /ingest/status   (state + counters)
+//   GET  /ingest/shards         (read current state)
+//   POST /ingest/shards         (rebuild on the ingest runtime)
+//   POST /ingest/shards/reset   (Wave 6.32.B — force-clear stuck rebuild mutex)
+//   GET  /ingest/status         (state + counters)
 //
 // Failure model: upstream connect/transport errors and any 5xx surface as
 // `502 { error: "ingest service unreachable" }` — matching the loadgen/source
@@ -138,6 +139,7 @@ export function registerIngestShardsRoutes(app: FastifyInstance, opts: IngestSha
 
     scope.get("/ingest/shards", (req, reply) => streamProxy(req, reply, base, "/ingest/shards", corsAllowed));
     scope.post("/ingest/shards", (req, reply) => streamProxy(req, reply, base, "/ingest/shards", corsAllowed));
+    scope.post("/ingest/shards/reset", (req, reply) => streamProxy(req, reply, base, "/ingest/shards/reset", corsAllowed));
     scope.get("/ingest/status", (req, reply) => streamProxy(req, reply, base, "/ingest/status", corsAllowed));
   });
 }

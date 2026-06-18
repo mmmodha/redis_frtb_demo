@@ -439,6 +439,12 @@ export async function getActiveGeneratorRuns(): Promise<{ active: ActiveGenerato
 // and 409 (rebuild already in progress) as JSON errors — both are turned
 // into Error.message strings here so the panel can render them as toasts or
 // inline errors rather than silently swallowing them.
+//
+// Wave 6.32.A — the snapshot now also carries `rebuilding` (true while a
+// drain+respawn is in flight) and, when true, `rebuild_started_at` (ISO8601)
+// so the UI can render a spinner with the elapsed time without polling a
+// separate endpoint. Both fields are optional here for forward/backward
+// compatibility with older ingest builds.
 export interface IngestShardsSnapshot {
   totalShards: number;
   // The runtime also returns `assignment` and `streams` but the UI only
@@ -446,6 +452,8 @@ export interface IngestShardsSnapshot {
   // ever trims the response.
   assignment?: number[];
   streams?: string[];
+  rebuilding?: boolean;
+  rebuild_started_at?: string;
 }
 
 export async function getIngestShards(): Promise<IngestShardsSnapshot> {
@@ -474,4 +482,32 @@ export async function setIngestShards(
     throw new Error(`api /ingest/shards ${detail}`);
   }
   return (await res.json()) as IngestShardsSnapshot;
+}
+
+// Wave 6.32.B — operator recovery for a stuck rebuild mutex. POST
+// /ingest/shards/reset force-clears the in-memory `rebuilding` flag on the
+// ingest service and detaches the abandoned MultiConsumer; the caller can
+// then POST /ingest/shards again to spawn a fresh one. Destructive: any
+// in-flight messages owned by the abandoned multi may be lost. The UI guards
+// the call behind a confirmation modal.
+export interface ResetIngestShardsResponse {
+  rebuilding: false;
+  multi_detached: true;
+}
+
+export async function resetIngestShards(): Promise<ResetIngestShardsResponse> {
+  const res = await fetch(`${apiBase()}/ingest/shards/reset`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{}",
+  });
+  if (!res.ok) {
+    let detail = `${res.status}`;
+    try {
+      const err = (await res.json()) as { error?: string };
+      if (err && typeof err.error === "string") detail = `${res.status}: ${err.error}`;
+    } catch { /* response body not json */ }
+    throw new Error(`api /ingest/shards/reset ${detail}`);
+  }
+  return (await res.json()) as ResetIngestShardsResponse;
 }

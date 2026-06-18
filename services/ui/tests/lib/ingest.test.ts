@@ -7,6 +7,8 @@ import {
   flushDb,
   cancelGenerator,
   cancelAllGeneratorRuns,
+  getIngestShards,
+  resetIngestShards,
   preflightAndRebuildIfNeeded,
   type PreflightResponse,
   type ProgressFrame,
@@ -369,5 +371,62 @@ describe("ingest api client", () => {
       }) as typeof fetch;
       await expect(preflightAndRebuildIfNeeded()).rejects.toThrow(/network down/);
     });
+  });
+
+  // Wave 6.32.C — getIngestShards must surface the new optional `rebuilding`
+  // and `rebuild_started_at` fields verbatim so the IngestPanel can render the
+  // spinner + elapsed-time affordance without an extra round-trip.
+  it("getIngestShards passes through rebuilding + rebuild_started_at when the server reports them", async () => {
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      totalShards: 4,
+      assignment: [0, 1, 2, 3],
+      streams: ["s0", "s1", "s2", "s3"],
+      rebuilding: true,
+      rebuild_started_at: "2026-06-18T09:30:00.000Z",
+    }), { headers: { "content-type": "application/json" } })) as typeof fetch;
+    const snap = await getIngestShards();
+    expect(snap.totalShards).toBe(4);
+    expect(snap.rebuilding).toBe(true);
+    expect(snap.rebuild_started_at).toBe("2026-06-18T09:30:00.000Z");
+  });
+
+  it("getIngestShards still parses snapshots that omit rebuilding (older ingest builds)", async () => {
+    globalThis.fetch = (async () => new Response(JSON.stringify({ totalShards: 1 }), {
+      headers: { "content-type": "application/json" },
+    })) as typeof fetch;
+    const snap = await getIngestShards();
+    expect(snap.totalShards).toBe(1);
+    expect(snap.rebuilding).toBeUndefined();
+    expect(snap.rebuild_started_at).toBeUndefined();
+  });
+
+  // Wave 6.32.C — resetIngestShards POSTs /ingest/shards/reset with a
+  // parseable empty JSON body so Fastify does not 400 with
+  // FST_ERR_CTP_EMPTY_JSON_BODY, and returns the parsed
+  // { rebuilding: false, multi_detached: true } shape from the ingest runtime.
+  it("resetIngestShards POSTs /ingest/shards/reset and returns the parsed body", async () => {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: typeof input === "string" ? input : input.toString(), init });
+      return new Response(JSON.stringify({ rebuilding: false, multi_detached: true }), {
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+    const res = await resetIngestShards();
+    expect(res).toEqual({ rebuilding: false, multi_detached: true });
+    const init = calls[0]!.init!;
+    expect(calls[0]!.url).toMatch(/\/ingest\/shards\/reset$/);
+    expect(init.method).toBe("POST");
+    const headers = (init.headers ?? {}) as Record<string, string>;
+    expect(headers["content-type"]).toBe("application/json");
+    expect(JSON.parse(init.body as string)).toEqual({});
+  });
+
+  it("resetIngestShards throws with the upstream error message on a non-2xx response", async () => {
+    globalThis.fetch = (async () => new Response(JSON.stringify({ error: "ingest service unreachable" }), {
+      status: 502,
+      headers: { "content-type": "application/json" },
+    })) as typeof fetch;
+    await expect(resetIngestShards()).rejects.toThrow(/502.*unreachable/);
   });
 });

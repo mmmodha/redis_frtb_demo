@@ -21,6 +21,7 @@ import {
   preflight,
   preflightAndRebuildIfNeeded,
   rebuildIndexes,
+  resetIngestShards,
   setIngestShards,
   startIngest,
   type GeneratorConfig,
@@ -384,6 +385,15 @@ export function IngestPanel() {
   const [producerDial, setProducerDial] = useState<number | "per-bucket" | null>(null);
   const [shardRebuilding, setShardRebuilding] = useState<boolean>(false);
   const [shardError, setShardError] = useState<string | null>(null);
+  // Wave 6.32.C — server-reported rebuild start time (ISO8601) when the
+  // ingest snapshot reports `rebuilding: true`. Null otherwise. Surfaces a
+  // spinner with elapsed seconds so the operator can tell a stuck rebuild
+  // from a normal one.
+  const [rebuildStartedAt, setRebuildStartedAt] = useState<string | null>(null);
+  // Wave 6.32.C — Force reset confirmation modal + in-flight flag for the
+  // POST /ingest/shards/reset call. Mirrors the flush-db button shape.
+  const [resetPending, setResetPending] = useState<boolean>(false);
+  const [resetBusy, setResetBusy] = useState<boolean>(false);
   // Pending value submitted via POST — used to render the transient
   // "rebuilding… → N" affordance until the next GET confirms the new value.
   const pendingShardRef = useRef<number | null>(null);
@@ -448,7 +458,15 @@ export function IngestPanel() {
         const snap = await getIngestShards();
         if (cancelled) return;
         setIngestShardsState(snap.totalShards);
-        if (pendingShardRef.current !== null && snap.totalShards === pendingShardRef.current) {
+        // Wave 6.32.C — server is authoritative for the rebuilding flag once
+        // it advertises it (snap.rebuilding === true|false). Older ingest
+        // builds omit the field; fall back to the local optimistic flag in
+        // that case so the existing "Rebuilding…" affordance still works.
+        if (typeof snap.rebuilding === "boolean") {
+          setShardRebuilding(snap.rebuilding);
+          setRebuildStartedAt(snap.rebuilding ? (snap.rebuild_started_at ?? null) : null);
+          if (!snap.rebuilding) pendingShardRef.current = null;
+        } else if (pendingShardRef.current !== null && snap.totalShards === pendingShardRef.current) {
           pendingShardRef.current = null;
           setShardRebuilding(false);
         }
@@ -626,6 +644,27 @@ export function IngestPanel() {
     }
   }
 
+  // Wave 6.32.C — Force reset handler. Operator recovery for a stuck rebuild
+  // mutex: POST /ingest/shards/reset force-clears `rebuilding` on the ingest
+  // service and detaches the abandoned MultiConsumer. We optimistically clear
+  // the local flag too so the Apply button re-enables immediately; the next
+  // GET tick confirms the server state. Errors surface via `shardError`.
+  async function onResetShardsConfirm(): Promise<void> {
+    setResetPending(false);
+    setResetBusy(true);
+    setShardError(null);
+    try {
+      await resetIngestShards();
+      pendingShardRef.current = null;
+      setShardRebuilding(false);
+      setRebuildStartedAt(null);
+    } catch (e) {
+      setShardError((e as Error).message);
+    } finally {
+      setResetBusy(false);
+    }
+  }
+
   const tput = chartPath(throughput.current, 360, 80);
   const memPath = chartPath(memorySeries.current, 360, 80);
   const sampleKeys = keys?.sample ?? [];
@@ -709,8 +748,11 @@ export function IngestPanel() {
             ingestShards={ingestShards}
             producerDial={producerDial}
             rebuilding={shardRebuilding}
+            rebuildStartedAt={rebuildStartedAt}
             error={shardError}
             onApply={onApplyShards}
+            onRequestReset={() => setResetPending(true)}
+            resetBusy={resetBusy}
           />
 
           <SyntheticGeneratorCard
@@ -787,6 +829,13 @@ export function IngestPanel() {
         <StopAllRunsConfirmModal
           onCancel={() => setStopAllPending(false)}
           onConfirm={onStopAllConfirm}
+        />
+      ) : null}
+
+      {resetPending ? (
+        <ResetShardsConfirmModal
+          onCancel={() => setResetPending(false)}
+          onConfirm={onResetShardsConfirm}
         />
       ) : null}
 
@@ -982,10 +1031,23 @@ function IngestFanoutCard(props: {
   ingestShards: number | null;
   producerDial: number | "per-bucket" | null;
   rebuilding: boolean;
+  // Wave 6.32.C — ISO8601 timestamp from the server snapshot when a rebuild
+  // is in flight; null when the server reports `rebuilding: false` (or omits
+  // the field). Used to render an elapsed-time spinner so a stuck rebuild
+  // becomes visible.
+  rebuildStartedAt: string | null;
   error: string | null;
   onApply: (next: number) => Promise<void>;
+  // Wave 6.32.C — opens the Force reset confirmation modal owned by the
+  // panel. `resetBusy` mirrors the in-flight POST so the button can show a
+  // spinner label while the request is outstanding.
+  onRequestReset: () => void;
+  resetBusy: boolean;
 }) {
-  const { ingestShards, producerDial, rebuilding, error, onApply } = props;
+  const {
+    ingestShards, producerDial, rebuilding, rebuildStartedAt,
+    error, onApply, onRequestReset, resetBusy,
+  } = props;
   // Default the dropdown to the current ingest value when known; fall back
   // to the first option so the form is always submittable.
   const initial = ingestShards != null && (INGEST_FANOUT_OPTIONS as readonly number[]).includes(ingestShards)
@@ -1064,9 +1126,40 @@ function IngestFanoutCard(props: {
         </div>
         {rebuilding ? (
           <div className="ingest-fanout__hint" data-testid="ingest-fanout-rebuilding" role="status">
-            Rebuilding ingest consumer — waiting for the next poll to confirm.
+            <span className="ingest-fanout__spinner" aria-hidden="true">⏳</span>
+            {" "}Rebuilding ingest consumer
+            {rebuildStartedAt ? (
+              <>
+                {" — started "}
+                <time
+                  dateTime={rebuildStartedAt}
+                  data-testid="ingest-fanout-rebuild-started-at"
+                  title={rebuildStartedAt}
+                >
+                  {formatRebuildStartedAt(rebuildStartedAt)}
+                </time>
+              </>
+            ) : (
+              " — waiting for the next poll to confirm."
+            )}
           </div>
         ) : null}
+        {/* Wave 6.32.C — Force reset escape hatch for a stuck rebuild mutex.
+            Always rendered so the operator can recover even if the snapshot
+            never flips back to `rebuilding: false`; visually de-emphasised
+            unless a rebuild is in flight. */}
+        <div className="ingest-fanout__row ingest-fanout__row--reset">
+          <button
+            type="button"
+            className="btn btn--danger"
+            onClick={onRequestReset}
+            disabled={resetBusy}
+            data-testid="ingest-fanout-reset"
+            title="Force-clear a stuck rebuild mutex on the ingest service. Destructive: in-flight messages from the abandoned consumer may be lost."
+          >
+            {resetBusy ? "Resetting…" : "Force reset"}
+          </button>
+        </div>
         {error ? (
           <div className="ingest-fanout__error" data-testid="ingest-fanout-error" role="alert">
             {error}
@@ -1075,6 +1168,19 @@ function IngestFanoutCard(props: {
       </form>
     </PanelCard>
   );
+}
+
+// Wave 6.32.C — render the rebuild start timestamp as a short relative
+// elapsed-seconds string ("5s ago") so the operator can spot a stuck rebuild
+// at a glance. Falls back to the raw ISO when parsing fails so the tooltip
+// still carries useful info.
+function formatRebuildStartedAt(iso: string): string {
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return iso;
+  const delta = Math.max(0, Math.floor((Date.now() - t) / 1000));
+  if (delta < 60) return `${delta}s ago`;
+  if (delta < 3600) return `${Math.floor(delta / 60)}m ${delta % 60}s ago`;
+  return `${Math.floor(delta / 3600)}h ${Math.floor((delta % 3600) / 60)}m ago`;
 }
 
 // Wave 5.20a — pre-submit sanity check.
@@ -2149,6 +2255,38 @@ function StopAllRunsConfirmModal(props: {
             Cancel
           </button>
           <button type="button" className="btn btn--danger" onClick={onConfirm} data-testid="stop-all-runs-confirm">
+            Confirm
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Wave 6.32.C — Force reset confirmation. Same dialog shape as
+// FlushDbConfirmModal / StopAllRunsConfirmModal so the layout stays
+// consistent. Copy reflects the destructive semantics documented on the
+// ingest runtime: the abandoned MultiConsumer is detached, not stopped, and
+// any in-flight messages it owns may be lost.
+function ResetShardsConfirmModal(props: {
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const { onCancel, onConfirm } = props;
+  return (
+    <div className="dialog-backdrop" role="dialog" aria-modal="true" aria-label="Force reset ingest shards confirmation">
+      <div className="dialog sanity-modal--block" data-testid="ingest-fanout-reset-modal">
+        <h2>Force-reset the ingest rebuild mutex?</h2>
+        <div className="sanity-modal__body">
+          This abandons the in-flight rebuild on the ingest service without waiting for it to drain. Any messages
+          owned by the abandoned consumer may be lost. Use this only when a rebuild appears stuck (e.g. after a
+          mid-ingest flush). The next "Apply" will spawn a fresh consumer.
+        </div>
+        <div className="dialog__actions">
+          <button type="button" className="btn" onClick={onCancel} data-testid="ingest-fanout-reset-cancel">
+            Cancel
+          </button>
+          <button type="button" className="btn btn--danger" onClick={onConfirm} data-testid="ingest-fanout-reset-confirm">
             Confirm
           </button>
         </div>
