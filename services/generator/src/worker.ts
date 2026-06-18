@@ -24,10 +24,15 @@ import { createRedisClient } from "@frtb/redis-client";
 import { loadSchema } from "@frtb/schema";
 import pino from "pino";
 import { createRowGenerator } from "./row-generator.ts";
-import { createStreamProducer } from "./producer.ts";
+import { createStreamProducer, type StreamProducer } from "./producer.ts";
 import { runGenerationInline } from "./coordinator.ts";
 import { createStreamRouter, type StreamShardsConfig } from "@frtb/stream-router";
 import { createStreamFlowControl } from "./flow-control.ts";
+// Wave 6.39.A — direct-write path. Lazy-bound via dynamic import so the
+// generator's tsconfig rootDir contract (./src) stays intact while the
+// writer reuses services/ingest/src/consumer.ts at runtime.
+import { createDirectWriter, type StorageFormat } from "./direct-writer.ts";
+import { loadDirectWriterHooks, resolveStorageFormatEnv } from "./direct-writer-bind.ts";
 
 export interface WorkerInitData {
   schemaPath: string;
@@ -62,6 +67,16 @@ export interface WorkerInitData {
   rate?: number;
   /** Rows ADDed per postMessage progress frame. Default 1000. */
   progressBatchSize?: number;
+  /** Wave 6.39.A — generator backend. `stream` (default) keeps the legacy
+   *  XADD path bit-identical; `direct` swaps the producer for the
+   *  direct-write writer (HSET + pre-aggregated HINCRBYFLOAT + SADD). */
+  mode?: "stream" | "direct";
+  /** Wave 6.39.A — bucket sampling mode. Undefined preserves the legacy
+   *  schema-aware draw (rng-isolation canary holds). */
+  distribution?: "uniform" | "realistic" | "pareto";
+  /** Wave 6.39.A — STORAGE_FORMAT override for direct-write. Ignored in
+   *  stream mode (ingest resolves its own STORAGE_FORMAT). */
+  storageFormat?: StorageFormat;
 }
 
 export type WorkerMessage =
@@ -94,23 +109,37 @@ async function main(): Promise<void> {
     sensitivityTypes: data.sensitivityTypes,
     tradePoolSize: data.tradePoolSize,
     factorPoolSize: data.factorPoolSize,
+    distribution: data.distribution,
   });
   const client = createClient(data.redisUrl);
-  const router = createStreamRouter(data.stream, data.streamShards);
   // Wave 5.92C — per-worker pino logger (worker_threads can't share the
-  // parent's pino instance) + per-worker flow-control gate. The gate polls
-  // XLEN on the worker's local client so backpressure is observed per-shard
-  // (each worker writes to a deterministic subset of streams via its router).
+  // parent's pino instance).
   const log = pino({ level: process.env.LOG_LEVEL ?? "info" }).child({ worker: data.workerIdx });
-  const flowControl = createStreamFlowControl(client, {}, log);
-  const producer = createStreamProducer(client, {
-    stream: data.stream,
-    batchSize: data.batchSize,
-    pipelineWindow: data.pipelineWindow,
-    router,
-    streamMaxLen: data.streamMaxLen > 0 ? data.streamMaxLen : undefined,
-    flowControl,
-  });
+  // Wave 6.39.A — mode-aware writer construction. `stream` keeps the
+  // pre-6.39.A producer path bit-identical; `direct` swaps in the direct-
+  // write writer (HSET + pre-aggregated HINCRBYFLOAT + SADD) and bypasses
+  // the stream entirely (router + flow-control gate are stream-only).
+  let producer: StreamProducer;
+  if (data.mode === "direct") {
+    const hooks = await loadDirectWriterHooks();
+    producer = createDirectWriter(client, {
+      schema,
+      storageFormat: data.storageFormat ?? "hash-sidetable",
+      batchSize: data.batchSize,
+      hooks,
+    }) as unknown as StreamProducer;
+  } else {
+    const router = createStreamRouter(data.stream, data.streamShards);
+    const flowControl = createStreamFlowControl(client, {}, log);
+    producer = createStreamProducer(client, {
+      stream: data.stream,
+      batchSize: data.batchSize,
+      pipelineWindow: data.pipelineWindow,
+      router,
+      streamMaxLen: data.streamMaxLen > 0 ? data.streamMaxLen : undefined,
+      flowControl,
+    });
+  }
 
   const progressEvery = data.progressBatchSize ?? 1000;
   const port = parentPort;

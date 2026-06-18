@@ -8,6 +8,7 @@ export {
   type RowGenerator,
   type RowGeneratorOptions,
   type SensitivityRow,
+  type DistributionMode,
 } from "./row-generator.ts";
 
 export {
@@ -16,6 +17,25 @@ export {
   type StreamProducerOptions,
   type StreamProducerFlowControl,
 } from "./producer.ts";
+
+// Wave 6.39.A — direct-write backend. Bypasses the Redis Stream and writes
+// HSET + pre-aggregated HINCRBYFLOAT + SADD directly. Same `add/flush/close`
+// surface as StreamProducer so the shared row-loop drives either backend.
+export {
+  createDirectWriter,
+  type DirectWriter,
+  type DirectWriterOptions,
+  type DirectWriterHooks,
+  type StorageFormat,
+} from "./direct-writer.ts";
+
+export {
+  loadDirectWriterHooks,
+  resolveStorageFormatEnv,
+  resolveGeneratorMode,
+  resolveDistribution,
+  type GeneratorMode,
+} from "./direct-writer-bind.ts";
 
 // Wave 5.92C-fix — re-exported so the api route can construct the same
 // producer-side XLEN credit gate the CLI uses (POST /generator/start{,/stream}

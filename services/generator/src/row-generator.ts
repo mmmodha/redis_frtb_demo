@@ -34,7 +34,21 @@ export interface RowGeneratorOptions {
    * Emitted as `RF_<CLASS>_<NN>` via the aux RNG.
    */
   factorPoolSize?: number;
+  /**
+   * Wave 6.39.A — bucket sampling mode.
+   *   • undefined (legacy): schema's `bucket_weights` if present, else uniform.
+   *     Preserves bit-equivalence with pre-6.39.A fixtures.
+   *   • "uniform":   every bucket equally likely regardless of schema weights.
+   *   • "realistic": 5/15/80 split across the bucket list's first/middle/last
+   *     thirds (FRTB book shape — see docs/generator-distribution.md).
+   *   • "pareto":    schema's `bucket_weights` (or uniform when absent).
+   * All branches consume exactly one rng() tick per bucket pick so the
+   * rng-isolation canary (existing) continues to hold.
+   */
+  distribution?: "uniform" | "realistic" | "pareto";
 }
+
+export type DistributionMode = NonNullable<RowGeneratorOptions["distribution"]>;
 
 export interface RowGenerator {
   generate(riskClass: string): SensitivityRow;
@@ -161,22 +175,52 @@ export function createRowGenerator(
         ops.push({ k: "array_numeric", name: dimName, len: tenorNodes?.length ?? 1 });
       }
     }
+    // Wave 6.39.A — distribution-aware bucket CDF resolution. Explicit
+    // `distribution` overrides the schema; default (undefined) preserves
+    // the legacy schema-first behaviour so all pre-6.39.A fixtures still
+    // replay bit-for-bit (rng-isolation canary, weighted-fixture tests).
     let bucketCdf: number[] | undefined;
     let bucketCdfTotal: number | undefined;
-    if (cls.bucket_weights) {
+    const dist = opts.distribution;
+    const useUniform = dist === "uniform";
+    const useRealistic = dist === "realistic";
+    const useSchemaWeights = (dist === undefined || dist === "pareto") && !!cls.bucket_weights;
+    if (useRealistic) {
+      // 5/15/80 split across sparse/medium/dense thirds of the bucket list.
+      // Per-bucket weights inside each band are equal; a 3-bucket class
+      // gets exactly [0.05, 0.15, 0.80]. Indices are stable across runs
+      // because the bucket list order is the schema's declared order.
+      const B = cls.buckets.values.length;
+      const sparseEnd = Math.max(1, Math.floor(B / 3));
+      const medEnd = Math.max(sparseEnd + 1, Math.floor((2 * B) / 3));
+      const denseCount = B - medEnd;
+      const sparseCount = sparseEnd;
+      const medCount = medEnd - sparseEnd;
+      const wSparse = sparseCount > 0 ? 0.05 / sparseCount : 0;
+      const wMed = medCount > 0 ? 0.15 / medCount : 0;
+      const wDense = denseCount > 0 ? 0.80 / denseCount : 0;
+      const cdf = new Array<number>(B);
+      let acc = 0;
+      for (let i = 0; i < B; i++) {
+        const w = i < sparseEnd ? wSparse : i < medEnd ? wMed : wDense;
+        acc += w;
+        cdf[i] = acc;
+      }
+      if (acc > 0) { bucketCdf = cdf; bucketCdfTotal = acc; }
+    } else if (useSchemaWeights) {
       const cdf = new Array<number>(cls.buckets.values.length);
       let acc = 0;
       for (let i = 0; i < cls.buckets.values.length; i++) {
-        const raw = cls.bucket_weights[cls.buckets.values[i]!];
+        const raw = cls.bucket_weights![cls.buckets.values[i]!];
         const w = typeof raw === "number" && raw > 0 ? raw : 0;
         acc += w;
         cdf[i] = acc;
       }
-      if (acc > 0) {
-        bucketCdf = cdf;
-        bucketCdfTotal = acc;
-      }
+      if (acc > 0) { bucketCdf = cdf; bucketCdfTotal = acc; }
     }
+    // useUniform falls through with bucketCdf undefined → uniform branch in
+    // generate() (single rng() tick, preserves rng-isolation invariant).
+    void useUniform;
     plan = { buckets: cls.buckets.values, tenorNodes, ops, bucketCdf, bucketCdfTotal };
     plans.set(riskClass, plan);
     return plan;

@@ -9,10 +9,19 @@ import { availableParallelism } from "node:os";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRowGenerator } from "./row-generator.js";
-import { createStreamProducer } from "./producer.js";
+import { createStreamProducer, type StreamProducer } from "./producer.js";
 import { pickRiskClasses } from "./mix.js";
 import { runGenerationInline } from "./coordinator.js";
 import type { WorkerInitData, WorkerMessage } from "./worker.js";
+// Wave 6.39.A — direct-write backend + env parsers.
+import { createDirectWriter, type StorageFormat } from "./direct-writer.js";
+import {
+  loadDirectWriterHooks,
+  resolveStorageFormatEnv,
+  resolveGeneratorMode,
+  resolveDistribution,
+  type GeneratorMode,
+} from "./direct-writer-bind.js";
 import { probeCluster, fallbackShape, BYTES_PER_ROW, type ClusterShape } from "./probe.js";
 import {
   pickProfile,
@@ -224,7 +233,20 @@ async function main(): Promise<void> {
     return;
   }
 
-  log.info({ totalRows, classes, schemaPath, stream: opts.stream, workers: requestedWorkers, profile: profileName }, "generator starting");
+  // Wave 6.39.A — read backend / distribution / storage-format from env so
+  // the existing CLI surface (--rows, --workers, etc.) stays untouched.
+  // Defaults: GENERATOR_MODE=stream (unchanged), DISTRIBUTION=undefined
+  // (legacy schema-aware draw), STORAGE_FORMAT=hash-sidetable.
+  const mode: GeneratorMode = resolveGeneratorMode(process.env.GENERATOR_MODE);
+  const distribution = resolveDistribution(process.env.DISTRIBUTION);
+  const storageFormat: StorageFormat = mode === "direct"
+    ? await resolveStorageFormatEnv(process.env.STORAGE_FORMAT)
+    : "hash-sidetable";
+
+  log.info(
+    { totalRows, classes, schemaPath, stream: opts.stream, workers: requestedWorkers, profile: profileName, mode, distribution, storageFormat },
+    "generator starting",
+  );
   const start = Date.now();
 
   if (requestedWorkers === 1) {
@@ -235,17 +257,22 @@ async function main(): Promise<void> {
     // streamShards !== 1; the N=1 / per-bucket=false branch leaves producer
     // construction byte-for-byte identical to pre-5.92 (no router arg).
     const client = createClient(redisUrl);
-    const generator = createRowGenerator(schema, { seed: baseSeed, sensitivityTypes });
-    const router = streamShards === 1 ? undefined : createStreamRouter(opts.stream, streamShards);
-    // Wave 5.92C — flow control polls XLEN via the same client; when streamMaxLen
-    // is opted out (0) we still attach the gate so consumer-slowdown protection
-    // works independently of the trim cap.
-    const flowControl = createStreamFlowControl(client, {}, log);
-    const producer = createStreamProducer(client, {
-      stream: opts.stream, batchSize, pipelineWindow, router,
-      streamMaxLen: streamMaxLen > 0 ? streamMaxLen : undefined,
-      flowControl,
-    });
+    const generator = createRowGenerator(schema, { seed: baseSeed, sensitivityTypes, distribution });
+    let producer: StreamProducer;
+    if (mode === "direct") {
+      const hooks = await loadDirectWriterHooks();
+      producer = createDirectWriter(client, {
+        schema, storageFormat, batchSize, hooks,
+      }) as unknown as StreamProducer;
+    } else {
+      const router = streamShards === 1 ? undefined : createStreamRouter(opts.stream, streamShards);
+      const flowControl = createStreamFlowControl(client, {}, log);
+      producer = createStreamProducer(client, {
+        stream: opts.stream, batchSize, pipelineWindow, router,
+        streamMaxLen: streamMaxLen > 0 ? streamMaxLen : undefined,
+        flowControl,
+      });
+    }
     try {
       await runGenerationInline({
         totalRows, classes, offset: 0, stride: 1,
@@ -273,6 +300,7 @@ async function main(): Promise<void> {
     schemaPath, redisUrl, stream: opts.stream, batchSize, pipelineWindow,
     baseSeed, totalRows, classes, totalWorkers: cappedWorkers, rate, start,
     streamShards, streamMaxLen, sensitivityTypes,
+    mode, distribution, storageFormat,
   });
 }
 
@@ -320,6 +348,13 @@ interface RunWithWorkersOpts {
   streamMaxLen: number;
   // Wave 5.96G-gen — canonical-cased sensitivity types to emit per row.
   sensitivityTypes: readonly string[];
+  // Wave 6.39.A — direct-write plumbing. `mode` defaults to "stream"
+  // (worker-side default if undefined), `distribution` undefined preserves
+  // legacy schema-aware draw; `storageFormat` is consumed only in direct
+  // mode and ignored otherwise.
+  mode: GeneratorMode;
+  distribution: "uniform" | "realistic" | "pareto" | undefined;
+  storageFormat: StorageFormat;
 }
 
 async function runWithWorkers(opts: RunWithWorkersOpts): Promise<void> {
@@ -370,6 +405,9 @@ async function runWithWorkers(opts: RunWithWorkersOpts): Promise<void> {
       cancelBuffer,
       rate: opts.rate,
       progressBatchSize: 1000,
+      mode: opts.mode,
+      distribution: opts.distribution,
+      storageFormat: opts.storageFormat,
     };
     const worker = new Worker(workerEntry, {
       workerData: init,
