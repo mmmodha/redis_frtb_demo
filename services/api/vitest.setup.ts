@@ -13,3 +13,12 @@ if (process.env.CALC_FAST_PATH === undefined) {
 if (process.env.CALC_ROLLUP_PATH === undefined) {
   process.env.CALC_ROLLUP_PATH = "0";
 }
+// Wave 6.31.C — the legacy Lua FCALL fallback is OFF by default in
+// production (the post-6.31.A sens-key shape no longer satisfies the
+// kernels' slot-local SCAN). The unit suite, however, retains a large
+// body of FCALL-stubbed coverage (calc-sbm.test.ts, calc-differential.test.ts)
+// that exercises the Lua path against fakeRedis. Default the flag ON for
+// tests so that coverage stays green; production keeps the flag unset.
+if (process.env.CALC_FCALL_FALLBACK === undefined) {
+  process.env.CALC_FCALL_FALLBACK = "1";
+}

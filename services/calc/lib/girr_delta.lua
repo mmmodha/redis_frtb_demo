@@ -1,3 +1,8 @@
+-- LEGACY (Wave 6.31, Option B): This kernel SCANs `sens:{rc:bkt}:*`
+-- slot-locally and requires the pre-Wave-6.31 key shape with hash-tag
+-- braces. Disabled by default after Wave 6.31. Enable via
+-- CALC_FCALL_FALLBACK=1 and restore the old sens-key shape to use.
+--
 -- frtb.sbm_delta_bucket — GIRR Delta per-bucket K_b function.
 -- Loaded as part of the cross-agent `frtb` library (see src/loadFrtbLibrary.ts).
 -- Slot-local: only reads keys matching sens:{<risk_class>:<bucket>}:* on the

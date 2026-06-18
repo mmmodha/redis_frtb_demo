@@ -148,6 +148,21 @@ function fastPathEnabled(schema: Schema | undefined): boolean {
   return process.env.CALC_FAST_PATH !== "0";
 }
 
+// Wave 6.31.C — gate for the legacy Lua FCALL kernels. The girr_delta.lua /
+// girr_curvature.lua (and sibling per-class) kernels SCAN
+// `sens:{<rc>:<bkt>}:*` slot-locally and required the pre-Wave-6.31 hash-tag
+// key shape to find docs. After Wave 6.31.A removed the hash-tag from sens
+// keys, the SCAN no longer locates anything in a single slot, so the FCALL
+// path returns empty results. The FT.AGGREGATE fast path (and the rollup
+// fast-fast path) cover the same surface and are the primary execution path.
+// Default off; flip CALC_FCALL_FALLBACK=1 to re-enable the legacy fallback
+// (which also requires restoring the old sens-key hash-tag shape to be
+// useful). Tests that exercise the legacy path set the flag in
+// vitest.setup.ts so the FCALL-stub coverage is retained.
+function fcallFallbackEnabled(): boolean {
+  return process.env.CALC_FCALL_FALLBACK === "1";
+}
+
 const ALLOWED_LEG = new Set(["delta", "vega", "curvature"]);
 type Leg = "delta" | "vega" | "curvature";
 
@@ -447,11 +462,31 @@ async function computeSbmCharge(
   }
 
   // 2) Per-bucket K_b/S_b via fast path or Lua FCALL.
-  const useFastPath = forcePath === "fast"
+  let useFastPath = forcePath === "fast"
     ? schema !== undefined
     : forcePath === "lua"
     ? false
     : fastPathEnabled(schema);
+  // Wave 6.31.C — refuse to dispatch the legacy Lua FCALL kernels unless the
+  // operator has explicitly re-enabled the fallback via CALC_FCALL_FALLBACK=1.
+  // The post-Wave-6.31.A sens key shape no longer satisfies the kernels'
+  // slot-local SCAN, so the fast path (or rollup) is the only correct path
+  // by default. With no schema available there is no fast path to fall back
+  // to, so surface a 503 rather than silently NPE on `schema!`.
+  if (!useFastPath && !fcallFallbackEnabled()) {
+    if (!schema) {
+      return {
+        ok: false,
+        statusCode: 503,
+        body: {
+          error: "fcall-fallback-disabled",
+          hint:
+            "Lua FCALL fallback is disabled (CALC_FCALL_FALLBACK!=1) and no schema is configured for the FT.AGGREGATE fast path.",
+        },
+      };
+    }
+    useFastPath = true;
+  }
   const fanoutStart = process.hrtime.bigint();
   const dispatchedKeys = buckets.map((b) => `sens:{${risk_class}:${b}}:_route`);
   let results: BucketResultWithEngine[];
