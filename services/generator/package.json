@@ -18,6 +18,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@frtb/calc-shared": "*",
     "@frtb/redis-client": "^0.0.1",
     "@frtb/schema": "*",
     "@frtb/stream-router": "^0.0.1",
