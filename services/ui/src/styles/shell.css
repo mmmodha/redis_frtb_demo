@@ -785,3 +785,125 @@ select:focus-visible {
   max-height: 280px;
   overflow-y: auto;
 }
+
+
+/* Wave 6.39.D — Admin route + observability widgets. Each card is a stock
+   PanelCard; these rules style the grid that holds them and the bits inside
+   each card (summary chips, tables, lists, progress bar, action form). */
+.admin-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+  gap: calc(var(--grid) * 2);
+}
+.admin-skeleton {
+  height: 96px;
+  background: var(--redis-bg-tertiary);
+  border-radius: var(--radius);
+  opacity: 0.5;
+  animation: spin 2s linear infinite reverse;
+}
+.admin-error {
+  color: var(--redis-hyper);
+  background: rgba(255, 68, 56, 0.08);
+  border: 1px solid var(--redis-border-secondary);
+  padding: calc(var(--grid) * 1.5);
+  border-radius: var(--radius);
+  font-size: 0.875rem;
+}
+.admin-empty, .admin-stub {
+  color: var(--redis-text-secondary);
+  padding: calc(var(--grid) * 2);
+  background: var(--redis-bg-tertiary);
+  border-radius: var(--radius);
+  font-size: 0.875rem;
+}
+.admin-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: calc(var(--grid) * 1.5);
+  align-items: center;
+  margin-bottom: var(--grid);
+  font-size: 0.875rem;
+  color: var(--redis-text-secondary);
+}
+.admin-summary strong { color: var(--redis-text-primary); }
+.admin-toolbar { margin-bottom: var(--grid); }
+.admin-search {
+  width: 100%;
+  padding: calc(var(--grid) * 1) calc(var(--grid) * 1.5);
+  background: var(--redis-bg-tertiary);
+  border: 1px solid var(--redis-border-primary);
+  border-radius: var(--radius);
+  color: var(--redis-text-primary);
+  font-size: 0.875rem;
+}
+.admin-search:focus-visible { outline: none; border-color: var(--redis-hyper); }
+.admin-table-wrap { overflow-x: auto; }
+.admin-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8125rem;
+}
+.admin-table th, .admin-table td {
+  text-align: left;
+  padding: calc(var(--grid) * 1) calc(var(--grid) * 1.25);
+  border-bottom: 1px solid var(--redis-border-primary);
+}
+.admin-table th { color: var(--redis-text-secondary); font-weight: 600; }
+.admin-th {
+  background: transparent;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  padding: 0;
+}
+.admin-th:hover, .admin-th:focus-visible { color: var(--redis-hyper); outline: none; }
+.admin-list { list-style: none; padding: 0; margin: 0; display: grid; gap: var(--grid); }
+.admin-list__item {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: calc(var(--grid) * 1) calc(var(--grid) * 1.25);
+  background: var(--redis-bg-tertiary);
+  border-radius: var(--radius);
+  font-size: 0.875rem;
+}
+.admin-list__primary { font-family: var(--font-mono); }
+.admin-list__secondary { color: var(--redis-text-secondary); }
+.admin-progress-bar {
+  height: 8px;
+  background: var(--redis-bg-tertiary);
+  border-radius: 999px;
+  overflow: hidden;
+  margin-top: var(--grid);
+}
+.admin-progress-bar__fill {
+  height: 100%;
+  background: var(--redis-hyper);
+  transition: width 200ms ease-out;
+}
+.admin-form { display: grid; gap: var(--grid); }
+.admin-form label { display: grid; gap: 4px; font-size: 0.8125rem; color: var(--redis-text-secondary); }
+.admin-form input, .admin-form select {
+  font-family: var(--font-body);
+  background: var(--redis-bg-tertiary);
+  color: var(--redis-text-primary);
+  border: 1px solid var(--redis-border-primary);
+  border-radius: var(--radius);
+  padding: calc(var(--grid) * 1) calc(var(--grid) * 1.25);
+  min-height: 36px;
+  font-size: 0.875rem;
+}
+.admin-form input:focus-visible, .admin-form select:focus-visible {
+  outline: none; border-color: var(--redis-hyper);
+}
+.admin-form__actions { display: flex; justify-content: flex-end; }
+.admin-result {
+  background: rgba(91, 211, 123, 0.08);
+  border: 1px solid #5BD37B;
+  color: var(--redis-text-primary);
+  padding: calc(var(--grid) * 1.5);
+  border-radius: var(--radius);
+  font-size: 0.875rem;
+}

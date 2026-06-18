@@ -16,6 +16,7 @@ const SECTIONS = [
   { to: "/calc", label: "Calculation" },
   { to: "/observability", label: "Observability" },
   { to: "/explorer", label: "JSON Explorer" },
+  { to: "/admin", label: "Admin" },
 ] as const;
 
 export interface AppShellProps {

@@ -12,6 +12,7 @@ import { Calc } from "./routes/Calc";
 import { Observability } from "./routes/Observability";
 import { Loadgen } from "./routes/Loadgen";
 import { Explorer } from "./routes/Explorer";
+import { Admin } from "./routes/Admin";
 
 export function App() {
   return (
@@ -30,6 +31,7 @@ export function App() {
                 <Route path="/observability" element={<Observability />} />
                 <Route path="/loadgen" element={<Loadgen />} />
                 <Route path="/explorer" element={<Explorer />} />
+                <Route path="/admin" element={<Admin />} />
               </Routes>
             </AppShell>
           </UploadsProvider>
