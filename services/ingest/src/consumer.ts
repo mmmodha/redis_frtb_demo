@@ -702,6 +702,266 @@ export async function processBatch(
   return processed;
 }
 
+// Wave 6.38.B — atomic delta reconciliation. Same write path as processBatch
+// but each entry runs through WATCH / HGETALL / MULTI / EXEC so a re-ingest
+// of the same `_id` with a changed `risk_value` applies only the (new − old)
+// rollup delta instead of additively re-incrementing the rollup hashes. The
+// pre-6.38.B contract was "re-XADDing the same logical _id with a fresh XADD
+// id will double-count" (see processBatch's comment block); 6.38.B closes
+// that gap without introducing Lua scripts.
+//
+// Concurrency: WATCH on `sens:<ulid>` catches a competing writer touching the
+// same key between our HGETALL and our EXEC. On EXEC returning null (the
+// watched key changed), we retry with jittered exponential backoff up to
+// MAX_WATCH_RETRIES. Entries that still fail after the cap stay in the PEL
+// (no XACK was issued in the aborted transaction) and will be re-delivered.
+//
+// FT.SUGADD calls are intentionally issued OUTSIDE the MULTI block: an
+// unknown FT.* command inside MULTI is rejected at QUEUE time and aborts the
+// transaction at EXEC. The autocomplete suggester is an enrichment, not part
+// of the data-consistency contract, so a best-effort post-EXEC pipeline keeps
+// the suggester populated without coupling its availability to ingest.
+
+export const MAX_WATCH_RETRIES = 8;
+
+// Reconstructs the old per-row rollup contribution from the existing
+// `sens:<ulid>` HASH. Mirrors flattenDocForHash field naming so the
+// (rc, sens) discriminator + lowercased class prefix recovers the same
+// scalar / per-tenor split that the writer originally emitted.
+interface OldContribution {
+  exists: boolean;
+  scalarWs: number | undefined;
+  perTenorWs: Record<string, number> | undefined;
+  scalarCvrUp: number | undefined;
+  scalarCvrDown: number | undefined;
+  perTenorCvrUp: Record<string, number> | undefined;
+  perTenorCvrDown: Record<string, number> | undefined;
+}
+
+function parseOldContribution(
+  oldHash: Record<string, string>,
+  riskClass: string,
+  sensType: string,
+): OldContribution {
+  const r: OldContribution = {
+    exists: Object.keys(oldHash).length > 0,
+    scalarWs: undefined, perTenorWs: undefined,
+    scalarCvrUp: undefined, scalarCvrDown: undefined,
+    perTenorCvrUp: undefined, perTenorCvrDown: undefined,
+  };
+  if (!r.exists) return r;
+  const lower = riskClass.toLowerCase();
+  if (!lower || !sensType) return r;
+
+  if (sensType === "Curvature") {
+    const upScalarKey = `ws_${lower}_cvr_up`;
+    const downScalarKey = `ws_${lower}_cvr_down`;
+    if (oldHash[upScalarKey] !== undefined) r.scalarCvrUp = Number(oldHash[upScalarKey]);
+    if (oldHash[downScalarKey] !== undefined) r.scalarCvrDown = Number(oldHash[downScalarKey]);
+    const upPrefix = `ws_${lower}_cvr_up_`;
+    const downPrefix = `ws_${lower}_cvr_down_`;
+    const upMap: Record<string, number> = {};
+    const downMap: Record<string, number> = {};
+    let upPT = false; let downPT = false;
+    for (const k of Object.keys(oldHash)) {
+      if (k.startsWith(upPrefix)) {
+        upMap[k.slice(upPrefix.length)] = Number(oldHash[k]); upPT = true;
+      } else if (k.startsWith(downPrefix)) {
+        downMap[k.slice(downPrefix.length)] = Number(oldHash[k]); downPT = true;
+      }
+    }
+    if (upPT) r.perTenorCvrUp = upMap;
+    if (downPT) r.perTenorCvrDown = downMap;
+    return r;
+  }
+
+  const leg = sensType === "Delta" ? "delta" : sensType === "Vega" ? "vega" : "";
+  if (!leg) return r;
+  const scalarKey = `ws_${lower}_${leg}`;
+  if (oldHash[scalarKey] !== undefined) r.scalarWs = Number(oldHash[scalarKey]);
+  const prefix = `ws_${lower}_${leg}_`;
+  const m: Record<string, number> = {};
+  let hasPT = false;
+  for (const k of Object.keys(oldHash)) {
+    if (k.startsWith(prefix)) {
+      m[k.slice(prefix.length)] = Number(oldHash[k]); hasPT = true;
+    }
+  }
+  if (hasPT) r.perTenorWs = m;
+  return r;
+}
+
+// Emits per-row rollup HINCRBYFLOAT calls as deltas (new − old). Mirrors
+// emitRollupHincrs's field layout exactly; the only difference is that the
+// `count` field is bumped by +1 ONLY when the row is fresh (oldC.exists is
+// false), and `sum_ws[_up|_down][_sq]` carries (new − old) so a re-ingest
+// with the same value is a no-op write.
+function emitRollupDelta(
+  pipeline: PipelineLike,
+  oldC: OldContribution,
+  newDoc: Record<string, unknown>,
+): void {
+  const rc = typeof newDoc.risk_class === "string" ? newDoc.risk_class : undefined;
+  const bkt = typeof newDoc.bucket === "string" ? newDoc.bucket : undefined;
+  const sens = typeof newDoc.sensitivity_type === "string" ? newDoc.sensitivity_type : undefined;
+  if (!rc || !bkt || !sens) return;
+  const countDelta = oldC.exists ? 0 : 1;
+
+  if (sens === "Curvature") {
+    const newUp = newDoc.weighted_cvr_up;
+    const newDown = newDoc.weighted_cvr_down;
+    if (typeof newUp === "number" && typeof newDown === "number") {
+      const oldUp = oldC.scalarCvrUp ?? 0;
+      const oldDown = oldC.scalarCvrDown ?? 0;
+      const baseKey = rollupKey(rc, bkt, sens);
+      pipeline.call("HINCRBYFLOAT", baseKey, "sum_ws_up", String(newUp - oldUp));
+      pipeline.call("HINCRBYFLOAT", baseKey, "sum_ws_up_sq", String(newUp * newUp - oldUp * oldUp));
+      pipeline.call("HINCRBYFLOAT", baseKey, "sum_ws_down", String(newDown - oldDown));
+      pipeline.call("HINCRBYFLOAT", baseKey, "sum_ws_down_sq", String(newDown * newDown - oldDown * oldDown));
+      if (countDelta) pipeline.call("HINCRBYFLOAT", baseKey, "count", String(countDelta));
+    }
+    const upMap = newDoc.weighted_cvr_up_per_tenor;
+    const downMap = newDoc.weighted_cvr_down_per_tenor;
+    if (
+      upMap && typeof upMap === "object" && !Array.isArray(upMap) &&
+      downMap && typeof downMap === "object" && !Array.isArray(downMap)
+    ) {
+      const upRec = upMap as Record<string, number>;
+      const downRec = downMap as Record<string, number>;
+      const oldUpRec = oldC.perTenorCvrUp ?? {};
+      const oldDownRec = oldC.perTenorCvrDown ?? {};
+      const tenors = new Set<string>([
+        ...Object.keys(upRec), ...Object.keys(oldUpRec),
+        ...Object.keys(downRec), ...Object.keys(oldDownRec),
+      ]);
+      for (const t of tenors) {
+        const nu = upRec[t] ?? 0;
+        const nd = downRec[t] ?? 0;
+        const ou = oldUpRec[t] ?? 0;
+        const od = oldDownRec[t] ?? 0;
+        const tKey = rollupKey(rc, bkt, sens, t);
+        pipeline.call("HINCRBYFLOAT", tKey, "sum_ws_up", String(nu - ou));
+        pipeline.call("HINCRBYFLOAT", tKey, "sum_ws_up_sq", String(nu * nu - ou * ou));
+        pipeline.call("HINCRBYFLOAT", tKey, "sum_ws_down", String(nd - od));
+        pipeline.call("HINCRBYFLOAT", tKey, "sum_ws_down_sq", String(nd * nd - od * od));
+        if (countDelta) pipeline.call("HINCRBYFLOAT", tKey, "count", String(countDelta));
+      }
+    }
+    return;
+  }
+
+  const newWs = newDoc.weighted_value;
+  if (typeof newWs === "number") {
+    const oldWs = oldC.scalarWs ?? 0;
+    const baseKey = rollupKey(rc, bkt, sens);
+    pipeline.call("HINCRBYFLOAT", baseKey, "sum_ws", String(newWs - oldWs));
+    pipeline.call("HINCRBYFLOAT", baseKey, "sum_ws_sq", String(newWs * newWs - oldWs * oldWs));
+    if (countDelta) pipeline.call("HINCRBYFLOAT", baseKey, "count", String(countDelta));
+  }
+  const newPT = newDoc.weighted_value_per_tenor;
+  if (newPT && typeof newPT === "object" && !Array.isArray(newPT)) {
+    const newPTRec = newPT as Record<string, number>;
+    const oldPTRec = oldC.perTenorWs ?? {};
+    const tenors = new Set<string>([...Object.keys(newPTRec), ...Object.keys(oldPTRec)]);
+    for (const t of tenors) {
+      const nv = newPTRec[t] ?? 0;
+      const ov = oldPTRec[t] ?? 0;
+      const tKey = rollupKey(rc, bkt, sens, t);
+      pipeline.call("HINCRBYFLOAT", tKey, "sum_ws", String(nv - ov));
+      pipeline.call("HINCRBYFLOAT", tKey, "sum_ws_sq", String(nv * nv - ov * ov));
+      if (countDelta) pipeline.call("HINCRBYFLOAT", tKey, "count", String(countDelta));
+    }
+  }
+}
+
+// Best-effort suggester populate. Sent as a non-transactional pipeline AFTER
+// the MULTI/EXEC committed so an unknown FT.* command on a Redis without
+// RediSearch is a per-command error instead of aborting the ingest's data
+// write.
+async function emitSuggestersAfterCommit(client: RedisLike, doc: Record<string, unknown>): Promise<void> {
+  const calls: Array<[string, string]> = [];
+  if (doc.book) calls.push(["sug:book", String(doc.book)]);
+  if (doc.trade_id) calls.push(["sug:trade_id", String(doc.trade_id)]);
+  if (doc.risk_factor) calls.push(["sug:risk_factor", String(doc.risk_factor)]);
+  if (calls.length === 0) return;
+  const p = client.pipeline();
+  for (const [k, v] of calls) p.call("FT.SUGADD", k, v, "1", "INCR");
+  try { await p.exec(); } catch { /* best-effort */ }
+}
+
+export async function processBatchAtomic(
+  client: RedisLike,
+  opts: ConsumerOptions,
+  id: ">" | "0" = ">",
+  blockMs?: number,
+): Promise<number> {
+  const count = Math.max(1, opts.batchSize ?? 500);
+  const block = blockMs ?? opts.blockMs ?? 0;
+  const reply = (await (client as Redis).xreadgroup(
+    "GROUP", opts.group, opts.consumerName,
+    "COUNT", count,
+    "BLOCK", block,
+    "STREAMS", opts.stream, id,
+  )) as XReadGroupReply;
+  if (!reply) return 0;
+
+  let processed = 0;
+  for (const [, entries] of reply) {
+    if (entries.length === 0) continue;
+    for (const [entryId, fields] of entries) {
+      const msg = fieldsToMap(fields);
+      const hashTag = msg._hash_tag ?? (msg.risk_class && msg.bucket ? `${msg.risk_class}:${msg.bucket}` : undefined);
+      const ulid = msg._id;
+      if (!hashTag || !ulid) {
+        // Malformed entry — ack so it leaves the PEL but don't write a doc.
+        await (client as Redis).xack(opts.stream, opts.group, entryId);
+        processed++;
+        continue;
+      }
+      const key = buildKey(hashTag, ulid);
+      const doc = enrichDoc(buildDoc(msg), opts.schema);
+      const riskClass = typeof doc.risk_class === "string" ? doc.risk_class : "";
+      const sensType = typeof doc.sensitivity_type === "string" ? doc.sensitivity_type : "";
+
+      let attempts = 0;
+      let committed = false;
+      while (attempts <= MAX_WATCH_RETRIES) {
+        await (client as Redis).watch(key);
+        const oldHash = (await (client as Redis).hgetall(key)) as Record<string, string>;
+        const oldC = parseOldContribution(oldHash, riskClass, sensType);
+        const txn = (client as Redis).multi();
+        writeDocForStorage(
+          txn as unknown as PipelineLike,
+          key,
+          doc,
+          opts.storageFormat ?? DEFAULT_STORAGE_FORMAT,
+        );
+        emitRollupDelta(txn as unknown as PipelineLike, oldC, doc);
+        emitSeenSadds(txn as unknown as PipelineLike, doc);
+        txn.xack(opts.stream, opts.group, entryId);
+        const res = await txn.exec();
+        if (res !== null) {
+          processed++;
+          committed = true;
+          break;
+        }
+        attempts++;
+        const backoff = Math.min(50, 1 << Math.min(attempts, 5)) + Math.floor(Math.random() * 5);
+        await new Promise((r) => setTimeout(r, backoff));
+      }
+      if (!committed) {
+        // Bounded retries exhausted — release the watch so the connection is
+        // clean for the next entry. The PEL retains this entry; the consumer
+        // group will redeliver on the next claim-on-restart drain.
+        await (client as Redis).unwatch().catch(() => undefined);
+        continue;
+      }
+      await emitSuggestersAfterCommit(client, doc);
+    }
+  }
+  return processed;
+}
+
 // Long-running XREADGROUP loop. On start, drains any pending entries this
 // consumer name was holding before exit, then blocks on new entries until
 // stop() is called. Graceful shutdown waits for the in-flight batch to
@@ -711,9 +971,22 @@ export function createConsumer(client: RedisLike, opts: ConsumerOptions): Consum
   let stopped = false;
   let loopDone: Promise<void> | undefined;
 
+  // Wave 6.38.B — HASH storage variants (`hash-sidetable`, `hash-encoded`) ride
+  // the atomic WATCH/MULTI/EXEC delta path so re-ingest of the same `_id` with
+  // a changed value applies (new − old) to the rollup hashes instead of
+  // additively double-counting. The legacy `json` and the `json-shadow-hash`
+  // variants stay on the non-atomic processBatch path — JSON.SET semantics
+  // don't admit the same scalar-level CAS that HSET does, and the per-row
+  // reconstruction of weighted contributions from a JSON document is out of
+  // scope for this wave (deferred to a follow-up; see task note).
+  const fmt = opts.storageFormat ?? DEFAULT_STORAGE_FORMAT;
+  const useAtomic = fmt === "hash-sidetable" || fmt === "hash-encoded";
+
   async function tick(id: ">" | "0", block: number): Promise<number> {
     try {
-      const n = await processBatch(client, opts, id, block);
+      const n = useAtomic
+        ? await processBatchAtomic(client, opts, id, block)
+        : await processBatch(client, opts, id, block);
       if (n > 0) {
         stats.consumed += n;
         stats.acked += n;
