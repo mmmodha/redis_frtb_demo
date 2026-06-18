@@ -32,6 +32,7 @@ import {
   scheduleBootstrap,
 } from "./bootstrap-status.ts";
 import { withBootTimeout } from "./lib/with-timeout.ts";
+import { startL4Crons, type L4CronsHandle } from "./jobs/start-l4-crons.ts";
 
 // Wave 5.79: precedence for self-binding is API_HOST/PORT → HOST/PORT →
 // HEALTH_PORT → hardcoded default. Lets operators remap or restrict the
@@ -290,7 +291,18 @@ async function main(): Promise<void> {
   await app.listen({ port: PORT, host: HOST });
   console.log(JSON.stringify({ service: "api", status: "ready", port: PORT, target: target.label }));
 
+  // Wave 6.39.C-fix — wire Layer 4 background jobs (drift detector,
+  // snapshot, periodic XTRIM) into the post-listen hook. Gated on
+  // redisConnected so a Redis-unreachable boot doesn't spin the timers
+  // against a wedged client; DISABLE_L4_CRONS=1 is a global kill switch
+  // honoured inside startL4Crons (used by single-shot / SMOKE runs).
+  let l4Crons: L4CronsHandle | null = null;
+  if (redisConnected) {
+    l4Crons = startL4Crons({ redis: redis as unknown as RedisLike });
+  }
+
   if (process.env.SMOKE === "1") {
+    l4Crons?.stop();
     await app.close();
     await redis.quit().catch(() => undefined);
     process.exit(0);
@@ -298,6 +310,7 @@ async function main(): Promise<void> {
 
   for (const sig of ["SIGINT", "SIGTERM"] as const) {
     process.on(sig, async () => {
+      l4Crons?.stop();
       await app.close();
       await redis.quit().catch(() => undefined);
       process.exit(0);
