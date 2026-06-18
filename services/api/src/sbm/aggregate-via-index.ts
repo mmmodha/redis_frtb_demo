@@ -260,14 +260,21 @@ export function formatRedisCommand(name: string, argv: ReadonlyArray<unknown>): 
 // fields unset on any given doc (each row populates only the tenors it carries),
 // so referencing them directly in APPLY trips RediSearch's "Could not find the
 // value for a parameter name, consider using EXISTS" error. Pre-coalesce each
-// indexed field to 0 via `case(exists(@f),@f,0)` then drive every downstream
-// APPLY + REDUCE off the safe alias.
+// indexed field to 0 before driving every downstream APPLY + REDUCE off the
+// safe alias.
 // Wave 5.83J3 — extended the coalesce to the scalar classes (EQUITY / FX /
 // Curvature). The live 5.84A/B throughput smokes can write rows where the
 // per-class `ws_*` field never lands (ingest-side pollution), and the bare
 // `@ws_equity_delta` / `@ws_fx_delta` reference tripped the same EXISTS
 // error J1 fixed for GIRR. The `perTenor` parameter is retained for the
 // public signature but no longer gates the safe-alias rewrite.
+// Wave 6.39.H — switched the coalesce from the prior `case`/`exists`-based
+// expression to an explicit `LOAD <n> @f1 @f2 …` + `APPLY @f+0 AS <f>_safe`.
+// RediSearch 2.10.x marks the `case` function UNSTABLE and Redis Enterprise /
+// Cloud gates it behind `ENABLE_UNSTABLE_FEATURES` (which clients cannot
+// toggle), so the old shape 500s there. Arithmetic on a missing numeric HASH
+// field coerces to 0 under `+`, giving identical semantics on every
+// RediSearch flavor.
 export function buildFastPathAggregateArgs(
   query: string,
   fields: LegFields,
@@ -276,11 +283,17 @@ export function buildFastPathAggregateArgs(
 ): unknown[] {
   void perTenor;
   const args: unknown[] = [indexName, query];
+  const loadFields: string[] = [];
+  const loadSeen = new Set<string>();
   const applyClauses: Array<[string, string]> = [];
   const sumReducers: Array<[string, string]> = [];
   const safeRef = (f: string): string => {
     const alias = `${f}_safe`;
-    applyClauses.push([`case(exists(@${f}),@${f},0)`, alias]);
+    if (!loadSeen.has(f)) {
+      loadSeen.add(f);
+      loadFields.push(f);
+    }
+    applyClauses.push([`@${f}+0`, alias]);
     return alias;
   };
   const addNumericLeg = (roots: string[], prefix: string): void => {
@@ -311,6 +324,10 @@ export function buildFastPathAggregateArgs(
   if (fields.vega) addNumericLeg(fields.vega, "v");
   if (fields.cvrUp) addCurvatureLeg(fields.cvrUp, "u");
   if (fields.cvrDown) addCurvatureLeg(fields.cvrDown, "n");
+  if (loadFields.length > 0) {
+    args.push("LOAD", String(loadFields.length));
+    for (const f of loadFields) args.push(`@${f}`);
+  }
   for (const [expr, alias] of applyClauses) {
     args.push("APPLY", expr, "AS", alias);
   }
@@ -335,11 +352,20 @@ export function buildComponentsAggregateArgs(
   indexName: string,
 ): unknown[] {
   const args: unknown[] = [indexName, query];
+  // Wave 6.39.H — same LOAD + `@f+0` arithmetic coercion as
+  // buildFastPathAggregateArgs (above) so the per-RF components aggregate is
+  // Enterprise/Cloud-safe.
+  const loadFields: string[] = [];
+  const loadSeen = new Set<string>();
   const applyClauses: Array<[string, string]> = [];
   const sumReducers: Array<[string, string]> = [];
   const safeRef = (f: string): string => {
     const alias = `${f}_safe`;
-    applyClauses.push([`case(exists(@${f}),@${f},0)`, alias]);
+    if (!loadSeen.has(f)) {
+      loadSeen.add(f);
+      loadFields.push(f);
+    }
+    applyClauses.push([`@${f}+0`, alias]);
     return alias;
   };
   const addLeg = (roots: string[], prefix: string): void => {
@@ -355,6 +381,10 @@ export function buildComponentsAggregateArgs(
   if (fields.vega) addLeg(fields.vega, "v");
   if (fields.cvrUp) addLeg(fields.cvrUp, "u");
   if (fields.cvrDown) addLeg(fields.cvrDown, "n");
+  if (loadFields.length > 0) {
+    args.push("LOAD", String(loadFields.length));
+    for (const f of loadFields) args.push(`@${f}`);
+  }
   for (const [expr, alias] of applyClauses) {
     args.push("APPLY", expr, "AS", alias);
   }

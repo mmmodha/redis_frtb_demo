@@ -713,9 +713,11 @@ describe("Wave 5.83D-1 — Lua ⇄ FT.AGGREGATE differential parity (9 variants)
   // The 5.83I live sweep surfaced a fast-path 500 on GIRR because each per-tenor
   // doc only populates the tenors it carries, so referencing
   // `@ws_girr_delta_3M` in APPLY trips RediSearch's "could not find the value"
-  // error. The fix (`case(exists(@f),@f,0)` coalesce) is exercised here via a
-  // 3-bucket × 3-tenor parity gate. The per-tenor Lua kernel sums first then
-  // weights, so the fast-path aggregates need to match those per-tenor SUMs.
+  // error. Wave 6.39.H replaced the J1 case/exists coalesce with the stable
+  // `LOAD @f` + `APPLY @f+0 AS f_safe` shape (Enterprise/Cloud compatible);
+  // this 3-bucket × 3-tenor parity gate now asserts that shape is emitted. The
+  // per-tenor Lua kernel sums first then weights, so the fast-path aggregates
+  // need to match those per-tenor SUMs.
   for (const leg of ["Delta", "Vega"] as const) {
     it(`GIRR ${leg} — multi-bucket × full tenor span parity (Wave 5.83J1 regression)`, async () => {
       const schema = diffSchema() as any;
@@ -800,9 +802,16 @@ describe("Wave 5.83D-1 — Lua ⇄ FT.AGGREGATE differential parity (9 variants)
         const fastFr: FakeRedis = fakeRedis();
         fastFr.setResponse("FT.AGGREGATE", (args: unknown[]) => {
           if (!args.includes("APPLY")) return ftDiscoverReply(buckets);
-          // Wave 5.83J1 — assert the per-tenor coalesce wrapper is in the
-          // argv so a future regression on the APPLY shape fails loudly.
-          expect(args.some((a) => typeof a === "string" && a.startsWith("case(exists(@ws_girr_")), `${leg} APPLY argv missing case(exists(...)) wrapper`).toBe(true);
+          // Wave 5.83J1 / 6.39.H — assert the per-tenor coalesce uses the
+          // stable `LOAD @f` + `APPLY @f+0 AS f_safe` shape (replacing the
+          // unstable `case(exists(@f),@f,0)`), so a future regression on the
+          // APPLY shape fails loudly.
+          const loadIdx = args.indexOf("LOAD");
+          expect(loadIdx, `${leg} APPLY argv missing LOAD clause`).toBeGreaterThan(-1);
+          const loadCount = Number(args[loadIdx + 1]);
+          const loaded = args.slice(loadIdx + 2, loadIdx + 2 + loadCount) as string[];
+          expect(loaded.some((a) => typeof a === "string" && a.startsWith("@ws_girr_")), `${leg} LOAD missing @ws_girr_* field`).toBe(true);
+          expect(args.some((a) => typeof a === "string" && a.startsWith("@ws_girr_") && a.endsWith("+0")), `${leg} APPLY argv missing @ws_girr_*+0 coalesce`).toBe(true);
           const rows: unknown[] = [perBucket.length];
           for (const p of perBucket) {
             const kv: Record<string, number> = { row_count: p.count };
@@ -860,10 +869,11 @@ describe("Wave 5.83D-1 — Lua ⇄ FT.AGGREGATE differential parity (9 variants)
   // pre-weighted `ws_equity_*` / `ws_fx_*` field landing on every doc.
   // Referencing the bare `@ws_equity_delta` (and the vega / FX equivalents)
   // in APPLY then trips the same RediSearch "could not find the value"
-  // error J1 fixed on GIRR. The J3 fix extends the `case(exists(@f),@f,0)`
-  // coalesce to the scalar classes. This gate asserts the wrapper is
-  // emitted on the EQUITY + FX fast paths and that the call still returns
-  // 200 with missing-field rows contributing 0.
+  // error J1 fixed on GIRR. Wave 6.39.H ships the stable `LOAD @f` +
+  // `APPLY @f+0 AS f_safe` coalesce for the scalar classes (replacing the
+  // J3 case/exists shape gated off on Enterprise/Cloud). This gate asserts
+  // the new wrapper is emitted on the EQUITY + FX fast paths and that the
+  // call still returns 200 with missing-field rows contributing 0.
   for (const cfg of [
     { rc: "EQUITY", st: "Delta" as const, prefix: "d", root: "ws_equity_delta", buckets: ["1"] },
     { rc: "EQUITY", st: "Vega" as const,  prefix: "v", root: "ws_equity_vega",  buckets: ["1"] },
@@ -878,13 +888,23 @@ describe("Wave 5.83D-1 — Lua ⇄ FT.AGGREGATE differential parity (9 variants)
         __resetCalcCacheForTests();
         const fastFr: FakeRedis = fakeRedis();
         let sawCoalesce = false;
+        let sawLoad = false;
         fastFr.setResponse("FT.AGGREGATE", (args: unknown[]) => {
           if (!args.includes("APPLY")) return ftDiscoverReply(cfg.buckets);
-          // J3 gate: APPLY argv must wrap the scalar `ws_<class>_<leg>` field
-          // in `case(exists(@f),@f,0)`. Without this wrap the live index would
-          // 500 on the polluted corpus.
+          // J3 / 6.39.H gate: argv must LOAD the scalar `ws_<class>_<leg>`
+          // field and emit an `APPLY @f+0 AS <f>_safe` coalesce. Without
+          // this the live index would 500 on the polluted corpus (or fail
+          // the Enterprise/Cloud unstable-feature gate on the prior shape).
+          const loadIdx = args.indexOf("LOAD");
+          if (loadIdx >= 0) {
+            const loadCount = Number(args[loadIdx + 1]);
+            const loaded = args.slice(loadIdx + 2, loadIdx + 2 + loadCount) as unknown[];
+            sawLoad = loaded.some(
+              (a) => typeof a === "string" && a === `@${cfg.root}`,
+            );
+          }
           sawCoalesce = args.some(
-            (a) => typeof a === "string" && a.startsWith(`case(exists(@${cfg.root}`),
+            (a) => typeof a === "string" && a === `@${cfg.root}+0`,
           );
           // Mimic the polluted corpus: aggregate replies omit the
           // `sum_<prefix>_<root>` field on some buckets, so `bucketResultFromRow`
@@ -911,7 +931,8 @@ describe("Wave 5.83D-1 — Lua ⇄ FT.AGGREGATE differential parity (9 variants)
         expect(res.statusCode).toBe(200);
         const body = res.json();
         expect(body.engine).toBe("ft_aggregate");
-        expect(sawCoalesce, `${cfg.rc} ${cfg.st} APPLY argv missing case(exists(@${cfg.root}...)) wrapper`).toBe(true);
+        expect(sawLoad, `${cfg.rc} ${cfg.st} FT.AGGREGATE argv missing LOAD of @${cfg.root}`).toBe(true);
+        expect(sawCoalesce, `${cfg.rc} ${cfg.st} APPLY argv missing @${cfg.root}+0 coalesce`).toBe(true);
         // Per-bucket math must be finite — missing-field buckets contribute
         // K_b = 0 / S_b = 0 (no NaN, no infinities) and still appear in the
         // reply alongside the bucket that carried real aggregates.
