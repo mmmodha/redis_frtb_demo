@@ -585,8 +585,8 @@ export function getActiveRedisClient(): Redis | null {
 //     selected round-robin so a single hung command does not stall unrelated
 //     routes. Category defaults to `"heavy"` so any caller that hasn't
 //     explicitly opted in to `"light"` keeps the safest fallback.
-// VM evidence on bigcluster (calc-discovery-failed × 24, all at exactly 10s)
-// showed routes being aborted by the boot-protection ioredis 10s timeout
+// Production evidence on a large clustered target (calc-discovery-failed × 24,
+// all at exactly 10s) showed routes being aborted by the boot-protection ioredis 10s timeout
 // before Redis itself had a chance to emit its 30s TIMEOUT error — clients
 // then saw a generic command-timeout instead of a clean recoverable error.
 // 35s = 30s in-Redis budget + 5s grace; still capped so genuinely hung
@@ -1164,11 +1164,24 @@ export function getPoolMemberInfo(
 // can refuse to flip green until the pool sockets are actually writable
 // (handshake complete, cluster topology discovered). `acquireFromPool`
 // rotates `rrIndex` per call, so issuing `poolSize` acquisitions in
-// sequence hits each slot once; the lazy `client.connect()` triggered by
-// the first PING is what surfaces the "Stream isn't writeable" the runtime
-// pool was raising on the first 3-5 calls after a fresh restart. The
-// verdict is cached for `RUNTIME_READINESS_CACHE_MS` and concurrent calls
-// share a single in-flight Promise so /readyz polling cannot stampede.
+// sequence hits each slot once. The verdict is cached for
+// `RUNTIME_READINESS_CACHE_MS` and concurrent calls share a single
+// in-flight Promise so /readyz polling cannot stampede.
+//
+// Wave 6.36.A — the original Wave 6.26 implementation walked the members
+// serially and relied on `await c.ping()` to trigger the lazy connect on
+// each socket in turn. With Wave 6.23's `enableOfflineQueue:false` +
+// `maxRetriesPerRequest:1`, that first PING fast-fails with "Stream isn't
+// writeable" if the socket is in `connecting`/`reconnecting` rather than
+// `wait`, and the 250ms failure cache turned each retry into a ≥250ms
+// wait — pushing /readyz warm-restart latency to ~2.8s (≈11 cycles × 250ms)
+// against a localhost Redis. Two fixes restore the <1s contract:
+//   1. `awaitMemberReady(...)` waits for the per-member socket to reach
+//      `ready` (via `connect()` from `wait`, or a `'ready'` event listener
+//      from any other transitional state) before firing PING, so the probe
+//      proves readiness instead of racing the handshake.
+//   2. Members are pinged via `Promise.all` so the 8 sockets establish
+//      concurrently rather than 8×RTT serially.
 export async function probeRuntimeRedisReadiness(): Promise<RuntimeReadinessVerdict> {
   const now = Date.now();
   if (runtimeReadinessCache && now - runtimeReadinessCache.ts < RUNTIME_READINESS_CACHE_MS) {
@@ -1179,14 +1192,19 @@ export async function probeRuntimeRedisReadiness(): Promise<RuntimeReadinessVerd
   if (runtimeReadinessInFlight) return runtimeReadinessInFlight;
   runtimeReadinessInFlight = (async () => {
     try {
+      const all: Redis[] = [];
       for (const category of ["heavy", "light"] as const) {
         const size = getRuntimePoolSize(category);
         for (let i = 0; i < size; i++) {
           const c = getActiveRedisRuntimeClient(category);
           if (!c) throw new Error(`no active runtime client (${category})`);
-          await c.ping();
+          all.push(c);
         }
       }
+      await Promise.all(all.map(async (c) => {
+        await awaitMemberReady(c);
+        await c.ping();
+      }));
       runtimeReadinessCache = { ts: Date.now(), ok: true };
       return { ok: true };
     } catch (e) {
@@ -1198,6 +1216,45 @@ export async function probeRuntimeRedisReadiness(): Promise<RuntimeReadinessVerd
     }
   })();
   return runtimeReadinessInFlight;
+}
+
+// Wave 6.36.A — bridge a pool member's ioredis socket from its initial
+// `wait` (lazyConnect) / transitional `connecting` / `reconnecting` state
+// to `ready` before issuing the probe PING. Tolerates the "already
+// connecting/connected" error from a racing `connect()` call. Clients
+// without a recognised `status` field (e.g. test fakes, the boot-protection
+// client) fall through to PING directly — preserving the pre-6.36 contract
+// for non-ioredis surfaces.
+async function awaitMemberReady(c: Redis): Promise<void> {
+  const e = c as unknown as {
+    status?: string;
+    connect?: () => Promise<unknown>;
+    once?: (event: string, cb: (...args: unknown[]) => void) => void;
+    off?: (event: string, cb: (...args: unknown[]) => void) => void;
+    removeListener?: (event: string, cb: (...args: unknown[]) => void) => void;
+  };
+  if (typeof e.status !== "string") return;
+  if (e.status === "ready") return;
+  if (e.status === "wait" && typeof e.connect === "function") {
+    try { await e.connect(); return; }
+    catch (err) {
+      if (!/already connect(ing|ed)/i.test(String(err))) throw err;
+    }
+  }
+  if (e.status === "ready") return;
+  if (typeof e.once !== "function") return;
+  await new Promise<void>((resolve, reject) => {
+    let done = false;
+    const cleanup = (): void => {
+      const off = e.off ?? e.removeListener;
+      off?.call(e, "ready", onReady);
+      off?.call(e, "error", onError);
+    };
+    const onReady = (): void => { if (done) return; done = true; cleanup(); resolve(); };
+    const onError = (err: unknown): void => { if (done) return; done = true; cleanup(); reject(err instanceof Error ? err : new Error(String(err))); };
+    e.once!("ready", onReady);
+    e.once!("error", onError);
+  });
 }
 
 // Test seam — drop the cached readiness verdict so the next probe runs

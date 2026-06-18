@@ -9,6 +9,7 @@ import {
 import {
   __resetRuntimeReadinessCacheForTests,
   __setRuntimeClientFactoryForTests,
+  probeRuntimeRedisReadiness,
   resetActiveTarget,
   setActiveTarget,
 } from "../src/active-target.ts";
@@ -240,6 +241,76 @@ describe("GET /readyz — runtime-pool readiness probe (Wave 6.26)", () => {
     const res = await app.inject({ method: "GET", url: "/readyz" });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual({ service: "api", status: "ok", bootstrap: "ready" });
+  });
+});
+
+// Wave 6.36.A — regression guard for the warm-restart latency contract.
+// Pre-fix, the probe walked pool members serially and called `ping()` while
+// the underlying socket was still in `connecting`/`reconnecting`, fast-
+// failing under Wave 6.23's `enableOfflineQueue:false` + the 250ms failure
+// cache — pushing /readyz first-200 to ~2.8s. The fix is two-part:
+//   1. Wait for each member's `'ready'` event (or `connect()` from `wait`)
+//      before issuing PING.
+//   2. Parallelise the per-member check via `Promise.all` so 8 sockets
+//      establish concurrently instead of 8×RTT.
+// These tests pin both invariants without standing up a real Redis.
+describe("probeRuntimeRedisReadiness — warm-restart latency (Wave 6.36.A)", () => {
+  beforeEach(() => {
+    __resetRuntimeReadinessCacheForTests();
+  });
+  afterEach(() => {
+    __setRuntimeClientFactoryForTests(null);
+    resetActiveTarget();
+    __resetRuntimeReadinessCacheForTests();
+  });
+
+  // Each fake client reports `status: "wait"` and a `connect()` that resolves
+  // after `connectDelayMs`. `ping()` resolves only AFTER connect — if the
+  // probe were to fire PING before awaiting connect, ping would reject
+  // with the same "Stream isn't writeable" error production saw.
+  function slowConnectClient(connectDelayMs: number): import("ioredis").Redis {
+    let connected = false;
+    const fake = {
+      status: "wait" as string,
+      options: { commandTimeout: 0, host: "fake", db: 0 },
+      on(): unknown { return this; },
+      once(): unknown { return this; },
+      off(): unknown { return this; },
+      disconnect(): void { /* no-op */ },
+      connect(): Promise<void> {
+        return new Promise((resolve) => setTimeout(() => {
+          connected = true;
+          fake.status = "ready";
+          resolve();
+        }, connectDelayMs));
+      },
+      ping(): Promise<string> {
+        return connected
+          ? Promise.resolve("PONG")
+          : Promise.reject(new Error("Stream isn't writeable"));
+      },
+    };
+    return fake as unknown as import("ioredis").Redis;
+  }
+
+  it("waits for each member's connect to complete before pinging (no Stream-isn't-writeable race)", async () => {
+    __setRuntimeClientFactoryForTests(() => slowConnectClient(20));
+    setActiveTarget({ host: "fake", port: 6379, tls: false, db: 0, label: "fake" });
+    const verdict = await probeRuntimeRedisReadiness();
+    expect(verdict).toEqual({ ok: true });
+  });
+
+  it("parallelises member checks (total time ≈ max per-member, not sum)", async () => {
+    // 8 members × 50ms each. Serial → ~400ms; parallel → ~50ms.
+    // Assert <200ms to leave headroom for CI variance while still catching
+    // a regression to the serial loop.
+    __setRuntimeClientFactoryForTests(() => slowConnectClient(50));
+    setActiveTarget({ host: "fake", port: 6379, tls: false, db: 0, label: "fake" });
+    const t0 = performance.now();
+    const verdict = await probeRuntimeRedisReadiness();
+    const elapsed = performance.now() - t0;
+    expect(verdict).toEqual({ ok: true });
+    expect(elapsed).toBeLessThan(200);
   });
 });
 
