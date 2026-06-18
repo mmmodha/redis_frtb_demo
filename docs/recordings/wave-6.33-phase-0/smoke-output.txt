@@ -1,0 +1,32 @@
+{
+  "generated_at": "2026-06-18T09:17:28.289Z",
+  "runId": "p0-smoke",
+  "rows_requested": 100000,
+  "rows_written": 100000,
+  "ingest_ms": 11848,
+  "shard_count": 0,
+  "sampled_slots": 0,
+  "per_shard_key_counts": [
+    0
+  ],
+  "calc_sbm_total": {
+    "status": 200,
+    "ms": 347
+  },
+  "cleanup": {
+    "keys_deleted": 100001,
+    "ms": 11089
+  },
+  "dbsize": {
+    "baseline": 1,
+    "final": 1,
+    "drift": 0
+  },
+  "total_ms": 23906,
+  "baseline_recording": {
+    "dir": "docs/recordings/wave-6.33-phase-0",
+    "shardCount": 0,
+    "modules": 5,
+    "ft_list_count": 0
+  }
+}

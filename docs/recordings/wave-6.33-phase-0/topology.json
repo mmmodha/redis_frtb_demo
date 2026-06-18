@@ -1,0 +1,28 @@
+{
+  "generated_at": "2026-06-18T09:17:04.693Z",
+  "shard_count": 0,
+  "slot_range_count": 0,
+  "modules": [
+    {
+      "name": "vectorset",
+      "ver": 1
+    },
+    {
+      "name": "search",
+      "ver": 80408
+    },
+    {
+      "name": "bf",
+      "ver": 80406
+    },
+    {
+      "name": "timeseries",
+      "ver": 80408
+    },
+    {
+      "name": "ReJSON",
+      "ver": 80404
+    }
+  ],
+  "notes": "host/port/auth intentionally omitted per Wave 6.33 P0 guard-rails"
+}

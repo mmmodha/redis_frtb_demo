@@ -7,7 +7,7 @@ FRTB-SA goes live in January. Your incumbent stack (Oracle + Spark + JVM risk en
 **Redis Enterprise Software** as the live operational layer in front of your existing Oracle + Spark batch:
 
 - **JSON-native storage** of the sensitivity shape, including tenor arrays, with no row explosion.
-- **Sub-100 ms searches** over 10M+ rows via Redis Query Engine on JSON.
+- **Sub-100 ms pivots** over 10M+ rows via Redis Query Engine on JSON.
 - **In-database SBM math** via Redis Functions — `FCALL` per bucket on the owning shard, slot-local, map-reduce.
 - **Auto Tiering** (RAM + NVMe in one logical DB) for the 450M scale story. Enterprise-exclusive.
 - **Active-Active CRDTs** for local-write latency in London, Hong Kong, New York.
@@ -15,7 +15,7 @@ FRTB-SA goes live in January. Your incumbent stack (Oracle + Spark + JVM risk en
 
 ## What today's demo proved
 - Live ingest of 10M synthetic sensitivities into a 3-shard cluster.
-- Sub-100 ms RQE searches over the loaded dataset.
+- Sub-100 ms RQE pivots over the loaded dataset.
 - SBM Delta + Vega charge for GIRR, Equity, and FX, computed inside Redis via Functions.
 - 200 concurrent analyst load with stable p99 latency.
 - Live schema swap with no code changes.
