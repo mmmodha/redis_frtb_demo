@@ -1,7 +1,7 @@
 // Wave 6.30.B4 — fail-fast pool circuit breaker for stuck heavy connections.
 //
-// Background (2026-06-17 incident): on a fresh-boot api pointing at bigcluster,
-// `/calc/sbm/total` returned 500 "Command timed out" after 35s × 2 then 200 in
+// Background (2026-06-17 incident): on a fresh-boot api pointing at a large
+// clustered target, `/calc/sbm/total` returned 500 "Command timed out" after 35s × 2 then 200 in
 // 6ms on the 3rd attempt. Root cause: ioredis's default commandTimeout is 35s,
 // and Wave 6.22's circuit breaker requires 3 consecutive failures — so one
 // stuck pool member can burn ~105s of clock time before being skipped.

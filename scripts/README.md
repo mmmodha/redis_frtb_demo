@@ -31,7 +31,7 @@ Outputs:
 
 Read-only: `CLUSTER SLOTS`, `CLUSTER KEYSLOT`, `INFO memory`,
 `FT.AGGREGATE … COUNT`. No writes, no `DEL`, no `DEBUG SLEEP`. Total
-runtime budget: < 60s on bigcluster at 100M.
+runtime budget: < 60s on a large clustered target at 100M.
 
 ## materialize-seen-sets.mjs (Wave 6.24)
 

@@ -28,7 +28,7 @@
 //   logfile — `.run/logs/shard-balance-<ISO>.json` (created on completion).
 //
 // Read-only; no DEL, no FLUSH, no DEBUG. Total runtime budget: < 60s on
-// bigcluster at 100M.
+// a large clustered target at 100M.
 
 import { Redis, Cluster } from "ioredis";
 import { existsSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
