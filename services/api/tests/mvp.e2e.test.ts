@@ -116,9 +116,13 @@ async function ingestFixture(client: Redis, rows: SensitivityRow[]): Promise<voi
   const producer = createStreamProducer(client, { stream, batchSize: 50 });
   for (const row of rows) await producer.add(row);
   await producer.flush();
-  // Drain the stream — single consumer, blocking pop=0 (poll-once-per-batch).
+  // Wave 6.38.A — this suite's `createIndex` uses `ON JSON`, so the ingest
+  // writer is pinned to the legacy JSON.SET variant. The hash-* variants
+  // are exercised by services/ingest/tests/consumer.test.ts; the e2e gate
+  // stays on `json` because it also serves as the customer-escape-hatch
+  // regression guard.
   for (let i = 0; i < 50; i++) {
-    const n = await processBatch(client, { stream, group, consumerName, batchSize: 200 }, ">", 100);
+    const n = await processBatch(client, { stream, group, consumerName, batchSize: 200, storageFormat: "json" }, ">", 100);
     if (n === 0) break;
   }
 }

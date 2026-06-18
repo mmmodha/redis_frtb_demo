@@ -61,7 +61,7 @@ describe("processBatch — INGEST_PROFILE counter wiring [Wave 6.15a]", () => {
     const profile = createRunnerProfile("test");
     const n = await processBatch(
       stubClient(record),
-      { stream: "sensitivities:in", group: "ingest", consumerName: "c1", profile },
+      { stream: "sensitivities:in", group: "ingest", consumerName: "c1", profile, storageFormat: "json" },
       ">",
     );
     expect(n).toBe(2);
@@ -80,9 +80,12 @@ describe("processBatch — INGEST_PROFILE counter wiring [Wave 6.15a]", () => {
 
   it("without profile attached, pipeline call sequence is byte-identical to the pre-6.15a contract", async () => {
     const record: RecordedPipelineCall[] = [];
+    // Wave 6.38.A — pinned to STORAGE_FORMAT=json because this test asserts the
+    // pre-6.15a JSON.SET-based command sequence; the new default `hash-sidetable`
+    // writer emits HSET instead.
     const n = await processBatch(
       stubClient(record),
-      { stream: "sensitivities:in", group: "ingest", consumerName: "c1" },
+      { stream: "sensitivities:in", group: "ingest", consumerName: "c1", storageFormat: "json" },
       ">",
     );
     expect(n).toBe(2);

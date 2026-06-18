@@ -649,6 +649,28 @@ describe("bootstrap — Wave 6.18i schema-hash skip + ASYNC drop", () => {
     const mutated = { ...(baseSchema as unknown as Record<string, unknown>), __extra: "x" };
     expect(computeSchemaHash(mutated)).not.toBe(computeSchemaHash(baseSchema));
   });
+
+  // Wave 6.38.A — KEY_LAYOUT_VERSION bumped from 2 to 3 (HASH side-table
+  // migration). The fingerprint must differ from a synthetic v2 payload over
+  // the same schema bytes so the next bootstrap forces a fresh
+  // `idx:sens:v{hash7}` instead of adopting the stale JSON-shaped index.
+  it("KEY_LAYOUT_VERSION → 3 changes the fingerprint for the same schema input", async () => {
+    const { createHash } = await import("node:crypto");
+    const baseSchema = loadSchema(SCHEMA_PATH);
+    function deepSort(value: unknown): unknown {
+      if (Array.isArray(value)) return value.map(deepSort);
+      if (value && typeof value === "object") {
+        const src = value as Record<string, unknown>;
+        const sorted: Record<string, unknown> = {};
+        for (const key of Object.keys(src).sort()) sorted[key] = deepSort(src[key]);
+        return sorted;
+      }
+      return value;
+    }
+    const v2Canonical = JSON.stringify({ key_layout_version: 2, schema: deepSort(baseSchema) });
+    const v2Hash = createHash("sha256").update(v2Canonical).digest("hex").slice(0, 16);
+    expect(computeSchemaHash(baseSchema)).not.toBe(v2Hash);
+  });
 });
 
 

@@ -44,6 +44,21 @@ const DEFAULT_SENSITIVITY_TYPES = ["Delta", "Vega"] as const;
 const DEFAULT_TRADE_POOL_SIZE = 200;
 const DEFAULT_FACTOR_POOL_SIZE = 16;
 
+// Wave 6.38.A — 15-desk taxonomy (5 asset classes × 3 regions). Underscore
+// separator keeps `FT.SEARCH idx:sens "@desk:{RATES_LDN}"` unescaped. The
+// asset-class half is selected by mapping the row's `risk_class` to the
+// natural affinity (GIRR→RATES, EQUITY→EQUITY, FX→FX, fallback RATES); the
+// region half is drawn from the aux RNG so re-runs with the same seed
+// produce stable desks, and the main value-RNG sequence is unchanged.
+const DESK_ASSET_CLASS_BY_RC: Readonly<Record<string, string>> = Object.freeze({
+  GIRR: "RATES",
+  EQUITY: "EQUITY",
+  FX: "FX",
+  CREDIT: "CREDIT",
+  COMMODITY: "COMMODITY",
+});
+const DESK_REGIONS = ["LDN", "NYC", "HKG"] as const;
+
 // Per-dimension op codes — resolved once per schema, then executed per row.
 type Op =
   | { k: "risk_class"; name: string }
@@ -301,6 +316,14 @@ export function createRowGenerator(
       row.trade_id = `T${String(tradeIdx + 1).padStart(4, "0")}`;
       const factorIdx = (auxRng() * factorPoolSize) | 0;
       row.risk_factor = `RF_${riskClass}_${String(factorIdx + 1).padStart(2, "0")}`;
+      // Wave 6.38.A — desk taxonomy. Asset-class half is determined by the
+      // row's risk_class (RATES/FX/EQUITY/CREDIT/COMMODITY) with a RATES
+      // fallback for any class without an explicit affinity; the region half
+      // is drawn from the aux RNG so the desk is reproducible across runs
+      // for a given seed without perturbing the main value-RNG sequence.
+      const assetClass = DESK_ASSET_CLASS_BY_RC[riskClass] ?? "RATES";
+      const regionIdx = (auxRng() * DESK_REGIONS.length) | 0;
+      row.desk = `${assetClass}_${DESK_REGIONS[regionIdx]!}`;
       return row;
     },
   };

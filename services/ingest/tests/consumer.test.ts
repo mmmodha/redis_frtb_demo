@@ -18,7 +18,13 @@ import {
   ensureGroup,
   processBatch,
   createConsumer,
+  writeDocForStorage,
+  resolveStorageFormat,
+  STORAGE_FORMATS,
+  DEFAULT_STORAGE_FORMAT,
+  type StorageFormat,
 } from "../src/consumer.ts";
+import { buildCreateArgs, IDX_NAME } from "@frtb/rqe";
 import { backfill } from "../src/backfill-weighted.ts";
 import { backfillRollups, accumulateRollup } from "../src/backfill-rollups.ts";
 import { loadSchema, type Schema } from "@frtb/schema";
@@ -392,7 +398,11 @@ describe("consumer SUGADD live-populate hook [Wave 5.30a]", () => {
         ]];
       },
     } as unknown as Redis;
-    const n = await processBatch(stub, { stream: "sensitivities:in", group: "ingest", consumerName: "c1" }, ">");
+    // Wave 6.38.A — pin storageFormat: "json" so the JSON.SET → SUGADD → XACK
+    // ordering assertions below match the legacy writer (the customer escape
+    // hatch). The hash-sidetable equivalent is exercised in the
+    // parameterized "STORAGE_FORMAT writer dispatch" suite below.
+    const n = await processBatch(stub, { stream: "sensitivities:in", group: "ingest", consumerName: "c1", storageFormat: "json" }, ">");
     expect(n).toBe(2);
 
     const sugadds = record.filter((r) => r.command === "FT.SUGADD");
@@ -455,8 +465,11 @@ describe("XREADGROUP consumer → JSON.SET", () => {
     ];
     for (const r of rows) await xaddRow("sensitivities:in", r);
 
+    // Wave 6.38.A — exercise the legacy JSON writer here so the existing key-
+    // shape regex assertion holds; per-variant coverage of the HASH writers
+    // lives in the parameterized suite below.
     const processed = await processBatch(redis, {
-      stream: "sensitivities:in", group: "ingest", consumerName: "ingest-1", batchSize: 100,
+      stream: "sensitivities:in", group: "ingest", consumerName: "ingest-1", batchSize: 100, storageFormat: "json",
     }, ">");
     expect(processed).toBe(3);
 
@@ -482,7 +495,8 @@ describe("XREADGROUP consumer → JSON.SET", () => {
       book: "RATES-LDN",
     });
     await xaddRow("sensitivities:in", row);
-    await processBatch(redis, { stream: "sensitivities:in", group: "ingest", consumerName: "ingest-1" }, ">");
+    // Wave 6.38.A — explicit `json` variant so JSON.GET succeeds below.
+    await processBatch(redis, { stream: "sensitivities:in", group: "ingest", consumerName: "ingest-1", storageFormat: "json" }, ">");
 
     const key = `sens:${row._id}`;
     const stored = JSON.parse(await redis.call("JSON.GET", key) as string);
@@ -557,8 +571,12 @@ describe("XREADGROUP consumer → JSON.SET", () => {
     const fx = makeRow("FX", "EURUSD", { sensitivity_type: "Delta", risk_value: { spot: 0.75 }, trade_id: "T-w3" });
     for (const r of [girr, equity, fx]) await xaddRow("sensitivities:in", r);
 
+    // Wave 6.38.A — `json` variant pinned so the JSON.GET assertions below
+    // remain meaningful. The HASH-variant equivalent of these enrichDoc
+    // round-trip assertions runs inside the parameterized STORAGE_FORMAT
+    // suite at the bottom of this file.
     await processBatch(redis, {
-      stream: "sensitivities:in", group: "ingest", consumerName: "ingest-w", batchSize: 100, schema: SCHEMA,
+      stream: "sensitivities:in", group: "ingest", consumerName: "ingest-w", batchSize: 100, schema: SCHEMA, storageFormat: "json",
     }, ">");
 
     const girrStored = JSON.parse(await redis.call("JSON.GET", `sens:${girr._id}`) as string);
@@ -1131,4 +1149,159 @@ describe("processBatch seen:* SADD integration [Wave 6.24]", () => {
       expect(sensTypes).toContain(c.sens);
     }
   });
+});
+
+// Wave 6.38.A — STORAGE_FORMAT writer dispatch + 4-variant ingest. The pure-
+// helper suite asserts that `writeDocForStorage` emits the right pipelined
+// commands per variant against the recording stub. The integration suite
+// then ingests a small fixture against a live Redis Stack under each
+// variant, asserts the stored shape, and (for index-covering variants)
+// runs FT.SEARCH `@desk:{RATES_LDN}` to confirm the new TAG attribute
+// resolves end-to-end.
+describe("STORAGE_FORMAT — env parsing + writer dispatch [Wave 6.38.A]", () => {
+  it("resolveStorageFormat returns the default for undefined / empty input", () => {
+    expect(resolveStorageFormat(undefined)).toBe(DEFAULT_STORAGE_FORMAT);
+    expect(resolveStorageFormat("")).toBe(DEFAULT_STORAGE_FORMAT);
+    expect(DEFAULT_STORAGE_FORMAT).toBe("hash-sidetable");
+  });
+
+  it("resolveStorageFormat accepts every documented variant", () => {
+    for (const f of STORAGE_FORMATS) {
+      expect(resolveStorageFormat(f)).toBe(f);
+    }
+  });
+
+  it("resolveStorageFormat throws on an unknown value (typo guard)", () => {
+    expect(() => resolveStorageFormat("hash_sidetable")).toThrow(/STORAGE_FORMAT/);
+    expect(() => resolveStorageFormat("HASH-SIDETABLE")).toThrow(/STORAGE_FORMAT/);
+  });
+
+  it("hash-sidetable: parent HSET + side-table HSET for a per-tenor GIRR row", () => {
+    const record: RecordedPipelineCall[] = [];
+    const stub = pipelineStub(record);
+    const doc = enrichDoc({
+      risk_class: "GIRR", bucket: "USD-IRS", sensitivity_type: "Delta",
+      risk_value: { "3M": 0.1, "1Y": 0.2 }, trade_id: "T-1", desk: "RATES_LDN",
+    }, SCHEMA);
+    writeDocForStorage(stub as unknown as { call: (cmd: string, ...args: unknown[]) => unknown }, "sens:01HZA", doc, "hash-sidetable");
+    const hsets = record.filter((r) => r.command === "HSET");
+    expect(hsets.length).toBe(2);
+    expect(hsets[0]!.args[0]).toBe("sens:01HZA");
+    expect(hsets[1]!.args[0]).toBe("sens:01HZA:tenors");
+    const parentFlat: Record<string, string> = {};
+    const pArgs = hsets[0]!.args;
+    for (let i = 1; i < pArgs.length; i += 2) parentFlat[pArgs[i] as string] = pArgs[i + 1] as string;
+    expect(parentFlat.risk_class).toBe("GIRR");
+    expect(parentFlat.desk).toBe("RATES_LDN");
+    expect(parentFlat["ws_girr_delta_3M"]).toBeDefined();
+    expect(parentFlat["ws_girr_delta_1Y"]).toBeDefined();
+    expect(record.some((r) => r.command === "JSON.SET")).toBe(false);
+  });
+
+  it("hash-encoded: single HSET on the parent with `weighted_value_per_tenor_json` blob", () => {
+    const record: RecordedPipelineCall[] = [];
+    const stub = pipelineStub(record);
+    const doc = enrichDoc({
+      risk_class: "GIRR", bucket: "USD-IRS", sensitivity_type: "Delta",
+      risk_value: { "3M": 0.1, "1Y": 0.2 }, trade_id: "T-1", desk: "RATES_LDN",
+    }, SCHEMA);
+    writeDocForStorage(stub as unknown as { call: (cmd: string, ...args: unknown[]) => unknown }, "sens:01HZB", doc, "hash-encoded");
+    const hsets = record.filter((r) => r.command === "HSET");
+    expect(hsets.length).toBe(1);
+    expect(hsets[0]!.args[0]).toBe("sens:01HZB");
+    const flat: Record<string, string> = {};
+    const pArgs = hsets[0]!.args;
+    for (let i = 1; i < pArgs.length; i += 2) flat[pArgs[i] as string] = pArgs[i + 1] as string;
+    expect(flat.desk).toBe("RATES_LDN");
+    expect(flat.weighted_value_per_tenor_json).toBeDefined();
+    const decoded = JSON.parse(flat.weighted_value_per_tenor_json!);
+    expect(decoded["3M"]).toBeCloseTo(GIRR_W.by_tenor["3M"]! * 0.1, 12);
+  });
+
+  it("json: emits JSON.SET only — no HASH writes (legacy customer escape hatch)", () => {
+    const record: RecordedPipelineCall[] = [];
+    const stub = pipelineStub(record);
+    const doc = enrichDoc({
+      risk_class: "EQUITY", bucket: "1", sensitivity_type: "Delta",
+      risk_value: { spot: 0.5 }, trade_id: "T-1", desk: "EQUITY_NYC",
+    }, SCHEMA);
+    writeDocForStorage(stub as unknown as { call: (cmd: string, ...args: unknown[]) => unknown }, "sens:01HZC", doc, "json");
+    expect(record.filter((r) => r.command === "JSON.SET").length).toBe(1);
+    expect(record.filter((r) => r.command === "HSET").length).toBe(0);
+  });
+
+  it("json-shadow-hash: emits JSON.SET on sens:<ulid> + HSET on sensh:<ulid> (index mirror)", () => {
+    const record: RecordedPipelineCall[] = [];
+    const stub = pipelineStub(record);
+    const doc = enrichDoc({
+      risk_class: "FX", bucket: "EURUSD", sensitivity_type: "Vega",
+      risk_value: { spot: 0.75 }, trade_id: "T-1", desk: "FX_HKG",
+    }, SCHEMA);
+    writeDocForStorage(stub as unknown as { call: (cmd: string, ...args: unknown[]) => unknown }, "sens:01HZD", doc, "json-shadow-hash");
+    const json = record.filter((r) => r.command === "JSON.SET");
+    const hset = record.filter((r) => r.command === "HSET");
+    expect(json.length).toBe(1);
+    expect(json[0]!.args[0]).toBe("sens:01HZD");
+    expect(hset.length).toBe(1);
+    expect(hset[0]!.args[0]).toBe("sensh:01HZD");
+  });
+});
+
+// Wave 6.38.A — live-Redis 4-variant matrix. Each variant ingests a small
+// fixture and verifies (a) the parent key carries the right type, (b) the
+// `desk` TAG resolves under FT.SEARCH for the variants that populate the
+// HASH index, and (c) emitRollupHincrs / emitSeenSadds are storage-format-
+// agnostic so the rollup + seen-set state matches across all four.
+describe("STORAGE_FORMAT — 4-variant ingest matrix [Wave 6.38.A]", () => {
+  const fixtureRows = () => [
+    makeRow("EQUITY", "1", { sensitivity_type: "Delta", risk_value: { spot: 0.42 }, trade_id: "T-eq1", desk: "RATES_LDN" }),
+    makeRow("FX", "EURUSD", { sensitivity_type: "Vega", risk_value: { spot: 0.75 }, trade_id: "T-fx1", desk: "RATES_LDN" }),
+    makeRow("GIRR", "USD", { sensitivity_type: "Delta", risk_value: { "3M": 0.1, "1Y": 0.2, "10Y": 0.3 }, trade_id: "T-gr1", desk: "RATES_LDN" }),
+  ];
+
+  for (const variant of STORAGE_FORMATS) {
+    integration(`STORAGE_FORMAT=${variant}: ingests fixture; parent key has expected Redis type`, async () => {
+      await redis.flushall();
+      // Recreate the index on each variant run so a previous variant's
+      // residual index name doesn't bleed across cases.
+      await redis.call("FT.DROPINDEX", IDX_NAME).catch(() => undefined);
+      await redis.call("FT.CREATE", ...buildCreateArgs(SCHEMA)).catch((err: unknown) => {
+        const msg = String(err instanceof Error ? err.message : err);
+        if (!/already exists/i.test(msg)) throw err;
+      });
+      await ensureGroup(redis, "sensitivities:in", "ingest");
+      const rows = fixtureRows();
+      for (const r of rows) await xaddRow("sensitivities:in", r);
+      const processed = await processBatch(redis, {
+        stream: "sensitivities:in", group: "ingest", consumerName: `ingest-${variant}`,
+        batchSize: 100, schema: SCHEMA, storageFormat: variant as StorageFormat,
+      }, ">");
+      expect(processed).toBe(3);
+
+      // Parent key types per variant.
+      for (const r of rows) {
+        const type = await redis.type(`sens:${r._id}`);
+        if (variant === "json") expect(type).toBe("ReJSON-RL");
+        else if (variant === "json-shadow-hash") {
+          expect(type).toBe("ReJSON-RL");
+          // Shadow HASH mirror present.
+          expect(await redis.type(`sensh:${r._id}`)).toBe("hash");
+        } else {
+          expect(type).toBe("hash");
+        }
+      }
+
+      // FT.SEARCH `@desk:{RATES_LDN}` returns hits whenever the index covers
+      // the parent shape. `json` only writes a JSON doc and idx:sens is
+      // `ON HASH`, so the legacy variant does NOT contribute index entries
+      // here — that's the documented escape-hatch trade-off.
+      await wait(300);
+      const reply = await redis.call(
+        "FT.SEARCH", IDX_NAME, "@desk:{RATES_LDN}",
+        "LIMIT", "0", "0", "DIALECT", "2",
+      ) as unknown as [number, ...unknown[]];
+      if (variant === "json") expect(reply[0]).toBe(0);
+      else expect(reply[0]).toBeGreaterThanOrEqual(3);
+    });
+  }
 });

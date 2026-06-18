@@ -103,8 +103,8 @@ describe("createRowGenerator (schema-driven, per-risk-class)", () => {
     const row = gen.generate("FX");
     const expected = schema.risk_classes.FX!.dimensions;
     for (const dim of expected) expect(row).toHaveProperty(dim);
-    // GIRR-only field must NOT appear on FX rows
-    expect(row).not.toHaveProperty("desk");
+    // GIRR-only schema field must NOT appear on FX rows
+    expect(row).not.toHaveProperty("issuer");
   });
 
   it("uses physical FRTB binding names — risk_class field carries the FRTB risk-class identifier", () => {

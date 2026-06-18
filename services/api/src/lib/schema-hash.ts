@@ -11,12 +11,13 @@
 // changes to the sens-key shape (independent of the schema YAML) also force
 // a fresh fingerprint and a clean reindex on next bootstrap. Bump this when
 // the on-disk key layout changes; leave it alone otherwise.
-//   v1 → sens:{<rc>:<bkt>}:<ulid>  (Wave 2 hash-tagged shape)
-//   v2 → sens:<ulid>               (Wave 6.31 Option B, ULID-only)
+//   v1 → sens:{<rc>:<bkt>}:<ulid>           (Wave 2 hash-tagged shape)
+//   v2 → sens:<ulid>                        (Wave 6.31 Option B, ULID-only, JSON)
+//   v3 → sens:<ulid> HASH + sens:<ulid>:tenors side-table (Wave 6.38.A)
 
 import { createHash } from "node:crypto";
 
-export const KEY_LAYOUT_VERSION = 2;
+export const KEY_LAYOUT_VERSION = 3;
 
 function deepSort(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(deepSort);

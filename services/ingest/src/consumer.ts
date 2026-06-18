@@ -11,11 +11,41 @@ import type { RunnerProfile } from "./profile.ts";
 // Stream consumer for the FRTB ingest service.
 // Reads from Redis Stream `sensitivities:in` via XREADGROUP, builds the final
 // key `sens:<ulid>` (ULID-only for uniform slot distribution across the cluster
-// per Wave 6.31 Option B), writes the doc with JSON.SET, then XACKs. JSON.SET
-// with the same key+doc is naturally idempotent: re-deliveries of the same
-// logical row produce no duplicate keys.
+// per Wave 6.31 Option B), writes the doc via the configured STORAGE_FORMAT
+// (Wave 6.38.A — default `hash-sidetable`), then XACKs. All writers are
+// idempotent on the (key, doc) pair so re-deliveries of the same logical row
+// produce no duplicate keys.
 
 export type RedisLike = Redis | Cluster;
+
+// Wave 6.38.A — STORAGE_FORMAT variants. Default `hash-sidetable`. The flag
+// is plumbed through ConsumerOptions and resolved at process startup from
+// `process.env.STORAGE_FORMAT` (see services/ingest/src/runtime/*). All four
+// variants must produce a queryable doc against idx:sens (ON HASH) — either
+// directly (hash-* variants) or via a shadow HASH mirror (json-shadow-hash).
+// The legacy `json` variant is the customer escape hatch and writes JSON.SET
+// only — idx:sens does NOT cover it (the migration assumption is that the
+// customer enabling `json` brings their own JSON-backed index).
+export type StorageFormat = "hash-sidetable" | "hash-encoded" | "json" | "json-shadow-hash";
+export const STORAGE_FORMATS: readonly StorageFormat[] = Object.freeze([
+  "hash-sidetable",
+  "hash-encoded",
+  "json",
+  "json-shadow-hash",
+]);
+export const DEFAULT_STORAGE_FORMAT: StorageFormat = "hash-sidetable";
+
+// Parses STORAGE_FORMAT env / opt value with a fallback to the default.
+// Throws on an unknown value so a typo at boot is loud — silent fallback was
+// considered and rejected (a user typing `hash_sidetable` would silently
+// pick up an unintended writer otherwise).
+export function resolveStorageFormat(value: string | undefined): StorageFormat {
+  if (!value || value === "") return DEFAULT_STORAGE_FORMAT;
+  if ((STORAGE_FORMATS as readonly string[]).includes(value)) return value as StorageFormat;
+  throw new Error(
+    `STORAGE_FORMAT: unknown value "${value}" (expected one of: ${STORAGE_FORMATS.join(", ")})`,
+  );
+}
 
 export interface ConsumerOptions {
   stream: string;
@@ -35,6 +65,11 @@ export interface ConsumerOptions {
   // is a single nil-check and skipped, keeping the hot path byte-identical
   // to pre-6.15a behaviour.
   profile?: RunnerProfile;
+  // Wave 6.38.A — storage variant selector. Omitted → DEFAULT_STORAGE_FORMAT
+  // (`hash-sidetable`). All four variants are functionally equivalent at the
+  // FT.SEARCH layer (`hash-*` and `json-shadow-hash` populate idx:sens; the
+  // legacy `json` variant is the customer escape hatch and bypasses idx:sens).
+  storageFormat?: StorageFormat;
 }
 
 export interface ConsumerStats {
@@ -401,10 +436,176 @@ function fieldsToMap(fields: string[]): Record<string, string> {
 
 type XReadGroupReply = Array<[string, Array<[string, string[]]>]> | null;
 
+// Wave 6.38.A — TAG attributes carried on the parent `sens:<ulid>` HASH. Kept
+// in lock-step with shared/rqe/src/index.mjs IDX_SCHEMA_FIELDS so the index
+// finds every field it declares.
+const HASH_TAG_FIELDS = Object.freeze([
+  "risk_class",
+  "bucket",
+  "sensitivity_type",
+  "book",
+  "trade_id",
+  "risk_factor",
+  "trader",
+  "_calibration",
+  "desk",
+]);
+
+// Per-leg key used by the buildSchemaFields aliases. Delta and Vega share
+// `weighted_value` / `weighted_value_per_tenor` source paths in enrichDoc
+// (the leg discriminator is the row's `sensitivity_type`); Curvature splits
+// into `weighted_cvr_up` / `weighted_cvr_down`.
+function legsForSensType(sens: string): readonly string[] {
+  if (sens === "Curvature") return ["cvr_up", "cvr_down"];
+  if (sens === "Delta") return ["delta"];
+  if (sens === "Vega") return ["vega"];
+  return [];
+}
+
+// Flattens the enriched doc into the parent `sens:<ulid>` HASH field list.
+// Static TAG attributes flow through as-is; per-leg pre-weighted numeric
+// fields are pushed under the `ws_<class>_<leg>[_<tenor>]` HASH field names
+// that match buildSchemaFields. Per-tenor classes (detected by the presence
+// of `weighted_value_per_tenor` / `weighted_cvr_*_per_tenor`) emit flat
+// per-tenor fields and skip the scalar field (which has no index alias for
+// per-tenor classes); scalar classes (Equity / FX) emit the scalar field.
+function flattenDocForHash(doc: Record<string, unknown>): string[] {
+  const args: string[] = [];
+  for (const k of HASH_TAG_FIELDS) {
+    const v = doc[k];
+    if (v !== undefined && v !== null) args.push(k, String(v));
+  }
+  const lower = String(doc.risk_class ?? "").toLowerCase();
+  const sens = String(doc.sensitivity_type ?? "");
+  if (!lower || !sens) return args;
+  const legs = legsForSensType(sens);
+  if (sens === "Curvature") {
+    const upMap = doc.weighted_cvr_up_per_tenor as Record<string, number> | undefined;
+    const downMap = doc.weighted_cvr_down_per_tenor as Record<string, number> | undefined;
+    const isPerTenor = !!(upMap && typeof upMap === "object" && !Array.isArray(upMap));
+    if (isPerTenor) {
+      for (const t of Object.keys(upMap!)) {
+        const v = upMap![t]; if (typeof v === "number") args.push(`ws_${lower}_cvr_up_${t}`, String(v));
+      }
+      if (downMap && typeof downMap === "object" && !Array.isArray(downMap)) {
+        for (const t of Object.keys(downMap)) {
+          const v = downMap[t]; if (typeof v === "number") args.push(`ws_${lower}_cvr_down_${t}`, String(v));
+        }
+      }
+    } else {
+      if (typeof doc.weighted_cvr_up === "number") args.push(`ws_${lower}_cvr_up`, String(doc.weighted_cvr_up));
+      if (typeof doc.weighted_cvr_down === "number") args.push(`ws_${lower}_cvr_down`, String(doc.weighted_cvr_down));
+    }
+    return args;
+  }
+  const leg = legs[0];
+  if (!leg) return args;
+  const pt = doc.weighted_value_per_tenor as Record<string, number> | undefined;
+  if (pt && typeof pt === "object" && !Array.isArray(pt)) {
+    // Per-tenor class — only emit `ws_<class>_<leg>_<tenor>` fields (the
+    // scalar `weighted_value` has no index alias for per-tenor classes so
+    // omitting it from the HASH saves ~30 bytes per row).
+    for (const t of Object.keys(pt)) {
+      const v = pt[t]; if (typeof v === "number") args.push(`ws_${lower}_${leg}_${t}`, String(v));
+    }
+  } else if (typeof doc.weighted_value === "number") {
+    // Scalar class (Equity / FX) — emit `ws_<class>_<leg>` only.
+    args.push(`ws_${lower}_${leg}`, String(doc.weighted_value));
+  }
+  return args;
+}
+
+// Wave 6.38.A — `hash-sidetable` side-table key holds the row's raw
+// per-tenor `risk_value` map (and the original tenor labels when present)
+// for diagnostic / backfill flows. Not indexed by idx:sens — the parent
+// HASH already carries the indexable pre-weighted values, so the side-
+// table key only exists when the row's `risk_value` is a per-tenor object.
+function sideTableArgsFor(doc: Record<string, unknown>): string[] | null {
+  const rv = doc.risk_value;
+  if (!rv || typeof rv !== "object" || Array.isArray(rv)) return null;
+  const keys = Object.keys(rv as Record<string, unknown>);
+  // Equity / FX scalar shape `{spot: …}` is not "per-tenor" — skip.
+  if (keys.length === 1 && keys[0] === "spot") return null;
+  // Curvature `{cvr_up, cvr_down}` is also a flat 2-key object — skip.
+  if (keys.length <= 2 && keys.every((k) => k === "cvr_up" || k === "cvr_down")) return null;
+  const args: string[] = [];
+  for (const k of keys) {
+    const v = (rv as Record<string, unknown>)[k];
+    if (typeof v === "number") args.push(k, String(v));
+  }
+  return args.length > 0 ? args : null;
+}
+
+// Wave 6.38.A — writer dispatcher. Resolves the storage variant, writes the
+// parent doc (and any companion key), and returns nothing. The caller is
+// responsible for pipelining emitRollupHincrs / emitSeenSadds alongside —
+// those are storage-format-agnostic and write to separate `rollup:*` /
+// `seen:*` keys that the index does NOT cover.
+export function writeDocForStorage(
+  pipeline: PipelineLike,
+  key: string,
+  doc: Record<string, unknown>,
+  format: StorageFormat,
+): void {
+  switch (format) {
+    case "hash-sidetable": {
+      const flat = flattenDocForHash(doc);
+      if (flat.length > 0) pipeline.call("HSET", key, ...flat);
+      const side = sideTableArgsFor(doc);
+      if (side) pipeline.call("HSET", `${key}:tenors`, ...side);
+      return;
+    }
+    case "hash-encoded": {
+      // Single HASH: the per-tenor weighted map travels as a JSON-encoded
+      // string field so customers who want a flat shape get one HSET round-
+      // trip. The flat fields (`ws_<class>_<leg>[_<tenor>]`) still populate
+      // the index so FT.AGGREGATE on `@desk:{…}` continues to return hits.
+      const flat = flattenDocForHash(doc);
+      const pt = doc.weighted_value_per_tenor;
+      if (pt && typeof pt === "object" && !Array.isArray(pt)) {
+        flat.push("weighted_value_per_tenor_json", JSON.stringify(pt));
+      }
+      const upPt = doc.weighted_cvr_up_per_tenor;
+      const downPt = doc.weighted_cvr_down_per_tenor;
+      if (upPt && typeof upPt === "object" && !Array.isArray(upPt)) {
+        flat.push("weighted_cvr_up_per_tenor_json", JSON.stringify(upPt));
+      }
+      if (downPt && typeof downPt === "object" && !Array.isArray(downPt)) {
+        flat.push("weighted_cvr_down_per_tenor_json", JSON.stringify(downPt));
+      }
+      if (flat.length > 0) pipeline.call("HSET", key, ...flat);
+      return;
+    }
+    case "json": {
+      // Legacy customer escape hatch. idx:sens is `ON HASH` so this row is
+      // NOT picked up by the standard index — customers running on `json`
+      // bring their own JSON-backed index. The doc shape is byte-identical
+      // to the pre-6.38.A JSON.SET writer for back-compat.
+      pipeline.call("JSON.SET", key, "$", JSON.stringify(doc));
+      return;
+    }
+    case "json-shadow-hash": {
+      // Dual-write. The canonical JSON.SET serves external JSON.GET callers;
+      // a parallel `sensh:<ulid>` HASH mirror feeds idx:sens (via the
+      // additional `sensh:` prefix on FT.CREATE). The mirror carries the
+      // same flat fields as the `hash-sidetable` parent so the index sees
+      // a single attribute shape regardless of which variant produced it.
+      pipeline.call("JSON.SET", key, "$", JSON.stringify(doc));
+      const flat = flattenDocForHash(doc);
+      if (flat.length > 0) {
+        const shadowKey = key.startsWith("sens:") ? `sensh:${key.slice(5)}` : `sensh:${key}`;
+        pipeline.call("HSET", shadowKey, ...flat);
+      }
+      return;
+    }
+  }
+}
+
 // Single XREADGROUP batch: reads up to `batchSize` entries, writes each via
-// JSON.SET and XACKs in one pipelined round-trip. `id` is either ">" (new
-// entries) or "0" (pending entries previously delivered to this consumer name
-// but not yet acked — used on restart to claim in-flight work).
+// the configured STORAGE_FORMAT writer and XACKs in one pipelined round-trip.
+// `id` is either ">" (new entries) or "0" (pending entries previously
+// delivered to this consumer name but not yet acked — used on restart to
+// claim in-flight work).
 export async function processBatch(
   client: RedisLike,
   opts: ConsumerOptions,
@@ -449,13 +650,18 @@ export async function processBatch(
       const key = buildKey(hashTag, ulid);
       // Wave 5.83B — enrichDoc folds in per-tenor `weighted_value`
       // (and `weighted_cvr_up/down` for Curvature) from the schema, plus
-      // the `_calibration: "demo"` literal tag, then JSON.SET writes the
-      // full enriched doc in one shot.
+      // the `_calibration: "demo"` literal tag, then the STORAGE_FORMAT
+      // writer (Wave 6.38.A) writes the full enriched doc — `hash-sidetable`
+      // by default — in one or two pipelined commands.
       const doc = enrichDoc(buildDoc(msg), opts.schema);
-      const docJson = JSON.stringify(doc);
       const buildStart = profile ? process.hrtime.bigint() : 0n;
       if (profile) profile.recordStep("parse", buildStart - parseStart);
-      pipeline.call("JSON.SET", key, "$", docJson);
+      writeDocForStorage(
+        pipeline as unknown as PipelineLike,
+        key,
+        doc,
+        opts.storageFormat ?? DEFAULT_STORAGE_FORMAT,
+      );
       // Wave 6.14a — per-row contribution to the per-bucket rollup hashes
       // (and per-tenor sub-rollups for perTenor classes). Pipelined alongside
       // the JSON.SET so the whole apply is one round-trip per row; placed

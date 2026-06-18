@@ -142,21 +142,25 @@ describe("@frtb/rqe — module constants (locked Wave 2 contract)", () => {
     expect(IDX_PREFIX).toBe("sens:");
   });
 
-  it("declares the 5 mandatory TAG fields with JSONPath aliases", () => {
+  it("declares the 5 mandatory TAG fields with flat HASH field paths", () => {
     const byAlias = Object.fromEntries(IDX_SCHEMA_FIELDS.map((f) => [f.as, f]));
     for (const alias of ["risk_class", "bucket", "sensitivity_type", "book", "trade_id"]) {
       expect(byAlias[alias], `field "${alias}" must be declared`).toBeDefined();
-      expect(byAlias[alias].path).toBe(`$.${alias}`);
+      // Wave 6.38.A — `ON HASH` migration: path == field name (no `$.`).
+      expect(byAlias[alias].path).toBe(alias);
       expect(byAlias[alias].type).toBe("TAG");
     }
   });
 
   // Wave 5.83A — trader (per-row attribution) and _calibration
   // (low-cardinality ingest tag) are part of the static base now.
-  it("declares trader and _calibration as static TAGs", () => {
+  // Wave 6.38.A — desk (15-desk taxonomy) is declared as a TAG and lives in
+  // the static base alongside trader / _calibration.
+  it("declares trader, _calibration, and desk as static TAGs (HASH paths)", () => {
     const byAlias = Object.fromEntries(IDX_SCHEMA_FIELDS.map((f) => [f.as, f]));
-    expect(byAlias.trader).toEqual({ path: "$.trader", as: "trader", type: "TAG" });
-    expect(byAlias._calibration).toEqual({ path: "$._calibration", as: "_calibration", type: "TAG" });
+    expect(byAlias.trader).toEqual({ path: "trader", as: "trader", type: "TAG" });
+    expect(byAlias._calibration).toEqual({ path: "_calibration", as: "_calibration", type: "TAG" });
+    expect(byAlias.desk).toEqual({ path: "desk", as: "desk", type: "TAG" });
   });
 });
 
@@ -190,29 +194,24 @@ describe("@frtb/rqe — buildSchemaFields / buildCreateArgs (Wave 5.83A)", () =>
         expect(byAlias[alias].sortable).toBe(true);
       }
     }
-    // Wave 5.83F — per-tenor maps now live at the `*_per_tenor` JSONPaths so
-    // the bare $.weighted_value / $.weighted_cvr_* paths can stay scalar
-    // (NUMERIC) across every risk class without colliding with the GIRR
-    // Object value (which used to abort idx:sens indexing).
-    expect(byAlias.ws_girr_delta_3M.path).toBe('$.weighted_value_per_tenor["3M"]');
-    expect(byAlias.ws_girr_vega_10Y.path).toBe('$.weighted_value_per_tenor["10Y"]');
-    expect(byAlias.ws_girr_cvr_up_2Y.path).toBe('$.weighted_cvr_up_per_tenor["2Y"]');
-    expect(byAlias.ws_girr_cvr_down_30Y.path).toBe('$.weighted_cvr_down_per_tenor["30Y"]');
+    // Wave 6.38.A — HASH layout: path == field name (flat). The consumer
+    // writer flattens the per-tenor map to these flat HASH fields on the
+    // parent `sens:<ulid>` HASH so FT.AGGREGATE can reach them in one hop.
+    expect(byAlias.ws_girr_delta_3M.path).toBe("ws_girr_delta_3M");
+    expect(byAlias.ws_girr_vega_10Y.path).toBe("ws_girr_vega_10Y");
+    expect(byAlias.ws_girr_cvr_up_2Y.path).toBe("ws_girr_cvr_up_2Y");
+    expect(byAlias.ws_girr_cvr_down_30Y.path).toBe("ws_girr_cvr_down_30Y");
   });
 
   it("emits scalar ws_<class>_<leg> NUMERIC SORTABLE for Equity/FX (no tenor suffix)", () => {
     const fields = buildSchemaFields(fakeSchema);
     const byAlias = Object.fromEntries(fields.map((f) => [f.as, f]));
     for (const klass of ["equity", "fx"]) {
-      for (const [leg, path] of [
-        ["delta", "$.weighted_value"],
-        ["vega", "$.weighted_value"],
-        ["cvr_up", "$.weighted_cvr_up"],
-        ["cvr_down", "$.weighted_cvr_down"],
-      ]) {
+      for (const leg of ["delta", "vega", "cvr_up", "cvr_down"]) {
         const alias = `ws_${klass}_${leg}`;
         expect(byAlias[alias], `${alias} must be declared`).toBeDefined();
-        expect(byAlias[alias].path).toBe(path);
+        // Wave 6.38.A — HASH layout: path == alias name (flat HASH field).
+        expect(byAlias[alias].path).toBe(alias);
         expect(byAlias[alias].type).toBe("NUMERIC");
         expect(byAlias[alias].sortable).toBe(true);
         // No tenor-suffixed variant for scalar classes.
@@ -223,8 +222,16 @@ describe("@frtb/rqe — buildSchemaFields / buildCreateArgs (Wave 5.83A)", () =>
 
   it("buildCreateArgs(schema) appends SORTABLE for every dynamic NUMERIC field", () => {
     const args = buildCreateArgs(fakeSchema);
-    // The static head is unchanged shape — ON JSON PREFIX 1 sens: SCHEMA …
-    expect(args.slice(0, 7)).toEqual([IDX_NAME, "ON", "JSON", "PREFIX", "1", IDX_PREFIX, "SCHEMA"]);
+    // Wave 6.38.A — `ON HASH` migration. PREFIX list carries `sens:` (default
+    // hash-sidetable / hash-encoded parent) and `sensh:` (json-shadow-hash
+    // mirror) so a single index covers every variant. The FILTER expression
+    // excludes side-table keys (`sens:<ulid>:tenors`) which match the `sens:`
+    // prefix but carry no `risk_class` TAG. The static head reads:
+    //   idx:sens ON HASH PREFIX 2 sens: sensh: FILTER exists(@risk_class) SCHEMA …
+    expect(args.slice(0, 10)).toEqual([
+      IDX_NAME, "ON", "HASH", "PREFIX", "2", IDX_PREFIX, "sensh:",
+      "FILTER", "exists(@risk_class)", "SCHEMA",
+    ]);
     // Every "NUMERIC" token in the argv is immediately followed by "SORTABLE".
     let numericCount = 0;
     for (let i = 0; i < args.length; i++) {
@@ -280,8 +287,12 @@ describe.skipIf(!STACK_BUNDLED_PRESENT)("@frtb/rqe — ensureSensIndex (integrat
         },
       },
     ];
+    // Wave 6.38.A — `ON HASH` migration: seed via HSET so the indexer sees
+    // the flat fields it now declares paths against.
     for (const { key, doc } of rows) {
-      await redis.call("JSON.SET", key, "$", JSON.stringify(doc));
+      const args = [];
+      for (const [k, v] of Object.entries(doc)) args.push(k, String(v));
+      await redis.call("HSET", key, ...args);
     }
     return rows;
   }
@@ -325,8 +336,8 @@ describe.skipIf(!STACK_BUNDLED_PRESENT)("@frtb/rqe — ensureSensIndex (integrat
     await ensureSensIndex(redis);
     await seedFixtureRows();
     // not-a-sens-doc must NOT be picked up by idx:sens
-    await redis.call("JSON.SET", "other:1", "$", JSON.stringify({ risk_class: "GIRR" }));
-    // Allow indexer to ingest the JSON.SETs we just wrote.
+    await redis.call("HSET", "other:1", "risk_class", "GIRR");
+    // Allow indexer to ingest the HSETs we just wrote.
     await wait(200);
     const total = await countSearch("*");
     expect(total).toBe(3);

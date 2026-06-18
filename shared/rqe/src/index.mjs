@@ -2,9 +2,11 @@
 //
 // Wave 2 locked contract (see spec.md "Wave 2 contracts"):
 //   - Index name:  idx:sens
-//   - Key prefix:  sens:           (matches sens:{risk_class:bucket}:{ulid})
-//   - ON JSON, DIALECT 2
-//   - Five mandatory TAG attributes: risk_class, bucket, sensitivity_type, book, trade_id
+//   - Key prefix:  sens:           (matches sens:<ulid> after Wave 6.31)
+//   - Wave 6.38.A: migrated ON JSON → ON HASH (HASH side-table layout default)
+//   - DIALECT 2
+//   - TAG attributes: risk_class, bucket, sensitivity_type, book, trade_id,
+//     risk_factor, trader, _calibration, desk
 //
 // Consumers:
 //   - api boot calls ensureSensIndex(client) once at startup
@@ -15,6 +17,7 @@
 //   FT.SEARCH idx:sens "@risk_class:{GIRR} @bucket:{USD\\-IRS}" LIMIT 0 50 DIALECT 2
 //   FT.SEARCH idx:sens "@sensitivity_type:{Delta}" GROUPBY 1 @bucket REDUCE COUNT 0 AS n
 //   FT.SEARCH idx:sens "@book:{RATES\\-LDN}" RETURN 3 risk_class bucket trade_id
+//   FT.SEARCH idx:sens "@desk:{RATES_LDN}" LIMIT 0 1 DIALECT 2
 //
 // Per redis-development rqe-index-creation: index ONLY the fields we query.
 // Per rqe-dialect: every query uses DIALECT 2.
@@ -31,15 +34,20 @@ export const IDX_PREFIX = "sens:";
 // (low-cardinality ingest tag) as static TAGs; per-class per-tenor
 // pre-weighted NUMERIC SORTABLE fields are derived from the schema via
 // buildSchemaFields(schema) below.
+// Wave 6.38.A — added `desk` (15-desk taxonomy: RATES/FX/EQUITY/CREDIT/
+// COMMODITY × LDN/NYC/HKG, e.g. `RATES_LDN`). Underscore separator so TAG
+// queries need no escaping. Paths switched to bare HASH field names — the
+// FT.CREATE clause is now `ON HASH`, so JSONPath prefixes are dropped.
 export const IDX_SCHEMA_FIELDS = Object.freeze([
-  { path: "$.risk_class", as: "risk_class", type: "TAG" },
-  { path: "$.bucket", as: "bucket", type: "TAG" },
-  { path: "$.sensitivity_type", as: "sensitivity_type", type: "TAG" },
-  { path: "$.book", as: "book", type: "TAG" },
-  { path: "$.trade_id", as: "trade_id", type: "TAG" },
-  { path: "$.risk_factor", as: "risk_factor", type: "TAG" },
-  { path: "$.trader", as: "trader", type: "TAG" },
-  { path: "$._calibration", as: "_calibration", type: "TAG" },
+  { path: "risk_class", as: "risk_class", type: "TAG" },
+  { path: "bucket", as: "bucket", type: "TAG" },
+  { path: "sensitivity_type", as: "sensitivity_type", type: "TAG" },
+  { path: "book", as: "book", type: "TAG" },
+  { path: "trade_id", as: "trade_id", type: "TAG" },
+  { path: "risk_factor", as: "risk_factor", type: "TAG" },
+  { path: "trader", as: "trader", type: "TAG" },
+  { path: "_calibration", as: "_calibration", type: "TAG" },
+  { path: "desk", as: "desk", type: "TAG" },
 ]);
 
 // Wave 5.83A — risk classes whose pre-weighted sensitivities live under a
@@ -63,11 +71,13 @@ const WS_LEGS = Object.freeze([
   { leg: "cvr_down", root: "weighted_cvr_down", perTenorRoot: "weighted_cvr_down_per_tenor" },
 ]);
 
-// Bracket-notation JSON path so digit-prefixed tenor labels ("3M", "10Y") are
-// safe — dot notation `$.weighted_value.3M` is ambiguous to RediSearch's
-// JSONPath parser.
-function tenorJsonPath(root, tenor) {
-  return `$.${root}["${tenor}"]`;
+// Wave 6.38.A — HASH layout. Per-tenor pre-weighted values are stored as
+// flat HASH fields named `ws_<class>_<leg>_<tenor>` on the parent
+// `sens:<ulid>` HASH (so a single HASH field reach is enough for
+// FT.AGGREGATE). For the side-table variant, the raw per-tenor risk_value
+// map lives on `sens:<ulid>:tenors` and is NOT indexed.
+function tenorHashField(classLower, leg, tenor) {
+  return `ws_${classLower}_${leg}_${tenor}`;
 }
 
 // buildSchemaFields — full ordered field list for FT.CREATE. Returns the
@@ -85,23 +95,28 @@ export function buildSchemaFields(schema) {
     const classLower = className.toLowerCase();
     const tenorNodes = cfg.tenor && Array.isArray(cfg.tenor.nodes) ? cfg.tenor.nodes : [];
     const isPerTenor = PER_TENOR_CLASSES.includes(className) && tenorNodes.length > 0;
-    for (const { leg, root, perTenorRoot } of WS_LEGS) {
+    for (const { leg, root } of WS_LEGS) {
+      void root;
       if (isPerTenor) {
-        // Wave 5.83F — per-tenor leg now points at the dedicated
-        // `*_per_tenor` JSONPath; the scalar `$.<root>` stays free for the
-        // class-level NUMERIC field (used by Equity/FX) without colliding.
+        // Wave 6.38.A — HASH field name == alias for per-tenor legs. The
+        // consumer writer flattens the per-tenor map to these flat fields on
+        // the parent HASH so a single FT.AGGREGATE reach is enough.
         for (const tenor of tenorNodes) {
+          const name = tenorHashField(classLower, leg, tenor);
           out.push({
-            path: tenorJsonPath(perTenorRoot, tenor),
-            as: `ws_${classLower}_${leg}_${tenor}`,
+            path: name,
+            as: name,
             type: "NUMERIC",
             sortable: true,
           });
         }
       } else {
+        // Scalar legs (Equity, FX) — HASH field name matches the alias and
+        // mirrors the JSON-era scalar root used by the consumer.
+        const name = `ws_${classLower}_${leg}`;
         out.push({
-          path: `$.${root}`,
-          as: `ws_${classLower}_${leg}`,
+          path: name,
+          as: name,
           type: "NUMERIC",
           sortable: true,
         });
@@ -117,11 +132,25 @@ export function buildSchemaFields(schema) {
 // SORTABLE fields; without one, just the static base (preserves CLI
 // back-compat — `print` / `ensure` without a schema still emit a valid
 // FT.CREATE for the TAG-only portion).
+//
+// Wave 6.38.A — switched `ON JSON` to `ON HASH`. All path values returned by
+// buildSchemaFields are bare HASH field names (no JSONPath `$.` prefix). The
+// PREFIX list now carries `sens:` (default `hash-sidetable` / `hash-encoded`
+// parents) AND `sensh:` (the `json-shadow-hash` HASH mirror). RediSearch on
+// `ON HASH` silently skips keys whose type does not match (so the legacy
+// `json` variant's `sens:<ulid>` JSON document, when present, is a no-op
+// here). The side-table `sens:<ulid>:tenors` HASH also matches the `sens:`
+// prefix but carries no `risk_class` TAG — the FILTER expression below
+// drops it from indexing entirely so num_docs stays equal to the row count
+// (no inflated per-doc index overhead, no empty-desk row in
+// `FT.AGGREGATE … GROUPBY @desk`).
+export const IDX_SHADOW_PREFIX = "sensh:";
 export function buildCreateArgs(schema) {
   const args = [
     IDX_NAME,
-    "ON", "JSON",
-    "PREFIX", "1", IDX_PREFIX,
+    "ON", "HASH",
+    "PREFIX", "2", IDX_PREFIX, IDX_SHADOW_PREFIX,
+    "FILTER", "exists(@risk_class)",
     "SCHEMA",
   ];
   for (const f of buildSchemaFields(schema)) {
