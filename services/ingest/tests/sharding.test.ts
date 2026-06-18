@@ -387,11 +387,12 @@ describe("POST /ingest/shards rebuilds the multi-consumer", () => {
     try {
       const res = await fetch(`${fx.base}/ingest/shards`);
       expect(res.status).toBe(200);
-      const body = await res.json() as { totalShards: number; assignment: number[]; streams: string[] };
+      const body = await res.json() as { totalShards: number; assignment: number[]; streams: string[]; rebuilding: boolean };
       expect(body).toEqual({
         totalShards: 2,
         assignment: [0, 1],
         streams: ["sensitivities:in:{0}", "sensitivities:in:{1}"],
+        rebuilding: false,
       });
     } finally {
       await fx.stop();
@@ -536,6 +537,92 @@ describe("POST /ingest/shards rebuilds the multi-consumer", () => {
     // nothing dangling across rebuilds.
     expect(builtClients).toHaveLength(12);
     expect(builtClients.every((c) => c.quitCalls === 1)).toBe(true);
+  });
+
+  // Wave 6.32.B — operator recovery for a stuck rebuild. Simulates a hung
+  // spawn() that leaks the `rebuilding=true` mutex (a real-world repro is
+  // `multi.stop()` against a flushed Redis). The reset endpoint must clear
+  // the flag and detach the abandoned multi so a fresh POST /ingest/shards
+  // can proceed without restarting the service.
+  it("POST /ingest/shards/reset clears a stuck rebuild mutex and lets a fresh rebuild proceed", async () => {
+    const stub = makeStubClient();
+    let releaseSpawn: (() => void) | null = null;
+    let spawnCalls = 0;
+    const runtime = createShardRuntime({
+      baseStream: "sensitivities:in",
+      initialTotalShards: 1,
+      initialAssignmentSpec: "all",
+      spawn: async (totalShards, assignment) => {
+        spawnCalls += 1;
+        if (spawnCalls === 2) {
+          await new Promise<void>((r) => { releaseSpawn = r; });
+        }
+        const streams = assignment.map((s) => shardStreamKey("sensitivities:in", s, totalShards));
+        await ensureGroupsForShards(stub.client, streams, "ingest");
+        const m = createMultiShardConsumer(stub.client, {
+          baseStream: "sensitivities:in", group: "ingest", consumerNameBase: "ingest-host-1",
+          totalShards, assignment, batchSize: 10, blockMs: 5,
+          makeRunnerClient: () => makeStubClient().client, runnerQuitTimeoutMs: 50,
+        });
+        m.start();
+        return m;
+      },
+    });
+    await runtime.rebuild();
+    const server = http.createServer((req, res) => {
+      if (runtime.handleRequest(req, res, { consumed: 0, errors: 0, ready: true })) return;
+      res.writeHead(404); res.end();
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const addr = server.address();
+    if (!addr || typeof addr === "string") throw new Error("no address");
+    const base = `http://127.0.0.1:${addr.port}`;
+    try {
+      // First rebuild request hangs inside spawn() → leaks rebuilding=true.
+      const stuck = fetch(`${base}/ingest/shards`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ totalShards: 4 }),
+      });
+      await new Promise((r) => setTimeout(r, 30));
+      // Confirm the mutex is held — a second POST returns 409.
+      const busy = await fetch(`${base}/ingest/shards`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ totalShards: 2 }),
+      });
+      expect(busy.status).toBe(409);
+
+      // Operator recovery: force-reset.
+      const reset = await fetch(`${base}/ingest/shards/reset`, { method: "POST" });
+      expect(reset.status).toBe(200);
+      expect(await reset.json()).toEqual({ rebuilding: false, multi_detached: true });
+      expect(runtime.getMulti()).toBeNull();
+
+      // Fresh rebuild now succeeds even though the previous spawn is still hung.
+      const fresh = await fetch(`${base}/ingest/shards`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ totalShards: 2 }),
+      });
+      expect(fresh.status).toBe(200);
+      // Capture the fresh multi before the eventually-released stuck spawn
+      // overwrites the closure-scoped `multi` reference.
+      const freshMulti = runtime.getMulti();
+
+      // Release the originally-hung spawn so the connection can drain and
+      // server.close() doesn't deadlock waiting on it.
+      if (releaseSpawn) (releaseSpawn as () => void)();
+      await stuck.catch(() => undefined);
+
+      // Stop both generations: the fresh multi we captured above, plus
+      // whatever the released stuck rebuild ended up assigning.
+      if (freshMulti) await freshMulti.stop();
+      const leaked = runtime.getMulti();
+      if (leaked && leaked !== freshMulti) await leaked.stop();
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
   });
 });
 

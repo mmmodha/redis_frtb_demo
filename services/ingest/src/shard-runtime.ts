@@ -19,12 +19,20 @@ export interface ShardRuntimeOptions {
   // schema from cli.ts so the runtime stays decoupled from those globals.
   spawn: (totalShards: number, assignment: readonly number[]) => Promise<MultiConsumer>;
   logger?: { warn: (msg: string, meta?: Record<string, unknown>) => void };
+  // Wave 6.32.A — hard cap on the drain+respawn sequence inside rebuild().
+  // Falls back to INGEST_REBUILD_TIMEOUT_MS (read per-call) then 30 000 ms.
+  rebuildTimeoutMs?: number;
 }
 
 export interface ShardSnapshot {
   totalShards: number;
   assignment: number[];
   streams: string[];
+  // Wave 6.32.A — surfaced via GET /ingest/shards and GET /ingest/status so
+  // operators / UI can see an in-flight rebuild. `rebuild_started_at` is only
+  // present while `rebuilding` is true.
+  rebuilding: boolean;
+  rebuild_started_at?: string;
 }
 
 export interface HandleExtras {
@@ -41,6 +49,26 @@ export class InvalidShardSpecError extends Error {
   constructor(message: string) { super(message); this.name = "InvalidShardSpecError"; }
 }
 
+// Wave 6.32.A — thrown when `multi.stop()` or `opts.spawn()` exceed the
+// configured budget. Mapped to HTTP 504 by the POST handler so the caller
+// knows the in-flight rebuild was abandoned and a retry will be accepted.
+export class RebuildTimeoutError extends Error {
+  constructor(public readonly stage: string, public readonly timeoutMs: number) {
+    super(`rebuild timed out at ${stage} after ${timeoutMs}ms`);
+    this.name = "RebuildTimeoutError";
+  }
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new RebuildTimeoutError(label, ms)), ms);
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
+
 export interface ShardRuntime {
   snapshot(): ShardSnapshot;
   getMulti(): MultiConsumer | null;
@@ -55,15 +83,30 @@ export function createShardRuntime(opts: ShardRuntimeOptions): ShardRuntime {
   let assignment = parseShardAssignment(assignmentSpec, totalShards);
   let multi: MultiConsumer | null = null;
   let rebuilding = false;
+  let rebuildStartedAt: string | null = null;
 
   const streamsFor = (a: readonly number[], total: number): string[] =>
     a.map((s) => shardStreamKey(opts.baseStream, s, total));
 
-  const snapshot = (): ShardSnapshot => ({
-    totalShards,
-    assignment: assignment.slice(),
-    streams: streamsFor(assignment, totalShards),
-  });
+  const snapshot = (): ShardSnapshot => {
+    const s: ShardSnapshot = {
+      totalShards,
+      assignment: assignment.slice(),
+      streams: streamsFor(assignment, totalShards),
+      rebuilding,
+    };
+    if (rebuilding && rebuildStartedAt) s.rebuild_started_at = rebuildStartedAt;
+    return s;
+  };
+
+  // Wave 6.32.A — resolve the rebuild budget per-call: explicit option wins,
+  // then env (so operators can dial it without redeploying), then 30 s default.
+  const resolveRebuildTimeoutMs = (): number => {
+    if (opts.rebuildTimeoutMs !== undefined && opts.rebuildTimeoutMs > 0) return opts.rebuildTimeoutMs;
+    const env = Number(process.env.INGEST_REBUILD_TIMEOUT_MS);
+    if (Number.isFinite(env) && env > 0) return env;
+    return 30_000;
+  };
 
   const rebuild = async (input?: { totalShards?: number; assignmentSpec?: string }): Promise<ShardSnapshot> => {
     if (rebuilding) throw new RebuildBusyError();
@@ -77,20 +120,26 @@ export function createShardRuntime(opts: ShardRuntimeOptions): ShardRuntime {
       throw new InvalidShardSpecError(`assignment ${nextSpec} resolves to no shards for totalShards=${nextTotal}`);
     }
 
+    const timeoutMs = resolveRebuildTimeoutMs();
     rebuilding = true;
+    rebuildStartedAt = new Date().toISOString();
     try {
       if (multi) {
-        try { await multi.stop(); } catch (err) {
+        try {
+          await withTimeout(multi.stop(), timeoutMs, "drain");
+        } catch (err) {
+          if (err instanceof RebuildTimeoutError) throw err;
           opts.logger?.warn("drain previous consumers failed", { err: String(err) });
         }
       }
       totalShards = nextTotal;
       assignmentSpec = nextSpec;
       assignment = nextAssignment;
-      multi = await opts.spawn(totalShards, assignment);
+      multi = await withTimeout(opts.spawn(totalShards, assignment), timeoutMs, "spawn");
       return snapshot();
     } finally {
       rebuilding = false;
+      rebuildStartedAt = null;
     }
   };
 
@@ -135,9 +184,28 @@ export function createShardRuntime(opts: ShardRuntimeOptions): ShardRuntime {
         } catch (err) {
           if (err instanceof RebuildBusyError) { writeJson(res, 409, { error: err.message }); return; }
           if (err instanceof InvalidShardSpecError) { writeJson(res, 400, { error: err.message }); return; }
+          // Wave 6.32.A — drain/spawn exceeded INGEST_REBUILD_TIMEOUT_MS; the
+          // finally block already cleared the rebuilding flag so the next POST
+          // is accepted.
+          if (err instanceof RebuildTimeoutError) { writeJson(res, 504, { error: err.message, stage: err.stage, timeout_ms: err.timeoutMs }); return; }
           writeJson(res, 500, { error: String((err as Error)?.message ?? err) });
         }
       })();
+      return true;
+    }
+    // Wave 6.32.B — operator recovery for a stuck rebuild mutex. When the
+    // previous rebuild() awaits a `multi.stop()` or `opts.spawn()` that hangs
+    // forever (e.g. operator flushed Redis mid-ingest), the in-memory
+    // `rebuilding` flag leaks and every subsequent POST /ingest/shards 409s
+    // until the service restarts. This endpoint force-clears the flag and
+    // abandons the old multi reference WITHOUT awaiting stop() — that's the
+    // whole point: if stop() worked we wouldn't need to be here. Destructive:
+    // any in-flight messages owned by the abandoned multi may be lost.
+    if (req.url === "/ingest/shards/reset" && req.method === "POST") {
+      rebuilding = false;
+      rebuildStartedAt = null;
+      multi = null;
+      writeJson(res, 200, { rebuilding: false, multi_detached: true });
       return true;
     }
     if (req.url === "/ingest/status" && req.method === "GET") {
