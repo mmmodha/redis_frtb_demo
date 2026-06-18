@@ -33,6 +33,19 @@ import { getSensIndexName } from "../lib/sens-index.ts";
 import { translateRedisError } from "../redis-errors.ts";
 import { bumpDataVersion } from "../sbm/calc-cache.ts";
 import { invalidateFacetsCache } from "./facets.ts";
+// Wave 6.39.C — Layer 4 safety nets. Wired through the existing admin
+// registration entrypoint so the new endpoints (drift-status, snapshots,
+// stream-status, reconcile-bucket, /metrics) land on the same Fastify app
+// without touching server.ts.
+import { registerAdminL4Routes, type DriftSensitivity } from "./admin-l4.ts";
+import { aggregateBucketsViaIndex } from "../sbm/aggregate-via-index.ts";
+import {
+  computeMaxLen,
+  DEFAULT_RETENTION_HOURS,
+  DEFAULT_SAFETY_FACTOR,
+  DEFAULT_STREAM_KEY,
+} from "../jobs/stream-retention.ts";
+import { registerAdminCalcRoutes } from "./admin-calc.ts";
 
 export interface AdminRoutesOpts {
   // Threaded through from createServer so the post-flush bootstrap can rebuild
@@ -50,6 +63,20 @@ export interface AdminRoutesOpts {
     log?: (entry: Record<string, unknown>) => void,
     opts?: BootstrapOpts,
   ) => Promise<unknown>;
+  // Wave 6.39.C — Layer 4 wiring overrides. Production reads ADMIN_TOKEN /
+  // DRIFT_THRESHOLD_PCT / INGEST_* from env; tests pass explicit values.
+  adminToken?: string;
+  driftThresholdPct?: number;
+  streamPeakRatePerSec?: number;
+  streamMaxLen?: number;
+  // Optional override for the FT.AGGREGATE-backed recompute used by
+  // /admin/reconcile-bucket and the drift detector (tests stub it).
+  recomputeBucketSum?: (
+    redis: RedisLike,
+    riskClass: string,
+    bucket: string,
+    sensitivityType: DriftSensitivity,
+  ) => Promise<number>;
 }
 
 export function registerAdminRoutes(
@@ -58,6 +85,61 @@ export function registerAdminRoutes(
   opts: AdminRoutesOpts = {},
 ): void {
   const runBootstrap = opts.bootstrap ?? bootstrapFrtb;
+
+  // Wave 6.39.B — calc coverage audit + backfill-status stub + /metrics
+  // exposition. Registered under the same surface so a single import
+  // path (registerAdminRoutes) wires every calc-side admin route.
+  registerAdminCalcRoutes(app, getRedis);
+
+  // Wave 6.39.C — Layer 4 safety nets (drift-status, snapshots, stream-
+  // status, reconcile-bucket). /metrics is owned by admin-calc.ts; the
+  // L4 counters surface through it via the shared jobs/metrics.ts
+  // registry. Defaults read from env so a fresh-clone boot stays usable;
+  // explicit values can be threaded via opts in tests.
+  const adminToken = opts.adminToken ?? process.env.ADMIN_TOKEN ?? "";
+  const driftThresholdPct = opts.driftThresholdPct
+    ?? Number(process.env.DRIFT_THRESHOLD_PCT ?? "0.01");
+  const peakRatePerSec = opts.streamPeakRatePerSec
+    ?? Number(process.env.INGEST_PEAK_RATE_PER_SEC ?? "0");
+  const streamMaxLen = opts.streamMaxLen
+    ?? Number(process.env.INGEST_STREAM_MAXLEN ?? "0")
+    ?? computeMaxLen(peakRatePerSec, {
+      retentionHours: DEFAULT_RETENTION_HOURS,
+      safetyFactor: DEFAULT_SAFETY_FACTOR,
+    });
+  const streamKey = process.env.STREAM_KEY ?? DEFAULT_STREAM_KEY;
+  // Production recompute bridge: reuse aggregateBucketsViaIndex so the
+  // drift/reconcile path stays byte-for-byte aligned with the fast-path
+  // calc kernel. No schema → 0 (the recompute is informational on a
+  // schema-less boot).
+  const schemaRef = opts.schema;
+  const recomputeBucketSum = opts.recomputeBucketSum ?? (async (
+    redis: RedisLike,
+    rc: string,
+    bucket: string,
+    sens: DriftSensitivity,
+  ): Promise<number> => {
+    if (!schemaRef) return 0;
+    const lbl = (() => { try { return getActiveTarget().label; } catch { return ""; } })();
+    let indexName = "idx:sens";
+    try { indexName = await getSensIndexName(redis, lbl); } catch { /* fall back to base */ }
+    const leg = sens === "Delta" ? "delta" : sens === "Vega" ? "vega" : "curvature";
+    const results = await aggregateBucketsViaIndex({
+      redis,
+      schema: schemaRef,
+      riskClass: rc,
+      leg,
+      filters: { bucketSubset: [bucket] },
+      indexName,
+    });
+    return results[0]?.S_b ?? 0;
+  });
+  registerAdminL4Routes(app, getRedis, {
+    adminToken,
+    driftThresholdPct,
+    streamConfig: { streamKey, maxLen: streamMaxLen, peakRatePerSec },
+    recomputeBucketSum,
+  });
 
   app.post("/admin/flush", async (_req, reply) => {
     let target_label: string;
