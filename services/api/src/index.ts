@@ -128,7 +128,17 @@ async function main(): Promise<void> {
   // active-target singleton still drives per-route routing via the UI.
   let redis: Redis | Cluster;
   if (process.env.REDIS_URL) {
-    redis = createRedisClient({ lazyConnect: true, maxRetriesPerRequest: 3 });
+    // Wave 6.35.A — pass an explicit `cluster` flag derived from the active
+    // profile's topology so a standalone target does not get a Cluster client
+    // (which would then emit ClusterAllFailedError stack traces on stdout
+    // before scheduleBootstrap re-resolves topology). Falls back to
+    // `createRedisClient`'s REDIS_CLUSTER-based default only when no active
+    // profile is present (rare — seedConnections auto-seeds from REDIS_URL).
+    redis = createRedisClient({
+      lazyConnect: true,
+      maxRetriesPerRequest: 3,
+      ...(activeRaw ? { cluster: target.clusterMode === true } : {}),
+    });
   } else {
     const { Redis: RedisCtor } = await import("ioredis");
     redis = new RedisCtor({
