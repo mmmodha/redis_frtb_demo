@@ -73,8 +73,8 @@ const fastCalcResponse = {
 const pivotResponse = {
   total: 2, limit: 100, offset: 0, ms: 11.7,
   rows: [
-    { key: "sens:{GIRR:USD-IRS}:01HXAA", doc: { risk_class: "GIRR", bucket: "USD-IRS", sensitivity_type: "Delta", book: "RATES-LDN", risk_value: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0] } },
-    { key: "sens:{GIRR:USD-IRS}:01HXBB", doc: { risk_class: "GIRR", bucket: "USD-IRS", sensitivity_type: "Delta", book: "RATES-LDN", risk_value: [0.11, 0.22, 0.33] } },
+    { key: "sens:01HXAA", doc: { risk_class: "GIRR", bucket: "USD-IRS", sensitivity_type: "Delta", book: "RATES-LDN", risk_value: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0] } },
+    { key: "sens:01HXBB", doc: { risk_class: "GIRR", bucket: "USD-IRS", sensitivity_type: "Delta", book: "RATES-LDN", risk_value: [0.11, 0.22, 0.33] } },
   ],
 };
 
@@ -159,7 +159,7 @@ async function installCommonRoutes(page: Page, opts: { activeName?: string } = {
   await page.route("**/observability/keys**", (route: Route) =>
     route.fulfill({
       status: 200, contentType: "application/json",
-      body: JSON.stringify({ prefix: "sens:", dbsize: 10_000_000, sample: ["sens:{GIRR:USD-IRS}:01HXAA"], sample_size: 1, ms: 2 }),
+      body: JSON.stringify({ prefix: "sens:", dbsize: 10_000_000, sample: ["sens:01HXAA"], sample_size: 1, ms: 2 }),
     }),
   );
   await page.route("**/observability/memory", (route: Route) =>

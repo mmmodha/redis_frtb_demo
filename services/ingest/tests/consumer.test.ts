@@ -146,10 +146,10 @@ async function xaddRow(stream: string, row: ReturnType<typeof makeRow>): Promise
 }
 
 describe("consumer pure helpers", () => {
-  it("buildKey wraps hash tag in literal braces matching sens:{rc:bucket}:{ulid}", () => {
+  it("buildKey returns the brace-less sens:{ulid} shape", () => {
     const k = buildKey("GIRR:USD-IRS", "01HZABCDEF1234567890123456");
-    expect(k).toBe("sens:{GIRR:USD-IRS}:01HZABCDEF1234567890123456");
-    expect(k).toMatch(/^sens:\{[A-Z_]+:[^}]+\}:[A-Z0-9]+$/);
+    expect(k).toBe("sens:01HZABCDEF1234567890123456");
+    expect(k).toMatch(/^sens:[A-Z0-9]+$/);
   });
 
   it("buildDoc merges top-level risk_class/bucket with payload JSON; strips meta fields", () => {
@@ -446,7 +446,7 @@ describe("XREADGROUP consumer → JSON.SET", () => {
     expect(groups.length).toBe(1);
   });
 
-  integration("writes one JSON doc per stream entry at sens:{rc:bucket}:{ulid} and XACKs it", async () => {
+  integration("writes one JSON doc per stream entry at sens:{ulid} and XACKs it", async () => {
     await ensureGroup(redis, "sensitivities:in", "ingest");
     const rows = [
       makeRow("GIRR", "USD", { sensitivity_type: "Delta", tenor: ["3M","1Y","10Y"], risk_value: [0.1,0.2,0.3], weight_ref: "girr_delta_weights", correlation_ref: "girr_corr", trade_id: "T1" }),
@@ -462,7 +462,7 @@ describe("XREADGROUP consumer → JSON.SET", () => {
 
     const keys = await redis.keys("sens:*");
     expect(keys).toHaveLength(3);
-    const literalKeyShape = /^sens:\{[A-Z_]+:[^}]+\}:[A-Z0-9]+$/;
+    const literalKeyShape = /^sens:[A-Z0-9]+$/;
     for (const k of keys) expect(k, `key ${k} must match locked pattern`).toMatch(literalKeyShape);
 
     // XPENDING reports zero pending entries for the group after successful ack
@@ -484,7 +484,7 @@ describe("XREADGROUP consumer → JSON.SET", () => {
     await xaddRow("sensitivities:in", row);
     await processBatch(redis, { stream: "sensitivities:in", group: "ingest", consumerName: "ingest-1" }, ">");
 
-    const key = `sens:{GIRR:USD-IRS}:${row._id}`;
+    const key = `sens:${row._id}`;
     const stored = JSON.parse(await redis.call("JSON.GET", key) as string);
     expect(stored).toMatchObject({
       risk_class: "GIRR",
@@ -561,7 +561,7 @@ describe("XREADGROUP consumer → JSON.SET", () => {
       stream: "sensitivities:in", group: "ingest", consumerName: "ingest-w", batchSize: 100, schema: SCHEMA,
     }, ">");
 
-    const girrStored = JSON.parse(await redis.call("JSON.GET", `sens:{GIRR:USD}:${girr._id}`) as string);
+    const girrStored = JSON.parse(await redis.call("JSON.GET", `sens:${girr._id}`) as string);
     expect(girrStored._calibration).toBe("demo");
     // Wave 5.83F — per-tenor map at `weighted_value_per_tenor`; scalar Σ at `weighted_value`.
     const gwv = girrStored.weighted_value_per_tenor as Record<string, number>;
@@ -576,11 +576,11 @@ describe("XREADGROUP consumer → JSON.SET", () => {
     // Raw fields preserved
     expect(girrStored.risk_value).toEqual([0.1, 0.2, 0.3]);
 
-    const eqStored = JSON.parse(await redis.call("JSON.GET", `sens:{EQUITY:1}:${equity._id}`) as string);
+    const eqStored = JSON.parse(await redis.call("JSON.GET", `sens:${equity._id}`) as string);
     expect(eqStored._calibration).toBe("demo");
     expect(Math.abs(eqStored.weighted_value - EQUITY_W.by_bucket["1"]! * 0.42)).toBeLessThanOrEqual(TOL);
 
-    const fxStored = JSON.parse(await redis.call("JSON.GET", `sens:{FX:EURUSD}:${fx._id}`) as string);
+    const fxStored = JSON.parse(await redis.call("JSON.GET", `sens:${fx._id}`) as string);
     expect(fxStored._calibration).toBe("demo");
     expect(Math.abs(fxStored.weighted_value - FX_W.constant * 0.75)).toBeLessThanOrEqual(TOL);
   });
@@ -591,9 +591,9 @@ describe("XREADGROUP consumer → JSON.SET", () => {
   integration("backfill patches docs missing weighted_value, then re-runs as a no-op", async () => {
     // Seed three docs WITHOUT _calibration / weighted_* (mimics 5.83A-era data).
     const seeds = [
-      { key: "sens:{GIRR:USD}:bf01", doc: { risk_class: "GIRR", bucket: "USD", sensitivity_type: "Delta", risk_value: { "3M": 0.1, "6M": 0.2 } } },
-      { key: "sens:{EQUITY:1}:bf02", doc: { risk_class: "EQUITY", bucket: "1", sensitivity_type: "Delta", risk_value: { spot: 0.5 } } },
-      { key: "sens:{FX:EURUSD}:bf03", doc: { risk_class: "FX", bucket: "EURUSD", sensitivity_type: "Curvature", risk_value: { cvr_up: 0.3, cvr_down: -0.2 } } },
+      { key: "sens:bf01", doc: { risk_class: "GIRR", bucket: "USD", sensitivity_type: "Delta", risk_value: { "3M": 0.1, "6M": 0.2 } } },
+      { key: "sens:bf02", doc: { risk_class: "EQUITY", bucket: "1", sensitivity_type: "Delta", risk_value: { spot: 0.5 } } },
+      { key: "sens:bf03", doc: { risk_class: "FX", bucket: "EURUSD", sensitivity_type: "Curvature", risk_value: { cvr_up: 0.3, cvr_down: -0.2 } } },
     ];
     for (const { key, doc } of seeds) {
       await redis.call("JSON.SET", key, "$", JSON.stringify(doc));
@@ -601,7 +601,7 @@ describe("XREADGROUP consumer → JSON.SET", () => {
     // Also seed one already-enriched doc (new Wave-5.83F shape) so we
     // exercise the skip path: scalar Σ at `weighted_value`, per-tenor map at
     // `weighted_value_per_tenor`.
-    await redis.call("JSON.SET", "sens:{GIRR:USD}:bf04", "$", JSON.stringify({
+    await redis.call("JSON.SET", "sens:bf04", "$", JSON.stringify({
       risk_class: "GIRR", bucket: "USD", sensitivity_type: "Delta",
       risk_value: { "3M": 0.5 },
       weighted_value: GIRR_W.by_tenor["3M"]! * 0.5,
@@ -615,7 +615,7 @@ describe("XREADGROUP consumer → JSON.SET", () => {
     expect(first.errors).toBe(0);
 
     // Verify the patches landed and raw fields preserved.
-    const girrAfter = JSON.parse(await redis.call("JSON.GET", "sens:{GIRR:USD}:bf01") as string);
+    const girrAfter = JSON.parse(await redis.call("JSON.GET", "sens:bf01") as string);
     expect(girrAfter._calibration).toBe("demo");
     const girrAfterMap = girrAfter.weighted_value_per_tenor as Record<string, number>;
     expect(Math.abs(girrAfterMap["3M"]! - GIRR_W.by_tenor["3M"]! * 0.1)).toBeLessThanOrEqual(TOL);
@@ -625,7 +625,7 @@ describe("XREADGROUP consumer → JSON.SET", () => {
     expect(Math.abs((girrAfter.weighted_value as number) - girrAfterSum)).toBeLessThanOrEqual(TOL);
     expect(girrAfter.risk_value).toEqual({ "3M": 0.1, "6M": 0.2 });
     // Wave 5.83B-fix — Curvature legs are identity, not FX_W-weighted.
-    const fxAfter = JSON.parse(await redis.call("JSON.GET", "sens:{FX:EURUSD}:bf03") as string);
+    const fxAfter = JSON.parse(await redis.call("JSON.GET", "sens:bf03") as string);
     expect(Math.abs(fxAfter.weighted_cvr_up - 0.3)).toBeLessThanOrEqual(TOL);
     expect(Math.abs(fxAfter.weighted_cvr_down - -0.2)).toBeLessThanOrEqual(TOL);
 
@@ -642,7 +642,7 @@ describe("XREADGROUP consumer → JSON.SET", () => {
   // `weighted_value_per_tenor` map) but with the WRONG values; default mode
   // still skips it (shape matches), force mode recomputes both fields.
   integration("backfill --force re-runs enrichDoc on already-tagged docs", async () => {
-    const staleKey = "sens:{GIRR:USD}:bfforce01";
+    const staleKey = "sens:bfforce01";
     const wrongWs = GIRR_W.by_tenor["1Y"]! * 0.3;  // pre-fix WRONG identity-violating value
     const stale = {
       risk_class: "GIRR", bucket: "USD", sensitivity_type: "Vega",

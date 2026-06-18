@@ -12,8 +12,8 @@ const happyResponse: PivotResp = {
   offset: 0,
   ms: 11.7,
   rows: [
-    makeRow("sens:{GIRR:USD-IRS}:01HXAA", { risk_class: "GIRR", bucket: "USD-IRS", sensitivity_type: "Delta", book: "RATES-LDN", risk_value: [0.1, 0.2] }),
-    makeRow("sens:{GIRR:USD-IRS}:01HXBB", { risk_class: "GIRR", bucket: "USD-IRS", sensitivity_type: "Delta", book: "RATES-LDN", risk_value: [0.3] }),
+    makeRow("sens:01HXAA", { risk_class: "GIRR", bucket: "USD-IRS", sensitivity_type: "Delta", book: "RATES-LDN", risk_value: [0.1, 0.2] }),
+    makeRow("sens:01HXBB", { risk_class: "GIRR", bucket: "USD-IRS", sensitivity_type: "Delta", book: "RATES-LDN", risk_value: [0.3] }),
   ],
 };
 
@@ -52,8 +52,8 @@ test.describe("/pivot — Query/Pivot panel", () => {
 
     const table = page.getByRole("table", { name: /search results/i });
     await expect(table).toBeVisible();
-    await expect(table.getByText("sens:{GIRR:USD-IRS}:01HXAA")).toBeVisible();
-    await expect(table.getByText("sens:{GIRR:USD-IRS}:01HXBB")).toBeVisible();
+    await expect(table.getByText("sens:01HXAA")).toBeVisible();
+    await expect(table.getByText("sens:01HXBB")).toBeVisible();
     expect(lastUrl).toContain("risk_class=GIRR");
     expect(lastUrl).toContain("bucket=USD-IRS");
     expect(lastUrl).toContain("sensitivity_type=Delta");

@@ -50,7 +50,7 @@ describe("config/schema/frtb-default.yaml", () => {
     expect(rv?.type).toBe("ARRAY_NUMERIC");
   });
 
-  it("has at least one primary hash_tag dimension on risk_class and bucket (for sens:{risk_class}:{bucket}:{ulid})", () => {
+  it("has at least one primary hash_tag dimension on risk_class and bucket (for rollup-key hash-tag construction)", () => {
     const primaries = schema.dimensions
       .filter((d) => d.hash_tag_role === "primary")
       .map((d) => d.name);

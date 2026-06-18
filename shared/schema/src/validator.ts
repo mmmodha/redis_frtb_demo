@@ -44,7 +44,7 @@ export function validateSchema(schema: Schema): ValidationResult {
   );
   if (!anyPrimary) {
     errors.push(
-      "at least one dimension must have hash_tag_role: primary (required for sens:{risk_class}:{bucket}:{ulid} hash-tag pattern)",
+      "at least one dimension must have hash_tag_role: primary (required for rollup-key hash-tag construction; sens-doc keys themselves are brace-less sens:{ulid})",
     );
   }
 

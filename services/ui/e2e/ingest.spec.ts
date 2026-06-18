@@ -20,9 +20,9 @@ test.describe("Ingest panel", () => {
           prefix: "sens:",
           dbsize: 1234,
           sample: [
-            "sens:{GIRR:USD-IRS}:01HXAA",
-            "sens:{GIRR:EUR-IRS}:01HXBB",
-            "sens:{Equity:B1}:01HXCC",
+            "sens:01HXAA",
+            "sens:01HXBB",
+            "sens:01HXCC",
           ],
           sample_size: 3,
           ms: 2,
@@ -41,8 +41,8 @@ test.describe("Ingest panel", () => {
     await expect(page.getByRole("heading", { name: /^Ingest$/, level: 1 })).toBeVisible();
     await expect(page.getByText(/JSON\|Streams/)).toBeVisible();
     await expect(page.getByText("1,234")).toBeVisible();
-    await expect(page.getByText("sens:{GIRR:USD-IRS}:01HXAA")).toBeVisible();
-    await expect(page.getByText("sens:{Equity:B1}:01HXCC")).toBeVisible();
+    await expect(page.getByText("sens:01HXAA")).toBeVisible();
+    await expect(page.getByText("sens:01HXCC")).toBeVisible();
     await expect(page.locator('[data-testid="chart-throughput"]')).toBeVisible();
     await expect(page.locator('[data-testid="chart-memory"]')).toBeVisible();
   });

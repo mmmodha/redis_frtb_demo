@@ -12,9 +12,9 @@ describe("GET /observability/keys", () => {
     const fr = fakeRedis();
     fr.setDbsize(123);
     fr.setScan("0", [
-      "sens:{GIRR:USD-IRS}:01HX0",
-      "sens:{GIRR:USD-IRS}:01HX1",
-      "sens:{GIRR:USD-IRS}:01HX2",
+      "sens:01HX0",
+      "sens:01HX1",
+      "sens:01HX2",
     ]);
     app = await createServer({ redis: fr });
     const res = await app.inject({ method: "GET", url: "/observability/keys" });
@@ -23,7 +23,7 @@ describe("GET /observability/keys", () => {
     expect(body.prefix).toBe("sens:");
     expect(body.dbsize).toBe(123);
     expect(body.sample).toHaveLength(3);
-    expect(body.sample[0]).toBe("sens:{GIRR:USD-IRS}:01HX0");
+    expect(body.sample[0]).toBe("sens:01HX0");
     expect(body.ms).toBeGreaterThanOrEqual(0);
 
     const scan = fr.calls.find((c) => c.command === "SCAN");

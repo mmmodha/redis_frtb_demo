@@ -246,11 +246,11 @@ describe("@frtb/rqe — buildSchemaFields / buildCreateArgs (Wave 5.83A)", () =>
 describe.skipIf(!STACK_BUNDLED_PRESENT)("@frtb/rqe — ensureSensIndex (integration)", () => {
   async function seedFixtureRows() {
     // Three docs spanning the 5 indexed TAGs so FT.SEARCH-by-tag assertions
-    // have something to find. Keys obey the Wave 2 contract literal shape:
-    //   sens:{risk_class:bucket}:{ulid}
+    // have something to find. Keys obey the brace-less sens contract:
+    //   sens:{ulid}
     const rows = [
       {
-        key: "sens:{GIRR:USD-IRS}:01HZAAAAAAAAAAAAAAAAAAA001",
+        key: "sens:01HZAAAAAAAAAAAAAAAAAAA001",
         doc: {
           risk_class: "GIRR",
           bucket: "USD-IRS",
@@ -260,7 +260,7 @@ describe.skipIf(!STACK_BUNDLED_PRESENT)("@frtb/rqe — ensureSensIndex (integrat
         },
       },
       {
-        key: "sens:{GIRR:USD-IRS}:01HZAAAAAAAAAAAAAAAAAAA002",
+        key: "sens:01HZAAAAAAAAAAAAAAAAAAA002",
         doc: {
           risk_class: "GIRR",
           bucket: "USD-IRS",
@@ -270,7 +270,7 @@ describe.skipIf(!STACK_BUNDLED_PRESENT)("@frtb/rqe — ensureSensIndex (integrat
         },
       },
       {
-        key: "sens:{EQUITY:5}:01HZAAAAAAAAAAAAAAAAAAA003",
+        key: "sens:01HZAAAAAAAAAAAAAAAAAAA003",
         doc: {
           risk_class: "EQUITY",
           bucket: "5",

@@ -28,11 +28,11 @@ describe("GET /pivot", () => {
       "FT.SEARCH",
       ftSearchReply(2, [
         {
-          key: "sens:{GIRR:USD-IRS}:01HXAA",
+          key: "sens:01HXAA",
           doc: { risk_class: "GIRR", bucket: "USD-IRS", sensitivity_type: "Delta", risk_value: [0.1, 0.2] },
         },
         {
-          key: "sens:{GIRR:USD-IRS}:01HXBB",
+          key: "sens:01HXBB",
           doc: { risk_class: "GIRR", bucket: "USD-IRS", sensitivity_type: "Delta", risk_value: [0.3] },
         },
       ])
@@ -49,7 +49,7 @@ describe("GET /pivot", () => {
     expect(body.offset).toBe(0);
     expect(body.ms).toBeGreaterThanOrEqual(0);
     expect(body.rows).toHaveLength(2);
-    expect(body.rows[0].key).toBe("sens:{GIRR:USD-IRS}:01HXAA");
+    expect(body.rows[0].key).toBe("sens:01HXAA");
     expect(body.rows[0].doc.risk_class).toBe("GIRR");
     expect(body.rows[0].doc.risk_value).toEqual([0.1, 0.2]);
 
