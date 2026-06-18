@@ -174,6 +174,10 @@ async function main(): Promise<void> {
         baseStream: STREAM, group: GROUP, consumerNameBase: CONSUMER_NAME,
         totalShards, assignment, batchSize: BATCH_SIZE, blockMs: BLOCK_MS, schema,
         makeRunnerClient: factory,
+        // Wave 6.39.G — H1: each consumer tick reports non-NOGROUP errors via
+        // pino so a CROSSSLOT-style regression is visible on first occurrence.
+        // H2: periodic PEL drain cadence (env-overridable inside createConsumer).
+        logger: { warn: (meta, msg) => log.warn(meta, msg) },
       });
       m.start();
       for (const h of m.handles) {

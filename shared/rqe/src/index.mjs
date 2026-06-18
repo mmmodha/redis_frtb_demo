@@ -75,7 +75,8 @@ const WS_LEGS = Object.freeze([
 // flat HASH fields named `ws_<class>_<leg>_<tenor>` on the parent
 // `sens:<ulid>` HASH (so a single HASH field reach is enough for
 // FT.AGGREGATE). For the side-table variant, the raw per-tenor risk_value
-// map lives on `sens:<ulid>:tenors` and is NOT indexed.
+// map lives on `{sens:<ulid>}:tenors` (Wave 6.39.G — re-tagged to share a
+// slot with its parent) and is NOT indexed.
 function tenorHashField(classLower, leg, tenor) {
   return `ws_${classLower}_${leg}_${tenor}`;
 }
@@ -139,11 +140,11 @@ export function buildSchemaFields(schema) {
 // parents) AND `sensh:` (the `json-shadow-hash` HASH mirror). RediSearch on
 // `ON HASH` silently skips keys whose type does not match (so the legacy
 // `json` variant's `sens:<ulid>` JSON document, when present, is a no-op
-// here). The side-table `sens:<ulid>:tenors` HASH also matches the `sens:`
-// prefix but carries no `risk_class` TAG — the FILTER expression below
-// drops it from indexing entirely so num_docs stays equal to the row count
-// (no inflated per-doc index overhead, no empty-desk row in
-// `FT.AGGREGATE … GROUPBY @desk`).
+// here). Wave 6.39.G — the side-table HASH lives at `{sens:<ulid>}:tenors`
+// (braces wrap the parent key so both share a slot). Its literal key starts
+// with `{` not `sens:`, so it never matches either FT.CREATE PREFIX and is
+// implicitly excluded from idx:sens — the FILTER `exists(@risk_class)` below
+// is kept as a defence-in-depth guard against rogue keys.
 export const IDX_SHADOW_PREFIX = "sensh:";
 export function buildCreateArgs(schema) {
   const args = [

@@ -2,6 +2,7 @@ import type { Redis, Cluster } from "ioredis";
 import type { Schema, RiskWeightTable } from "@frtb/schema";
 import {
   rollupKey,
+  processedMarkerKey,
   SEEN_RISK_CLASS_KEY,
   seenBucketKey,
   seenSensTypeKey,
@@ -35,6 +36,19 @@ export const STORAGE_FORMATS: readonly StorageFormat[] = Object.freeze([
 ]);
 export const DEFAULT_STORAGE_FORMAT: StorageFormat = "hash-sidetable";
 
+// Wave 6.39.G — defaults for the idempotency-marker TTL (Phase 2 dedup) and
+// the periodic PEL drain cadence (H2). Both are runtime-overridable via
+// ConsumerOptions; the env defaults below are resolved lazily inside the
+// consumer so a single boot's process.env is the source of truth.
+export const DEFAULT_STREAM_RETENTION_SEC = 86_400;        // 24h — long enough that any unacked
+                                                            // stream entry has long since been
+                                                            // re-delivered (XLEN MAXLEN typically
+                                                            // trims much sooner).
+export const DEFAULT_PEL_DRAIN_INTERVAL_MS = 30_000;       // 30s — interleave between forward
+                                                            // ticks so a transient failure that
+                                                            // left an entry in the PEL replays
+                                                            // without a process restart.
+
 // Parses STORAGE_FORMAT env / opt value with a fallback to the default.
 // Throws on an unknown value so a typo at boot is loud — silent fallback was
 // considered and rejected (a user typing `hash_sidetable` would silently
@@ -47,12 +61,35 @@ export function resolveStorageFormat(value: string | undefined): StorageFormat {
   );
 }
 
+// Wave 6.39.G — structured-warn sink for the tick() catch block. Optional so
+// unit tests that drive processBatch directly can omit it; the consumer
+// service plumbs the per-shard pino logger through cli.ts.
+export interface ConsumerLogger {
+  warn: (meta: Record<string, unknown>, msg: string) => void;
+}
+
 export interface ConsumerOptions {
   stream: string;
   group: string;
   consumerName: string;
   batchSize?: number;
   blockMs?: number;
+  // Wave 6.39.G — structured logger for the tick() catch block (H1 hygiene
+  // fix from the RCA). Omitted in unit tests; the cli plumbs a pino instance
+  // through multi-consumer.
+  logger?: ConsumerLogger;
+  // Wave 6.39.G — periodic PEL drain cadence in milliseconds (H2 hygiene
+  // fix). When set to a positive number, createConsumer's loop interleaves
+  // an `id="0"` XREADGROUP every `pelDrainIntervalMs` between forward
+  // batches so transient-failure entries replay without a process restart.
+  // Defaults to INGEST_PEL_DRAIN_INTERVAL_MS env (or 30_000ms) inside
+  // createConsumer; set to 0 to disable periodic drains.
+  pelDrainIntervalMs?: number;
+  // Wave 6.39.G — TTL on the per-entry idempotency marker (Phase 2 of the
+  // two-phase atomic writer). Defaults to STREAM_RETENTION_SEC env (or
+  // DEFAULT_STREAM_RETENTION_SEC = 86_400s = 24h) inside processBatchAtomic;
+  // override for tests that need a shorter window.
+  processedMarkerTtlSec?: number;
   // Wave 5.83B — schema is loaded once at consumer creation and threaded
   // through processBatch so enrichDoc can pre-compute per-tenor
   // weighted_value (and weighted_cvr_up/down for Curvature) from the
@@ -515,6 +552,17 @@ function flattenDocForHash(doc: Record<string, unknown>): string[] {
   return args;
 }
 
+// Wave 6.39.G — side-table key shape `{<parentKey>}:tenors`. The braces wrap
+// the entire parent key (e.g. `{sens:01HZA...}:tenors`) so CRC16 hashes over
+// the same `sens:<ulid>` bytes as the unbraced parent — both keys land on
+// the same Redis Cluster slot and the per-row Phase 1 MULTI stays slot-local
+// even when a row produces a side-table HSET. The literal key starts with
+// `{`, so it never matches the FT.CREATE `sens:` PREFIX (so the side-table
+// is implicitly excluded from idx:sens without relying on the filter alone).
+export function sideTableKeyFor(parentKey: string): string {
+  return `{${parentKey}}:tenors`;
+}
+
 // Wave 6.38.A — `hash-sidetable` side-table key holds the row's raw
 // per-tenor `risk_value` map (and the original tenor labels when present)
 // for diagnostic / backfill flows. Not indexed by idx:sens — the parent
@@ -552,7 +600,7 @@ export function writeDocForStorage(
       const flat = flattenDocForHash(doc);
       if (flat.length > 0) pipeline.call("HSET", key, ...flat);
       const side = sideTableArgsFor(doc);
-      if (side) pipeline.call("HSET", `${key}:tenors`, ...side);
+      if (side) pipeline.call("HSET", sideTableKeyFor(key), ...side);
       return;
     }
     case "hash-encoded": {
@@ -889,6 +937,29 @@ async function emitSuggestersAfterCommit(client: RedisLike, doc: Record<string, 
   try { await p.exec(); } catch { /* best-effort */ }
 }
 
+// Wave 6.39.G — Route D. The pre-6.39.G single-MULTI block spanned 5–6 hash
+// slots (`sens:<ulid>`, `{sens:<ulid>}:tenors`, `rollup:{<rc>:<bkt>}:*`,
+// `seen:sens_type:{<rc>:<bkt>}`, the stream key) and EXECABORTed with
+// CROSSSLOT on Redis Enterprise / Cluster. Route D splits each per-row write
+// into THREE slot-local phases joined by an idempotency marker:
+//
+//   Phase 1 — Sens-slot MULTI on the slot of `sens:<ulid>`:
+//     WATCH sens:<ulid>; HGETALL sens:<ulid>; MULTI; HSET sens:<ulid> …;
+//     HSET {sens:<ulid>}:tenors … (when per-tenor); EXEC.
+//   Phase 2 — Rollup-slot MULTI on the slot of `{<rc>:<bkt>}`:
+//     WATCH processed:{<rc>:<bkt>}:<entryId>; EXISTS processed:…;
+//     if NOT alreadyApplied: MULTI; HINCRBYFLOAT rollup:…; SADD
+//     seen:sens_type:…; SET processed:… 1 EX <STREAM_RETENTION_SEC>; EXEC.
+//     If alreadyApplied: skip the rollup writes entirely (replay short-
+//     circuit). Both branches still issue MULTI/EXEC for shape parity so
+//     the WATCH is consumed cleanly.
+//   Phase 3 — Tail pipeline (non-atomic, all idempotent):
+//     SADD seen:risk_class; SADD seen:bucket:{<rc>}; XACK …; SUGADD ….
+//
+// Failure modes (see task note table): Phase 1 fail → entry stays in PEL,
+// replay re-runs idempotently. Phase 1 OK + Phase 2 fail → replay; marker
+// absent → rollup re-applies cleanly via delta. Phase 2 OK + Phase 3 fail
+// → replay; marker present → Phase 2 short-circuits, XACK retries.
 export async function processBatchAtomic(
   client: RedisLike,
   opts: ConsumerOptions,
@@ -904,6 +975,9 @@ export async function processBatchAtomic(
     "STREAMS", opts.stream, id,
   )) as XReadGroupReply;
   if (!reply) return 0;
+
+  const markerTtl = opts.processedMarkerTtlSec
+    ?? (Number(process.env.STREAM_RETENTION_SEC ?? "") || DEFAULT_STREAM_RETENTION_SEC);
 
   let processed = 0;
   for (const [, entries] of reply) {
@@ -921,41 +995,114 @@ export async function processBatchAtomic(
       const key = buildKey(hashTag, ulid);
       const doc = enrichDoc(buildDoc(msg), opts.schema);
       const riskClass = typeof doc.risk_class === "string" ? doc.risk_class : "";
+      const bucket = typeof doc.bucket === "string" ? doc.bucket : "";
       const sensType = typeof doc.sensitivity_type === "string" ? doc.sensitivity_type : "";
 
-      let attempts = 0;
-      let committed = false;
-      while (attempts <= MAX_WATCH_RETRIES) {
+      // Phase 1 — sens-slot MULTI. WATCH `sens:<ulid>` so a concurrent writer
+      // touching the same row forces a retry; the side-table HSET co-locates
+      // via the `{sens:<ulid>}` hash-tag wrapper so the whole MULTI stays
+      // slot-local.
+      const oldHashForPhase2: Record<string, string> = {};
+      let phase1Committed = false;
+      let phase1Attempts = 0;
+      while (phase1Attempts <= MAX_WATCH_RETRIES) {
         await (client as Redis).watch(key);
         const oldHash = (await (client as Redis).hgetall(key)) as Record<string, string>;
-        const oldC = parseOldContribution(oldHash, riskClass, sensType);
-        const txn = (client as Redis).multi();
+        const txn1 = (client as Redis).multi();
         writeDocForStorage(
-          txn as unknown as PipelineLike,
+          txn1 as unknown as PipelineLike,
           key,
           doc,
           opts.storageFormat ?? DEFAULT_STORAGE_FORMAT,
         );
-        emitRollupDelta(txn as unknown as PipelineLike, oldC, doc);
-        emitSeenSadds(txn as unknown as PipelineLike, doc);
-        txn.xack(opts.stream, opts.group, entryId);
-        const res = await txn.exec();
-        if (res !== null) {
-          processed++;
-          committed = true;
+        const res1 = await txn1.exec();
+        if (res1 !== null) {
+          // Snapshot the pre-write HASH for Phase 2's delta computation.
+          for (const k of Object.keys(oldHash)) oldHashForPhase2[k] = oldHash[k]!;
+          phase1Committed = true;
           break;
         }
-        attempts++;
-        const backoff = Math.min(50, 1 << Math.min(attempts, 5)) + Math.floor(Math.random() * 5);
+        phase1Attempts++;
+        const backoff = Math.min(50, 1 << Math.min(phase1Attempts, 5)) + Math.floor(Math.random() * 5);
         await new Promise((r) => setTimeout(r, backoff));
       }
-      if (!committed) {
-        // Bounded retries exhausted — release the watch so the connection is
-        // clean for the next entry. The PEL retains this entry; the consumer
-        // group will redeliver on the next claim-on-restart drain.
+      if (!phase1Committed) {
         await (client as Redis).unwatch().catch(() => undefined);
         continue;
       }
+
+      // Phase 2 — rollup-slot MULTI. Only the rollup HINCRBYFLOATs, the
+      // sens-type SADD, and the idempotency-marker SET live here; everything
+      // is slot-tagged on `{<rc>:<bkt>}`. The marker is checked under WATCH
+      // so concurrent replays short-circuit deterministically.
+      let phase2Committed = false;
+      let phase2Attempts = 0;
+      if (riskClass && bucket && sensType) {
+        const markerKey = processedMarkerKey(riskClass, bucket, entryId);
+        while (phase2Attempts <= MAX_WATCH_RETRIES) {
+          await (client as Redis).watch(markerKey);
+          const exists = (await (client as Redis).exists(markerKey)) as number;
+          const txn2 = (client as Redis).multi();
+          if (exists === 0) {
+            const oldC = parseOldContribution(oldHashForPhase2, riskClass, sensType);
+            emitRollupDelta(txn2 as unknown as PipelineLike, oldC, doc);
+            // Only the `seen:sens_type:{<rc>:<bkt>}` SADD is slot-local to
+            // the rollup hashes; the other two (`seen:risk_class`,
+            // `seen:bucket:{<rc>}`) move to the Phase 3 tail pipeline where
+            // CROSSSLOT does not apply. emitSeenSadds is left intact for the
+            // non-atomic processBatch path (writes all three on a single
+            // pipeline, which standalone Redis accepts unconditionally).
+            txn2.call("SADD", seenSensTypeKey(riskClass, bucket), sensType);
+            txn2.call("SET", markerKey, "1", "EX", String(markerTtl));
+          } else {
+            // Replay short-circuit. Issue a single no-op on the same slot so
+            // the WATCH is consumed and EXEC returns a non-null array (the
+            // contract `res2 !== null === committed` keeps the retry loop
+            // simple). EXISTS on the already-watched marker key is a cheap
+            // slot-local no-op write-free probe.
+            txn2.call("EXISTS", markerKey);
+          }
+          const res2 = await txn2.exec();
+          if (res2 !== null) {
+            phase2Committed = true;
+            break;
+          }
+          phase2Attempts++;
+          const backoff = Math.min(50, 1 << Math.min(phase2Attempts, 5)) + Math.floor(Math.random() * 5);
+          await new Promise((r) => setTimeout(r, backoff));
+        }
+        if (!phase2Committed) {
+          await (client as Redis).unwatch().catch(() => undefined);
+          // Phase 1 already committed; bail without XACK so the entry replays
+          // (replay sees the parent HASH already written → Phase 1 idempotent,
+          // Phase 2 re-attempts).
+          continue;
+        }
+      } else {
+        // Missing rc / bkt / sens_type means there's nothing to roll up;
+        // skip Phase 2 entirely and proceed to the tail. emitSeenSadds /
+        // emitRollupDelta would early-return on the same condition anyway.
+        phase2Committed = true;
+      }
+
+      // Phase 3 — tail pipeline. All commands are idempotent so a tail
+      // failure replays the entry safely: Phase 1 is HSET (idempotent on the
+      // same value), Phase 2's marker short-circuits the rollup, and XACK is
+      // a no-op on already-acked entries. SUGADD is best-effort and lives in
+      // its own try/catch below for back-compat.
+      const tail = client.pipeline();
+      if (riskClass) tail.call("SADD", SEEN_RISK_CLASS_KEY, riskClass);
+      if (riskClass && bucket) tail.call("SADD", seenBucketKey(riskClass), bucket);
+      tail.xack(opts.stream, opts.group, entryId);
+      try {
+        await tail.exec();
+      } catch (err) {
+        // Tail failure → entry replays via PEL. Surface via the logger so
+        // the H1 hygiene fix in tick() doesn't swallow it (we're below
+        // tick()'s try/catch here so re-throw to bubble it up).
+        throw err;
+      }
+      processed++;
       await emitSuggestersAfterCommit(client, doc);
     }
   }
@@ -982,6 +1129,10 @@ export function createConsumer(client: RedisLike, opts: ConsumerOptions): Consum
   const fmt = opts.storageFormat ?? DEFAULT_STORAGE_FORMAT;
   const useAtomic = fmt === "hash-sidetable" || fmt === "hash-encoded";
 
+  // Wave 6.39.G — H1: log every non-NOGROUP error from the tick. The pre-
+  // 6.39.G silent counter increment masked the CROSSSLOT EXECABORT loop for
+  // two waves; structured warn output (when a logger is plumbed through)
+  // makes the next regression visible on first occurrence.
   async function tick(id: ">" | "0", block: number): Promise<number> {
     try {
       const n = useAtomic
@@ -998,10 +1149,31 @@ export function createConsumer(client: RedisLike, opts: ConsumerOptions): Consum
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes("NOGROUP")) {
         await ensureGroup(client, opts.stream, opts.group);
+      } else if (opts.logger) {
+        opts.logger.warn(
+          {
+            err: msg,
+            stream: opts.stream,
+            group: opts.group,
+            consumerName: opts.consumerName,
+            id,
+            errCount: stats.errors,
+          },
+          "ingest tick failed",
+        );
       }
       return 0;
     }
   }
+
+  // Wave 6.39.G — H2: periodic PEL drain. Pre-6.39.G the `id="0"` claim-on-
+  // restart only ran at boot, so any entry that landed in the PEL after a
+  // transient WATCH-cap exhaustion needed a process restart to retry. The
+  // periodic drain interleaves an `id="0"` XREADGROUP every
+  // pelDrainIntervalMs between forward (`id=">"`) ticks so stuck entries
+  // replay within one cadence window.
+  const pelDrainMs = opts.pelDrainIntervalMs
+    ?? (Number(process.env.INGEST_PEL_DRAIN_INTERVAL_MS ?? "") || DEFAULT_PEL_DRAIN_INTERVAL_MS);
 
   async function loop(): Promise<void> {
     // claim-on-restart: replay anything previously delivered to this
@@ -1010,7 +1182,19 @@ export function createConsumer(client: RedisLike, opts: ConsumerOptions): Consum
       const n = await tick("0", 0);
       if (n === 0) break;
     }
+    let lastDrain = Date.now();
     while (!stopped) {
+      // Periodic PEL drain — interleaved with the forward read so a
+      // transient-failure entry replays without a restart. `id="0"` returns
+      // null when the PEL for this consumer is empty, so the call is cheap
+      // when there's nothing to claim.
+      if (pelDrainMs > 0 && Date.now() - lastDrain >= pelDrainMs) {
+        let drained: number;
+        do {
+          drained = await tick("0", 0);
+        } while (!stopped && drained > 0);
+        lastDrain = Date.now();
+      }
       await tick(">", opts.blockMs ?? 1000);
     }
   }

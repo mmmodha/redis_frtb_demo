@@ -1187,7 +1187,8 @@ describe("STORAGE_FORMAT — env parsing + writer dispatch [Wave 6.38.A]", () =>
     const hsets = record.filter((r) => r.command === "HSET");
     expect(hsets.length).toBe(2);
     expect(hsets[0]!.args[0]).toBe("sens:01HZA");
-    expect(hsets[1]!.args[0]).toBe("sens:01HZA:tenors");
+    // Wave 6.39.G — side-table re-tagged to share a slot with its parent.
+    expect(hsets[1]!.args[0]).toBe("{sens:01HZA}:tenors");
     const parentFlat: Record<string, string> = {};
     const pArgs = hsets[0]!.args;
     for (let i = 1; i < pArgs.length; i += 2) parentFlat[pArgs[i] as string] = pArgs[i + 1] as string;

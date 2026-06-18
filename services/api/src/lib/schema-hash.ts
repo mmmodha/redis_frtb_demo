@@ -14,10 +14,13 @@
 //   v1 → sens:{<rc>:<bkt>}:<ulid>           (Wave 2 hash-tagged shape)
 //   v2 → sens:<ulid>                        (Wave 6.31 Option B, ULID-only, JSON)
 //   v3 → sens:<ulid> HASH + sens:<ulid>:tenors side-table (Wave 6.38.A)
+//   v4 → sens:<ulid> HASH + {sens:<ulid>}:tenors side-table (Wave 6.39.G — the
+//         side-table is hash-tag co-located with its parent so the per-row
+//         Phase 1 MULTI stays slot-local on Redis Enterprise / Cluster).
 
 import { createHash } from "node:crypto";
 
-export const KEY_LAYOUT_VERSION = 3;
+export const KEY_LAYOUT_VERSION = 4;
 
 function deepSort(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(deepSort);

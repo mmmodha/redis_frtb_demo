@@ -17,6 +17,7 @@ import type { Schema } from "@frtb/schema";
 import {
   createConsumer,
   ensureGroup,
+  type ConsumerLogger,
   type ConsumerRunner,
   type ConsumerStats,
   type RedisLike,
@@ -55,6 +56,12 @@ export interface MultiConsumerOptions {
   // attempted first; if it doesn't resolve within this window we fall back
   // to disconnect(). Defaults to 2000ms; tests override to keep runs fast.
   runnerQuitTimeoutMs?: number;
+  // Wave 6.39.G — per-shard structured logger for the tick() catch (H1) and
+  // the periodic PEL drain interval (H2). Optional so tests that drive
+  // createMultiShardConsumer without a logger still work; cli.ts wires up
+  // the shared pino instance.
+  logger?: ConsumerLogger;
+  pelDrainIntervalMs?: number;
 }
 
 export interface MultiConsumer {
@@ -130,6 +137,8 @@ export function createMultiShardConsumer(
       blockMs: opts.blockMs,
       schema: opts.schema,
       profile: profile ?? undefined,
+      logger: opts.logger,
+      pelDrainIntervalMs: opts.pelDrainIntervalMs,
     });
     return { shard, stream, consumerName, runner, client: runnerClient, profile };
   });

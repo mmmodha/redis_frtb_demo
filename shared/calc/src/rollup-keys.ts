@@ -69,3 +69,16 @@ export function seenBucketKey(rc: string): string {
 export function seenSensTypeKey(rc: string, bkt: string): string {
   return `seen:sens_type:{${rc}:${bkt}}`;
 }
+
+// Wave 6.39.G — per-entry idempotency marker for the rollup phase of the
+// two-phase ingest writer. The atomic delta-reconciliation MULTI used to span
+// `sens:<ulid>` and `rollup:{<rc>:<bkt>}:*` (different slots → CROSSSLOT on
+// Redis Enterprise / Cluster). Route D splits the per-row write into a sens-
+// slot MULTI (Phase 1) and a rollup-slot MULTI (Phase 2); this marker lives on
+// the rollup slot so Phase 2 can short-circuit on replay without re-applying
+// the HINCRBYFLOAT deltas. TTL is set to the stream-retention window by the
+// caller so the marker disappears once the stream entry can no longer be
+// re-delivered.
+export function processedMarkerKey(rc: string, bkt: string, entryId: string): string {
+  return `processed:{${rc}:${bkt}}:${entryId}`;
+}
