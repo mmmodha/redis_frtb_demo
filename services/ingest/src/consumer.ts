@@ -9,11 +9,11 @@ import {
 import type { RunnerProfile } from "./profile.ts";
 
 // Stream consumer for the FRTB ingest service.
-// Reads from Redis Stream `sensitivities:in` via XREADGROUP, builds the locked
-// final key `sens:{risk_class:bucket}:{ulid}` (literal braces = hash-tag for
-// slot-affinity per Wave 2 contract), writes the doc with JSON.SET, then XACKs.
-// JSON.SET with the same key+doc is naturally idempotent: re-deliveries of the
-// same logical row produce no duplicate keys.
+// Reads from Redis Stream `sensitivities:in` via XREADGROUP, builds the final
+// key `sens:<ulid>` (ULID-only for uniform slot distribution across the cluster
+// per Wave 6.31 Option B), writes the doc with JSON.SET, then XACKs. JSON.SET
+// with the same key+doc is naturally idempotent: re-deliveries of the same
+// logical row produce no duplicate keys.
 
 export type RedisLike = Redis | Cluster;
 
@@ -50,12 +50,15 @@ export interface ConsumerRunner {
   readonly stats: ConsumerStats;
 }
 
-// Builds the locked final key shape `sens:{risk_class:bucket}:{ulid}`.
-// The literal `{...}` braces around the hash-tag are required so Redis
-// Cluster routes all sensitivities for the same (risk_class, bucket) to the
-// same slot (per Wave 2 contract — keeps SBM FCALL slot-local).
+// Builds the final sens-doc key `sens:<ulid>` — ULID-only for uniform slot
+// distribution across the Redis Cluster keyspace (Wave 6.31, Option B). The
+// `hashTag` parameter is retained for call-site signature stability and is
+// intentionally ignored. `risk_class` / `bucket` remain JSON fields on the
+// doc and indexed via `idx:sens`, so FT.AGGREGATE `GROUPBY @risk_class
+// @bucket` still works; rollup and seen keys keep their hash-tag wrapper.
 export function buildKey(hashTag: string, id: string): string {
-  return `sens:{${hashTag}}:${id}`;
+  void hashTag;
+  return `sens:${id}`;
 }
 
 // Reassembles the JSON doc from a Stream message. The generator stamps
