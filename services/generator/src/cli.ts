@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import { Redis, Cluster } from "ioredis";
-import { createRedisClient } from "@frtb/redis-client";
+import { createRedisClient, resolveRedisTarget } from "@frtb/redis-client";
 import pino from "pino";
 import { loadSchema } from "@frtb/schema";
 import { Worker } from "node:worker_threads";
@@ -169,10 +169,18 @@ async function main(): Promise<void> {
   if (!schemaPath) {
     throw new Error("schema file path missing: pass --schema-file or set SCHEMA_FILE");
   }
-  const redisUrl = opts.redisUrl ?? process.env.REDIS_URL;
-  if (!redisUrl) {
-    throw new Error("redis URL missing: pass --redis-url or set REDIS_URL");
-  }
+  // Wave 6.39.F — one-shot tools resolve their Redis target from the api's
+  // live active-target (matching long-running services), with REDIS_URL only
+  // a bootstrap fallback. Precedence: --redis-url > active-target > REDIS_URL.
+  // The resolver logs which tier won (host/port only — never the URL).
+  const resolved = await resolveRedisTarget({
+    explicitUrl: opts.redisUrl,
+    apiBase: process.env.API_URL ?? process.env.API_BASE,
+    token: process.env.INTERNAL_API_TOKEN,
+    envRedisUrl: process.env.REDIS_URL,
+    logger: log,
+  });
+  const redisUrl = resolved.url;
   if (!PROFILE_NAMES.has(opts.profile)) {
     throw new Error(`--profile must be one of auto|small|medium|large (got: ${opts.profile})`);
   }

@@ -13,6 +13,19 @@
 
 import { Cluster, Redis, type ClusterOptions, type RedisOptions } from "ioredis";
 
+// Wave 6.39.F — re-export the one-shot active-target resolver so CLI tools
+// (e.g. generator) can honour the api's live active target without copying
+// the helper into every package.
+export {
+  resolveRedisTarget,
+  buildRedisUrlFromTarget,
+  type ActiveTargetFull,
+  type ResolvedRedisTarget,
+  type ResolvedRedisSource,
+  type ResolverLogger,
+  type ResolveRedisTargetOptions,
+} from "./active-target-resolver.ts";
+
 export interface ParsedRedisUrl {
   host: string;
   port: number;
