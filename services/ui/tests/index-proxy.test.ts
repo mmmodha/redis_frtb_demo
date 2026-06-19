@@ -241,6 +241,59 @@ describe("UI /api reverse proxy", () => {
     expect(upstreamHit).toBe(false);
   });
 
+  it("10. injects Authorization: Bearer on /internal/* upstream paths from INTERNAL_API_TOKEN", async () => {
+    const prevToken = process.env.INTERNAL_API_TOKEN;
+    process.env.INTERNAL_API_TOKEN = "secret-test-token";
+    try {
+      let seenAuth: string | undefined;
+      let seenUrl = "";
+      setUpstream((req, res) => {
+        seenAuth = req.headers["authorization"] as string | undefined;
+        seenUrl = req.url ?? "";
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end('{"ok":true}');
+      });
+      const res = await fetch(
+        `${baseUrl}/api/internal/redis/active-target/switch-status`,
+      );
+      expect(res.status).toBe(200);
+      expect(seenUrl).toBe("/internal/redis/active-target/switch-status");
+      expect(seenAuth).toBe("Bearer secret-test-token");
+      // Token must be header-only — never in the URL.
+      expect(seenUrl).not.toContain("secret-test-token");
+    } finally {
+      if (prevToken === undefined) delete process.env.INTERNAL_API_TOKEN;
+      else process.env.INTERNAL_API_TOKEN = prevToken;
+    }
+  });
+
+  it("11. does NOT inject Authorization on non-internal paths (no token leak)", async () => {
+    const prevToken = process.env.INTERNAL_API_TOKEN;
+    process.env.INTERNAL_API_TOKEN = "secret-test-token";
+    try {
+      const seenAuths: Record<string, string | undefined> = {};
+      setUpstream((req, res) => {
+        seenAuths[req.url ?? ""] = req.headers["authorization"] as
+          | string
+          | undefined;
+        res.writeHead(200);
+        res.end();
+      });
+      // Sample public/user-fetchable endpoints — none should carry the token.
+      await fetch(`${baseUrl}/api/admin/index-count`);
+      await fetch(`${baseUrl}/api/calc/sbm`);
+      await fetch(`${baseUrl}/api/pivot?bucket=GIRR`);
+      await fetch(`${baseUrl}/api/sources/upload`, { method: "POST" });
+      expect(seenAuths["/admin/index-count"]).toBeUndefined();
+      expect(seenAuths["/calc/sbm"]).toBeUndefined();
+      expect(seenAuths["/pivot?bucket=GIRR"]).toBeUndefined();
+      expect(seenAuths["/sources/upload"]).toBeUndefined();
+    } finally {
+      if (prevToken === undefined) delete process.env.INTERNAL_API_TOKEN;
+      else process.env.INTERNAL_API_TOKEN = prevToken;
+    }
+  });
+
   it("9. multipart/form-data upload is byte-exact (CSV drop)", async () => {
     const boundary = "----test-boundary-9d4a7";
     const csv = Buffer.from(

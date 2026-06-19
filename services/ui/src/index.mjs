@@ -29,6 +29,12 @@ function apiProxyTarget() {
 // multipart uploads at /api/sources/upload stay memory-safe and preserve the
 // exact byte sequence (and boundary token) the client sent. Headers are
 // forwarded verbatim apart from `host`, which is rewritten to the upstream.
+//
+// Wave 6.43.B.4.auth: outbound requests to bearer-guarded internal endpoints
+// (path prefix `/internal/`) get an `Authorization: Bearer <token>` header
+// injected from $INTERNAL_API_TOKEN. The token is header-only — it is never
+// added to URLs, query strings, or log lines. Public proxy routes (admin,
+// calc, generator, ingest, source/loadgen public endpoints) are unchanged.
 function proxyApi(req, res) {
   const { host, port } = apiProxyTarget();
   const original = req.url ?? '/api';
@@ -37,6 +43,13 @@ function proxyApi(req, res) {
 
   const headers = { ...req.headers };
   headers.host = `${host}:${port}`;
+
+  if (upstreamPath.startsWith('/internal/')) {
+    const token = process.env.INTERNAL_API_TOKEN;
+    if (token) {
+      headers.authorization = `Bearer ${token}`;
+    }
+  }
 
   const upstreamReq = http.request(
     { host, port, method: req.method, path: upstreamPath, headers },
@@ -193,6 +206,17 @@ export function start() {
       }),
     );
     process.exit(1);
+  }
+
+  if (!process.env.INTERNAL_API_TOKEN) {
+    console.warn(
+      JSON.stringify({
+        service: SERVICE,
+        status: 'warn',
+        message:
+          'INTERNAL_API_TOKEN not set — proxy will not inject Authorization on /internal/* routes; bearer-guarded endpoints (e.g. /internal/redis/active-target/switch-status) will return 401',
+      }),
+    );
   }
 
   const server = createServer();
