@@ -453,7 +453,8 @@ apply_defaults() {
 
 # ---------------------------------------------------------------------------
 # Build gates: only run `npm install` if node_modules missing (or --force-install).
-# Only run UI build if services/ui/dist missing (or --force-build).
+# UI build runs when services/ui/dist is missing, --force-build is set, or any
+# file under services/ui/src is newer than services/ui/dist/index.html (Wave 6.44.H).
 # ---------------------------------------------------------------------------
 ensure_deps() {
   if [[ "${OPT_FORCE_INSTALL}" == "1" ]] || [[ ! -d "${REPO_ROOT}/node_modules" ]]; then
@@ -466,13 +467,37 @@ ensure_deps() {
   return 0
 }
 
+# Wave 6.44.H — auto-rebuild the UI dist when sources are newer than the
+# built bundle. The `ui` service serves a pre-built bundle via
+# `node src/index.mjs`, so a bare `restart ui` would otherwise ship stale
+# code from the last manual `pnpm build`. mtime-comparison fast-path:
+# `find services/ui/src -newer services/ui/dist/index.html` is empty ⇒ skip.
 ensure_ui_build() {
-  if [[ "${OPT_FORCE_BUILD}" == "1" ]] || [[ ! -d "${REPO_ROOT}/services/ui/dist" ]]; then
-    info "Building UI…"
-    if ! ( cd "${REPO_ROOT}" && npm run -w @frtb/ui build ); then
-      fail "UI build failed."
-      return 1
+  local src_dir="${REPO_ROOT}/services/ui/src"
+  local dist_marker="${REPO_ROOT}/services/ui/dist/index.html"
+  local reason=""
+  if [[ "${OPT_FORCE_BUILD}" == "1" ]]; then
+    reason="--force-build set"
+  elif [[ ! -f "${dist_marker}" ]]; then
+    reason="no existing dist"
+  else
+    local newer_count=0
+    if [[ -d "${src_dir}" ]]; then
+      newer_count="$(find "${src_dir}" -type f -newer "${dist_marker}" 2>/dev/null | wc -l | tr -d '[:space:]')"
+      [[ -z "${newer_count}" ]] && newer_count=0
     fi
+    if [[ "${newer_count}" -gt 0 ]]; then
+      reason="${newer_count} sources newer than dist"
+    fi
+  fi
+  if [[ -z "${reason}" ]]; then
+    info "ui: dist up-to-date, skipping build"
+    return 0
+  fi
+  info "ui: building dist (${reason})…"
+  if ! ( cd "${REPO_ROOT}" && npm run -w @frtb/ui build ); then
+    fail "UI build failed."
+    return 1
   fi
   return 0
 }
