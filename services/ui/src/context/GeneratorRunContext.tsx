@@ -44,6 +44,15 @@ const DEFAULT_GEN_ROWS = 200;
 // `terminalGraceMs` (30s by default — see services/api/src/routes/generator.ts);
 // the client mirrors that so a refresh just-after-completion still surfaces
 // the "done" summary before the entry disappears.
+//
+// Wave 6.44.B audit — this key is intentionally global (NOT suffixed with
+// the active target label). Rationale: run_id is a server-issued ULID
+// unique across targets; a run started against target A and persisted here
+// becomes orphaned (not "wrong") if the user switches to target B before
+// reload. The mount-time orphan-discovery flow (GET /generator/runs against
+// the active target) already filters out run_ids the new target doesn't
+// know about, so a cross-target stored entry degrades to a no-op clear
+// rather than mis-attributing progress.
 const STORAGE_KEY = "generator-active-run";
 const POLL_INTERVAL_MS = 500;
 const TERMINAL_GRACE_MS = 30_000;

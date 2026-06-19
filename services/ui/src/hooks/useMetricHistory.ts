@@ -2,6 +2,9 @@
 // /observability/history (RedisTimeSeries). When the active target lacks
 // the TS module we fall back to a client-side ring buffer persisted in
 // localStorage so a tab reload keeps recent history.
+//
+// Wave 6.44.B audit — already target-scoped: storageKey() composes
+// `obs.ring.{target_label}.{metric}` so each target keeps its own ring.
 
 import { useEffect, useRef, useState } from "react";
 import { getObservabilityHistory, type ObservabilityHistoryPoint } from "../lib/api";

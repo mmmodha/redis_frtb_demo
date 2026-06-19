@@ -26,11 +26,23 @@
 // xlen stays positive and consumed stays at-or-above target, and
 // (b) consumed-plateau hatch.
 
+// Wave 6.44.B — anchors are partitioned by active-target label in storage.
+// All tests below seed their anchor against `TEST_LABEL` and the fetch mock
+// returns the same label from /redis/active-target so `useActiveTargetLabel`
+// resolves to it on first poll.
+
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { IngestPanel } from "../../src/panels/IngestPanel";
-import { STORAGE_KEY, type IndexingAnchor } from "../../src/lib/indexingState";
+import { storageKeyFor, type IndexingAnchor } from "../../src/lib/indexingState";
+
+const TEST_LABEL = "test-label";
+const STORAGE_KEY = storageKeyFor(TEST_LABEL);
+
+function makeAnchor(partial: Omit<IndexingAnchor, "targetLabel"> & { targetLabel?: string }): IndexingAnchor {
+  return { ...partial, targetLabel: partial.targetLabel ?? TEST_LABEL };
+}
 
 vi.mock("../../src/components/PanelCard", () => ({
   PanelCard: ({ title, children, actions }: any) => (
@@ -101,6 +113,17 @@ function mockFetch() {
     if (url.endsWith("/sources") && method === "GET") return { ok: true, json: async () => [] };
     if (url.includes("/observability/keys")) return { ok: true, json: async () => ({ prefix: "sens:", dbsize: 0, sample: [], sample_size: 0, ms: 1 }) };
     if (url.includes("/observability/memory")) return { ok: true, json: async () => ({ used_memory: 0, used_memory_human: "0B", ms: 1 }) };
+    // Wave 6.44.B — IndexingProgress reads /redis/active-target through
+    // useActiveTargetLabel(); return TEST_LABEL so the hook resolves and
+    // the anchor reads/writes succeed.
+    if (url.endsWith("/redis/active-target") && method === "GET") {
+      return {
+        ok: true,
+        json: async () => ({
+          host: "localhost", port: 6379, tls: false, db: 0, label: TEST_LABEL,
+        }),
+      };
+    }
     if (url.endsWith("/admin/stream-status") && method === "GET") {
       return {
         ok: true,
@@ -168,6 +191,7 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
       consumedAtAnchor: 0,
       anchorTs: Date.now(),
       lastSeenAt: Date.now(),
+      targetLabel: TEST_LABEL,
     };
     globalThis.localStorage.setItem(STORAGE_KEY, JSON.stringify(anchor));
     // 750 indexed since anchor ⇒ 75% of 1000-row denominator. xlen is kept
@@ -221,6 +245,7 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
       consumedAtAnchor: 0,
       anchorTs: Date.now(),
       lastSeenAt: Date.now(),
+      targetLabel: TEST_LABEL,
     };
     globalThis.localStorage.setItem(STORAGE_KEY, JSON.stringify(anchor));
     streamState.xlen = 200;
@@ -258,6 +283,7 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
       consumedAtAnchor: 0,
       anchorTs: Date.now(),
       lastSeenAt: Date.now(),
+      targetLabel: TEST_LABEL,
     };
     globalThis.localStorage.setItem(STORAGE_KEY, JSON.stringify(anchor));
     streamState.xlen = 200;
@@ -292,6 +318,7 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
       consumedAtAnchor: 0,
       anchorTs: Date.now(),
       lastSeenAt: Date.now(),
+      targetLabel: TEST_LABEL,
     };
     globalThis.localStorage.setItem(STORAGE_KEY, JSON.stringify(anchor));
     streamState.xlen = 500;
@@ -316,6 +343,7 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
       consumedAtAnchor: 500,
       anchorTs: Date.now(),
       lastSeenAt: Date.now(),
+      targetLabel: TEST_LABEL,
     };
     globalThis.localStorage.setItem(STORAGE_KEY, JSON.stringify(anchor));
     // Stream-status keeps returning xlen > 0 (unbounded stream) and
@@ -354,6 +382,7 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
       consumedAtAnchor: 0,
       anchorTs: Date.now(),
       lastSeenAt: Date.now(),
+      targetLabel: TEST_LABEL,
     };
     globalThis.localStorage.setItem(STORAGE_KEY, JSON.stringify(anchor));
     // Live-evidence shape: maxlen=0 stream where xlen is cumulative-ever
@@ -479,6 +508,7 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
       consumedAtAnchor: 500,
       anchorTs: Date.now(),
       lastSeenAt: Date.now(),
+      targetLabel: TEST_LABEL,
     };
     globalThis.localStorage.setItem(STORAGE_KEY, JSON.stringify(anchor));
     streamState.xlen = 200;
@@ -519,6 +549,7 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
       consumedAtAnchor: 1_000,
       anchorTs,
       lastSeenAt: anchorTs,
+      targetLabel: TEST_LABEL,
     };
     globalThis.localStorage.setItem(STORAGE_KEY, JSON.stringify(anchor));
     streamState.xlen = 5_000;
@@ -548,6 +579,7 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
       consumedAtAnchor: 0,
       anchorTs: Date.now(),
       lastSeenAt: Date.now(),
+      targetLabel: TEST_LABEL,
     };
     globalThis.localStorage.setItem(STORAGE_KEY, JSON.stringify(anchor));
     setMockRun({
@@ -580,6 +612,7 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
       consumedAtAnchor: 0,
       anchorTs: Date.now(),
       lastSeenAt: Date.now(),
+      targetLabel: TEST_LABEL,
     };
     globalThis.localStorage.setItem(STORAGE_KEY, JSON.stringify(anchor));
     setMockRun({

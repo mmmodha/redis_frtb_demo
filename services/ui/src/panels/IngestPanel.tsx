@@ -39,6 +39,7 @@ import {
   type ConsumedSample,
   type IndexingAnchor,
 } from "../lib/indexingState";
+import { useActiveTargetLabel } from "../lib/connections";
 
 // Wave 5.20a — defensive fallback when dbsize=0 (no rows yet) so the sanity
 // check still produces a meaningful estimate. ~1.5 KB/row is the smoke-run-12
@@ -2213,6 +2214,11 @@ function formatEtaSeconds(s: number): string {
 
 function IndexingProgress() {
   const { run } = useGeneratorRun();
+  // Wave 6.44.B — active-target label drives per-target anchor isolation.
+  // While the label is `null` (first paint before /redis/active-target
+  // resolves) we skip all anchor reads/writes — the storage layer needs a
+  // label to form the v3 key.
+  const targetLabel = useActiveTargetLabel();
   const [currentConsumed, setCurrentConsumed] = useState<number | null>(null);
   const [samples, setSamples] = useState<ConsumedSample[]>([]);
   const [anchor, setAnchor] = useState<IndexingAnchor | null>(null);
@@ -2224,23 +2230,31 @@ function IndexingProgress() {
   const completeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Shared reset used by the auto-clear escape hatches and the 3s completion
-  // timeout callback.
+  // timeout callback. Wave 6.44.B — clears storage only for the active label;
+  // anchors on other targets are left intact.
   const resetIndexingState = (): void => {
     if (completeTimeoutRef.current !== null) {
       clearTimeout(completeTimeoutRef.current);
       completeTimeoutRef.current = null;
     }
-    clearAnchor();
+    if (targetLabel) clearAnchor(targetLabel);
     setAnchor(null);
     setCompleteShownAt(null);
     setSamples([]);
   };
 
-  // Mount: restore anchor from localStorage if present.
+  // Mount + target-switch: load the anchor for the live target. Re-runs
+  // when `targetLabel` changes so flipping active cluster swaps the
+  // displayed anchor in-place (the storage layer is partitioned by label
+  // so each target keeps its own anchor across switches).
   useEffect(() => {
-    const a = readAnchor();
-    if (a) setAnchor(a);
-  }, []);
+    if (!targetLabel) {
+      setAnchor(null);
+      return;
+    }
+    const a = readAnchor(targetLabel);
+    setAnchor(a);
+  }, [targetLabel]);
 
   // Unmount: cancel any pending completion timeout to avoid setState on an
   // unmounted component.
@@ -2278,6 +2292,7 @@ function IndexingProgress() {
   // new value so the bar continues smoothly without going negative.
   useEffect(() => {
     if (anchor === null || currentConsumed === null) return;
+    if (!targetLabel || anchor.targetLabel !== targetLabel) return;
     if (currentConsumed >= anchor.consumedAtAnchor) return;
     const now = Date.now();
     const next: IndexingAnchor = {
@@ -2285,9 +2300,9 @@ function IndexingProgress() {
       consumedAtAnchor: currentConsumed,
       lastSeenAt: now,
     };
-    writeAnchor(next);
+    writeAnchor(targetLabel, next);
     setAnchor(next);
-  }, [anchor, currentConsumed]);
+  }, [anchor, currentConsumed, targetLabel]);
 
   // Implicit-anchor seed removed by 6.41.E.fix4: on unbounded streams
   // (stream_maxlen=0) xlen never returns to 0, so a "xlen>0 ⇒ seed anchor"
@@ -2319,7 +2334,7 @@ function IndexingProgress() {
       // Seed the anchor immediately when we have a consumed sample to
       // anchor against; otherwise the in-generation effect below picks it
       // up on the next poll.
-      if (currentConsumed !== null && (run?.rowsTotal ?? 0) > 0) {
+      if (targetLabel && currentConsumed !== null && (run?.rowsTotal ?? 0) > 0) {
         const now = Date.now();
         const a: IndexingAnchor = {
           runId: run?.runId ?? null,
@@ -2327,8 +2342,9 @@ function IndexingProgress() {
           consumedAtAnchor: currentConsumed,
           anchorTs: now,
           lastSeenAt: now,
+          targetLabel,
         };
-        writeAnchor(a);
+        writeAnchor(targetLabel, a);
         setAnchor(a);
       }
       return;
@@ -2338,6 +2354,7 @@ function IndexingProgress() {
     if (!becomesTerminal) return;
     if (anchor !== null) return;
     if (currentConsumed === null) return;
+    if (!targetLabel) return;
     const rowsTotal = run?.rowsTotal ?? 0;
     if (rowsTotal <= 0) return;
     const now = Date.now();
@@ -2347,11 +2364,12 @@ function IndexingProgress() {
       consumedAtAnchor: currentConsumed,
       anchorTs: now,
       lastSeenAt: now,
+      targetLabel,
     };
-    writeAnchor(a);
+    writeAnchor(targetLabel, a);
     setAnchor(a);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [run?.status, run?.runId, run?.rowsTotal, anchor, currentConsumed]);
+  }, [run?.status, run?.runId, run?.rowsTotal, anchor, currentConsumed, targetLabel]);
 
   // While a run is active and the anchor is still missing (e.g. first poll
   // hadn't landed when the run started), seed it as soon as the consumed
@@ -2361,6 +2379,7 @@ function IndexingProgress() {
     const status = run?.status ?? null;
     if (status !== "running" && status !== "cancelling") return;
     if (currentConsumed === null) return;
+    if (!targetLabel) return;
     const rowsTotal = run?.rowsTotal ?? 0;
     if (rowsTotal <= 0) return;
     const now = Date.now();
@@ -2370,10 +2389,11 @@ function IndexingProgress() {
       consumedAtAnchor: currentConsumed,
       anchorTs: now,
       lastSeenAt: now,
+      targetLabel,
     };
-    writeAnchor(a);
+    writeAnchor(targetLabel, a);
     setAnchor(a);
-  }, [anchor, run?.status, run?.runId, run?.rowsTotal, currentConsumed]);
+  }, [anchor, run?.status, run?.runId, run?.rowsTotal, currentConsumed, targetLabel]);
 
   // Wave 6.41.E.fix (A) — pct reached 100% with an active anchor ⇒ show
   // "Indexing complete" for INDEXING_COMPLETE_MS then clear. The timeout id
@@ -2396,9 +2416,10 @@ function IndexingProgress() {
     }
     if (completeTimeoutRef.current !== null) return; // already scheduled
     setCompleteShownAt(Date.now());
+    const clearLabel = anchor.targetLabel;
     completeTimeoutRef.current = setTimeout(() => {
       completeTimeoutRef.current = null;
-      clearAnchor();
+      clearAnchor(clearLabel);
       setAnchor(null);
       setCompleteShownAt(null);
       setSamples([]);
@@ -2428,7 +2449,12 @@ function IndexingProgress() {
   // Render decision. Single phase: bar is visible iff an anchor exists and
   // we have observed at least one consumed poll. The in-generation /
   // post-terminal split is gone — both compute pct off the same formula.
+  // Wave 6.44.B — also evict when the in-memory anchor was created against
+  // a different active target than the one currently selected. The mount
+  // effect re-reads on label change so this guard only fires for the one
+  // render between a label flip and the re-read settling.
   if (anchor === null || currentConsumed === null) return null;
+  if (!targetLabel || anchor.targetLabel !== targetLabel) return null;
 
   const showingComplete = completeShownAt !== null;
   const rawIndexed = currentConsumed - anchor.consumedAtAnchor;

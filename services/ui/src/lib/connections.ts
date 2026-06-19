@@ -6,6 +6,7 @@
 // The server redacts them on every response; nothing in this module ever
 // reads a password field off a fetched profile.
 
+import { useEffect, useState } from "react";
 import { apiBase } from "./api";
 
 export interface ActiveTarget {
@@ -110,6 +111,33 @@ async function sendJson<T>(path: string, method: "POST" | "PUT" | "DELETE", body
 
 export function getActiveTarget(): Promise<ActiveTarget> {
   return getJson<ActiveTarget>("/redis/active-target");
+}
+
+// Wave 6.44.B — live active-target label for per-target client-side state
+// (e.g. the IngestPanel indexing anchor in lib/indexingState.ts). Returns
+// `null` until the first /redis/active-target response lands, and re-fetches
+// whenever the Connections panel dispatches `connections:active-changed`
+// (the same event that drives <ActiveTargetPill/> in AppShell). Fetch
+// failures collapse to `null` so callers degrade to "no per-target storage".
+export function useActiveTargetLabel(): string | null {
+  const [label, setLabel] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    const fetchLabel = () => {
+      getActiveTarget()
+        .then((t) => { if (!cancelled) setLabel(t.label || null); })
+        .catch(() => { if (!cancelled) setLabel(null); });
+    };
+    fetchLabel();
+    if (typeof window === "undefined") return;
+    const onChanged = () => { fetchLabel(); };
+    window.addEventListener("connections:active-changed", onChanged);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("connections:active-changed", onChanged);
+    };
+  }, []);
+  return label;
 }
 
 export function listConnections(): Promise<ConnectionProfile[]> {

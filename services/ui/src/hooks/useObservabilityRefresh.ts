@@ -1,6 +1,10 @@
 // Wave 5.51 — cadence state for the Observability page. Reads/writes
 // localStorage["obs.refresh.ms"]; invalid or missing values fall back to the
 // 2s default. Valid cadences are 0 (Off) / 1s / 2s / 5s / 10s in ms.
+//
+// Wave 6.44.B audit — intentionally global (not target-scoped). The poll
+// cadence is an operator UI preference for the Observability page; the same
+// human wants the same refresh rate against any active target.
 
 import { useCallback, useEffect, useState } from "react";
 

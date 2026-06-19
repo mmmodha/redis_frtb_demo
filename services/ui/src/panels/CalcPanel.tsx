@@ -269,6 +269,11 @@ function BucketChargeChart({
 
 // localStorage key for the "Show Redis commands" toggle. Persisted across
 // sessions so the demo-viewer setting survives reloads.
+//
+// Wave 6.44.B audit — intentionally global (not target-scoped). This is a
+// UI display preference of the operator, not a per-cluster fact; the same
+// human wants to see (or hide) the Redis commands panel regardless of
+// which target is active.
 const SHOW_REDIS_COMMANDS_KEY = "calc.show-redis-commands";
 
 // Wave 6.41.C — translate the FilterChips state into the `include` field on

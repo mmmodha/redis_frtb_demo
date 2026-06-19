@@ -8,9 +8,22 @@
 // peak-xlen design pinned the bar at 0%. Pct math is now
 // (consumedNow - consumedAtAnchor) / rowsTotal. Storage key bumped to v2;
 // v1 anchors are silently dropped on read (acceptable per the task spec).
+//
+// Wave 6.44.B — anchor is now per-active-target. Storage key bumped to
+// `frtb:indexing:anchor:v3:{target_label}` so switching targets mid-flow
+// (Connections panel "Activate" on another cluster) shows the new target's
+// own progress (or no bar) instead of mis-attributing the prior target's
+// state. v2 entries are silently dropped on first read after upgrade —
+// same precedent as v1→v2; no migration is written. The anchor body
+// additionally carries `targetLabel` so the IngestPanel render guard can
+// evict in-memory state that lags a live target switch by one render.
 
-export const STORAGE_KEY = "frtb:indexing:anchor:v2";
+export const STORAGE_KEY_PREFIX = "frtb:indexing:anchor:v3:";
 export const ANCHOR_TTL_MS = 24 * 60 * 60 * 1000;
+
+export function storageKeyFor(label: string): string {
+  return STORAGE_KEY_PREFIX + label;
+}
 
 export interface IndexingAnchor {
   // The generator run that seeded this indexing pass. May be null when the
@@ -30,6 +43,12 @@ export interface IndexingAnchor {
   // future iteration could use it for staleness heuristics; today it is
   // bumped on writes and read for diagnostics only.
   lastSeenAt: number;
+  // Wave 6.44.B — active target label this anchor was created against.
+  // Redundant with the storage-key suffix (anchors are already partitioned
+  // by label in storage) but persisted on the body so the IngestPanel
+  // render guard can detect a target switch even when the in-memory state
+  // hasn't yet been re-read against the new label.
+  targetLabel: string;
 }
 
 function getStorage(): Storage | null {
@@ -41,11 +60,12 @@ function getStorage(): Storage | null {
   }
 }
 
-export function readAnchor(now: number = Date.now()): IndexingAnchor | null {
+export function readAnchor(label: string, now: number = Date.now()): IndexingAnchor | null {
   const store = getStorage();
   if (!store) return null;
+  const key = storageKeyFor(label);
   let raw: string | null;
-  try { raw = store.getItem(STORAGE_KEY); } catch { return null; }
+  try { raw = store.getItem(key); } catch { return null; }
   if (!raw) return null;
   let parsed: Partial<IndexingAnchor>;
   try { parsed = JSON.parse(raw) as Partial<IndexingAnchor>; }
@@ -59,7 +79,7 @@ export function readAnchor(now: number = Date.now()): IndexingAnchor | null {
     return null;
   }
   if (now - parsed.anchorTs > ANCHOR_TTL_MS) {
-    try { store.removeItem(STORAGE_KEY); } catch { /* noop */ }
+    try { store.removeItem(key); } catch { /* noop */ }
     return null;
   }
   return {
@@ -68,19 +88,20 @@ export function readAnchor(now: number = Date.now()): IndexingAnchor | null {
     consumedAtAnchor: parsed.consumedAtAnchor,
     anchorTs: parsed.anchorTs,
     lastSeenAt: parsed.lastSeenAt,
+    targetLabel: typeof parsed.targetLabel === "string" ? parsed.targetLabel : label,
   };
 }
 
-export function writeAnchor(a: IndexingAnchor): void {
+export function writeAnchor(label: string, a: IndexingAnchor): void {
   const store = getStorage();
   if (!store) return;
-  try { store.setItem(STORAGE_KEY, JSON.stringify(a)); } catch { /* quota */ }
+  try { store.setItem(storageKeyFor(label), JSON.stringify(a)); } catch { /* quota */ }
 }
 
-export function clearAnchor(): void {
+export function clearAnchor(label: string): void {
   const store = getStorage();
   if (!store) return;
-  try { store.removeItem(STORAGE_KEY); } catch { /* noop */ }
+  try { store.removeItem(storageKeyFor(label)); } catch { /* noop */ }
 }
 
 // Clamp to [0, 100]. rowsTotal <= 0 ⇒ nothing to index ⇒ 100%. A

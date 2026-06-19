@@ -134,6 +134,11 @@ export async function postReconcileBucket(
 // Admin token persistence — localStorage only, never the URL. Defaults to
 // empty so the reconcile form starts blocked until the operator types or
 // pastes a token.
+//
+// Wave 6.44.B audit — intentionally global (not target-scoped). The admin
+// token is shared shell credential of the operator, not a per-cluster
+// secret; partitioning by target label would force the operator to re-paste
+// it on every switch with no security benefit.
 export const ADMIN_TOKEN_STORAGE_KEY = "frtb.admin.token";
 
 export function loadAdminToken(): string {

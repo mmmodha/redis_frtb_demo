@@ -1,11 +1,15 @@
 // Wave 6.41.E — pure unit tests for the IngestPanel indexing anchor.
 // Wave 6.41.E.fix3 — anchor stores `consumedAtAnchor` (monotonic consumer
 // counter) instead of `anchorXlen`. Storage key bumped to v2.
+// Wave 6.44.B — anchors are per-active-target. Storage key bumped to v3
+// with a `:{target_label}` suffix; v2 entries are dropped silently on
+// read. read/write/clearAnchor now take a `label: string` argument.
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   ANCHOR_TTL_MS,
-  STORAGE_KEY,
+  STORAGE_KEY_PREFIX,
+  storageKeyFor,
   clearAnchor,
   computePct,
   computeRatePerSec,
@@ -15,6 +19,8 @@ import {
   type ConsumedSample,
   type IndexingAnchor,
 } from "../../src/lib/indexingState";
+
+const LABEL = "test-label";
 
 // Node 22's experimental globalThis.localStorage shadows jsdom's so the
 // standard API is unavailable by default; stub a small in-memory Storage.
@@ -46,62 +52,135 @@ afterEach(() => {
   });
 });
 
-function anchorAt(ts: number): IndexingAnchor {
+function anchorAt(ts: number, label: string = LABEL): IndexingAnchor {
   return {
     runId: "01HXRUN",
     rowsTotal: 100,
     consumedAtAnchor: 50,
     anchorTs: ts,
     lastSeenAt: ts,
+    targetLabel: label,
   };
 }
 
 describe("indexingState — anchor persistence", () => {
   it("returns null when nothing is stored", () => {
-    expect(readAnchor()).toBeNull();
+    expect(readAnchor(LABEL)).toBeNull();
   });
 
   it("round-trips writeAnchor + readAnchor", () => {
     const a = anchorAt(1_700_000_000_000);
-    writeAnchor(a);
-    expect(readAnchor(a.anchorTs + 1000)).toEqual(a);
-    expect(localStorage.getItem(STORAGE_KEY)).not.toBeNull();
+    writeAnchor(LABEL, a);
+    expect(readAnchor(LABEL, a.anchorTs + 1000)).toEqual(a);
+    expect(localStorage.getItem(storageKeyFor(LABEL))).not.toBeNull();
   });
 
-  it("uses the v2 storage key (v1 entries are silently dropped on read)", () => {
-    expect(STORAGE_KEY).toBe("frtb:indexing:anchor:v2");
-    // A v1-shaped entry (anchorXlen field, no consumedAtAnchor) parses to
-    // missing-required-fields → readAnchor returns null.
+  it("uses the v3 label-scoped storage key prefix", () => {
+    expect(STORAGE_KEY_PREFIX).toBe("frtb:indexing:anchor:v3:");
+    expect(storageKeyFor("local")).toBe("frtb:indexing:anchor:v3:local");
+  });
+
+  it("silently drops v2 entries left behind by the prior layout", () => {
+    // A v2-shaped entry sat at the old unscoped key. After upgrade, the
+    // v3 reader never consults it; the entry is left in storage and the
+    // v3 read returns null (mirrors the v1→v2 migration precedent).
     localStorage.setItem(
       "frtb:indexing:anchor:v2",
-      JSON.stringify({ runId: "x", rowsTotal: 100, anchorXlen: 100, anchorTs: Date.now(), lastSeenAt: Date.now() }),
+      JSON.stringify({
+        runId: "x", rowsTotal: 100, consumedAtAnchor: 0,
+        anchorTs: Date.now(), lastSeenAt: Date.now(),
+      }),
     );
-    expect(readAnchor()).toBeNull();
+    expect(readAnchor(LABEL)).toBeNull();
   });
 
   it("expires entries older than 24h and clears them", () => {
     const a = anchorAt(1_000);
-    writeAnchor(a);
+    writeAnchor(LABEL, a);
     // 24h + 1ms later
-    expect(readAnchor(1_000 + ANCHOR_TTL_MS + 1)).toBeNull();
+    expect(readAnchor(LABEL, 1_000 + ANCHOR_TTL_MS + 1)).toBeNull();
     // entry should have been cleared as a side effect
-    expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
+    expect(localStorage.getItem(storageKeyFor(LABEL))).toBeNull();
   });
 
   it("returns null on malformed JSON", () => {
-    localStorage.setItem(STORAGE_KEY, "not json");
-    expect(readAnchor()).toBeNull();
+    localStorage.setItem(storageKeyFor(LABEL), "not json");
+    expect(readAnchor(LABEL)).toBeNull();
   });
 
   it("returns null when required numeric fields are missing", () => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ runId: "x" }));
-    expect(readAnchor()).toBeNull();
+    localStorage.setItem(storageKeyFor(LABEL), JSON.stringify({ runId: "x" }));
+    expect(readAnchor(LABEL)).toBeNull();
   });
 
-  it("clearAnchor removes the entry", () => {
-    writeAnchor(anchorAt(100));
-    clearAnchor();
-    expect(readAnchor()).toBeNull();
+  it("clearAnchor removes the entry for that label only", () => {
+    writeAnchor(LABEL, anchorAt(100));
+    clearAnchor(LABEL);
+    expect(readAnchor(LABEL)).toBeNull();
+  });
+});
+
+// Wave 6.44.B — per-target isolation. The DoD scenario: write an anchor
+// under label A, switch to label B → read returns null; switch back to A
+// → the original anchor is preserved untouched.
+describe("indexingState — Wave 6.44.B per-target isolation", () => {
+  it("read under a different label returns null even when one is stored", () => {
+    const a = anchorAt(1_000, "local");
+    writeAnchor("local", a);
+    expect(readAnchor("live-standalone")).toBeNull();
+  });
+
+  it("writes never collide across labels (A then B then A is preserved)", () => {
+    const onA = anchorAt(1_000, "local");
+    writeAnchor("local", onA);
+    // Switch: read under B returns null.
+    expect(readAnchor("live-standalone", onA.anchorTs + 1)).toBeNull();
+    // Seed an independent anchor on B.
+    const onB: IndexingAnchor = {
+      runId: "01HXRUN-B",
+      rowsTotal: 50,
+      consumedAtAnchor: 10,
+      anchorTs: onA.anchorTs + 2,
+      lastSeenAt: onA.anchorTs + 2,
+      targetLabel: "live-standalone",
+    };
+    writeAnchor("live-standalone", onB);
+    expect(readAnchor("live-standalone", onB.anchorTs + 1)).toEqual(onB);
+    // Switch back to A — original anchor still there, unchanged.
+    expect(readAnchor("local", onA.anchorTs + 1000)).toEqual(onA);
+  });
+
+  it("clearAnchor on one label does not affect anchors on other labels", () => {
+    const ts = Date.now();
+    writeAnchor("local", anchorAt(ts, "local"));
+    writeAnchor("live-standalone", anchorAt(ts, "live-standalone"));
+    clearAnchor("local");
+    expect(readAnchor("local")).toBeNull();
+    expect(readAnchor("live-standalone")).not.toBeNull();
+  });
+
+  it("storage entries live under distinct label-scoped keys", () => {
+    writeAnchor("local", anchorAt(100, "local"));
+    writeAnchor("live-standalone", anchorAt(100, "live-standalone"));
+    expect(localStorage.getItem(storageKeyFor("local"))).not.toBeNull();
+    expect(localStorage.getItem(storageKeyFor("live-standalone"))).not.toBeNull();
+    expect(storageKeyFor("local")).not.toBe(storageKeyFor("live-standalone"));
+  });
+
+  it("backfills targetLabel from the read key when the stored body omits it", () => {
+    // Defensive: a body written without a targetLabel field (shouldn't
+    // happen from writeAnchor, but guards against hand-written entries)
+    // returns with targetLabel = the label used to read.
+    localStorage.setItem(
+      storageKeyFor("local"),
+      JSON.stringify({
+        runId: "x", rowsTotal: 100, consumedAtAnchor: 0,
+        anchorTs: Date.now(), lastSeenAt: Date.now(),
+      }),
+    );
+    const r = readAnchor("local");
+    expect(r).not.toBeNull();
+    expect(r!.targetLabel).toBe("local");
   });
 });
 
