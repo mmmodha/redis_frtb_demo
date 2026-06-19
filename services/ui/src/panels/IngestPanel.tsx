@@ -2359,8 +2359,32 @@ function IndexingProgress() {
       }
       return;
     }
-    const becomesTerminal = (status === "done" || status === "cancelled")
+    // Wave 6.44.E — explicit-cancel / error transition, or the run
+    // disappearing from the active list, while an anchor is still in
+    // place. If the indexed delta has NOT reached rowsTotal yet, hard-
+    // clear the bar immediately; the prior "3s Indexing complete toast"
+    // path only runs when pct hits 100% so a stopped/errored run would
+    // otherwise leave the bar stranded until tab close. The
+    // running→done case is intentionally excluded: the indexer often
+    // lags the generator and the existing post-terminal anchor display
+    // is the right UX for that case.
+    const becomesTerminal = (status === "done" || status === "cancelled" || status === "error")
       && (prev === "running" || prev === "cancelling");
+    const becomesCancelOrError = (status === "cancelled" || status === "error")
+      && (prev === "running" || prev === "cancelling");
+    const runDropped = status === null && prev !== null;
+    if (becomesCancelOrError || runDropped) {
+      if (anchor !== null) {
+        const indexed = currentIndexCount !== null
+          ? currentIndexCount - anchor.indexCountAtAnchor
+          : 0;
+        const atTarget = anchor.rowsTotal > 0 && indexed >= anchor.rowsTotal;
+        if (!atTarget) {
+          resetIndexingState();
+        }
+        return;
+      }
+    }
     if (!becomesTerminal) return;
     if (anchor !== null) return;
     if (currentIndexCount === null) return;

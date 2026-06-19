@@ -560,6 +560,51 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
     expect(text.textContent).toMatch(/0%/);
   });
 
+  // Wave 6.44.E — pressing "Stop all runs" mid-stream flips the run from
+  // "running" → "cancelled" before the indexer reaches anchor + rowsTotal.
+  // The bar must disappear on the next render (and the v4 anchor must be
+  // hard-cleared from localStorage) instead of sitting stranded until tab
+  // close.
+  it("(6.44.E) cancel mid-run with indexed < rowsTotal hard-clears the bar", async () => {
+    setMockRun({
+      rowsTotal: 100_000, rowsDone: 30_000, elapsedMs: 1_000, rowsPerSec: 30_000,
+      runId: "01HXRUN", status: "running",
+    });
+    const anchor: IndexingAnchor = {
+      runId: "01HXRUN",
+      rowsTotal: 100_000,
+      indexCountAtAnchor: 0,
+      anchorTs: Date.now(),
+      lastSeenAt: Date.now(),
+      targetLabel: TEST_LABEL,
+    };
+    globalThis.localStorage.setItem(STORAGE_KEY, JSON.stringify(anchor));
+    indexCountState.count = 30_000; // 30% indexed at cancel time
+    vi.stubGlobal("fetch", mockFetch());
+    const { rerender } = renderPanel();
+    await waitFor(() => {
+      expect(screen.queryAllByTestId("indexing-progress").length).toBeGreaterThan(0);
+    });
+    // User clicks "Stop all runs" ⇒ run.status flips to "cancelled".
+    setMockRun({
+      rowsTotal: 100_000, rowsDone: 30_000, elapsedMs: 1_000, rowsPerSec: 30_000,
+      runId: "01HXRUN", status: "cancelled",
+    });
+    rerender(
+      <MemoryRouter>
+        <GeneratorRunProvider>
+          <IngestPanel />
+        </GeneratorRunProvider>
+      </MemoryRouter>,
+    );
+    await waitFor(() => {
+      expect(screen.queryByTestId("indexing-progress")).not.toBeInTheDocument();
+    });
+    // Anchor was hard-cleared from localStorage so a page refresh would
+    // not resurrect the stranded bar.
+    expect(globalThis.localStorage.getItem(STORAGE_KEY)).toBeNull();
+  });
+
   // Wave 6.44.D — indexing pct grows monotonically as the live FT.SEARCH
   // count increases against the rowsTotal denominator. Mirrors real
   // production rates: ~30K rows/s indexing on a 10M-row target.
