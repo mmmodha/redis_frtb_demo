@@ -192,7 +192,7 @@ export function registerFacetsRoute(
   getRedis: () => RedisLike,
   opts: { schema?: Schema } = {},
 ): void {
-  app.get("/facets", async (_req, reply) => {
+  app.get("/facets", { config: { category: "heavy-calc" } }, async (_req, reply) => {
     const t0 = process.hrtime.bigint();
     const key = identityKey();
     const now = Date.now();

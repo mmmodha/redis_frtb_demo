@@ -257,14 +257,16 @@ async function main(): Promise<void> {
   // `bootstrapFrtb` above and the post-listen `scheduleBootstrap` below so
   // the Wave 6.18c boot-protection invariants (withBootTimeout 12s,
   // commandTimeout 10s) are preserved.
-  // Wave 6.21 — thread the pool category through. Default "heavy" keeps any
-  // unmigrated route on the safe pool; routes that opt in to "light" via
-  // `config: { category: "light" }` land on the independent light pool so a
-  // slow FT.AGGREGATE on heavy cannot stall observability/healthz. The
-  // boot-time `redis` fallback applies to both categories — it exists only
-  // for the brief window before the active-target singleton resolves, where
-  // pool isolation is not a concern.
-  const getRedis = (category: RuntimeCategory = "heavy"): RedisLike => {
+  // Wave 6.21 / 6.40.X — thread the pool category through. Default
+  // "heavy-calc" keeps any unmigrated route on the safest pool (35s
+  // command-timeout, biggest fast-path budget); routes that opt in to
+  // "heavy-ingest" or "light" via `config: { category: ... }` land on the
+  // independent pool so a slow FT.AGGREGATE on heavy-calc cannot stall
+  // ingest writes or observability/healthz. The boot-time `redis` fallback
+  // applies across all categories — it exists only for the brief window
+  // before the active-target singleton resolves, where pool isolation is
+  // not a concern.
+  const getRedis = (category: RuntimeCategory = "heavy-calc"): RedisLike => {
     const active = getActiveRedisRuntimeClient(category);
     return (active ?? redis) as unknown as RedisLike;
   };

@@ -671,7 +671,7 @@ export function registerGeneratorRoutes(
   const streamName = opts.streamName ?? "sensitivities:in";
   const corsAllowed = opts.corsAllowed ?? "http://localhost:3000";
 
-  app.post<{ Body: GeneratorStartBody }>("/generator/start", async (req, reply) => {
+  app.post<{ Body: GeneratorStartBody }>("/generator/start", { config: { category: "heavy-ingest" } }, async (req, reply) => {
     if (!schema) {
       app.log.warn({ evt: "generator-start", err: "schema-missing" });
       reply.code(503);
@@ -754,7 +754,7 @@ export function registerGeneratorRoutes(
   // flips, so the terminal-frame transition + grace-eviction below
   // continues to be the only SSE-specific orchestration.
 
-  app.post<{ Body: GeneratorStartBody }>("/generator/start/stream", async (req, reply) => {
+  app.post<{ Body: GeneratorStartBody }>("/generator/start/stream", { config: { category: "heavy-ingest" } }, async (req, reply) => {
     if (!schema) {
       app.log.warn({ evt: "generator-stream", err: "schema-missing" });
       reply.code(503);

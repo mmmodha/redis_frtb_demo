@@ -62,7 +62,7 @@ export function registerSuggestRoutes(
   getRedis: () => RedisLike,
   _opts: RegisterSuggestOpts = {},
 ): void {
-  app.get<{ Querystring: SuggestQuery }>("/suggest", async (req, reply) => {
+  app.get<{ Querystring: SuggestQuery }>("/suggest", { config: { category: "heavy-calc" } }, async (req, reply) => {
     const field = req.query.field;
     const prefix = req.query.prefix;
     const fuzzyRaw = req.query.fuzzy ?? "1";

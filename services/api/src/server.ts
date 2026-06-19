@@ -181,15 +181,22 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
 
   // Wave 6.21 (B1) — resolve the route-level pool category onto the request
   // BEFORE any preHandler / handler body runs. Routes declare `config:
-  // { category: "light" }`; everything else stays on heavy. Registered ahead
-  // of `registerBackpressure` so the 6.23 semaphore middleware can read
-  // `req.poolCategory` rather than re-deriving the category from the URL.
-  // `decorateRequest` gives every request a default value so the property
-  // access is monomorphic; the hook then overwrites it from route config.
-  app.decorateRequest("poolCategory", "heavy");
+  // { category: "heavy-calc" | "heavy-ingest" | "light" }`; everything else
+  // defaults to heavy-calc. Registered ahead of `registerBackpressure` so the
+  // 6.23 semaphore middleware can read `req.poolCategory` rather than
+  // re-deriving the category from the URL. `decorateRequest` gives every
+  // request a default value so the property access is monomorphic; the hook
+  // then overwrites it from route config.
+  //
+  // Wave 6.40.X — the default is `"heavy-calc"` (formerly `"heavy"`) so any
+  // unmigrated route lands on the safer/longer-timeout pool. Routes that
+  // perform XADD writes opt in to `"heavy-ingest"`. The `"heavy"` value is
+  // still accepted from route config for backward compatibility — see the
+  // alias normalisation in active-target.ts.
+  app.decorateRequest("poolCategory", "heavy-calc");
   app.addHook("onRequest", async (req) => {
     const cfg = req.routeOptions?.config as { category?: RuntimeCategory } | undefined;
-    req.poolCategory = cfg?.category ?? "heavy";
+    req.poolCategory = cfg?.category ?? "heavy-calc";
   });
 
   // Wave 6.23 — per-category concurrency limits. Registered before any
@@ -286,13 +293,14 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
   //      commandTimeout) so the in-Redis FT_AGGREGATE TIMEOUT (30s) can fire
   //      first; the boot client (10s) remains reserved for `bootstrapFrtb` +
   //      `scheduleBootstrap` callers.
-  // Wave 6.21 — category defaults to `"heavy"` so a route that hasn't been
-  // explicitly migrated stays on the same safe runtime client it had before.
-  // Routes opt in to `"light"` by declaring `config: { category: "light" }`
-  // on the route definition (see B1); the handler then calls
-  // `getRedis(req.poolCategory)` — never a hardcoded literal — so the choice
-  // is visible at hook time for 6.23's semaphore middleware.
-  const getRedis = (category: RuntimeCategory = "heavy"): RedisLike => {
+  // Wave 6.21 / 6.40.X — category defaults to `"heavy-calc"` so a route that
+  // hasn't been explicitly migrated stays on the safest runtime client (35s
+  // command-timeout budget). Routes opt in to `"light"` / `"heavy-ingest"`
+  // by declaring `config: { category: ... }` on the route definition; the
+  // handler then calls `getRedis(req.poolCategory)` — never a hardcoded
+  // literal — so the choice is visible at hook time for 6.23's semaphore
+  // middleware.
+  const getRedis = (category: RuntimeCategory = "heavy-calc"): RedisLike => {
     if (opts.getRedis) return opts.getRedis(category);
     if (opts.redis) return opts.redis;
     const active = getActiveRedisRuntimeClient(category);

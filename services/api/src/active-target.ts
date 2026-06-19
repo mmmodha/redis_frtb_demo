@@ -39,7 +39,7 @@ let overrideCreds: ActiveTargetCreds = {};
 // cache key string.
 let credsGeneration = 0;
 const listeners = new Set<ActiveTargetListener>();
-// Wave 6.21 — THREE kinds of client live behind this module, all identical
+// Wave 6.21 — multiple kinds of client live behind this module, all identical
 // host/port/auth/keepalive but with different per-command timeouts AND
 // different multiplicity:
 //   * `cachedBootClient` — commandTimeout: 10_000 (Wave 6.18c). SINGLETON.
@@ -48,21 +48,29 @@ const listeners = new Set<ActiveTargetListener>();
 //     `app.listen(...)` is reached. Companion to `withBootTimeout(...)` in
 //     index.ts (12s). Intentionally NOT pooled: the boot path is a single,
 //     infrequent call; a singleton avoids opening N sockets just to bootstrap.
-//   * `heavyPool` — commandTimeout: 35_000 (Wave 6.18f). POOL of
-//     `RUNTIME_REDIS_POOL_SIZE_HEAVY` (default 4) ioredis clients selected
-//     round-robin. Used for slow per-request work (FT.AGGREGATE, FCALL, calc,
-//     facets, sbm-total). The pool exists purely to bound blast radius: a
-//     single hung command stalls only the one member it landed on; the other
-//     three keep serving traffic. ioredis already pipelines commands on each
-//     socket, so this is NOT a checkout/lease pool.
-//   * `lightPool` — commandTimeout: 35_000 (Wave 6.18f). POOL of
-//     `RUNTIME_REDIS_POOL_SIZE_LIGHT` (default 4) ioredis clients selected
-//     round-robin. Used for cheap reads (observability, /admin/preflight,
-//     healthz-adjacent endpoints) so a poisoned heavy connection from a slow
-//     FT.AGGREGATE cannot push the snapshot/health UI to multi-second
-//     latencies. Independent from heavyPool — staling a heavy member never
-//     affects light, and vice versa.
-// All three share the same `targetKey(...)` cache invalidation so
+//   * `heavyCalcPool` — POOL of `RUNTIME_REDIS_POOL_SIZE_HEAVY_CALC` (default
+//     4) ioredis clients selected round-robin. Used for slow per-request calc
+//     work (FT.AGGREGATE, FCALL, /calc/sbm, /pivot, /facets, /suggest, snapshot
+//     and drift jobs). Wave 6.40.X — split out of the prior unified `heavyPool`
+//     so a calc burst can no longer monopolise the heavy slot population and
+//     starve ingest writes.
+//   * `heavyIngestPool` — POOL of `RUNTIME_REDIS_POOL_SIZE_HEAVY_INGEST`
+//     (default 4). Used for API-side ingest writers (XADD producers via
+//     /generator/start, /admin/rebuild-indexes when it MKSTREAMs the ingest
+//     stream, /admin/flush). Independent failure domain from heavyCalcPool —
+//     all members of one going `open` does NOT affect the other. The ingest
+//     SERVICE (`services/ingest/src/consumer.ts`) is unaffected: it owns its
+//     own client via `services/ingest/src/shard-runtime.ts`. Both heavy pools
+//     resolve via `getActiveTarget()` to the SAME host/port/creds; the split
+//     is operational (size, timeout, circuit) not topological — that's a
+//     follow-up wave once divergent ingest/calc targets are needed.
+//   * `lightPool` — POOL of `RUNTIME_REDIS_POOL_SIZE_LIGHT` (default 4)
+//     ioredis clients selected round-robin. Used for cheap reads
+//     (observability, /admin/preflight, healthz-adjacent endpoints) so a
+//     poisoned heavy connection from a slow FT.AGGREGATE cannot push the
+//     snapshot/health UI to multi-second latencies. Independent from both
+//     heavy pools.
+// All four share the same `targetKey(...)` cache invalidation so
 // `setActiveTarget` rebuilds the boot singleton AND every pool member in
 // lockstep (lazily — each slot rebuilds on its next acquisition with the new
 // key). Per-member recycle (see `wrapWithRecycle`) marks individual pool
@@ -98,15 +106,20 @@ const RUNTIME_POOL_SIZE_DEFAULT = 4;
 const POOL_MEMBER_FAILURE_THRESHOLD_DEFAULT = 3;
 const CIRCUIT_BACKOFF_DEFAULT_MS = 5_000;
 
-// Wave 6.30.B4 — per-command timeout (Option A) wrapped around each pool
-// dispatch via the recycle Proxy. Heavy commands (FT.AGGREGATE / FCALL /
-// pipelines that touch the 100M-row sensitivity index) get a 5s budget —
-// generous enough for legit slow queries under load but a 7× speedup over
-// ioredis's 35s default when a socket is silently dead. Light commands
-// (GET / SET / PING / observability) get 1.5s since they have no business
-// taking longer. Both env-overridable so an operator can tighten or loosen
-// the window without shipping new code.
-const POOL_COMMAND_TIMEOUT_HEAVY_DEFAULT_MS = 5_000;
+// Wave 6.30.B4 / 6.40.X — per-command timeout (Option A) wrapped around each
+// pool dispatch via the recycle Proxy. Three independent budgets:
+//   * heavy-calc:   35s — FT.AGGREGATE / FCALL / SBM pipelines that touch the
+//     100M-row sensitivity index need to outlast the in-Redis 30s
+//     FT_AGGREGATE TIMEOUT directive so the engine error surfaces first.
+//   * heavy-ingest: 5s — XADD producers + MKSTREAM ops fast-fail so a stuck
+//     write surfaces before it backs up the consumer.
+//   * light:        1.5s — observability / preflight should never take longer.
+// All three env-overridable so an operator can tighten/loosen the window
+// without shipping new code. The legacy `POOL_COMMAND_TIMEOUT_HEAVY_MS`
+// remains as a backward-compatible fallback feeding the heavy-calc pool
+// (and therefore the `"heavy"` deprecated alias).
+const POOL_COMMAND_TIMEOUT_HEAVY_CALC_DEFAULT_MS = 35_000;
+const POOL_COMMAND_TIMEOUT_HEAVY_INGEST_DEFAULT_MS = 5_000;
 const POOL_COMMAND_TIMEOUT_LIGHT_DEFAULT_MS = 1_500;
 
 // Wave 6.30.B4 — scheduled half-open probe backoff. Once a member opens, a
@@ -142,15 +155,38 @@ function getCircuitBackoffMs(): number {
   return Number.isFinite(n) && n >= 0 ? Math.floor(n) : CIRCUIT_BACKOFF_DEFAULT_MS;
 }
 
-function getCommandTimeoutMs(category: RuntimeCategory): number {
-  const envName = category === "light" ? "POOL_COMMAND_TIMEOUT_LIGHT_MS" : "POOL_COMMAND_TIMEOUT_HEAVY_MS";
-  const fallback = category === "light"
-    ? POOL_COMMAND_TIMEOUT_LIGHT_DEFAULT_MS
-    : POOL_COMMAND_TIMEOUT_HEAVY_DEFAULT_MS;
-  const raw = process.env[envName];
+// Read a positive-integer ms env var, falling back when unset/invalid.
+function readMsEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
   if (raw === undefined || raw === "") return fallback;
   const n = Number(raw);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
+// Wave 6.40.X — pool category drives both the per-command race timeout and
+// the env-var lookup chain. heavy-calc reads its dedicated var first, then
+// falls back to the legacy `POOL_COMMAND_TIMEOUT_HEAVY_MS` (so operators
+// who already tuned the unified heavy pool keep the same dial), then the
+// default. heavy-ingest has no legacy fallback — it's a new pool.
+function getCommandTimeoutMs(category: NormalizedCategory): number {
+  if (category === "light") {
+    return readMsEnv("POOL_COMMAND_TIMEOUT_LIGHT_MS", POOL_COMMAND_TIMEOUT_LIGHT_DEFAULT_MS);
+  }
+  if (category === "heavy-ingest") {
+    return readMsEnv(
+      "POOL_COMMAND_TIMEOUT_HEAVY_INGEST_MS",
+      POOL_COMMAND_TIMEOUT_HEAVY_INGEST_DEFAULT_MS,
+    );
+  }
+  const direct = process.env.POOL_COMMAND_TIMEOUT_HEAVY_CALC_MS;
+  if (direct !== undefined && direct !== "") {
+    const n = Number(direct);
+    if (Number.isFinite(n) && n > 0) return Math.floor(n);
+  }
+  return readMsEnv(
+    "POOL_COMMAND_TIMEOUT_HEAVY_MS",
+    POOL_COMMAND_TIMEOUT_HEAVY_CALC_DEFAULT_MS,
+  );
 }
 
 function getHalfOpenInitialBackoffMs(): number {
@@ -174,10 +210,54 @@ function isFatalErrorPattern(err: unknown): boolean {
   return FATAL_ERROR_PATTERN.test(msg);
 }
 
-// Public category label for the runtime pools. `"heavy"` is the safe default —
-// any route that hasn't explicitly opted in stays on the heavy pool so a
-// missing migration cannot accidentally downgrade timeout protection.
-export type RuntimeCategory = "heavy" | "light";
+// Public category label for the runtime pools.
+//   * `"heavy-calc"`   — FT.AGGREGATE / FCALL / SBM / pivot / facets / suggest.
+//   * `"heavy-ingest"` — XADD producers, MKSTREAM, ingest-stream maintenance.
+//   * `"light"`        — observability / preflight / healthz-adjacent reads.
+//   * `"heavy"`        — DEPRECATED alias for `"heavy-calc"`. Wave 6.40.X kept
+//     the label so unmigrated callers still get a sensible pool; the first
+//     use per process emits a one-shot `pool-category-alias` warning so the
+//     migration progress is visible without log spam.
+export type RuntimeCategory = "heavy-calc" | "heavy-ingest" | "light" | "heavy";
+
+// Wave 6.40.X — internal three-value form used by pool selection and env
+// lookup. `normalizeCategory("heavy")` returns `"heavy-calc"` AFTER emitting
+// the alias warn so every internal switch is exhaustive on the three real
+// categories without each call site re-checking for the alias. Exported so
+// the structured `PoolEventPayload.category` field can advertise a closed
+// alphabet (no `"heavy"` ever escapes the emitter).
+export type NormalizedCategory = "heavy-calc" | "heavy-ingest" | "light";
+
+let aliasWarnEmitted = false;
+function normalizeCategory(category: RuntimeCategory): NormalizedCategory {
+  if (category === "heavy") {
+    if (!aliasWarnEmitted) {
+      aliasWarnEmitted = true;
+      // Use the same console-based fallback the pool event sink uses so this
+      // never breaks under vitest (NODE_ENV=test silences it) but is loud
+      // enough in production logs that operators can drive the migration.
+      try {
+        if (process.env.NODE_ENV !== "test") {
+          // eslint-disable-next-line no-console
+          console.warn(JSON.stringify({
+            evt: "pool-category-alias",
+            category: "heavy",
+            mapped_to: "heavy-calc",
+            msg: "deprecated RuntimeCategory \"heavy\"; route to \"heavy-calc\" or \"heavy-ingest\" explicitly",
+          }));
+        }
+      } catch { /* sink must never break the pool path */ }
+    }
+    return "heavy-calc";
+  }
+  return category;
+}
+
+// Test seam — reset the alias warn so unit tests can observe the one-shot
+// emission contract without process restart.
+export function __resetAliasWarnForTests(): void {
+  aliasWarnEmitted = false;
+}
 
 // Wave 6.21 (M1) — stable identity surface for pool members. Format is
 // `${category}:${index}` (e.g. `heavy:0`, `light:3`); the index is the slot
@@ -245,13 +325,25 @@ interface PoolMember {
 }
 
 interface Pool {
-  readonly category: RuntimeCategory;
+  readonly category: NormalizedCategory;
   members: PoolMember[];
   rrIndex: number;
 }
 
-const heavyPool: Pool = { category: "heavy", members: [], rrIndex: 0 };
+const heavyCalcPool: Pool = { category: "heavy-calc", members: [], rrIndex: 0 };
+const heavyIngestPool: Pool = { category: "heavy-ingest", members: [], rrIndex: 0 };
 const lightPool: Pool = { category: "light", members: [], rrIndex: 0 };
+
+// Wave 6.40.X — iterate every runtime pool (used by target-swap detach,
+// resetActiveTarget teardown, readiness probe). Order is stable so test
+// snapshots can rely on it.
+const allPools: readonly Pool[] = [heavyCalcPool, heavyIngestPool, lightPool];
+
+function poolForNormalized(category: NormalizedCategory): Pool {
+  if (category === "light") return lightPool;
+  if (category === "heavy-ingest") return heavyIngestPool;
+  return heavyCalcPool;
+}
 
 // Wave 6.21 (M6) — grace window during which an old pool member keeps
 // serving in-flight commands after a `setActiveTarget` swap. Default 500ms,
@@ -384,7 +476,7 @@ export function setActiveTarget(t: ActiveTarget, creds?: ActiveTargetCreds): voi
 // rebuild on the same slot id.
 function detachPoolMembersForSwap(): void {
   const graceMs = getPoolDrainGraceMs();
-  for (const pool of [heavyPool, lightPool]) {
+  for (const pool of allPools) {
     for (const m of pool.members) {
       const old = m.client;
       m.client = null;
@@ -445,7 +537,7 @@ export function resetActiveTarget(): void {
   // lazily against the (now-default) target. No drain grace here: this path
   // is test-teardown / process shutdown, where prompt cleanup matters more
   // than letting in-flight commands finish.
-  for (const pool of [heavyPool, lightPool]) {
+  for (const pool of allPools) {
     for (const m of pool.members) {
       if (m.client) {
         try { m.client.disconnect(); } catch { /* ignore */ }
@@ -598,26 +690,28 @@ export function getActiveRedisClient(): Redis | null {
 // fast" UX workaround was operators tearing down the singleton. The pool
 // turns that workaround into a built-in behaviour — slow work lands on one
 // member, the other three keep the snapshot UI responsive.
-export function getActiveRedisRuntimeClient(category: RuntimeCategory = "heavy"): Redis | null {
-  const pool = category === "light" ? lightPool : heavyPool;
-  return acquireFromPool(pool, poolSizeEnvName(category));
+export function getActiveRedisRuntimeClient(category: RuntimeCategory = "heavy-calc"): Redis | null {
+  const normalized = normalizeCategory(category);
+  const pool = poolForNormalized(normalized);
+  return acquireFromPool(pool, normalized);
 }
 
-// Env name carrying the configured pool size for `category`. Single source of
-// truth so the backpressure plugin can derive its per-category in-flight
-// budget from the same number the pool itself sizes against.
-function poolSizeEnvName(category: RuntimeCategory): string {
-  return category === "light"
-    ? "RUNTIME_REDIS_POOL_SIZE_LIGHT"
-    : "RUNTIME_REDIS_POOL_SIZE_HEAVY";
-}
-
-// Wave 6.23 — read the effective pool size for `category` (env override or
-// `RUNTIME_POOL_SIZE_DEFAULT`). Exported so the backpressure plugin can default
-// its concurrency limit to a small multiple of the pool size, keeping the two
-// dials linked without re-implementing the env parsing here.
+// Wave 6.40.X — read the effective pool size for `category` with a per-category
+// env-var chain. heavy-calc falls back to the legacy `RUNTIME_REDIS_POOL_SIZE_
+// HEAVY` so an operator who already tuned the unified heavy pool keeps the same
+// dial. heavy-ingest has no legacy fallback (new pool). Exported so the
+// backpressure plugin can derive its per-category in-flight budget from the
+// same number the pool itself sizes against.
 export function getRuntimePoolSize(category: RuntimeCategory): number {
-  return getPoolSize(poolSizeEnvName(category));
+  const normalized = normalizeCategory(category);
+  if (normalized === "light") return getPoolSize("RUNTIME_REDIS_POOL_SIZE_LIGHT");
+  if (normalized === "heavy-ingest") return getPoolSize("RUNTIME_REDIS_POOL_SIZE_HEAVY_INGEST");
+  const raw = process.env.RUNTIME_REDIS_POOL_SIZE_HEAVY_CALC;
+  if (raw !== undefined && raw !== "") {
+    const n = Number(raw);
+    if (Number.isFinite(n) && n > 0) return Math.floor(n);
+  }
+  return getPoolSize("RUNTIME_REDIS_POOL_SIZE_HEAVY");
 }
 
 // Resize the pool's slot array to `size`. Grows by appending empty slots
@@ -663,11 +757,11 @@ function ensurePoolSized(pool: Pool, size: number): void {
 // oldest one is transitioned to `half-open` and rebuilt to probe recovery.
 // Returns the recycle-aware Proxy wrapper, NOT the raw ioredis client, so
 // callers automatically participate in the per-member self-heal flow.
-function acquireFromPool(pool: Pool, sizeEnvName: string): Redis | null {
+function acquireFromPool(pool: Pool, category: NormalizedCategory): Redis | null {
   const t = getActiveTarget();
   const c = overrideCreds;
   const key = targetKey(t);
-  ensurePoolSized(pool, getPoolSize(sizeEnvName));
+  ensurePoolSized(pool, getRuntimePoolSize(category));
   if (pool.members.length === 0) return null;
 
   // Wave 6.22 — find the next member whose circuit is NOT open. Walk at
@@ -881,7 +975,10 @@ type PoolEvent =
 
 export interface PoolEventPayload {
   evt: PoolEvent;
-  category: RuntimeCategory;
+  // Wave 6.40.X — emitted as one of the three concrete categories (the
+  // `"heavy"` alias is normalised to `"heavy-calc"` before any pool event
+  // fires) so log filters can match on stable values.
+  category: NormalizedCategory;
   member_id: string;
   consecutive_failures: number;
   circuit_state: CircuitState;
@@ -952,7 +1049,9 @@ function attachErrorRecycle(client: Redis, member: PoolMember): void {
 // (`${category}:${index}`). Cheap enough — every member id is parsed once
 // per error event, and pools never move members between categories.
 function poolForCategory(member: PoolMember): Pool {
-  return member.id.startsWith("light:") ? lightPool : heavyPool;
+  if (member.id.startsWith("light:")) return lightPool;
+  if (member.id.startsWith("heavy-ingest:")) return heavyIngestPool;
+  return heavyCalcPool;
 }
 
 // Wrap the ioredis client in a Proxy that mirrors every property access but
@@ -1126,7 +1225,7 @@ export function __getRuntimePoolForTests(category: RuntimeCategory): {
   }[];
   rrIndex: number;
 } {
-  const pool = category === "light" ? lightPool : heavyPool;
+  const pool = poolForNormalized(normalizeCategory(category));
   return {
     members: pool.members.map((m) => ({
       id: m.id,
@@ -1154,7 +1253,7 @@ export function getPoolMemberInfo(
   category: RuntimeCategory,
   index: number,
 ): PoolMemberInfo | null {
-  const pool = category === "light" ? lightPool : heavyPool;
+  const pool = poolForNormalized(normalizeCategory(category));
   const m = pool.members[index];
   if (!m) return null;
   return { id: m.id, createdAt: m.createdAt, generation: m.generation };
@@ -1193,7 +1292,10 @@ export async function probeRuntimeRedisReadiness(): Promise<RuntimeReadinessVerd
   runtimeReadinessInFlight = (async () => {
     try {
       const all: Redis[] = [];
-      for (const category of ["heavy", "light"] as const) {
+      // Wave 6.40.X — probe all three categories. heavy-calc / heavy-ingest /
+      // light each have their own pool; readiness must verify EVERY pool's
+      // members so a stuck ingest pool can fail /readyz independently of calc.
+      for (const category of ["heavy-calc", "heavy-ingest", "light"] as const) {
         const size = getRuntimePoolSize(category);
         for (let i = 0; i < size; i++) {
           const c = getActiveRedisRuntimeClient(category);

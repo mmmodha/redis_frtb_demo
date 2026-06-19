@@ -74,11 +74,15 @@ beforeEach(() => {
   delete process.env.REDIS_URL;
   delete process.env.RUNTIME_REDIS_COMMAND_TIMEOUT_MS;
   delete process.env.RUNTIME_REDIS_POOL_SIZE_HEAVY;
+  delete process.env.RUNTIME_REDIS_POOL_SIZE_HEAVY_CALC;
+  delete process.env.RUNTIME_REDIS_POOL_SIZE_HEAVY_INGEST;
   delete process.env.RUNTIME_REDIS_POOL_SIZE_LIGHT;
   delete process.env.RUNTIME_REDIS_POOL_DRAIN_GRACE_MS;
   delete process.env.POOL_MEMBER_FAILURE_THRESHOLD;
   delete process.env.CIRCUIT_BACKOFF_MS;
   delete process.env.POOL_COMMAND_TIMEOUT_HEAVY_MS;
+  delete process.env.POOL_COMMAND_TIMEOUT_HEAVY_CALC_MS;
+  delete process.env.POOL_COMMAND_TIMEOUT_HEAVY_INGEST_MS;
   delete process.env.POOL_COMMAND_TIMEOUT_LIGHT_MS;
   delete process.env.HALF_OPEN_INITIAL_BACKOFF_MS;
   delete process.env.HALF_OPEN_BACKOFF_CAP_MS;
@@ -116,7 +120,7 @@ describe("Wave 6.30.B4 — per-command timeout fail-fast", () => {
     }
     const ff = capturedEvents.filter((e) => e.evt === "pool-command-fail-fast");
     expect(ff.length).toBeGreaterThanOrEqual(3);
-    expect(ff[0]!.category).toBe("heavy");
+    expect(ff[0]!.category).toBe("heavy-calc");
   });
 
   it("a single fail-fast trips the circuit on consecutive_failures=1 (fatal error pattern)", async () => {

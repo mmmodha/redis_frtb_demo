@@ -27,7 +27,7 @@ export function registerPivotRoute(
   app: FastifyInstance,
   getRedis: () => RedisLike,
 ): void {
-  app.get<{ Querystring: PivotQuery }>("/pivot", async (req, reply) => {
+  app.get<{ Querystring: PivotQuery }>("/pivot", { config: { category: "heavy-calc" } }, async (req, reply) => {
     const q = req.query;
     const limit = Math.min(1000, Math.max(0, parseInt(q.limit ?? "100", 10) || 100));
     const offset = parseInt(q.offset ?? "0", 10);

@@ -736,13 +736,13 @@ export function registerCalcRoute(
   // limit=5 covers the Observability card's expanded mini-table; max=20
   // matches the buffer capacity. Out-of-range / non-numeric inputs clamp
   // silently so a stray "?limit=foo" still returns a usable response.
-  app.get<{ Querystring: { limit?: string } }>("/calc/recent", async (req) => {
+  app.get<{ Querystring: { limit?: string } }>("/calc/recent", { config: { category: "heavy-calc" } }, async (req) => {
     const raw = Number(req.query?.limit);
     const limit = Number.isFinite(raw) && raw > 0 ? Math.min(Math.floor(raw), 20) : 5;
     return { items: listRecentRuns(limit) };
   });
 
-  app.post<{ Body: CalcBody; Querystring: CalcQuery }>("/calc/sbm", async (req, reply) => {
+  app.post<{ Body: CalcBody; Querystring: CalcQuery }>("/calc/sbm", { config: { category: "heavy-calc" } }, async (req, reply) => {
     const risk_class_raw = req.body?.risk_class;
     const legRaw = req.body?.sensitivity_type;
     if (!risk_class_raw || !legRaw) {
@@ -904,6 +904,7 @@ export function registerCalcRoute(
   // so the UI can render the "Redis-fast" callout with concrete numbers.
   app.post<{ Body: TotalSbmBody; Querystring: CalcQuery }>(
     "/calc/sbm/total",
+    { config: { category: "heavy-calc" } },
     async (req, reply) => {
       // Validation mirrors /calc/sbm so the orchestrator rejects the same
       // malformed payloads at entry. bucket_subset / exclude apply uniformly
@@ -1267,6 +1268,7 @@ export function registerCalcRoute(
     Querystring: CalcQuery;
   }>(
     "/calc/sbm/bucket",
+    { config: { category: "heavy-calc" } },
     async (req, reply) => {
       const risk_class_raw = req.body?.risk_class;
       const legRaw = req.body?.sensitivity_type;
@@ -1427,6 +1429,7 @@ export function registerCalcRoute(
   // don't surface component-level data (Wave 5.96A option B).
   app.post<{ Body: CalcBody & { bucket?: string } }>(
     "/calc/sbm/bucket-cross-detail",
+    { config: { category: "heavy-calc" } },
     async (req, reply) => {
       const risk_class_raw = req.body?.risk_class;
       const legRaw = req.body?.sensitivity_type;

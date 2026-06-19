@@ -2,11 +2,21 @@
 //
 // Two independent semaphores (heavy + light) gate route admission at the
 // Fastify hook layer. Heavy routes (FCALL / FT.AGGREGATE — /calc, /pivot,
-// /facets) share one budget so a UI navigation that fans out a dozen /calc
-// calls cannot pile work onto the small Redis runtime pool faster than it
-// drains. Light routes (Redis commands measured in microseconds —
-// admin/observability/connections) get their own larger budget so heavy
-// saturation does NOT starve them.
+// /facets, /generator/start, /admin/rebuild-indexes) share one budget so a
+// UI navigation that fans out a dozen /calc calls cannot pile work onto the
+// small Redis runtime pool faster than it drains. Light routes (Redis
+// commands measured in microseconds — admin/observability/connections) get
+// their own larger budget so heavy saturation does NOT starve them.
+//
+// Wave 6.40.X — the underlying Redis pool was split into `heavy-calc` and
+// `heavy-ingest`, but the in-flight SEMAPHORE stays unified at the request
+// admission layer ("heavy" bucket). Splitting the semaphore would force
+// every route to declare which sub-bucket it lives in BEFORE the handler
+// runs, but the goal of the wave was failure isolation at the SOCKET layer
+// (a stuck calc connection can't poison ingest writes), not request-side
+// queueing. The unified heavy semaphore therefore reads its limit as the
+// SUM of both heavy pool sizes so the in-flight budget still scales with
+// the total heavy connection capacity actually provisioned.
 //
 // Request-level gate, not connection-level: ioredis pipelines commands on
 // each pool member, so a single admitted /calc request can fan out many
@@ -80,8 +90,16 @@ export function readRouteCategory(req: FastifyRequest): RuntimeCategory | null {
   const cfg = (req.routeOptions as { config?: unknown } | undefined)?.config;
   if (!cfg || typeof cfg !== "object") return null;
   const raw = (cfg as { category?: unknown }).category;
-  if (raw === "heavy" || raw === "light") return raw;
+  if (raw === "heavy-calc" || raw === "heavy-ingest" || raw === "light" || raw === "heavy") return raw;
   return null;
+}
+
+// Wave 6.40.X — collapse a declared route category onto the two semaphore
+// buckets (`"heavy"` / `"light"`). Both heavy-calc and heavy-ingest map to
+// the unified "heavy" admission semaphore; the deprecated `"heavy"` alias
+// keeps mapping to itself.
+function semaphoreBucket(cat: RuntimeCategory): "heavy" | "light" {
+  return cat === "light" ? "light" : "heavy";
 }
 
 function readLimit(envKey: string, def: number): number {
@@ -91,12 +109,18 @@ function readLimit(envKey: string, def: number): number {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : def;
 }
 
-// Effective per-category default: `INFLIGHT_PER_POOL_MEMBER × pool size`.
+// Effective per-bucket default: `INFLIGHT_PER_POOL_MEMBER × pool size`.
 // Pulling the pool size from active-target keeps the two dials in lockstep
 // — operators only need to tune `RUNTIME_REDIS_POOL_SIZE_*` and the
-// concurrency budget follows automatically.
-function defaultLimit(category: RuntimeCategory): number {
-  return INFLIGHT_PER_POOL_MEMBER * getRuntimePoolSize(category);
+// concurrency budget follows automatically. Wave 6.40.X — the heavy bucket
+// sums both heavy pools (`heavy-calc` + `heavy-ingest`) so the unified
+// in-flight budget tracks total heavy connection capacity, not just one
+// half.
+function defaultLimit(bucket: "heavy" | "light"): number {
+  if (bucket === "light") return INFLIGHT_PER_POOL_MEMBER * getRuntimePoolSize("light");
+  return INFLIGHT_PER_POOL_MEMBER * (
+    getRuntimePoolSize("heavy-calc") + getRuntimePoolSize("heavy-ingest")
+  );
 }
 
 export interface BackpressureOpts {
@@ -134,7 +158,7 @@ function makeProductionClassify(
   return (req) => {
     if (isExemptUrl(req.url)) return "exempt";
     const declared = readRouteCategory(req);
-    if (declared) return declared;
+    if (declared) return semaphoreBucket(declared);
     const url = req.url.split("?", 1)[0] ?? req.url;
     if (!warnedRoutes.has(url)) {
       warnedRoutes.add(url);

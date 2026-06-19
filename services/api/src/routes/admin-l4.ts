@@ -90,7 +90,7 @@ export function registerAdminL4Routes(
     return status;
   });
 
-  app.post("/admin/reconcile-bucket", async (req: FastifyRequest, reply: FastifyReply) => {
+  app.post("/admin/reconcile-bucket", { config: { category: "heavy-ingest" } }, async (req: FastifyRequest, reply: FastifyReply) => {
     const presented = tokenFromRequest(req);
     if (!adminToken || presented !== adminToken) {
       reply.code(401);

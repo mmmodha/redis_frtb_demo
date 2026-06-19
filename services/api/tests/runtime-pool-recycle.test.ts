@@ -67,6 +67,8 @@ beforeEach(() => {
   delete process.env.REDIS_URL;
   delete process.env.RUNTIME_REDIS_COMMAND_TIMEOUT_MS;
   delete process.env.RUNTIME_REDIS_POOL_SIZE_HEAVY;
+  delete process.env.RUNTIME_REDIS_POOL_SIZE_HEAVY_CALC;
+  delete process.env.RUNTIME_REDIS_POOL_SIZE_HEAVY_INGEST;
   delete process.env.RUNTIME_REDIS_POOL_SIZE_LIGHT;
   delete process.env.RUNTIME_REDIS_POOL_DRAIN_GRACE_MS;
   delete process.env.POOL_MEMBER_FAILURE_THRESHOLD;
@@ -111,7 +113,7 @@ describe("Wave 6.22 — failure-threshold circuit open", () => {
     // At least one structured pool-circuit-transition event must mention
     // the closed→open transition for heavy:0.
     const transitions = capturedEvents.filter(
-      (e) => e.evt === "pool-circuit-transition" && e.member_id === "heavy:0",
+      (e) => e.evt === "pool-circuit-transition" && e.member_id === "heavy-calc:0",
     );
     expect(transitions.some((e) => e.from === "closed" && e.to === "open")).toBe(true);
   });
@@ -172,7 +174,7 @@ describe("Wave 6.22 — all-open promotes oldest to half-open", () => {
     expect(snap1.members[0]!.client).not.toBeNull();
     // Structured event for the open→half-open transition was emitted.
     expect(capturedEvents.some(
-      (e) => e.evt === "pool-circuit-transition" && e.member_id === "heavy:0"
+      (e) => e.evt === "pool-circuit-transition" && e.member_id === "heavy-calc:0"
         && e.from === "open" && e.to === "half-open",
     )).toBe(true);
   });

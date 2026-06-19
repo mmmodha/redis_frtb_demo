@@ -52,6 +52,8 @@ beforeEach(() => {
   delete process.env.REDIS_URL;
   delete process.env.RUNTIME_REDIS_COMMAND_TIMEOUT_MS;
   delete process.env.RUNTIME_REDIS_POOL_SIZE_HEAVY;
+  delete process.env.RUNTIME_REDIS_POOL_SIZE_HEAVY_CALC;
+  delete process.env.RUNTIME_REDIS_POOL_SIZE_HEAVY_INGEST;
   delete process.env.RUNTIME_REDIS_POOL_SIZE_LIGHT;
   delete process.env.RUNTIME_REDIS_POOL_DRAIN_GRACE_MS;
   __setRuntimeClientFactoryForTests((_t, _c, opts) => makeFakeClient(opts.commandTimeout));
@@ -75,10 +77,12 @@ describe("Wave 6.21 — round-robin pool distribution", () => {
     // The first 4 acquisitions return distinct wrappers; the next 4 return
     // the SAME 4 wrappers (cached per slot until the slot is recycled).
     expect(new Set(wrappers).size).toBe(4);
-    // Each slot must carry the M1 identity: heavy:0..3, generation 1.
+    // Each slot must carry the M1 identity: heavy-calc:0..3, generation 1.
+    // Wave 6.40.X renamed the prefix from `heavy:N` to `heavy-calc:N` when the
+    // pool was split; the legacy `"heavy"` category argument is an alias.
     for (let i = 0; i < 4; i++) {
       const info = getPoolMemberInfo("heavy", i);
-      expect(info?.id).toBe(`heavy:${i}`);
+      expect(info?.id).toBe(`heavy-calc:${i}`);
       expect(info?.generation).toBe(1);
     }
   });
@@ -152,12 +156,13 @@ describe("Wave 6.21 — heavy/light pool independence", () => {
   });
 });
 
-describe("Wave 6.21 — default category is heavy", () => {
-  it("getActiveRedisRuntimeClient() with no argument materialises only the heavy pool", () => {
+describe("Wave 6.21 / 6.40.X — default category is heavy-calc", () => {
+  it("getActiveRedisRuntimeClient() with no argument materialises only the heavy-calc pool", () => {
     getActiveRedisRuntimeClient();
-    expect(__getRuntimePoolForTests("heavy").members.length).toBe(4);
-    // Light pool has not been touched (no acquisitions yet); members array
-    // is still empty until something opts in to "light".
+    // Wave 6.40.X — default category is now `"heavy-calc"` (was `"heavy"`).
+    // Heavy-ingest and light pools stay empty until something opts in.
+    expect(__getRuntimePoolForTests("heavy-calc").members.length).toBe(4);
+    expect(__getRuntimePoolForTests("heavy-ingest").members.length).toBe(0);
     expect(__getRuntimePoolForTests("light").members.length).toBe(0);
   });
 });

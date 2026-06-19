@@ -141,7 +141,7 @@ export function registerAdminRoutes(
     recomputeBucketSum,
   });
 
-  app.post("/admin/flush", async (_req, reply) => {
+  app.post("/admin/flush", { config: { category: "heavy-ingest" } }, async (_req, reply) => {
     let target_label: string;
     try {
       target_label = getActiveTarget().label;
@@ -338,7 +338,7 @@ export function registerAdminRoutes(
   // is fully wired after a single rebuild click. BUSYGROUP (group already
   // exists, MKSTREAM is a no-op) is tolerated; other XGROUP errors are
   // logged but do not fail the rebuild because bootstrap itself succeeded.
-  app.post("/admin/rebuild-indexes", async (req) => {
+  app.post("/admin/rebuild-indexes", { config: { category: "heavy-ingest" } }, async (req) => {
     if (!opts.schema) {
       return { ok: false, ms: 0, bootstrap: { ok: false, error: "schema-missing" } };
     }
