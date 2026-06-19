@@ -32,6 +32,9 @@ import {
   lookupKbCacheEntry,
   storeKbCacheEntry,
 } from "./kb-cache.ts";
+// Wave 6.41.E.fix5 — version-aware FT.AGGREGATE APPLY null-coercion. See the
+// comment block above buildFastPathAggregateArgs for the rationale.
+import { getSearchModuleMajorVersion } from "../lib/search-module-version.ts";
 
 export type FastLeg = "delta" | "vega" | "curvature";
 
@@ -302,12 +305,37 @@ export function formatRedisCommand(name: string, argv: ReadonlyArray<unknown>): 
 // Cloud gates it behind `ENABLE_UNSTABLE_FEATURES` (which clients cannot
 // toggle), so the old shape 500s there. Arithmetic on a missing numeric HASH
 // field coerces to 0 under `+`, giving identical semantics on every
-// RediSearch flavor.
+// RediSearch flavor at the time.
+// Wave 6.41.E.fix5 — neither shape works on both flavours any more. davpin
+// (RediSearch 8.6.6) tightened the SEARCH_EXPR parser and now rejects
+// `@field+0` in APPLY with `Syntax error at offset 17 near '+0'`. localcluster
+// (RediSearch 2.10.27) still gates `case(exists(...),...)` behind
+// ENABLE_UNSTABLE_FEATURES and cannot be flipped at runtime (FT.CONFIG and
+// CONFIG SET both rejected against Redis Enterprise/Cloud). Other candidates
+// were ruled out too — `coalesce` / `if` are unknown functions on both, and
+// `to_number(@f)` throws on a missing field. Branch on the connected
+// cluster's search module version (resolved once per RedisLike by
+// `getSearchModuleMajorVersion`) so each cluster sees the form it accepts.
+// DO NOT collapse this back to a single path — the historical context above
+// is the reason the two-branch shape exists.
+function nullCoerceApplyExpr(field: string, searchVer: number): string {
+  // RediSearch 8.x: the legacy `@f+0` arithmetic null-coercion was removed
+  // from the SEARCH_EXPR parser; `case(exists(...),...)` is the supported
+  // replacement on the same versions where the unstable-feature gate has
+  // been lifted.
+  if (searchVer >= 80000) return `case(exists(@${field}),@${field},0)`;
+  // Everything else (2.10.x, unknown / undetected ⇒ 0) gets the historical
+  // arithmetic shape. The Wave 6.39.H comment above documents why this
+  // form is needed on Enterprise / Cloud builds of RediSearch 2.x.
+  return `@${field}+0`;
+}
+
 export function buildFastPathAggregateArgs(
   query: string,
   fields: LegFields,
   perTenor: boolean,
   indexName: string,
+  searchVer: number,
 ): unknown[] {
   void perTenor;
   const args: unknown[] = [indexName, query];
@@ -321,7 +349,7 @@ export function buildFastPathAggregateArgs(
       loadSeen.add(f);
       loadFields.push(f);
     }
-    applyClauses.push([`@${f}+0`, alias]);
+    applyClauses.push([nullCoerceApplyExpr(f, searchVer), alias]);
     return alias;
   };
   const addNumericLeg = (roots: string[], prefix: string): void => {
@@ -378,11 +406,13 @@ export function buildComponentsAggregateArgs(
   query: string,
   fields: LegFields,
   indexName: string,
+  searchVer: number,
 ): unknown[] {
   const args: unknown[] = [indexName, query];
-  // Wave 6.39.H — same LOAD + `@f+0` arithmetic coercion as
-  // buildFastPathAggregateArgs (above) so the per-RF components aggregate is
-  // Enterprise/Cloud-safe.
+  // Wave 6.39.H / Wave 6.41.E.fix5 — version-aware null-coercion: see the
+  // comment block above `buildFastPathAggregateArgs` for why the choice
+  // between `case(exists(@f),@f,0)` (RediSearch 8.x) and `@f+0` (2.10.x)
+  // is gated on the live `searchVer`.
   const loadFields: string[] = [];
   const loadSeen = new Set<string>();
   const applyClauses: Array<[string, string]> = [];
@@ -393,7 +423,7 @@ export function buildComponentsAggregateArgs(
       loadSeen.add(f);
       loadFields.push(f);
     }
-    applyClauses.push([`@${f}+0`, alias]);
+    applyClauses.push([nullCoerceApplyExpr(f, searchVer), alias]);
     return alias;
   };
   const addLeg = (roots: string[], prefix: string): void => {
@@ -1014,14 +1044,21 @@ export async function aggregateBucketsViaIndex(opts: AggregateBucketsOpts): Prom
   // missed plumbing step now fails at compile time instead of silently
   // hitting the literal `idx:sens` against a versioned-only cluster.
   const indexName = opts.indexName;
-  const argv = buildFastPathAggregateArgs(query, fields, perTenor, indexName);
+  // Wave 6.41.E.fix5 — resolve the live search module major version once per
+  // call so both this aggregate and the optional per-RF components aggregate
+  // emit the APPLY null-coercion shape this cluster accepts. The helper
+  // caches per-RedisLike so the lookup amortises across calls on the same
+  // connection; a target swap rebuilds the pool client and naturally misses
+  // the cache.
+  const searchVer = await getSearchModuleMajorVersion(opts.redis);
+  const argv = buildFastPathAggregateArgs(query, fields, perTenor, indexName, searchVer);
   const nodes = resolveQueryNodes(opts.redis);
   const merged = new Map<string, Record<string, string>>();
   // Wave 5.96A.1 — scalar (non-perTenor) classes need a second FT.AGGREGATE
   // grouped by (@bucket, @risk_factor) to recover per-RF components; perTenor
   // (GIRR) already exposes per-tenor sums via the main aggregate.
   const needsPerRf = opts.components !== undefined && !perTenor;
-  const perRfArgv = needsPerRf ? buildComponentsAggregateArgs(query, fields, indexName) : null;
+  const perRfArgv = needsPerRf ? buildComponentsAggregateArgs(query, fields, indexName, searchVer) : null;
   const perRfMerged = new Map<string, Map<string, Record<string, string>>>();
   for (const node of nodes) {
     const reply = await node.call("FT.AGGREGATE", ...argv);

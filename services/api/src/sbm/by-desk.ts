@@ -29,6 +29,8 @@ import {
   resolveQueryNodes,
   resolveRho,
 } from "./aggregate-via-index.ts";
+// Wave 6.41.E.fix5 — version-aware FT.AGGREGATE APPLY null-coercion.
+import { getSearchModuleMajorVersion } from "../lib/search-module-version.ts";
 
 export type ByDeskLeg = "delta" | "vega" | "curvature";
 
@@ -93,19 +95,28 @@ function kbFromConstantRho(sumWs: number, sumWsSq: number, rho: number): number 
 }
 
 // Build the FT.AGGREGATE argv (everything after the command name). LOAD +
-// APPLY @f+0 coercion mirrors buildFastPathAggregateArgs so missing HASH
-// fields collapse to 0 on every RediSearch flavour (avoids the EXISTS /
-// UNSTABLE `case` rejection path documented in Wave 6.39.H).
+// APPLY null-coercion mirrors buildFastPathAggregateArgs so missing HASH
+// fields collapse to 0 on every RediSearch flavour.
+// Wave 6.39.H wired the `@f+0` arithmetic shape because Enterprise / Cloud
+// gated the prior `case(exists(...),...)` form behind ENABLE_UNSTABLE_FEATURES.
+// Wave 6.41.E.fix5 — davpin (RediSearch 8.6.6) tightened SEARCH_EXPR and
+// rejects `@f+0` outright, while localcluster (RediSearch 2.10.27) still
+// rejects `case(...)`. Branch on the caller-supplied `searchVer` (resolved
+// once per RedisLike via getSearchModuleMajorVersion). See the matching
+// comment block above buildFastPathAggregateArgs in aggregate-via-index.ts.
 export function buildByDeskAggregateArgs(
   query: string,
   fieldList: ReadonlyArray<string>,
   indexName: string,
+  searchVer: number,
 ): unknown[] {
   const args: unknown[] = [indexName, query];
   const loadFields: string[] = [];
   const loadSeen = new Set<string>();
   const applyClauses: Array<[string, string]> = [];
   const sumReducers: Array<[string, string]> = [];
+  const nullCoerce = (f: string): string =>
+    searchVer >= 80000 ? `case(exists(@${f}),@${f},0)` : `@${f}+0`;
   for (const f of fieldList) {
     if (!loadSeen.has(f)) {
       loadSeen.add(f);
@@ -113,7 +124,7 @@ export function buildByDeskAggregateArgs(
     }
     const safeAlias = `${f}_safe`;
     const sqAlias = `${f}_sq`;
-    applyClauses.push([`@${f}+0`, safeAlias]);
+    applyClauses.push([nullCoerce(f), safeAlias]);
     applyClauses.push([`(@${safeAlias}*@${safeAlias})`, sqAlias]);
     sumReducers.push([safeAlias, `sum_${f}`]);
     sumReducers.push([sqAlias, `sum_${f}_sq`]);
@@ -222,7 +233,10 @@ export async function aggregateByDesk(opts: ByDeskAggregateOpts): Promise<ByDesk
     opts.leg === "vega" ? vegaList :
     [...cvrUp, ...cvrDown];
 
-  const argv = buildByDeskAggregateArgs(query, legList, opts.indexName);
+  // Wave 6.41.E.fix5 — resolve the search module version once per call so
+  // the APPLY null-coercion matches what this cluster's RediSearch accepts.
+  const searchVer = await getSearchModuleMajorVersion(opts.redis);
+  const argv = buildByDeskAggregateArgs(query, legList, opts.indexName, searchVer);
 
   // Cluster fan-out: dispatch the same FT.AGGREGATE on every master shard
   // and merge per-desk numeric reducer outputs. Mirrors the shard-merge

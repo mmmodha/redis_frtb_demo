@@ -34,6 +34,9 @@ import {
 // top-N ranking endpoint. Kept in its own module so the precision-contract
 // comment block + LOAD/APPLY argv builder don't bloat the route file.
 import { aggregateByDesk, type ByDeskLeg } from "../sbm/by-desk.ts";
+// Wave 6.41.E.fix5 — needed to render `resolved_command` with the same APPLY
+// null-coercion shape the live cluster's RediSearch will actually accept.
+import { getSearchModuleMajorVersion } from "../lib/search-module-version.ts";
 import {
   calcCacheKey,
   getDataVersion,
@@ -722,13 +725,17 @@ async function computeSbmCharge(
         desk: resolvedIncludeDesk,
         bucket: includeCsv.bucket ? includeCsv.bucket.split(",") : [],
       };
+      // Wave 6.41.E.fix5 — resolve search module version once so the
+      // rendered `resolved_command` mirrors what the kernel will actually
+      // execute on this cluster (case(exists,...) on v8 vs `@f+0` on v2).
+      const searchVer = await getSearchModuleMajorVersion(redis);
       const buildResolvedCommand = (b: string): string => {
         const perBucketQuery = buildFastPathQuery(risk_class, legFields.sensitivityType, {
           bucketSubset: [b],
           exclude: excludeFilter,
           include: includeFilter,
         });
-        const perBucketArgv = buildFastPathAggregateArgs(perBucketQuery, legFields, perTenor, indexName);
+        const perBucketArgv = buildFastPathAggregateArgs(perBucketQuery, legFields, perTenor, indexName, searchVer);
         return formatRedisCommand("FT.AGGREGATE", perBucketArgv);
       };
       let rollup: BucketResult[] | null = null;
