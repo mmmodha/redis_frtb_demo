@@ -2183,8 +2183,15 @@ function GeneratorProgress(props: { run: GeneratorRunState; onCancel: () => void
 // xlen shrink, so the prior peak-xlen design pinned the bar at 0% for
 // large/overnight presets. pct = (consumedNow - consumedAtAnchor) /
 // rowsTotal across both in-generation and post-terminal phases — the
-// split branch is gone. xlen is still read from the same response and
-// used purely for the auto-clear heuristics (idle / FLUSHDB).
+// split branch is gone.
+// Wave 6.41.E.fix4 — IndexingProgress no longer reads `xlen` for any
+// state decision. The implicit-anchor seed (xlen>0 ⇒ create anchor) is
+// removed because on maxlen=0 streams it re-fired immediately after the
+// 3s "Indexing complete" toast cleared the anchor, pinning the bar at
+// 0%. The xlen===0 auto-clear hatch is replaced by a consumed-plateau
+// signal that works on unbounded streams. xlen is still pushed into
+// ConsumedSample for diagnostic continuity but is unused by this
+// component.
 const INDEXING_POLL_MS = 2_500;
 const INDEXING_COMPLETE_MS = 3_000;
 const INDEXING_WINDOW = 10;
@@ -2207,7 +2214,6 @@ function formatEtaSeconds(s: number): string {
 function IndexingProgress() {
   const { run } = useGeneratorRun();
   const [currentConsumed, setCurrentConsumed] = useState<number | null>(null);
-  const [currentXlen, setCurrentXlen] = useState<number | null>(null);
   const [samples, setSamples] = useState<ConsumedSample[]>([]);
   const [anchor, setAnchor] = useState<IndexingAnchor | null>(null);
   const [completeShownAt, setCompleteShownAt] = useState<number | null>(null);
@@ -2256,7 +2262,6 @@ function IndexingProgress() {
           if (cancelled) return;
           const xlen = typeof s.xlen === "number" ? s.xlen : 0;
           const consumed = typeof s.consumed === "number" ? s.consumed : 0;
-          setCurrentXlen(xlen);
           setCurrentConsumed(consumed);
           setSamples((prev) => pushSample(prev, { consumed, xlen, ts: Date.now() }, INDEXING_WINDOW));
         })
@@ -2284,27 +2289,14 @@ function IndexingProgress() {
     setAnchor(next);
   }, [anchor, currentConsumed]);
 
-  // Implicit anchor: xlen > 0 with no prior anchor AND no run state ⇒ treat
-  // current xlen as the rowsTotal estimate and seed `consumedAtAnchor` at
-  // the current consumed value. As the consumer drains the leftover work,
-  // pct grows toward 100%. Skipped while a run is active — the run-status
-  // transition below owns anchor creation in that case.
-  useEffect(() => {
-    if (anchor !== null) return;
-    if (currentXlen === null || currentXlen <= 0) return;
-    if (currentConsumed === null) return;
-    if (run !== null) return;
-    const now = Date.now();
-    const a: IndexingAnchor = {
-      runId: null,
-      rowsTotal: currentXlen,
-      consumedAtAnchor: currentConsumed,
-      anchorTs: now,
-      lastSeenAt: now,
-    };
-    writeAnchor(a);
-    setAnchor(a);
-  }, [anchor, currentXlen, currentConsumed, run]);
+  // Implicit-anchor seed removed by 6.41.E.fix4: on unbounded streams
+  // (stream_maxlen=0) xlen never returns to 0, so a "xlen>0 ⇒ seed anchor"
+  // effect re-fired immediately after the 3s "Indexing complete" toast
+  // cleared the previous anchor and pinned the bar at 0%. The localStorage
+  // anchor and the run-status transitions below are the only seed paths.
+  // A future reconnect-mid-drain heuristic should gate on
+  // run.status === "running" from /generator/runs, not on xlen/consumed
+  // deltas.
 
   // Run-status transitions:
   //  • running just started ⇒ wipe any stale anchor + samples then seed a
@@ -2413,27 +2405,22 @@ function IndexingProgress() {
     }, INDEXING_COMPLETE_MS);
   }, [anchor, currentConsumed]);
 
-  // Wave 6.41.E.fix (C + D) — auto-clear escape hatches that bypass the 3s
-  // toast when the stream is clearly idle:
-  //  • C: 2+ trailing xlen=0 polls AND no active run ⇒ clear immediately.
-  //  • D: anchor.rowsTotal > 0 AND every sample in the window has xlen=0
-  //       (FLUSHDB heuristic — the user wiped the DB while the bar was
-  //       mid-drain) ⇒ clear immediately.
-  // xlen is still in the /admin/stream-status response (the bar's pct math
-  // doesn't use it) so these heuristics remain the cleanest idle signal.
+  // Wave 6.41.E.fix4 — consumed-plateau auto-clear. The prior xlen===0
+  // hatches never fired on maxlen=0 streams (xlen is cumulative-ever).
+  // Replaced with: when every sample in the window already reflects
+  // consumed >= consumedAtAnchor + rowsTotal AND no run is active, the
+  // bar has nothing left to display and the 3s completion toast has had
+  // ample time to run; drop the anchor as a fallback dismiss path. The
+  // sample window (10 × 2.5s = 25s) is long enough that the 3s toast
+  // wins in the happy path.
   useEffect(() => {
     if (anchor === null) return;
-    if (samples.length === 0) return;
+    if (samples.length < 2) return;
     const runActive = run?.status === "running" || run?.status === "cancelling";
-    let trailingZeros = 0;
-    for (let i = samples.length - 1; i >= 0; i--) {
-      if (samples[i]!.xlen === 0) trailingZeros++;
-      else break;
-    }
-    const allZero = samples.length >= 2 && samples.every((s) => s.xlen === 0);
-    const hardClear = (trailingZeros >= 2 && !runActive)
-      || (allZero && anchor.rowsTotal > 0);
-    if (!hardClear) return;
+    if (runActive) return;
+    const target = anchor.consumedAtAnchor + anchor.rowsTotal;
+    const allAtTarget = samples.every((s) => s.consumed >= target);
+    if (!allAtTarget) return;
     resetIndexingState();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [samples, anchor, run?.status]);

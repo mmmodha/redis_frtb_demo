@@ -17,6 +17,14 @@
 // post-terminal phases. xlen is still polled and used only by the C/D
 // auto-clear heuristics. New tests cover restart re-anchoring and tab
 // reload mid-run.
+//
+// Wave 6.41.E.fix4 — implicit-anchor seed and xlen===0 auto-clear are
+// gone (re-fired immediately on maxlen=0 streams, pinning the bar at
+// 0% after the toast). Replaced with a consumed-plateau auto-clear.
+// Tests for the old implicit-anchor and C/D xlen-zero paths were
+// removed; new tests cover (a) no-reappear after toast even though
+// xlen stays positive and consumed stays at-or-above target, and
+// (b) consumed-plateau hatch.
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { render, screen, waitFor, within } from "@testing-library/react";
@@ -178,20 +186,20 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
     expect(pb.getAttribute("aria-valuenow")).toBe("75");
   });
 
-  it("renders an implicit anchor when xlen > 0 on mount with no prior anchor", async () => {
+  // Wave 6.41.E.fix4 — implicit-anchor seed removed. With xlen > 0 but no
+  // localStorage anchor and no active run, the bar must NOT appear: the
+  // localStorage anchor and the run-status transitions are now the only
+  // seed paths.
+  it("(fix4) does NOT seed an implicit anchor when xlen > 0 on mount with no run", async () => {
     streamState.xlen = 500;
     streamState.consumed = 0;
     vi.stubGlobal("fetch", mockFetch());
     renderPanel();
-    const bars = await screen.findAllByTestId("indexing-progress");
-    expect(bars.length).toBeGreaterThan(0);
-    // Implicit anchor seeds consumedAtAnchor=currentConsumed (0) and
-    // rowsTotal=currentXlen (500) ⇒ 0% on first render.
-    const pb = bars[0]!.querySelector('[role="progressbar"]') as HTMLElement;
-    expect(pb.getAttribute("aria-valuenow")).toBe("0");
-    // anchor should now be persisted to localStorage so a refresh would
-    // resume from the same baseline.
-    expect(globalThis.localStorage.getItem(STORAGE_KEY)).not.toBeNull();
+    await waitFor(() => {
+      expect(screen.getByTestId("ingest-preset-radiogroup")).toBeInTheDocument();
+    });
+    expect(screen.queryByTestId("indexing-progress")).not.toBeInTheDocument();
+    expect(globalThis.localStorage.getItem(STORAGE_KEY)).toBeNull();
   });
 
   // Wave 6.41.E.fix3 — completion is no longer driven by xlen=0 (which is
@@ -295,31 +303,32 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
     expect(within(bars[0]!).queryByRole("button", { name: /dismiss/i })).toBeNull();
   });
 
-  // Wave 6.41.E.fix — Fix C: 2+ trailing xlen=0 polls and no active run ⇒
-  // hard-clear (no 3s toast). Anchor.rowsTotal > 0 alone would also be
-  // caught by D, so we use a window that mixes a positive sample with
-  // trailing zeros to isolate C.
-  it("(C) hard-clears after 2+ consecutive xlen=0 polls with no active run", async () => {
+  // Wave 6.41.E.fix4 — consumed-plateau auto-clear (replaces the prior C/D
+  // xlen===0 hatches, which never fired on unbounded streams). When every
+  // sample in the window already has consumed >= consumedAtAnchor +
+  // rowsTotal AND no run is active, the anchor is cleared as a fallback
+  // dismiss path. samples.length must reach 2 before the hatch evaluates.
+  it("(fix4) consumed-plateau auto-clear fires when consumed stays at-or-past target with no active run", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const anchor: IndexingAnchor = {
       runId: "01HXRUN",
       rowsTotal: 1000,
-      consumedAtAnchor: 0,
+      consumedAtAnchor: 500,
       anchorTs: Date.now(),
       lastSeenAt: Date.now(),
     };
     globalThis.localStorage.setItem(STORAGE_KEY, JSON.stringify(anchor));
-    streamState.xlen = 50;
-    streamState.consumed = 100;
+    // Stream-status keeps returning xlen > 0 (unbounded stream) and
+    // consumed already at the target (500 + 1000 = 1500). mockRun stays
+    // null so the plateau hatch's run-inactive gate is satisfied.
+    streamState.xlen = 10_000;
+    streamState.consumed = 1500;
     vi.stubGlobal("fetch", mockFetch());
     renderPanel();
-    await waitFor(() => {
-      expect(screen.queryAllByTestId("indexing-progress").length).toBeGreaterThan(0);
-    });
-    // Two consecutive xlen=0 polls; the first poll's positive sample keeps
-    // D's "all samples in window are zero" check from firing.
-    streamState.xlen = 0;
-    await vi.advanceTimersByTimeAsync(2_600);
+    // First poll lands; bar appears (or completion toast fires immediately
+    // because consumed >= target). Either way, after a second poll the
+    // plateau hatch sees samples.length >= 2 and all at-target, so it
+    // clears the anchor.
     await vi.advanceTimersByTimeAsync(2_600);
     await waitFor(() => {
       expect(screen.queryByTestId("indexing-progress")).not.toBeInTheDocument();
@@ -328,10 +337,17 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
     vi.useRealTimers();
   });
 
-  // Wave 6.41.E.fix — Fix D: FLUSHDB heuristic. All samples in window are
-  // xlen=0 AND anchor.rowsTotal > 0 ⇒ clear immediately, no toast.
-  it("(D) hard-clears when rowsTotal > 0 and every sample in the window is zero", async () => {
+  // Wave 6.41.E.fix4 — regression: after the 3s "Indexing complete" toast
+  // dismisses, the bar must NOT reappear on subsequent polls even though
+  // /admin/stream-status keeps returning xlen > 0 and consumed >=
+  // rowsTotal with no active run. Pre-fix the implicit-anchor effect
+  // re-seeded an anchor every poll and pinned the bar at 0%.
+  it("(fix4) bar does NOT reappear after 'Indexing complete' toast clears (unbounded stream, no run)", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
+    setMockRun({
+      rowsTotal: 1000, rowsDone: 1000, elapsedMs: 1000, rowsPerSec: 1000,
+      runId: "01HXRUN", status: "done",
+    });
     const anchor: IndexingAnchor = {
       runId: "01HXRUN",
       rowsTotal: 1000,
@@ -340,17 +356,31 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
       lastSeenAt: Date.now(),
     };
     globalThis.localStorage.setItem(STORAGE_KEY, JSON.stringify(anchor));
-    // xlen is already 0 from the start; every sample in the window will be 0.
-    streamState.xlen = 0;
-    streamState.consumed = 0;
+    // Live-evidence shape: maxlen=0 stream where xlen is cumulative-ever
+    // and consumed has caught up to rowsTotal.
+    streamState.xlen = 100_000;
+    streamState.consumed = 1000;
     vi.stubGlobal("fetch", mockFetch());
     renderPanel();
-    // Bar appears briefly (anchor restored) then the second xlen=0 poll
-    // triggers D and the bar is hard-cleared.
-    await vi.advanceTimersByTimeAsync(2_600);
+    await waitFor(() => {
+      expect(screen.queryAllByTestId("indexing-complete").length).toBeGreaterThan(0);
+    });
+    // Simulate the user's "no active runs" condition from the regression
+    // (drives the implicit-anchor effect pre-fix4).
+    setMockRun(null);
+    // 3s + ε later the completion timeout fires, anchor cleared, bar gone.
+    await vi.advanceTimersByTimeAsync(3_100);
     await waitFor(() => {
       expect(screen.queryByTestId("indexing-progress")).not.toBeInTheDocument();
     });
+    expect(globalThis.localStorage.getItem(STORAGE_KEY)).toBeNull();
+    // Three more polls (3 × 2.5s = 7.5s) with xlen still > 0 and consumed
+    // still at-or-past rowsTotal. Pre-fix4 the implicit-anchor effect
+    // would have re-created an anchor on the very next tick.
+    for (let i = 0; i < 3; i++) {
+      await vi.advanceTimersByTimeAsync(2_600);
+      expect(screen.queryByTestId("indexing-progress")).not.toBeInTheDocument();
+    }
     expect(globalThis.localStorage.getItem(STORAGE_KEY)).toBeNull();
     vi.useRealTimers();
   });
