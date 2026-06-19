@@ -209,7 +209,7 @@ describe("GET /pivot", () => {
       });
     });
 
-    it("GIRR Curvature — round-trips cvr_up / cvr_down arrays stored as JSON in side-table", async () => {
+    it("GIRR Curvature — Wave 6.47.C __shape__=curvature_per_tenor reconstructs cvr_up/cvr_down arrays", async () => {
       const fr = fakeRedis();
       fr.setResponse(
         "FT.SEARCH",
@@ -220,11 +220,13 @@ describe("GET /pivot", () => {
           },
         ]),
       );
-      // Forward-compat shape: a future hash-sidetable variant could JSON-
-      // encode the cvr_up/cvr_down legs into the same side-table HASH.
+      // Wave 6.47.C — writer JSON-encodes the cvr_up/cvr_down arrays and
+      // tags the side-table HASH with `__shape__=curvature_per_tenor` so
+      // the reader branches on the discriminator (not on field names).
       fr.setResponse("HGETALL", (args) => {
         if (String(args[0]) === "{sens:01HXCC}:tenors") {
           return [
+            "__shape__", "curvature_per_tenor",
             "cvr_up", JSON.stringify([0.1, 0.2, 0.3]),
             "cvr_down", JSON.stringify([-0.1, -0.2, -0.3]),
           ];
@@ -242,6 +244,64 @@ describe("GET /pivot", () => {
         cvr_up: [0.1, 0.2, 0.3],
         cvr_down: [-0.1, -0.2, -0.3],
       });
+    });
+
+    it("Equity Delta — Wave 6.47.C __shape__=scalar reconstructs {spot}", async () => {
+      const fr = fakeRedis();
+      fr.setResponse(
+        "FT.SEARCH",
+        ftSearchReply(1, [
+          {
+            key: "sens:01HXES",
+            doc: { risk_class: "Equity", bucket: "6", sensitivity_type: "Delta" },
+          },
+        ]),
+      );
+      fr.setResponse("HGETALL", (args) => {
+        if (String(args[0]) === "{sens:01HXES}:tenors") {
+          return ["__shape__", "scalar", "spot", "0.42"];
+        }
+        return [];
+      });
+      app = await createServer({ redis: fr, schema: equityOnlySchema() });
+      const res = await app.inject({
+        method: "GET",
+        url: "/pivot?risk_class=Equity&bucket=6&sensitivity_type=Delta",
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.rows[0].doc.risk_value).toEqual({ spot: 0.42 });
+    });
+
+    it("backwards-compat — no __shape__ discriminator on side-table → treat all keys as tenor labels", async () => {
+      // Wave 6.47.C — pre-6.47.C rows on the side-table never carry a
+      // `__shape__` field. The reader must keep round-tripping them as
+      // tenor → number objects exactly as it did before the discriminator
+      // was introduced.
+      const fr = fakeRedis();
+      fr.setResponse(
+        "FT.SEARCH",
+        ftSearchReply(1, [
+          {
+            key: "sens:01HXOLD",
+            doc: { risk_class: "GIRR", bucket: "USD-IRS", sensitivity_type: "Delta" },
+          },
+        ]),
+      );
+      fr.setResponse("HGETALL", (args) => {
+        if (String(args[0]) === "{sens:01HXOLD}:tenors") {
+          return ["3M", "0.5", "1Y", "2.0"];
+        }
+        return [];
+      });
+      app = await createServer({ redis: fr, schema: girrOnlySchema() });
+      const res = await app.inject({
+        method: "GET",
+        url: "/pivot?risk_class=GIRR&bucket=USD-IRS&sensitivity_type=Delta",
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.rows[0].doc.risk_value).toEqual({ "3M": 0.5, "1Y": 2.0 });
     });
 
     it("Equity Delta — no side-table key (HGETALL empty) leaves doc.risk_value undefined; weight resolves from by_bucket", async () => {

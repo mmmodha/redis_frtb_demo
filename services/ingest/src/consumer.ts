@@ -563,22 +563,59 @@ export function sideTableKeyFor(parentKey: string): string {
   return `{${parentKey}}:tenors`;
 }
 
-// Wave 6.38.A — `hash-sidetable` side-table key holds the row's raw
-// per-tenor `risk_value` map (and the original tenor labels when present)
-// for diagnostic / backfill flows. Not indexed by idx:sens — the parent
-// HASH already carries the indexable pre-weighted values, so the side-
-// table key only exists when the row's `risk_value` is a per-tenor object.
+// Wave 6.38.A / 6.47.C — `hash-sidetable` side-table key holds the row's
+// raw `risk_value` for the CalcPanel drilldown / diagnostic flows. Not
+// indexed by idx:sens — the parent HASH already carries the pre-weighted
+// numerics. Wave 6.47.C extends the writer beyond the original per-tenor
+// Delta/Vega case to also persist Curvature (`{cvr_up, cvr_down}` arrays
+// or scalars), scalar Equity/FX `{spot}` and bare-number variants. The
+// per-tenor shape (pre-6.47.C) intentionally has no `__shape__` field so
+// pre-existing rows already on the side-table keep round-tripping
+// correctly; every new shape carries an explicit discriminator the
+// reader (services/api/src/routes/pivot.ts) branches on.
 function sideTableArgsFor(doc: Record<string, unknown>): string[] | null {
   const rv = doc.risk_value;
-  if (!rv || typeof rv !== "object" || Array.isArray(rv)) return null;
-  const keys = Object.keys(rv as Record<string, unknown>);
-  // Equity / FX scalar shape `{spot: …}` is not "per-tenor" — skip.
-  if (keys.length === 1 && keys[0] === "spot") return null;
-  // Curvature `{cvr_up, cvr_down}` is also a flat 2-key object — skip.
-  if (keys.length <= 2 && keys.every((k) => k === "cvr_up" || k === "cvr_down")) return null;
+  if (rv === undefined || rv === null) return null;
+  // Bare number (some fixtures pass `risk_value: 1.23` directly).
+  if (typeof rv === "number") {
+    if (!Number.isFinite(rv)) return null;
+    return ["__shape__", "bare_scalar", "value", String(rv)];
+  }
+  if (typeof rv !== "object" || Array.isArray(rv)) return null;
+  const obj = rv as Record<string, unknown>;
+  const keys = Object.keys(obj);
+  if (keys.length === 0) return null;
+  // Scalar `{spot: number}` — Equity / FX Delta / Vega.
+  if (keys.length === 1 && keys[0] === "spot" && typeof obj.spot === "number") {
+    return ["__shape__", "scalar", "spot", String(obj.spot)];
+  }
+  // Curvature `{cvr_up, cvr_down}` — arrays (per-tenor) or numbers (scalar).
+  if (keys.length <= 2 && keys.every((k) => k === "cvr_up" || k === "cvr_down")) {
+    const up = obj.cvr_up;
+    const down = obj.cvr_down;
+    const upIsArr = Array.isArray(up);
+    const downIsArr = Array.isArray(down);
+    if (upIsArr || downIsArr) {
+      // JSON-encode the arrays so the flat HASH preserves order without
+      // needing tenor labels (positional against cls.tenor.nodes).
+      const args: string[] = ["__shape__", "curvature_per_tenor"];
+      if (upIsArr) args.push("cvr_up", JSON.stringify(up));
+      if (downIsArr) args.push("cvr_down", JSON.stringify(down));
+      return args;
+    }
+    if (typeof up === "number" || typeof down === "number") {
+      const args: string[] = ["__shape__", "curvature_scalar"];
+      if (typeof up === "number") args.push("cvr_up", String(up));
+      if (typeof down === "number") args.push("cvr_down", String(down));
+      return args;
+    }
+    return null;
+  }
+  // Per-tenor object — existing behaviour. Intentionally no `__shape__`
+  // discriminator so pre-6.47.C rows on the side-table keep round-tripping.
   const args: string[] = [];
   for (const k of keys) {
-    const v = (rv as Record<string, unknown>)[k];
+    const v = obj[k];
     if (typeof v === "number") args.push(k, String(v));
   }
   return args.length > 0 ? args : null;

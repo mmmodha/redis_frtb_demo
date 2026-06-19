@@ -1199,6 +1199,108 @@ describe("STORAGE_FORMAT — env parsing + writer dispatch [Wave 6.38.A]", () =>
     expect(record.some((r) => r.command === "JSON.SET")).toBe(false);
   });
 
+  it("hash-sidetable [Wave 6.47.C]: Curvature per-tenor → JSON-encoded cvr_up/cvr_down + __shape__=curvature_per_tenor", () => {
+    const record: RecordedPipelineCall[] = [];
+    const stub = pipelineStub(record);
+    const up = [0.1, 0.2, 0.3];
+    const down = [-0.1, -0.2, -0.3];
+    const doc = enrichDoc({
+      risk_class: "GIRR", bucket: "USD-IRS", sensitivity_type: "Curvature",
+      risk_value: { cvr_up: up, cvr_down: down }, trade_id: "T-cvr", desk: "RATES_LDN",
+    }, SCHEMA);
+    writeDocForStorage(stub as unknown as { call: (cmd: string, ...args: unknown[]) => unknown }, "sens:01HZE", doc, "hash-sidetable");
+    const hsets = record.filter((r) => r.command === "HSET");
+    expect(hsets.length).toBe(2);
+    // Parent HSET still lands on the unbraced key; side-table HSET on the
+    // braced `{key}:tenors` companion key.
+    expect(hsets[0]!.args[0]).toBe("sens:01HZE");
+    expect(hsets[1]!.args[0]).toBe("{sens:01HZE}:tenors");
+    const side: Record<string, string> = {};
+    const sArgs = hsets[1]!.args;
+    for (let i = 1; i < sArgs.length; i += 2) side[sArgs[i] as string] = sArgs[i + 1] as string;
+    expect(side.__shape__).toBe("curvature_per_tenor");
+    expect(JSON.parse(side.cvr_up!)).toEqual(up);
+    expect(JSON.parse(side.cvr_down!)).toEqual(down);
+  });
+
+  it("hash-sidetable [Wave 6.47.C]: scalar {spot} → __shape__=scalar + spot field", () => {
+    const record: RecordedPipelineCall[] = [];
+    const stub = pipelineStub(record);
+    const doc = enrichDoc({
+      risk_class: "EQUITY", bucket: "1", sensitivity_type: "Delta",
+      risk_value: { spot: 1.5 }, trade_id: "T-sp", desk: "EQUITY_NYC",
+    }, SCHEMA);
+    writeDocForStorage(stub as unknown as { call: (cmd: string, ...args: unknown[]) => unknown }, "sens:01HZF", doc, "hash-sidetable");
+    const hsets = record.filter((r) => r.command === "HSET");
+    expect(hsets.length).toBe(2);
+    expect(hsets[1]!.args[0]).toBe("{sens:01HZF}:tenors");
+    const side: Record<string, string> = {};
+    const sArgs = hsets[1]!.args;
+    for (let i = 1; i < sArgs.length; i += 2) side[sArgs[i] as string] = sArgs[i + 1] as string;
+    expect(side.__shape__).toBe("scalar");
+    expect(Number(side.spot)).toBe(1.5);
+  });
+
+  it("hash-sidetable [Wave 6.47.C]: EQUITY Vega {spot} → __shape__=scalar (same wrapping as Delta per row-generator.ts:333)", () => {
+    // Generator emits Equity/FX Vega as { spot: n } too — see
+    // services/generator/src/row-generator.ts:324-340 (the rv_scalar branch
+    // wraps every non-Curvature Equity/FX value in `{ spot }`). This guard
+    // catches a future generator change that would emit a different scalar
+    // key (e.g. `{ vol }`) without an explicit side-table-shape update.
+    const record: RecordedPipelineCall[] = [];
+    const stub = pipelineStub(record);
+    const doc = enrichDoc({
+      risk_class: "EQUITY", bucket: "1", sensitivity_type: "Vega",
+      risk_value: { spot: 0.42 }, trade_id: "T-ev", desk: "EQUITY_NYC",
+    }, SCHEMA);
+    writeDocForStorage(stub as unknown as { call: (cmd: string, ...args: unknown[]) => unknown }, "sens:01HZF1", doc, "hash-sidetable");
+    const hsets = record.filter((r) => r.command === "HSET");
+    expect(hsets.length).toBe(2);
+    expect(hsets[1]!.args[0]).toBe("{sens:01HZF1}:tenors");
+    const side: Record<string, string> = {};
+    const sArgs = hsets[1]!.args;
+    for (let i = 1; i < sArgs.length; i += 2) side[sArgs[i] as string] = sArgs[i + 1] as string;
+    expect(side.__shape__).toBe("scalar");
+    expect(Number(side.spot)).toBe(0.42);
+  });
+
+  it("hash-sidetable [Wave 6.47.C]: FX Vega {spot} → __shape__=scalar (same wrapping as Delta per row-generator.ts:333)", () => {
+    const record: RecordedPipelineCall[] = [];
+    const stub = pipelineStub(record);
+    const doc = enrichDoc({
+      risk_class: "FX", bucket: "EURUSD", sensitivity_type: "Vega",
+      risk_value: { spot: 0.75 }, trade_id: "T-fv", desk: "FX_HKG",
+    }, SCHEMA);
+    writeDocForStorage(stub as unknown as { call: (cmd: string, ...args: unknown[]) => unknown }, "sens:01HZF2", doc, "hash-sidetable");
+    const hsets = record.filter((r) => r.command === "HSET");
+    expect(hsets.length).toBe(2);
+    expect(hsets[1]!.args[0]).toBe("{sens:01HZF2}:tenors");
+    const side: Record<string, string> = {};
+    const sArgs = hsets[1]!.args;
+    for (let i = 1; i < sArgs.length; i += 2) side[sArgs[i] as string] = sArgs[i + 1] as string;
+    expect(side.__shape__).toBe("scalar");
+    expect(Number(side.spot)).toBe(0.75);
+  });
+
+  it("hash-sidetable [Wave 6.47.C]: per-tenor object regression — flat HASH fields, no discriminator", () => {
+    const record: RecordedPipelineCall[] = [];
+    const stub = pipelineStub(record);
+    const doc = enrichDoc({
+      risk_class: "GIRR", bucket: "USD-IRS", sensitivity_type: "Delta",
+      risk_value: { "3M": 0.1, "1Y": 0.2 }, trade_id: "T-pt", desk: "RATES_LDN",
+    }, SCHEMA);
+    writeDocForStorage(stub as unknown as { call: (cmd: string, ...args: unknown[]) => unknown }, "sens:01HZG", doc, "hash-sidetable");
+    const hsets = record.filter((r) => r.command === "HSET");
+    expect(hsets.length).toBe(2);
+    expect(hsets[1]!.args[0]).toBe("{sens:01HZG}:tenors");
+    const side: Record<string, string> = {};
+    const sArgs = hsets[1]!.args;
+    for (let i = 1; i < sArgs.length; i += 2) side[sArgs[i] as string] = sArgs[i + 1] as string;
+    expect(side.__shape__).toBeUndefined();
+    expect(Number(side["3M"])).toBe(0.1);
+    expect(Number(side["1Y"])).toBe(0.2);
+  });
+
   it("hash-encoded: single HSET on the parent with `weighted_value_per_tenor_json` blob", () => {
     const record: RecordedPipelineCall[] = [];
     const stub = pipelineStub(record);

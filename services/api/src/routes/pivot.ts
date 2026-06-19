@@ -48,21 +48,24 @@ function hasPipeline(r: RedisLike): r is RedisLike & PipelineClient {
   return typeof (r as unknown as Partial<PipelineClient>).pipeline === "function";
 }
 
-// Wave 6.47.B — reconstruct `risk_value` from an HGETALL reply on the
-// `hash-sidetable` companion key. The writer (sideTableArgsFor) stores
-// per-tenor `<label> -> <number-as-string>` pairs for Delta/Vega rows whose
-// raw risk_value is a tenor-keyed object; scalar Equity/FX rows have no
-// side-table key at all (and Curvature is currently skipped by the writer
-// too — see consumer.ts:577). This parser is defensive against both shapes
-// plus a hypothetical Curvature variant that JSON-encodes cvr_up/cvr_down
-// arrays and an optional `__tenor_order__` JSON array used to preserve
-// tenor ordering when present.
+// Wave 6.47.B / 6.47.C — reconstruct `risk_value` from an HGETALL reply on
+// the `hash-sidetable` companion key. Wave 6.47.C extended the writer to
+// persist every risk_value shape (per-tenor Delta/Vega, Curvature per-tenor
+// arrays, Curvature scalar, `{spot}` scalar, bare number) with an explicit
+// `__shape__` discriminator field; this reader branches on that field.
+// Pre-6.47.C rows have no discriminator and only the per-tenor shape was
+// ever written — those fall through to the legacy "all keys are tenor
+// labels" path, which is preserved bit-for-bit. An optional
+// `__tenor_order__` JSON array is honoured for tenor ordering when
+// present (also used by the legacy path).
 function parseSideTableRiskValue(reply: unknown): unknown {
   const entries = entriesFromHashReply(reply);
   if (!entries || entries.length === 0) return undefined;
+  let shape: string | undefined;
   let tenorOrder: string[] | null = null;
   const map = new Map<string, string>();
   for (const [k, v] of entries) {
+    if (k === "__shape__") { shape = v; continue; }
     if (k === "__tenor_order__") {
       try {
         const parsed = JSON.parse(v);
@@ -72,16 +75,18 @@ function parseSideTableRiskValue(reply: unknown): unknown {
     }
     map.set(k, v);
   }
-  const keys = [...map.keys()];
-  if (keys.length === 0) return undefined;
-  if (keys.every((k) => k === "cvr_up" || k === "cvr_down")) {
+  if (map.size === 0) return undefined;
+
+  if (shape === "curvature_per_tenor") {
     const out: Record<string, number[]> = {};
-    for (const k of keys) {
+    for (const k of ["cvr_up", "cvr_down"] as const) {
+      const raw = map.get(k);
+      if (raw == null) continue;
       try {
-        const v = JSON.parse(map.get(k)!);
-        if (Array.isArray(v)) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
           const nums: number[] = [];
-          for (const e of v) {
+          for (const e of parsed) {
             const n = Number(e);
             if (Number.isFinite(n)) nums.push(n);
           }
@@ -91,6 +96,32 @@ function parseSideTableRiskValue(reply: unknown): unknown {
     }
     return Object.keys(out).length > 0 ? out : undefined;
   }
+  if (shape === "curvature_scalar") {
+    const out: Record<string, number> = {};
+    for (const k of ["cvr_up", "cvr_down"] as const) {
+      const raw = map.get(k);
+      if (raw == null) continue;
+      const n = Number(raw);
+      if (Number.isFinite(n)) out[k] = n;
+    }
+    return Object.keys(out).length > 0 ? out : undefined;
+  }
+  if (shape === "scalar") {
+    const raw = map.get("spot");
+    if (raw == null) return undefined;
+    const n = Number(raw);
+    return Number.isFinite(n) ? { spot: n } : undefined;
+  }
+  if (shape === "bare_scalar") {
+    const raw = map.get("value");
+    if (raw == null) return undefined;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : undefined;
+  }
+
+  // No discriminator — pre-6.47.C per-tenor shape. Treat all remaining
+  // keys as tenor labels mapping to numeric strings.
+  const keys = [...map.keys()];
   const orderedKeys = tenorOrder ? tenorOrder.filter((k) => map.has(k)) : keys;
   const out: Record<string, number> = {};
   for (const k of orderedKeys) {
