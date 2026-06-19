@@ -1,9 +1,8 @@
-// Wave 6.41.C — typed clients for the FilterChips backend surface added in
-// 6.41.A. Each /facets/* call returns the rows that have at least one sens
-// indexed in the active target; the FilterChips component drives its desk /
-// region / bucket dropdowns from these. The book chip uses the existing
-// /suggest?field=book FT.SUGGET passthrough (Wave 5.30a) rather than a facet
-// scan because book cardinality is unbounded.
+// Wave 6.41.A — typed clients for the /facets/* backend surface. Each call
+// returns the rows that have at least one sens indexed in the active target
+// (desk / region / bucket). The book lookup uses the existing /suggest?field=
+// book FT.SUGGET passthrough (Wave 5.30a) rather than a facet scan because
+// book cardinality is unbounded.
 
 import { apiBase } from "./api";
 

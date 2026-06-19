@@ -31,12 +31,10 @@ export interface CalcSbmRequest {
     trade_id?: string[];
     risk_factor?: string[];
   };
-  // Wave 6.41.C — positive-include predicate driven by the FilterChips strip.
-  // Mirrors the api's CalcBody.include shape (services/api/src/routes/calc.ts):
-  // when any list is non-empty the kernel keeps only rows whose value is IN
-  // the list. `region` resolves to a desk-set on the api side; `bucket` accepts
-  // numbers since the chip dropdown is grouped by risk_class and the user
-  // selects integer bucket ids.
+  // Wave 6.41.C — positive-include predicate mirroring the api's CalcBody.include
+  // shape (services/api/src/routes/calc.ts): when any list is non-empty the
+  // kernel keeps only rows whose value is IN the list. `region` resolves to a
+  // desk-set on the api side; `bucket` accepts integer bucket ids.
   include?: {
     book?: string[];
     trade_id?: string[];
