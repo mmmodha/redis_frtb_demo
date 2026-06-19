@@ -14,6 +14,16 @@
 // primitives are introduced. Resume reuses the existing active-target
 // watcher polling / refresh path so this file holds no Redis client state.
 //
+// Wave 6.44.D1 — commit-phase reconnect retries on RebuildBusyError. When 5
+// switches fire in <5s the previous switch's rebuild is still in flight when
+// the new commit arrives; the rebuild mutex throws RebuildBusyError and the
+// commit-phase ACK was previously lost (per-service state stuck at "drained").
+// We now retry the commit closure up to 3 times with 250→500→1000ms backoff
+// before responding {phase:"push_failed"} with the busy error in the body.
+// Retry loop probes pendingSwitchId between attempts so a newer prepare
+// mid-retry causes a clean 409 (superseded) instead of stomping the new
+// switch's state.
+//
 // IMPORTANT: this is push-only; the existing watcher polling at
 // /internal/redis/active-target/full stays in place as the safety net.
 
@@ -87,6 +97,21 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   });
 }
 
+// Wave 6.44.D1 — commit-phase reconnect retry schedule. Three attempts after
+// the initial call (250ms → 500ms → 1s) covers the typical rebuild window
+// observed during S6 rapid-switch (~1.2s end-to-end) without dragging the
+// HTTP push past the api's SWITCH_PUSH_TIMEOUT_MS (2.5s default + the api
+// already waits past commit). Exported for tests to assert exact timings.
+export const COMMIT_RETRY_DELAYS_MS: readonly number[] = [250, 500, 1000];
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function isRebuildBusyError(err: unknown): boolean {
+  return err instanceof Error && err.name === "RebuildBusyError";
+}
+
 export function makeAdminActiveTargetHandler(
   deps: AdminActiveTargetDeps,
 ): (req: http.IncomingMessage, res: http.ServerResponse) => Promise<boolean> {
@@ -147,13 +172,65 @@ export function makeAdminActiveTargetHandler(
       writeJson(res, 409, { ok: false, error: "switch_id mismatch", pending_switch_id: pendingSwitchId });
       return true;
     }
-    try {
-      await deps.commit();
+    // Wave 6.44.D1 — retry loop around the commit closure on RebuildBusyError.
+    // Non-busy errors short-circuit to the existing 500 path so we don't add
+    // ~1.75s of latency to a permanent failure. Between attempts we re-check
+    // pendingSwitchId: if a newer prepare landed (overwriting it) we abandon
+    // this switch and respond 409 so the api stops waiting on this ACK.
+    let lastErr: unknown = null;
+    let committed = false;
+    let superseded = false;
+    for (let attempt = 0; attempt <= COMMIT_RETRY_DELAYS_MS.length; attempt++) {
+      if (pendingSwitchId !== null && pendingSwitchId !== parsed.switch_id) {
+        superseded = true;
+        break;
+      }
+      try {
+        await deps.commit();
+        committed = true;
+        break;
+      } catch (err) {
+        lastErr = err;
+        if (!isRebuildBusyError(err)) break;
+        if (attempt === COMMIT_RETRY_DELAYS_MS.length) break;
+        const delay = COMMIT_RETRY_DELAYS_MS[attempt];
+        log?.warn(
+          { switch_id: parsed.switch_id, attempt: attempt + 1, delay_ms: delay, err: String(err) },
+          "active-target commit reconnect busy, retrying",
+        );
+        await sleep(delay);
+      }
+    }
+    if (committed) {
       pendingSwitchId = null;
       writeJson(res, 200, { ok: true, switch_id: parsed.switch_id, phase: "committed" });
-    } catch (err) {
-      log?.error({ err: String(err), switch_id: parsed.switch_id }, "active-target commit failed");
-      writeJson(res, 500, { ok: false, error: err instanceof Error ? err.message : String(err) });
+    } else if (superseded) {
+      writeJson(res, 409, {
+        ok: false,
+        error: "switch_id superseded by newer prepare",
+        switch_id: parsed.switch_id,
+        pending_switch_id: pendingSwitchId,
+      });
+    } else {
+      const msg = lastErr instanceof Error ? lastErr.message : String(lastErr);
+      if (isRebuildBusyError(lastErr)) {
+        // Wave 6.44.D1 — retries exhausted. Explicit phase:"push_failed" so
+        // the api / log surface can show a clear failure state rather than a
+        // stale "drained". The polling fallback still converges within 30s.
+        log?.error(
+          { switch_id: parsed.switch_id, err: msg, attempts: COMMIT_RETRY_DELAYS_MS.length + 1 },
+          "active-target commit reconnect exhausted retries on RebuildBusyError",
+        );
+        writeJson(res, 500, {
+          ok: false,
+          switch_id: parsed.switch_id,
+          phase: "push_failed",
+          error: msg,
+        });
+      } else {
+        log?.error({ err: msg, switch_id: parsed.switch_id }, "active-target commit failed");
+        writeJson(res, 500, { ok: false, error: msg });
+      }
     }
     return true;
   };

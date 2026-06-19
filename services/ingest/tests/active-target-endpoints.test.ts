@@ -7,7 +7,8 @@
 import http from "node:http";
 import { Readable } from "node:stream";
 import { describe, it, expect, vi } from "vitest";
-import { makeAdminActiveTargetHandler } from "../src/admin-active-target.ts";
+import { COMMIT_RETRY_DELAYS_MS, makeAdminActiveTargetHandler } from "../src/admin-active-target.ts";
+import { RebuildBusyError } from "../src/shard-runtime.ts";
 
 const TOKEN = "test-internal-token";
 
@@ -128,6 +129,69 @@ describe("makeAdminActiveTargetHandler (Wave 6.43.B.2)", () => {
     expect(commit).not.toHaveBeenCalled();
     expect(got.code).toBe(409);
     expect((got.body as { ok: boolean }).ok).toBe(false);
+  });
+
+  // Wave 6.44.D1 — commit-phase reconnect retries on RebuildBusyError so a
+  // rapid-switch cadence (S6 evidence: 5 switches in <5s) does not leave the
+  // ingest service stuck at phase:"drained" when the previous switch's
+  // rebuild is still in flight.
+  it("retries commit on RebuildBusyError and ACKs committed after backoff", async () => {
+    vi.useFakeTimers();
+    try {
+      let calls = 0;
+      const commit = vi.fn(async () => {
+        calls += 1;
+        if (calls <= 2) throw new RebuildBusyError();
+      });
+      const handler = makeAdminActiveTargetHandler({
+        internalToken: TOKEN, drain: vi.fn(async () => undefined), commit,
+      });
+      const prep = await call(handler, "/admin/active-target/prepare", { switch_id: "s1", target: { label: "x" } });
+      expect(prep.code).toBe(200);
+      const pending = call(handler, "/admin/active-target/commit", { switch_id: "s1", target: { label: "x" } });
+      // Walk the documented backoff schedule (250 → 500ms) explicitly; the
+      // third attempt resolves so no further timer should arm.
+      await vi.advanceTimersByTimeAsync(COMMIT_RETRY_DELAYS_MS[0]);
+      await vi.advanceTimersByTimeAsync(COMMIT_RETRY_DELAYS_MS[1]);
+      const got = await pending;
+      expect(commit).toHaveBeenCalledTimes(3);
+      expect(got.code).toBe(200);
+      expect(got.body).toEqual({ ok: true, switch_id: "s1", phase: "committed" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("posts push_failed ACK after retry exhaustion on persistent RebuildBusyError", async () => {
+    vi.useFakeTimers();
+    try {
+      const commit = vi.fn(async () => { throw new RebuildBusyError(); });
+      const warn = vi.fn();
+      const error = vi.fn();
+      const handler = makeAdminActiveTargetHandler({
+        internalToken: TOKEN, drain: vi.fn(async () => undefined), commit,
+        logger: { warn, error },
+      });
+      const prep = await call(handler, "/admin/active-target/prepare", { switch_id: "s1", target: { label: "x" } });
+      expect(prep.code).toBe(200);
+      const pending = call(handler, "/admin/active-target/commit", { switch_id: "s1", target: { label: "x" } });
+      // Initial attempt fails synchronously inside the await; advance through
+      // each backoff to let the next attempt run. The fourth (final) attempt
+      // also fails — total = 1 initial + 3 retries.
+      for (const ms of COMMIT_RETRY_DELAYS_MS) await vi.advanceTimersByTimeAsync(ms);
+      const got = await pending;
+      expect(commit).toHaveBeenCalledTimes(1 + COMMIT_RETRY_DELAYS_MS.length);
+      expect(got.code).toBe(500);
+      const body = got.body as { ok: boolean; switch_id: string; phase: string; error: string };
+      expect(body.ok).toBe(false);
+      expect(body.switch_id).toBe("s1");
+      expect(body.phase).toBe("push_failed");
+      expect(body.error).toMatch(/rebuild already in progress/);
+      // Sanity: exhaustion path logs error, not just warn.
+      expect(error).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("ignores unknown urls so other handlers can claim them", async () => {
