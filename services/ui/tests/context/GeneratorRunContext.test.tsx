@@ -311,6 +311,47 @@ describe("<GeneratorRunProvider /> — Wave 5.40b reconnect", () => {
     const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "{}");
     expect(stored.run_id).toBe("01HXNEW");
   });
+
+  // Wave 6.44.F — defence-in-depth for the cancel-path leak. The
+  // server-side /generator/runs filter normally returns running-only, but
+  // if a registry entry transitions terminal between that filter pass and
+  // our adoption the orphan response may still include a `status:"cancelled"`
+  // (or other terminal) row. The provider must NOT start polling against
+  // such an entry — doing so would transiently set `run.status="running"`
+  // and re-seed the IndexingProgress anchor, leaving the bar stuck at 0%.
+  it("(6.44.F) orphan-discovery never starts polling for a terminal entry returned mid-grace", async () => {
+    fetchMock.on(
+      (url, method) => /\/generator\/runs$/.test(url) && method === "GET",
+      () => ({
+        status: 200,
+        body: { active: [{ run_id: "01HXTERM", status: "cancelled", rows_done: 0, rows_total: 100_000 }] },
+      }),
+    );
+    // If startPolling were called the provider would hit this URL; the
+    // assertion below confirms it never does.
+    const statusCalls: string[] = [];
+    fetchMock.on(
+      (url, method) => /\/generator\/runs\/[^/]+\/status$/.test(url) && method === "GET",
+      () => {
+        statusCalls.push("called");
+        return { status: 200, body: { run_id: "01HXTERM", status: "running", rows_done: 0, rows_total: 100_000, rows_per_sec: 0, elapsed_ms: 0 } };
+      },
+    );
+
+    const ui = renderProvider();
+    // Drain the mount-time orphan-discovery promise chain.
+    await act(async () => { for (let i = 0; i < 10; i++) await Promise.resolve(); });
+    // Wait a poll interval; if startPolling had been invoked a status
+    // request would have fired by now.
+    await new Promise((r) => setTimeout(r, 600));
+
+    // Invariants: run stays null AND no status polls were issued.
+    expect(ui.value.run).toBeNull();
+    expect(statusCalls).toHaveLength(0);
+    // localStorage stayed clean too — the provider didn't writeStored a
+    // terminal entry.
+    expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
+  });
 });
 
 // Wave 5.45 — auto-dismiss timer for the terminal summary so the pill clears

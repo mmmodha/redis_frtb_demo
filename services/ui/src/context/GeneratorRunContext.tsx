@@ -385,6 +385,14 @@ export function GeneratorRunProvider({ children }: { children: ReactNode }): JSX
       // we recover from a wiped/disabled storage. If multiple runs are
       // active the registry's insertion order makes the last entry the
       // most-recently-started one.
+      // Wave 6.44.F — the `orphan.status === "running"` guard below is
+      // load-bearing for the IndexingProgress cancel-path leak: a terminal
+      // entry returned mid-grace must NOT trigger startPolling (which
+      // would transiently call setRun({status:"running"}) and re-seed the
+      // indexing anchor). The server-side /generator/runs filter already
+      // returns running-only, but this client-side guard is the defence-
+      // in-depth in case an in-flight cancel transitions an entry between
+      // the server's filter pass and our adoption.
       let list: { active: { run_id: string; status: string; rows_done: number; rows_total: number }[] } | null = null;
       try { list = await getActiveGeneratorRuns(); } catch { list = null; }
       if (cancelled) return;

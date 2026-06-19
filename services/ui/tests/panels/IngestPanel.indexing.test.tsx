@@ -605,6 +605,52 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
     expect(globalThis.localStorage.getItem(STORAGE_KEY)).toBeNull();
   });
 
+  // Wave 6.44.F — defensive auto-clear: ANY transition where `run` becomes
+  // null while `anchor !== null` must reset the indexing state. Simulates
+  // the failure mode where the GeneratorRunContext drops the run from
+  // `running` straight to `null` (registry-eviction race, grace-expiry, or
+  // a Stop-all-runs that beats the status-transition effect's gating).
+  // The status-transition effect's `becomesCancelOrError` branch never
+  // fires here because status goes running→null directly (skipping the
+  // cancelled/error intermediates), so the defensive effect is the only
+  // path that drops the stranded bar.
+  it("(6.44.F) run transitioning directly from running to null clears the anchor", async () => {
+    setMockRun({
+      rowsTotal: 100_000, rowsDone: 0, elapsedMs: 1_000, rowsPerSec: 0,
+      runId: "01HXLEAK", status: "running",
+    });
+    const anchor: IndexingAnchor = {
+      runId: "01HXLEAK",
+      rowsTotal: 100_000,
+      indexCountAtAnchor: 0,
+      anchorTs: Date.now(),
+      lastSeenAt: Date.now(),
+      targetLabel: TEST_LABEL,
+    };
+    globalThis.localStorage.setItem(STORAGE_KEY, JSON.stringify(anchor));
+    indexCountState.count = 0;
+    vi.stubGlobal("fetch", mockFetch());
+    const { rerender } = renderPanel();
+    await waitFor(() => {
+      expect(screen.queryAllByTestId("indexing-progress").length).toBeGreaterThan(0);
+    });
+    // Registry evicts the run while indexer is still at 0 indexed; the
+    // provider drops `run` to null (skipping the cancelled intermediate).
+    setMockRun(null);
+    rerender(
+      <MemoryRouter>
+        <GeneratorRunProvider>
+          <IngestPanel />
+        </GeneratorRunProvider>
+      </MemoryRouter>,
+    );
+    await waitFor(() => {
+      expect(screen.queryByTestId("indexing-progress")).not.toBeInTheDocument();
+    });
+    // Anchor was hard-cleared from localStorage by the defensive effect.
+    expect(globalThis.localStorage.getItem(STORAGE_KEY)).toBeNull();
+  });
+
   // Wave 6.44.D — indexing pct grows monotonically as the live FT.SEARCH
   // count increases against the rowsTotal denominator. Mirrors real
   // production rates: ~30K rows/s indexing on a 10M-row target.

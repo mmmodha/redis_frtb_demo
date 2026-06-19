@@ -2234,6 +2234,12 @@ function IndexingProgress() {
   const [anchor, setAnchor] = useState<IndexingAnchor | null>(null);
   const [completeShownAt, setCompleteShownAt] = useState<number | null>(null);
   const prevRunStatusRef = useRef<string | null>(null);
+  // Wave 6.44.F — tracks whether the previous render saw a non-null `run`.
+  // Used by the defensive auto-clear effect below to detect ANY transition
+  // from a present run to `null` (registry eviction, grace-expiry, manual
+  // clear, Stop-all-runs) so we can unconditionally drop the indexing
+  // anchor and avoid the "stuck bar at 0%" leak.
+  const prevRunPresenceRef = useRef<boolean>(false);
   // Wave 6.41.E.fix (A) — timeout id held in a ref (not state) so re-renders
   // during the 3s "Indexing complete" toast do not cancel it via the effect
   // cleanup path that was the root cause of the stuck-toast bug.
@@ -2428,6 +2434,25 @@ function IndexingProgress() {
     writeAnchor(targetLabel, a);
     setAnchor(a);
   }, [anchor, run?.status, run?.runId, run?.rowsTotal, currentIndexCount, targetLabel]);
+
+  // Wave 6.44.F — defensive auto-clear. When `run` transitions from non-
+  // null to null (any cause: registry-eviction, grace-expiry, manual clear,
+  // Stop-all-runs flipping the registry entry terminal then auto-dismiss
+  // dropping it from context) and an anchor still exists, unconditionally
+  // reset the indexing state. The status-transition effect above only fires
+  // when `run?.status` actually changes AND has additional `atTarget`
+  // gating that misses this transition when the registry-eviction races
+  // with the indexer-catches-up path; this effect is the unconditional
+  // backstop that guarantees the bar disappears once no run is in flight.
+  useEffect(() => {
+    const wasPresent = prevRunPresenceRef.current;
+    const isPresent = run !== null;
+    prevRunPresenceRef.current = isPresent;
+    if (wasPresent && !isPresent && anchor !== null) {
+      resetIndexingState();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [run, anchor]);
 
   // Wave 6.41.E.fix (A) — pct reached 100% with an active anchor ⇒ show
   // "Indexing complete" for INDEXING_COMPLETE_MS then clear. The timeout id

@@ -1111,15 +1111,18 @@ export function registerGeneratorRoutes(
   //      progress (6.44.D) drops to 0 immediately. If ingest is unreachable
   //      the response still returns 200 with `flush: null` (callers see a
   //      partial-success banner; the cancel flags are already set).
+  // Wave 6.44.F — after the drain window, any entry still `status === "running"`
+  // is force-marked terminal (`status="cancelled"`, `stop_reason="cancelled"`,
+  // `terminal_at_ms=now`) and grace-eviction is scheduled. This guarantees
+  // GET /generator/runs/:id/status returns `{status:"cancelled"}` within the
+  // bounded `cancelDrainMs` window — the UI's IndexingProgress defensive
+  // auto-clear relies on this terminal visibility to drop the bar instead
+  // of waiting on the producer's own terminal handler (which may lag if the
+  // producer is mid-FCALL). The producer's `.then` will overwrite these
+  // fields idempotently when it eventually finishes.
   // No body required — Fastify accepts an empty POST and we never read req.body.
   app.post("/admin/cancel-all-runs", async () => {
-    const run_ids: string[] = [];
-    for (const entry of activeRuns.values()) {
-      if (entry.status === "running" && !entry.cancelFlag.cancelled) {
-        entry.cancelFlag.cancelled = true;
-        run_ids.push(entry.run_id);
-      }
-    }
+    const run_ids = cancelAllActiveRuns();
 
     // Best-effort drain: poll until every entry we just marked transitions to
     // a terminal status, capped at cancelDrainMs. A producer mid-batch may
@@ -1136,11 +1139,43 @@ export function registerGeneratorRoutes(
         if (!stillRunning) break;
         await new Promise((r) => setTimeout(r, 50));
       }
+      // Wave 6.44.F — drain window expired (or all entries transitioned
+      // naturally). For any entry still running, force-mark terminal so the
+      // status endpoint reflects the cancel immediately. The producer's
+      // own terminal handler will idempotently overwrite these fields if
+      // it eventually finishes.
+      const nowMs = Date.now();
+      for (const id of run_ids) {
+        const e = activeRuns.get(id);
+        if (e && e.status === "running") {
+          e.status = "cancelled";
+          e.stop_reason = "cancelled";
+          e.terminal_at_ms = nowMs;
+          setTimeout(() => { activeRuns.delete(id); }, terminalGraceMs).unref?.();
+        }
+      }
     }
 
     const flush = await callIngestHaltAndFlush(app, opts.ingestBase, cancelFetch);
     return { ok: true, cancelled: run_ids.length, run_ids, flush };
   });
+}
+
+// Wave 6.44.F — extracted helper used by the /admin/cancel-all-runs route
+// handler. Iterates the module-local `activeRuns` registry and flips the
+// cancel flag on every entry currently `status === "running"` whose flag
+// isn't already set. Returns the list of run_ids that were just marked so
+// the caller can drain and (after timeout) force-mark them terminal.
+// Exported so future admin-route consumers don't duplicate registry access.
+export function cancelAllActiveRuns(): string[] {
+  const run_ids: string[] = [];
+  for (const entry of activeRuns.values()) {
+    if (entry.status === "running" && !entry.cancelFlag.cancelled) {
+      entry.cancelFlag.cancelled = true;
+      run_ids.push(entry.run_id);
+    }
+  }
+  return run_ids;
 }
 
 // Wave 6.44.E — proxy the halt-and-flush call to ingest. Returns the parsed
@@ -1189,6 +1224,10 @@ export interface TestActiveRun {
   run_id: string;
   status: "running" | "done" | "cancelled" | "error";
   cancelFlag: { cancelled: boolean };
+  // Wave 6.44.F — expose terminal bookkeeping fields so tests can assert
+  // the cancel-all-runs handler force-marks runs terminal after drain.
+  stop_reason?: StopReason;
+  terminal_at_ms?: number;
 }
 export function _testInsertActiveRun(run: TestActiveRun): void {
   activeRuns.set(run.run_id, {
@@ -1207,7 +1246,13 @@ export function _testInsertActiveRun(run: TestActiveRun): void {
 export function _testGetActiveRun(run_id: string): TestActiveRun | undefined {
   const e = activeRuns.get(run_id);
   if (!e) return undefined;
-  return { run_id: e.run_id, status: e.status, cancelFlag: e.cancelFlag };
+  return {
+    run_id: e.run_id,
+    status: e.status,
+    cancelFlag: e.cancelFlag,
+    ...(e.stop_reason ? { stop_reason: e.stop_reason } : {}),
+    ...(e.terminal_at_ms !== undefined ? { terminal_at_ms: e.terminal_at_ms } : {}),
+  };
 }
 export function _testResetActiveRuns(): void {
   activeRuns.clear();

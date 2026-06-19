@@ -1230,14 +1230,55 @@ describe("POST /admin/cancel-all-runs (Wave 5.44 / 6.44.E) — admin stop all ge
     const first = await app.inject({ method: "POST", url: "/admin/cancel-all-runs" });
     expect((first.json() as { cancelled: number }).cancelled).toBe(2);
 
-    // Status is still "running" (the detached loop hasn't observed the flag
-    // yet); the route must skip these on the second call so we don't
-    // double-count an already-cancelled run. The flush still runs and is
-    // idempotent on the ingest side too — DoD #2.
+    // Wave 6.44.F — after the drain window expires the route force-marks
+    // both entries `status="cancelled"`; the second call skips them on the
+    // `status === "running"` filter so the cancelled count stays at 0. The
+    // flush still runs and is idempotent on the ingest side too — DoD #2.
     const second = await app.inject({ method: "POST", url: "/admin/cancel-all-runs" });
     expect(second.statusCode).toBe(200);
     expect(second.json()).toEqual({ ok: true, cancelled: 0, run_ids: [], flush: FLUSH_OK });
     expect(stub.calls).toHaveLength(2);
+  });
+
+  // Wave 6.44.F — DoD #2: immediately after cancel-all-runs returns 200,
+  // GET /generator/runs/:id/status for every previously-active run_id must
+  // return `{status:"cancelled"}` — not `{status:"running"}` and not 404.
+  // The detached producer loop never observes the flag in this test (no
+  // producer is running), so the route must force-mark each entry terminal
+  // after the drain window expires.
+  it("(6.44.F) force-marks entries cancelled after drain so /generator/runs/:id/status reports terminal immediately", async () => {
+    const schema = loadFixtureSchema();
+    const fr = pipelineFakeRedis();
+    const stub = makeIngestFetchStub({ ok: true, body: FLUSH_OK });
+    app = await createServer({ redis: fr, schema, ingestBase: "http://stub-ingest:8083", generatorFetchImpl: stub.impl, generatorCancelDrainMs: 10 });
+
+    _testInsertActiveRun({ run_id: "run-stuck-1", status: "running", cancelFlag: { cancelled: false } });
+    _testInsertActiveRun({ run_id: "run-stuck-2", status: "running", cancelFlag: { cancelled: false } });
+
+    const res = await app.inject({ method: "POST", url: "/admin/cancel-all-runs" });
+    expect(res.statusCode).toBe(200);
+    expect((res.json() as { cancelled: number }).cancelled).toBe(2);
+
+    // Registry-level invariant: both entries are terminal with cancel
+    // bookkeeping populated.
+    for (const id of ["run-stuck-1", "run-stuck-2"]) {
+      const entry = _testGetActiveRun(id);
+      expect(entry).toBeDefined();
+      expect(entry!.status).toBe("cancelled");
+      expect(entry!.stop_reason).toBe("cancelled");
+      expect(typeof entry!.terminal_at_ms).toBe("number");
+      expect(entry!.cancelFlag.cancelled).toBe(true);
+    }
+
+    // Status-route invariant: the UI's polling sees `{status:"cancelled"}`
+    // immediately, not `{status:"running"}` and not 404.
+    for (const id of ["run-stuck-1", "run-stuck-2"]) {
+      const statusRes = await app.inject({ method: "GET", url: `/generator/runs/${id}/status` });
+      expect(statusRes.statusCode).toBe(200);
+      const body = statusRes.json() as { status: string; stop_reason?: string };
+      expect(body.status).toBe("cancelled");
+      expect(body.stop_reason).toBe("cancelled");
+    }
   });
 
   // Wave 6.44.E DoD #4 — ingest unreachable must NOT 5xx; cancel flags must
