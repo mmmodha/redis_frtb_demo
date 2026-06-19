@@ -8,7 +8,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import { IngestPanel } from "../../src/panels/IngestPanel";
+import {
+  IngestPanel,
+  RUN_PRESETS,
+  buildRunPresetConfig,
+} from "../../src/panels/IngestPanel";
 import { GeneratorRunProvider } from "../../src/context/GeneratorRunContext";
 
 vi.mock("../../src/components/PanelCard", () => ({
@@ -133,14 +137,61 @@ describe("IngestPanel — Wave 6.17 presets-only run", () => {
   beforeEach(() => { /* no fake timers — orchestrator is fully promise-driven */ });
   afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
-  it("renders the Run preset card with all five preset radios + a Start button", async () => {
+  it("renders the Run preset card with all seven preset radios (incl. xl + xxl) + a Start button", async () => {
     mockFetch();
     renderPanel();
     const card = await screen.findByTestId("ingest-preset-radiogroup");
-    for (const k of ["quick", "demo", "medium", "large", "overnight"]) {
+    for (const k of ["quick", "demo", "medium", "large", "xl", "overnight", "xxl"]) {
       expect(card.querySelector(`[data-testid="ingest-preset-${k}"]`)).not.toBeNull();
     }
     expect(screen.getByTestId("ingest-preset-start-btn")).toBeEnabled();
+  });
+
+  // 6.41.UI — labels are numeric row-counts only ("10K rows" … "200M rows"),
+  // rendered in ascending order, and the legacy grey description span is
+  // absent for every preset (all descriptions are empty strings).
+  it("renders preset labels as numeric row-counts in ascending order with no description sub-text", async () => {
+    mockFetch();
+    renderPanel();
+    const card = await screen.findByTestId("ingest-preset-radiogroup");
+    const expected = [
+      ["quick", "10K rows"],
+      ["demo", "100K rows"],
+      ["medium", "1M rows"],
+      ["large", "10M rows"],
+      ["xl", "50M rows"],
+      ["overnight", "100M rows"],
+      ["xxl", "200M rows"],
+    ] as const;
+    const buttons = Array.from(card.querySelectorAll('[data-testid^="ingest-preset-"]'))
+      .filter((el) => el.getAttribute("data-testid") !== "ingest-preset-radiogroup"
+        && el.getAttribute("data-testid") !== "ingest-preset-start-btn"
+        && el.getAttribute("data-testid") !== "ingest-preset-step"
+        && el.getAttribute("data-testid") !== "ingest-preset-error");
+    expect(buttons.map((b) => b.getAttribute("data-testid"))).toEqual(
+      expected.map(([k]) => `ingest-preset-${k}`),
+    );
+    for (const [k, label] of expected) {
+      const btn = card.querySelector(`[data-testid="ingest-preset-${k}"]`)!;
+      expect(btn.querySelector(".ingest-presets__label")?.textContent).toBe(label);
+      expect(btn.querySelector(".ingest-presets__desc")).toBeNull();
+    }
+  });
+
+  // 6.41.UI — config emission for the two new defer-trim tiers must match the
+  // spec: stream_maxlen=0 + defer_trim=true at this scale, with the right
+  // rows + shards plumbed through buildRunPresetConfig().
+  it("buildRunPresetConfig emits defer_trim:true / stream_maxlen:0 for the xl and xxl presets", () => {
+    const xl = buildRunPresetConfig(RUN_PRESETS.xl);
+    expect(xl.rows).toBe(50_000_000);
+    expect(xl.stream_shards).toBe(12);
+    expect(xl.stream_maxlen).toBe(0);
+    expect(xl.defer_trim).toBe(true);
+    const xxl = buildRunPresetConfig(RUN_PRESETS.xxl);
+    expect(xxl.rows).toBe(200_000_000);
+    expect(xxl.stream_shards).toBe(20);
+    expect(xxl.stream_maxlen).toBe(0);
+    expect(xxl.defer_trim).toBe(true);
   });
 
   it("Quick preset Start runs preflight, posts /ingest/shards=1, then starts the stream with rows=10000 / shards=1 / maxlen=100000", async () => {

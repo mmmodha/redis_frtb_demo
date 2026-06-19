@@ -136,7 +136,7 @@ function parseManualMaxlen(raw: string): number | null | Error {
 // before /generator/start/stream so the consumer fan-out matches the
 // producer dial without manual fiddling. Numbers mirror the task spec; the
 // description is the small grey line under each radio button.
-export type RunPresetKey = "quick" | "demo" | "medium" | "large" | "overnight";
+export type RunPresetKey = "quick" | "demo" | "medium" | "large" | "xl" | "overnight" | "xxl";
 export interface RunPreset {
   key: RunPresetKey;
   label: string;
@@ -149,13 +149,15 @@ export interface RunPreset {
   description: string;
 }
 export const RUN_PRESETS: Record<RunPresetKey, RunPreset> = {
-  quick:     { key: "quick",     label: "Quick",     rows: 10_000,      shards: 1,  maxlen: 100_000,    deferTrim: false, description: "10k rows · 1 shard · 100k cap" },
-  demo:      { key: "demo",      label: "Demo",      rows: 100_000,     shards: 1,  maxlen: 200_000,    deferTrim: false, description: "100k rows · 1 shard · 200k cap" },
-  medium:    { key: "medium",    label: "Medium",    rows: 1_000_000,   shards: 4,  maxlen: 2_000_000,  deferTrim: false, description: "1M rows · 4 shards · 2M cap" },
-  large:     { key: "large",     label: "Large",     rows: 10_000_000,  shards: 8,  maxlen: 0,          deferTrim: true,  description: "10M rows · 8 shards · deferred trim" },
-  overnight: { key: "overnight", label: "Overnight", rows: 100_000_000, shards: 16, maxlen: 0,          deferTrim: true,  description: "100M rows · 16 shards · deferred trim" },
+  quick:     { key: "quick",     label: "10K rows",  rows: 10_000,      shards: 1,  maxlen: 100_000,   deferTrim: false, description: "" },
+  demo:      { key: "demo",      label: "100K rows", rows: 100_000,     shards: 1,  maxlen: 200_000,   deferTrim: false, description: "" },
+  medium:    { key: "medium",    label: "1M rows",   rows: 1_000_000,   shards: 4,  maxlen: 2_000_000, deferTrim: false, description: "" },
+  large:     { key: "large",     label: "10M rows",  rows: 10_000_000,  shards: 8,  maxlen: 0,         deferTrim: true,  description: "" },
+  xl:        { key: "xl",        label: "50M rows",  rows: 50_000_000,  shards: 12, maxlen: 0,         deferTrim: true,  description: "" },
+  overnight: { key: "overnight", label: "100M rows", rows: 100_000_000, shards: 16, maxlen: 0,         deferTrim: true,  description: "" },
+  xxl:       { key: "xxl",       label: "200M rows", rows: 200_000_000, shards: 20, maxlen: 0,         deferTrim: true,  description: "" },
 };
-const RUN_PRESET_ORDER: RunPresetKey[] = ["quick", "demo", "medium", "large", "overnight"];
+const RUN_PRESET_ORDER: RunPresetKey[] = ["quick", "demo", "medium", "large", "xl", "overnight", "xxl"];
 
 export function buildRunPresetConfig(p: RunPreset): GeneratorConfig {
   // Wave 6.17 — emit defer_trim verbatim (true or false) so the request body
@@ -965,7 +967,9 @@ function RunPresetCard(props: {
                 onChange={() => onSelect(k)}
               />
               <span className="ingest-presets__label">{p.label}</span>
-              <span className="ingest-presets__desc">{p.description}</span>
+              {p.description ? (
+                <span className="ingest-presets__desc">{p.description}</span>
+              ) : null}
             </label>
           );
         })}
