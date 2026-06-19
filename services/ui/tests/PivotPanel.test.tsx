@@ -465,9 +465,9 @@ describe("PivotPanel", () => {
     await waitFor(() => {
       expect(Array.from(rc.options).map((o) => o.value)).toEqual(["", "GIRR", "Equity"]);
     });
-    // Counts appear next to each option label.
+    // Bare labels are rendered (no count suffix).
     expect(Array.from(rc.options).map((o) => o.textContent)).toEqual(
-      expect.arrayContaining(["GIRR (8)", "Equity (4)"]),
+      expect.arrayContaining(["GIRR", "Equity"]),
     );
     const sens = screen.getByLabelText(/sensitivity type/i) as HTMLSelectElement;
     const sensValues = Array.from(sens.options).map((o) => o.value);

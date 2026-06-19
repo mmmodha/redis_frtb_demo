@@ -178,7 +178,7 @@ describe("JsonExplorerPanel", () => {
     expect(err).toHaveTextContent(/network down|failed/i);
   });
 
-  it("Wave 5.56 — risk_class / bucket / sensitivity_type dropdowns reflect facet hits with counts", async () => {
+  it("Wave 5.56 — risk_class / bucket / sensitivity_type dropdowns reflect facet hits", async () => {
     installFetchRouter({
       facets: {
         ok: true, status: 200, json: async () => ({
@@ -195,7 +195,7 @@ describe("JsonExplorerPanel", () => {
       expect(Array.from(rc.options).map((o) => o.value)).toEqual(["", "GIRR", "FX"]);
     });
     expect(Array.from(rc.options).map((o) => o.textContent)).toEqual(
-      expect.arrayContaining(["GIRR (6)", "FX (3)"]),
+      expect.arrayContaining(["GIRR", "FX"]),
     );
     const sens = screen.getByLabelText(/sensitivity type/i) as HTMLSelectElement;
     const sensValues = Array.from(sens.options).map((o) => o.value);

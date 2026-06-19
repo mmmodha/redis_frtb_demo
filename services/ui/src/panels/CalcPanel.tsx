@@ -587,7 +587,7 @@ export function CalcPanel() {
             >
               {calcRiskClassOptions.map((o) => (
                 <option key={o.value} value={o.value}>
-                  {o.count !== null ? `${o.label} (${o.count})` : o.label}
+                  {o.label}
                 </option>
               ))}
             </select>
@@ -600,7 +600,7 @@ export function CalcPanel() {
             >
               {calcSensitivityOptions.map((s) => (
                 <option key={s.value} value={s.value}>
-                  {s.count !== null ? `${s.value} (${s.count})` : s.value}
+                  {s.value}
                 </option>
               ))}
             </select>

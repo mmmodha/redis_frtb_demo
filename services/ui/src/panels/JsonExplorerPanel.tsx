@@ -117,7 +117,7 @@ export function JsonExplorerPanel(): JSX.Element {
           >
             <option value="">All risk classes</option>
             {riskClasses.map((r) => (
-              <option key={r.value} value={r.value}>{r.label}</option>
+              <option key={r.value} value={r.value}>{r.value}</option>
             ))}
           </select>
           <label htmlFor="je-bucket">Bucket</label>
@@ -130,7 +130,7 @@ export function JsonExplorerPanel(): JSX.Element {
           >
             <option value="">{buckets.length === 0 ? "Pick a class first" : "All buckets"}</option>
             {buckets.map((b) => (
-              <option key={b.value} value={b.value}>{b.label}</option>
+              <option key={b.value} value={b.value}>{b.value}</option>
             ))}
           </select>
           <label htmlFor="je-sensitivity-type">Sensitivity type</label>
@@ -142,7 +142,7 @@ export function JsonExplorerPanel(): JSX.Element {
           >
             <option value="">All sensitivity types</option>
             {sensTypes.map((s) => (
-              <option key={s.value} value={s.value}>{s.label}</option>
+              <option key={s.value} value={s.value}>{s.value}</option>
             ))}
           </select>
           <label htmlFor="je-book">Book</label>

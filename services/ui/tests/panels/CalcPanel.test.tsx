@@ -87,10 +87,10 @@ describe("<CalcPanel />", () => {
     expect(within(st).getByRole("option", { name: "Vega" })).toBeInTheDocument();
   });
 
-  it("Wave 5.56 — risk_class / sensitivity dropdowns hide options absent from /facets and show counts", async () => {
+  it("Wave 5.56 — risk_class / sensitivity dropdowns hide options absent from /facets", async () => {
     // /facets reports only GIRR rows (Equity + FX have zero rows in the
     // active index) and only Delta sensitivities. The dropdowns should
-    // narrow to those values and render each label with the row count.
+    // narrow to those values.
     globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
       if (url.includes("/facets")) {
@@ -109,11 +109,11 @@ describe("<CalcPanel />", () => {
       const vals = Array.from(rc.options).map((o) => o.value);
       expect(vals).toEqual(["GIRR"]);
     });
-    expect(rc.options[0]!.textContent).toContain("(5)");
+    expect(rc.options[0]!.textContent).toBe("GIRR");
     const st = screen.getByLabelText(/^sensitivity$/i) as HTMLSelectElement;
     const stVals = Array.from(st.options).map((o) => o.value);
     expect(stVals).toEqual(["Delta"]);
-    expect(st.options[0]!.textContent).toContain("(5)");
+    expect(st.options[0]!.textContent).toBe("Delta");
   });
 
   it("renders three EnterpriseCallout banners for in-database compute / map-reduce / hash-tag locality", () => {
