@@ -7,6 +7,7 @@
 // to the REDIS_URL env var, then to localhost — keeping CI / unit tests
 // trivially configurable.
 
+import { randomUUID } from "node:crypto";
 import { Redis } from "ioredis";
 
 export interface ActiveTarget {
@@ -419,20 +420,270 @@ function targetKey(t: ActiveTarget): string {
   return `${t.host}|${t.port}|${t.tls ? 1 : 0}|${t.db}|${t.clusterMode ? 1 : 0}|${credsGeneration}`;
 }
 
-// Three kinds of mutation are supported on this singleton:
-//   1. Full identity switch — `setActiveTarget(...)`: replaces host/port/tls/db
-//      (and creds), bumps `credsGeneration` so the cached ioredis client is
-//      rebuilt, and fires listeners (the bootstrap scheduler hangs off this).
-//   2. Label-only refresh — `setActiveTargetLabel(...)`: a rename of the
-//      currently-active profile. The Redis we're pointed at is unchanged, so we
-//      MUST NOT bump `credsGeneration` (would invalidate the cached client for
-//      no reason) and MUST NOT fire listeners (would re-trigger bootstrap).
-//      Consumers learn the new label via the next `GET /redis/active-target`.
-//   3. Creds-only rotation — currently handled by funnelling through
-//      `setActiveTarget`. It bumps creds and re-runs bootstrap; acceptable
-//      because creds rotations are rare. Documented here so a future split
-//      (setActiveTargetCreds) can be added without surprising existing callers.
-export function setActiveTarget(t: ActiveTarget, creds?: ActiveTargetCreds): void {
+// Wave 6.43.B.1 — monotonically-increasing version of the active target,
+// bumped on every successful commit inside `setActiveTarget`. Surfaced via
+// `GET /internal/redis/active-target/full` so pollers (source, loadgen)
+// detect identity changes without diffing every field. Lives here (not in
+// internal-target.ts) so the new switch coordinator can include `version+1`
+// in the prepare PUBLISH payload without an awkward back-import.
+let activeTargetVersion = 1;
+
+export function getActiveTargetVersion(): number {
+  return activeTargetVersion;
+}
+
+// Test seam — reset the version counter to 1 so tests can assert exact values.
+export function __resetActiveTargetVersionForTests(): void {
+  activeTargetVersion = 1;
+}
+
+// Wave 6.43.B.1 — switch coordinator. The api orchestrates a two-phase
+// prepare/commit handoff: PUBLISH `intent:active-target:prepare` on the OLD
+// client, wait for each known subscriber to ACK `drained` (or the timeout
+// to elapse), commit, then PUBLISH `intent:active-target:commit` on the
+// NEW client. State is per-switch and keyed on a `switch_id` so a late ACK
+// from a superseded switch can be rejected with 409.
+
+const SWITCH_DRAIN_TIMEOUT_DEFAULT_MS = 10_000;
+const DEFAULT_KNOWN_SERVICES = "ingest,source,loadgen";
+
+export const SWITCH_PREPARE_CHANNEL = "intent:active-target:prepare";
+export const SWITCH_COMMIT_CHANNEL = "intent:active-target:commit";
+
+export type ServiceSwitchPhase =
+  | "pending"
+  | "drained"
+  | "committed"
+  | "drain_timeout"
+  | "error";
+
+export type SwitchPhase =
+  | "idle"
+  | "prepare"
+  | "draining"
+  | "committed";
+
+export interface ServiceSwitchState {
+  name: string;
+  phase: ServiceSwitchPhase;
+  drained_at?: number;
+  committed_at?: number;
+  error?: string;
+}
+
+export interface SwitchStatus {
+  current_switch_id: string | null;
+  phase: SwitchPhase;
+  per_service: ServiceSwitchState[];
+}
+
+export interface SwitchAckInput {
+  switch_id: string;
+  service: string;
+  phase: "drained" | "committed";
+  ok: boolean;
+  error?: string;
+}
+
+interface SwitchRecord {
+  switch_id: string;
+  startedAt: number;
+  next: { label: string; version: number };
+  phase: SwitchPhase;
+  perService: Map<string, ServiceSwitchState>;
+  drainNotify?: () => void;
+}
+
+let currentSwitch: SwitchRecord | null = null;
+// Past switch_ids retained so a late ACK that names a stale switch can be
+// rejected with 409 `superseded` rather than silently coerced into the
+// current switch. Bounded — only keep the most recent N to avoid unbounded
+// growth in long-running processes.
+const priorSwitchIds = new Set<string>();
+const PRIOR_SWITCH_HISTORY_MAX = 64;
+
+function getSwitchDrainTimeoutMs(): number {
+  const raw = process.env.SWITCH_DRAIN_TIMEOUT_MS;
+  if (raw === undefined || raw === "") return SWITCH_DRAIN_TIMEOUT_DEFAULT_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : SWITCH_DRAIN_TIMEOUT_DEFAULT_MS;
+}
+
+function getKnownServices(): string[] {
+  const raw = process.env.KNOWN_SERVICES ?? DEFAULT_KNOWN_SERVICES;
+  return raw.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+}
+
+// Test seam — fake the prepare/commit PUBLISH so unit tests can drive the
+// coordinator without opening a real Redis pub/sub. Returns the subscriber
+// count the api should treat the publish as having reached (zero ⇒ skip the
+// drain wait, non-zero ⇒ wait for ACKs or the timeout). Pass `null` to
+// restore the production path (which uses the active Redis client).
+let switchPublisherForTests:
+  | ((channel: string, payload: string, kind: "old" | "new") => Promise<number>)
+  | null = null;
+
+export function __setSwitchPublisherForTests(
+  fn:
+    | ((channel: string, payload: string, kind: "old" | "new") => Promise<number>)
+    | null,
+): void {
+  switchPublisherForTests = fn;
+}
+
+// Test seam — wipe the switch registry so tests start from a clean slate.
+export function __resetSwitchStateForTests(): void {
+  if (currentSwitch?.drainNotify) {
+    currentSwitch.drainNotify = undefined;
+  }
+  currentSwitch = null;
+  priorSwitchIds.clear();
+}
+
+export function getSwitchStatus(): SwitchStatus {
+  if (!currentSwitch) {
+    return { current_switch_id: null, phase: "idle", per_service: [] };
+  }
+  return {
+    current_switch_id: currentSwitch.switch_id,
+    phase: currentSwitch.phase,
+    per_service: [...currentSwitch.perService.values()].map((sp) => ({ ...sp })),
+  };
+}
+
+export type RecordSwitchAckResult =
+  | { status: "ok" }
+  | { status: "superseded" }
+  | { status: "malformed"; reason: string };
+
+// Apply a service-side ACK to the current switch registry. Validation is
+// strict (typeof string, phase ∈ {drained,committed}, ok is boolean) so a
+// garbage POST body cannot poison the in-memory state. Stale switch_ids
+// (anything other than the currently-tracked switch) surface as `superseded`
+// — the route layer translates that into a 409 with no state mutation.
+export function recordSwitchAck(input: unknown): RecordSwitchAckResult {
+  if (!input || typeof input !== "object") {
+    return { status: "malformed", reason: "body must be an object" };
+  }
+  const body = input as Record<string, unknown>;
+  if (typeof body.switch_id !== "string" || body.switch_id.length === 0) {
+    return { status: "malformed", reason: "switch_id must be a non-empty string" };
+  }
+  if (typeof body.service !== "string" || body.service.length === 0) {
+    return { status: "malformed", reason: "service must be a non-empty string" };
+  }
+  if (body.phase !== "drained" && body.phase !== "committed") {
+    return { status: "malformed", reason: "phase must be \"drained\" or \"committed\"" };
+  }
+  if (typeof body.ok !== "boolean") {
+    return { status: "malformed", reason: "ok must be a boolean" };
+  }
+  if (body.error !== undefined && typeof body.error !== "string") {
+    return { status: "malformed", reason: "error must be a string when present" };
+  }
+  const ack: SwitchAckInput = {
+    switch_id: body.switch_id,
+    service: body.service,
+    phase: body.phase,
+    ok: body.ok,
+    ...(typeof body.error === "string" ? { error: body.error } : {}),
+  };
+  if (!currentSwitch || currentSwitch.switch_id !== ack.switch_id) {
+    return { status: "superseded" };
+  }
+  let sp = currentSwitch.perService.get(ack.service);
+  if (!sp) {
+    // A service not listed in KNOWN_SERVICES still ACKed — record it so the
+    // status response surfaces every participant, but the drain wait does
+    // not block on unknown services (they are not part of the initial
+    // perService keyset that allDrained() iterates).
+    sp = { name: ack.service, phase: "pending" };
+    currentSwitch.perService.set(ack.service, sp);
+  }
+  const now = Date.now();
+  if (!ack.ok) {
+    sp.phase = "error";
+    sp.error = ack.error ?? "unspecified";
+  } else if (ack.phase === "drained") {
+    sp.phase = "drained";
+    sp.drained_at = now;
+  } else {
+    sp.phase = "committed";
+    sp.committed_at = now;
+  }
+  if (currentSwitch.drainNotify) currentSwitch.drainNotify();
+  return { status: "ok" };
+}
+
+function rotateSwitchHistory(nextRecord: SwitchRecord): void {
+  if (currentSwitch && currentSwitch.switch_id !== nextRecord.switch_id) {
+    priorSwitchIds.add(currentSwitch.switch_id);
+    if (priorSwitchIds.size > PRIOR_SWITCH_HISTORY_MAX) {
+      const oldest = priorSwitchIds.values().next().value as string | undefined;
+      if (oldest) priorSwitchIds.delete(oldest);
+    }
+  }
+  currentSwitch = nextRecord;
+}
+
+function allTerminallyDrained(record: SwitchRecord): boolean {
+  for (const sp of record.perService.values()) {
+    if (sp.phase === "pending") return false;
+  }
+  return true;
+}
+
+function waitForDrain(record: SwitchRecord, timeoutMs: number): Promise<void> {
+  if (allTerminallyDrained(record)) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      record.drainNotify = undefined;
+      resolve();
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    if (typeof timer.unref === "function") timer.unref();
+    record.drainNotify = () => {
+      if (allTerminallyDrained(record)) finish();
+    };
+  });
+}
+
+async function publishSwitchEvent(
+  channel: string,
+  payload: { switch_id: string; next: { label: string; version: number } },
+  kind: "old" | "new",
+): Promise<number> {
+  const body = JSON.stringify(payload);
+  if (switchPublisherForTests) {
+    try { return await switchPublisherForTests(channel, body, kind); }
+    catch { return 0; }
+  }
+  // Tests without an explicit publisher seam skip the real PUBLISH so they
+  // don't hang on lazyConnect to a non-existent Redis. Production goes
+  // through the active client.
+  if (process.env.NODE_ENV === "test") return 0;
+  const c = getActiveRedisClient();
+  if (!c) return 0;
+  try {
+    const r = await c.publish(channel, body);
+    const n = Number(r);
+    return Number.isFinite(n) ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
+// Apply the new target to the singleton — the synchronous core of what the
+// pre-6.43 `setActiveTarget` did. Split out so the async switch coordinator
+// can run prepare/drain BEFORE committing, while a first-time set (or any
+// path with no subscribers) can still complete inside one event-loop tick
+// so existing call sites that don't `await` see the same observable
+// ordering as before.
+function commitActiveTargetSync(t: ActiveTarget, creds?: ActiveTargetCreds): void {
   // Strip any stray fields (notably `password`) — the public type is intentionally
   // password-free; secrets live only in the encrypted Connections store and in
   // the private `overrideCreds` slot below.
@@ -449,6 +700,7 @@ export function setActiveTarget(t: ActiveTarget, creds?: ActiveTargetCreds): voi
   // get an empty record and the client is built without username/password.
   overrideCreds = creds ? { username: creds.username, password: creds.password } : {};
   credsGeneration += 1;
+  activeTargetVersion += 1;
   // Wave 6.21 (M6) — detach every pool member from its current client and
   // schedule a deferred `disconnect()` so any command issued in the last few
   // hundred ms gets a chance to complete. The pool slot itself is reset
@@ -464,6 +716,95 @@ export function setActiveTarget(t: ActiveTarget, creds?: ActiveTargetCreds): voi
   for (const fn of listeners) {
     try { fn(override); } catch { /* listener errors must not break the setter */ }
   }
+}
+
+// Three kinds of mutation are supported on this singleton:
+//   1. Full identity switch — `setActiveTarget(...)`: replaces host/port/tls/db
+//      (and creds), bumps `credsGeneration` so the cached ioredis client is
+//      rebuilt, and fires listeners (the bootstrap scheduler hangs off this).
+//   2. Label-only refresh — `setActiveTargetLabel(...)`: a rename of the
+//      currently-active profile. The Redis we're pointed at is unchanged, so we
+//      MUST NOT bump `credsGeneration` (would invalidate the cached client for
+//      no reason) and MUST NOT fire listeners (would re-trigger bootstrap).
+//      Consumers learn the new label via the next `GET /redis/active-target`.
+//   3. Creds-only rotation — currently handled by funnelling through
+//      `setActiveTarget`. It bumps creds and re-runs bootstrap; acceptable
+//      because creds rotations are rare. Documented here so a future split
+//      (setActiveTargetCreds) can be added without surprising existing callers.
+//
+// Wave 6.43.B.1 — `setActiveTarget` is now async: it generates a `switch_id`,
+// PUBLISHes `intent:active-target:prepare` on the OLD client, waits for every
+// known subscriber to ACK `drained` (or `SWITCH_DRAIN_TIMEOUT_MS` to elapse —
+// whichever first), commits the identity swap, then PUBLISHes
+// `intent:active-target:commit` on the NEW client. The first-ever set (no
+// prior `override`) skips the prepare phase entirely — there is no OLD client
+// to drain. In NODE_ENV=test without an explicit `__setSwitchPublisherForTests`
+// seam, the prepare/commit PUBLISHes short-circuit to 0 subscribers and the
+// commit fires synchronously, preserving the observable ordering of the
+// pre-6.43 sync setter for the existing test fleet.
+export async function setActiveTarget(
+  t: ActiveTarget,
+  creds?: ActiveTargetCreds,
+): Promise<void> {
+  const isFirstSwitch = override === undefined;
+  const knownServices = getKnownServices();
+  const switchId = randomUUID();
+  const nextVersion = activeTargetVersion + 1;
+  const record: SwitchRecord = {
+    switch_id: switchId,
+    startedAt: Date.now(),
+    next: { label: t.label, version: nextVersion },
+    phase: "prepare",
+    perService: new Map(
+      knownServices.map((name) => [name, { name, phase: "pending" as ServiceSwitchPhase }]),
+    ),
+  };
+  rotateSwitchHistory(record);
+
+  // Skip prepare/drain on the first-ever set — there's no OLD active client
+  // to publish on (env fallback) and no subscribers expected. Same fast path
+  // applies when the test environment hasn't installed a publisher seam: a
+  // real PUBLISH would just hang on lazyConnect to a fake target.
+  const useFastPath =
+    isFirstSwitch ||
+    (switchPublisherForTests === null && process.env.NODE_ENV === "test") ||
+    knownServices.length === 0;
+
+  if (useFastPath) {
+    commitActiveTargetSync(t, creds);
+    record.phase = "committed";
+    // Best-effort commit publish — fire-and-forget so the caller's sync
+    // call sites still observe the commit before any awaits.
+    void publishSwitchEvent(
+      SWITCH_COMMIT_CHANNEL,
+      { switch_id: switchId, next: { label: t.label, version: activeTargetVersion } },
+      "new",
+    );
+    return;
+  }
+
+  const subCount = await publishSwitchEvent(
+    SWITCH_PREPARE_CHANNEL,
+    { switch_id: switchId, next: { label: t.label, version: nextVersion } },
+    "old",
+  );
+  if (subCount > 0) {
+    record.phase = "draining";
+    await waitForDrain(record, getSwitchDrainTimeoutMs());
+  }
+
+  // Anything still in `pending` after the wait did not drain in time.
+  for (const sp of record.perService.values()) {
+    if (sp.phase === "pending") sp.phase = "drain_timeout";
+  }
+  commitActiveTargetSync(t, creds);
+  record.phase = "committed";
+
+  await publishSwitchEvent(
+    SWITCH_COMMIT_CHANNEL,
+    { switch_id: switchId, next: { label: t.label, version: activeTargetVersion } },
+    "new",
+  );
 }
 
 // Wave 6.21 (M6) — runs on `setActiveTarget` profile-switch / creds rotation.
@@ -524,6 +865,14 @@ export function setActiveTargetLabel(label: string): void {
 export function resetActiveTarget(): void {
   override = undefined;
   overrideCreds = {};
+  activeTargetVersion = 1;
+  // Wave 6.43.B.1 — clear in-flight switch coordination state so a test
+  // teardown can't leak per-service ACK history or a pending drain notifier
+  // into the next case. Note: the production `__setSwitchPublisherForTests`
+  // seam is NOT touched here — tests install / uninstall it explicitly.
+  if (currentSwitch?.drainNotify) currentSwitch.drainNotify = undefined;
+  currentSwitch = null;
+  priorSwitchIds.clear();
   if (cachedBootClient) {
     try { cachedBootClient.disconnect(); } catch { /* ignore */ }
   }

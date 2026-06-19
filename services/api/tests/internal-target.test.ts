@@ -6,7 +6,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "../src/server.ts";
 import { createStore, type ConnectionsStore } from "../src/store.ts";
-import { resetActiveTarget } from "../src/active-target.ts";
+import {
+  resetActiveTarget,
+  setActiveTarget,
+  __setSwitchPublisherForTests,
+  __resetSwitchStateForTests,
+} from "../src/active-target.ts";
 import { resetInternalTargetVersionForTests } from "../src/routes/internal-target.ts";
 
 const KEY = "test-master-key";
@@ -225,5 +230,224 @@ describe("GET /internal/redis/active-target/full", () => {
     });
     expect(res.statusCode).toBe(503);
     expect(res.json()).toEqual({ error: "INTERNAL_API_TOKEN not configured" });
+  });
+});
+
+// Wave 6.43.B.1 — switch coordinator: prepare/commit handoff plus the ACK
+// ingress (`POST /internal/redis/active-target/ack`) and status surface
+// (`GET /internal/redis/active-target/switch-status`). Subscribers ship in
+// 6.43.B.2/3; these tests drive the coordinator via the test seam.
+describe("Wave 6.43.B.1 — switch coordinator", () => {
+  let app: Awaited<ReturnType<typeof createServer>>;
+  let store: ConnectionsStore;
+  const originalToken = process.env.INTERNAL_API_TOKEN;
+  const originalKnown = process.env.KNOWN_SERVICES;
+  const originalDrainMs = process.env.SWITCH_DRAIN_TIMEOUT_MS;
+  const AUTH = { authorization: "Bearer test-internal-token" } as const;
+
+  beforeEach(async () => {
+    resetActiveTarget();
+    resetInternalTargetVersionForTests();
+    __resetSwitchStateForTests();
+    __setSwitchPublisherForTests(null);
+    process.env.INTERNAL_API_TOKEN = "test-internal-token";
+    process.env.KNOWN_SERVICES = "ingest,source,loadgen";
+    store = await freshStore();
+    app = await createServer({ store });
+    // Seed an initial active target so the next setActiveTarget triggers the
+    // prepare/commit path (first-ever set takes the fast path by design).
+    setActiveTarget({ host: "old.host", port: 6379, tls: false, db: 0, label: "old" });
+  });
+
+  afterEach(async () => {
+    __setSwitchPublisherForTests(null);
+    __resetSwitchStateForTests();
+    await app.close();
+    resetActiveTarget();
+    if (originalToken === undefined) delete process.env.INTERNAL_API_TOKEN;
+    else process.env.INTERNAL_API_TOKEN = originalToken;
+    if (originalKnown === undefined) delete process.env.KNOWN_SERVICES;
+    else process.env.KNOWN_SERVICES = originalKnown;
+    if (originalDrainMs === undefined) delete process.env.SWITCH_DRAIN_TIMEOUT_MS;
+    else process.env.SWITCH_DRAIN_TIMEOUT_MS = originalDrainMs;
+  });
+
+  it("happy path: 3 services ACK drained → switch commits and per-service progresses to committed on commit ACKs", async () => {
+    // Capture the switch_id from the prepare publish; deliver ACKs from
+    // three known services so the drain wait resolves quickly.
+    let switchId: string | null = null;
+    const publishes: Array<{ channel: string; payload: unknown; kind: string }> = [];
+    __setSwitchPublisherForTests(async (channel, payload, kind) => {
+      const parsed = JSON.parse(payload) as { switch_id: string };
+      publishes.push({ channel, payload: JSON.parse(payload), kind });
+      if (channel === "intent:active-target:prepare") {
+        switchId = parsed.switch_id;
+        // Fire ACKs from the three known services on the next tick so the
+        // coordinator has already entered `draining` when they arrive.
+        queueMicrotask(() => {
+          for (const svc of ["ingest", "source", "loadgen"]) {
+            void app.inject({
+              method: "POST",
+              url: "/internal/redis/active-target/ack",
+              headers: AUTH,
+              payload: { switch_id: switchId, service: svc, phase: "drained", ok: true },
+            });
+          }
+        });
+      }
+      return 3;
+    });
+    await setActiveTarget({ host: "new.host", port: 6379, tls: false, db: 0, label: "new" });
+    // After commit each service reports a commit ACK.
+    expect(switchId).not.toBeNull();
+    for (const svc of ["ingest", "source", "loadgen"]) {
+      const r = await app.inject({
+        method: "POST",
+        url: "/internal/redis/active-target/ack",
+        headers: AUTH,
+        payload: { switch_id: switchId, service: svc, phase: "committed", ok: true },
+      });
+      expect(r.statusCode).toBe(200);
+    }
+    const status = await app.inject({
+      method: "GET",
+      url: "/internal/redis/active-target/switch-status",
+      headers: AUTH,
+    });
+    expect(status.statusCode).toBe(200);
+    const body = status.json();
+    expect(body.current_switch_id).toBe(switchId);
+    expect(body.phase).toBe("committed");
+    const phasesByName = Object.fromEntries(
+      body.per_service.map((s: { name: string; phase: string }) => [s.name, s.phase]),
+    );
+    expect(phasesByName).toEqual({ ingest: "committed", source: "committed", loadgen: "committed" });
+    expect(publishes.map((p) => p.channel)).toEqual([
+      "intent:active-target:prepare",
+      "intent:active-target:commit",
+    ]);
+  });
+
+  it("missing-ACK timeout: 1 service never ACKs → switch commits at the configured timeout, marked drain_timeout", async () => {
+    process.env.SWITCH_DRAIN_TIMEOUT_MS = "60";
+    let switchId: string | null = null;
+    __setSwitchPublisherForTests(async (channel, payload) => {
+      const parsed = JSON.parse(payload) as { switch_id: string };
+      if (channel === "intent:active-target:prepare") {
+        switchId = parsed.switch_id;
+        queueMicrotask(() => {
+          for (const svc of ["ingest", "source"]) {
+            void app.inject({
+              method: "POST",
+              url: "/internal/redis/active-target/ack",
+              headers: AUTH,
+              payload: { switch_id: switchId, service: svc, phase: "drained", ok: true },
+            });
+          }
+        });
+      }
+      return 3;
+    });
+    const t0 = Date.now();
+    await setActiveTarget({ host: "n2", port: 6379, tls: false, db: 0, label: "n2" });
+    const elapsed = Date.now() - t0;
+    // Drain window is 60ms; commit must fire within a generous bound and not
+    // earlier than the timeout if loadgen never ACKs.
+    expect(elapsed).toBeGreaterThanOrEqual(50);
+    expect(elapsed).toBeLessThan(1000);
+    const status = await app.inject({
+      method: "GET",
+      url: "/internal/redis/active-target/switch-status",
+      headers: AUTH,
+    });
+    const body = status.json();
+    expect(body.phase).toBe("committed");
+    const phasesByName = Object.fromEntries(
+      body.per_service.map((s: { name: string; phase: string }) => [s.name, s.phase]),
+    );
+    expect(phasesByName.ingest).toBe("drained");
+    expect(phasesByName.source).toBe("drained");
+    expect(phasesByName.loadgen).toBe("drain_timeout");
+  });
+
+  it("stale switch_id: ACK is rejected with 409 superseded and status is unchanged", async () => {
+    let switchId: string | null = null;
+    __setSwitchPublisherForTests(async (channel, payload) => {
+      const parsed = JSON.parse(payload) as { switch_id: string };
+      if (channel === "intent:active-target:prepare") {
+        switchId = parsed.switch_id;
+        queueMicrotask(() => {
+          for (const svc of ["ingest", "source", "loadgen"]) {
+            void app.inject({
+              method: "POST",
+              url: "/internal/redis/active-target/ack",
+              headers: AUTH,
+              payload: { switch_id: switchId, service: svc, phase: "drained", ok: true },
+            });
+          }
+        });
+      }
+      return 3;
+    });
+    await setActiveTarget({ host: "n1", port: 6379, tls: false, db: 0, label: "n1" });
+    const firstSwitchId = switchId;
+    // Trigger a second switch; the first switch_id is now stale.
+    await setActiveTarget({ host: "n2", port: 6379, tls: false, db: 0, label: "n2" });
+    const statusBefore = (await app.inject({
+      method: "GET", url: "/internal/redis/active-target/switch-status", headers: AUTH,
+    })).json();
+    const lateAck = await app.inject({
+      method: "POST",
+      url: "/internal/redis/active-target/ack",
+      headers: AUTH,
+      payload: { switch_id: firstSwitchId, service: "ingest", phase: "committed", ok: true },
+    });
+    expect(lateAck.statusCode).toBe(409);
+    expect(lateAck.json()).toEqual({ error: "superseded" });
+    const statusAfter = (await app.inject({
+      method: "GET", url: "/internal/redis/active-target/switch-status", headers: AUTH,
+    })).json();
+    expect(statusAfter).toEqual(statusBefore);
+  });
+
+  it("malformed ACK is rejected with 400 and a reason", async () => {
+    const r1 = await app.inject({
+      method: "POST",
+      url: "/internal/redis/active-target/ack",
+      headers: AUTH,
+      payload: { switch_id: 123, service: "ingest", phase: "drained", ok: true },
+    });
+    expect(r1.statusCode).toBe(400);
+    expect(r1.json().error).toBe("malformed");
+
+    const r2 = await app.inject({
+      method: "POST",
+      url: "/internal/redis/active-target/ack",
+      headers: AUTH,
+      payload: { switch_id: "x", service: "ingest", phase: "garbage", ok: true },
+    });
+    expect(r2.statusCode).toBe(400);
+
+    const r3 = await app.inject({
+      method: "POST",
+      url: "/internal/redis/active-target/ack",
+      headers: AUTH,
+      payload: { switch_id: "x", service: "ingest", phase: "drained", ok: "yes" },
+    });
+    expect(r3.statusCode).toBe(400);
+  });
+
+  it("ACK + status endpoints require bearer auth", async () => {
+    const ack = await app.inject({
+      method: "POST",
+      url: "/internal/redis/active-target/ack",
+      payload: { switch_id: "x", service: "ingest", phase: "drained", ok: true },
+    });
+    expect(ack.statusCode).toBe(401);
+    const status = await app.inject({
+      method: "GET",
+      url: "/internal/redis/active-target/switch-status",
+    });
+    expect(status.statusCode).toBe(401);
   });
 });
