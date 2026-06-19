@@ -31,6 +31,19 @@ export interface CalcSbmRequest {
     trade_id?: string[];
     risk_factor?: string[];
   };
+  // Wave 6.41.C — positive-include predicate driven by the FilterChips strip.
+  // Mirrors the api's CalcBody.include shape (services/api/src/routes/calc.ts):
+  // when any list is non-empty the kernel keeps only rows whose value is IN
+  // the list. `region` resolves to a desk-set on the api side; `bucket` accepts
+  // numbers since the chip dropdown is grouped by risk_class and the user
+  // selects integer bucket ids.
+  include?: {
+    book?: string[];
+    trade_id?: string[];
+    desk?: string[];
+    region?: string[];
+    bucket?: number[];
+  };
 }
 
 // Wave 5.96A — per-bucket drilldown intermediates. Populated by the FT.AGGREGATE
@@ -200,6 +213,15 @@ export async function postBucketCrossDetail(
 export interface TotalSbmRequest {
   bucket_subset?: string[];
   exclude?: { book?: string[]; trade_id?: string[]; risk_factor?: string[] };
+  // Wave 6.41.C — same positive-include predicate as CalcSbmRequest.include,
+  // passed straight through to every inner /calc/sbm cell on the api side.
+  include?: {
+    book?: string[];
+    trade_id?: string[];
+    desk?: string[];
+    region?: string[];
+    bucket?: number[];
+  };
 }
 export type TotalSbmLeg = "delta" | "vega" | "curvature";
 export interface TotalSbmScenarioCell {
@@ -264,4 +286,43 @@ export async function postCalcSbmTotal(body: TotalSbmRequest): Promise<TotalSbmR
     throw await buildApiError(res, `api /calc/sbm/total ${res.status}`);
   }
   return (await res.json()) as TotalSbmResponse;
+}
+
+// Wave 6.41.D — top-N desks ranked by |contribution to K_b|, via the
+// single-FT.AGGREGATE GROUPBY @desk path on the api. The per-desk K_b is a
+// constant-ρ closed-form approximation (see services/api/src/sbm/by-desk.ts);
+// suitable for ranking, not for reporting the Basel-correct desk-level charge.
+export interface CalcSbmByDeskRequest {
+  risk_class: string;
+  sensitivity_type: SensitivityType;
+  correlation_regime?: CorrelationRegime;
+  top_n?: number;
+  include?: { book?: string[]; desk?: string[] };
+  exclude?: { book?: string[]; trade_id?: string[]; risk_factor?: string[] };
+}
+export interface CalcSbmByDeskRow {
+  desk: string;
+  K_b: number;
+  contribution_pct: number;
+  count: number;
+}
+export interface CalcSbmByDeskResponse {
+  ok: true;
+  ms: number;
+  desks: CalcSbmByDeskRow[];
+  total_K_b: number;
+  cached: boolean;
+}
+export async function postCalcSbmByDesk(
+  body: CalcSbmByDeskRequest,
+): Promise<CalcSbmByDeskResponse> {
+  const res = await fetch(`${apiBase()}/calc/sbm/by-desk`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    throw await buildApiError(res, `api /calc/sbm/by-desk ${res.status}`);
+  }
+  return (await res.json()) as CalcSbmByDeskResponse;
 }
