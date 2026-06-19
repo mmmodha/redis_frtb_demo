@@ -2,12 +2,15 @@
 // DoD: mount-restore from localStorage anchor, no bar without anchor at
 // xlen=0, % math, and the "Indexing complete" terminal banner when xlen
 // drains to 0 with an active anchor.
+//
+// Wave 6.41.E.fix — added coverage for the timeout-cancel bug fix, the ×
+// dismiss button, the C/D auto-clear escape hatches, and the E
+// in-generation render path.
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { IngestPanel } from "../../src/panels/IngestPanel";
-import { GeneratorRunProvider } from "../../src/context/GeneratorRunContext";
 import { STORAGE_KEY, type IndexingAnchor } from "../../src/lib/indexingState";
 
 vi.mock("../../src/components/PanelCard", () => ({
@@ -24,6 +27,35 @@ vi.mock("../../src/components/EnterpriseCallout", () => ({
 vi.mock("../../src/components/MetricTile", () => ({
   MetricTile: ({ label, value }: any) => (<div data-label={label}>{value}</div>),
 }));
+
+// Wave 6.41.E.fix — controllable mock for the generator-run context. Tests
+// that need to drive run state (E in-generation view) reassign mockRun
+// between renders; the existing tests leave it at null which matches the
+// prior "no run" default of <GeneratorRunProvider />.
+type MockRun = {
+  rowsTotal: number;
+  rowsDone: number;
+  elapsedMs: number;
+  rowsPerSec: number;
+  runId: string | null;
+  status: "running" | "cancelling" | "done" | "cancelled" | "error";
+} | null;
+let mockRun: MockRun = null;
+function setMockRun(r: MockRun): void { mockRun = r; }
+vi.mock("../../src/context/GeneratorRunContext", () => ({
+  GeneratorRunProvider: ({ children }: { children: any }) => children,
+  useGeneratorRun: () => ({
+    run: mockRun,
+    error: null,
+    startRun: () => {},
+    cancelRun: () => {},
+    clearRun: () => {},
+  }),
+}));
+
+// Re-import after the mock is registered so the named export resolves to
+// the stub above.
+import { GeneratorRunProvider } from "../../src/context/GeneratorRunContext";
 
 function makeMemoryStorage(): Storage {
   const map = new Map<string, string>();
@@ -81,6 +113,7 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
       writable: true,
     });
     streamState.xlen = 0;
+    setMockRun(null);
   });
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -165,5 +198,202 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
       expect(screen.queryAllByTestId("indexing-complete").length).toBeGreaterThan(0);
     });
     vi.useRealTimers();
+  });
+
+  // Wave 6.41.E.fix — Fix A: the 3s completion timeout must actually fire
+  // and clear the anchor. Pre-fix this leaked because the effect cleanup
+  // canceled its own setTimeout via the completeShownAt dependency.
+  it("(A) clears the anchor after the 3s 'Indexing complete' timeout fires", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const anchor: IndexingAnchor = {
+      runId: "01HXRUN",
+      rowsTotal: 1000,
+      anchorXlen: 1000,
+      anchorTs: Date.now(),
+      lastSeenAt: Date.now(),
+    };
+    globalThis.localStorage.setItem(STORAGE_KEY, JSON.stringify(anchor));
+    streamState.xlen = 200;
+    vi.stubGlobal("fetch", mockFetch());
+    renderPanel();
+    await waitFor(() => {
+      expect(screen.queryAllByTestId("indexing-progress").length).toBeGreaterThan(0);
+    });
+    streamState.xlen = 0;
+    // First poll observes xlen=0 ⇒ "Indexing complete" toast scheduled.
+    await vi.advanceTimersByTimeAsync(2_600);
+    await waitFor(() => {
+      expect(screen.queryAllByTestId("indexing-complete").length).toBeGreaterThan(0);
+    });
+    // 3s later the timeout must fire and clear the anchor + hide the bar.
+    await vi.advanceTimersByTimeAsync(3_100);
+    await waitFor(() => {
+      expect(screen.queryByTestId("indexing-progress")).not.toBeInTheDocument();
+    });
+    expect(globalThis.localStorage.getItem(STORAGE_KEY)).toBeNull();
+    vi.useRealTimers();
+  });
+
+  // Wave 6.41.E.fix — Fix B: × dismiss button clears anchor + hides bar.
+  it("(B) × dismiss button clears the anchor and hides the bar", async () => {
+    const anchor: IndexingAnchor = {
+      runId: "01HXRUN",
+      rowsTotal: 1000,
+      anchorXlen: 1000,
+      anchorTs: Date.now(),
+      lastSeenAt: Date.now(),
+    };
+    globalThis.localStorage.setItem(STORAGE_KEY, JSON.stringify(anchor));
+    streamState.xlen = 500;
+    vi.stubGlobal("fetch", mockFetch());
+    renderPanel();
+    const bars = await screen.findAllByTestId("indexing-progress");
+    const dismiss = within(bars[0]!).getByTestId("indexing-dismiss-btn");
+    expect(dismiss.getAttribute("aria-label")).toBe("Dismiss indexing progress");
+    fireEvent.click(dismiss);
+    await waitFor(() => {
+      expect(screen.queryByTestId("indexing-progress")).not.toBeInTheDocument();
+    });
+    expect(globalThis.localStorage.getItem(STORAGE_KEY)).toBeNull();
+  });
+
+  // Wave 6.41.E.fix — Fix C: 2+ trailing xlen=0 polls and no active run ⇒
+  // hard-clear (no 3s toast). Anchor.anchorXlen > 0 alone would also be
+  // caught by D, so we use a window that mixes a positive sample with
+  // trailing zeros to isolate C.
+  it("(C) hard-clears after 2+ consecutive xlen=0 polls with no active run", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const anchor: IndexingAnchor = {
+      runId: "01HXRUN",
+      rowsTotal: 1000,
+      anchorXlen: 1000,
+      anchorTs: Date.now(),
+      lastSeenAt: Date.now(),
+    };
+    globalThis.localStorage.setItem(STORAGE_KEY, JSON.stringify(anchor));
+    streamState.xlen = 50;
+    vi.stubGlobal("fetch", mockFetch());
+    renderPanel();
+    await waitFor(() => {
+      expect(screen.queryAllByTestId("indexing-progress").length).toBeGreaterThan(0);
+    });
+    // Two consecutive xlen=0 polls; the first poll's positive sample keeps
+    // D's "all samples in window are zero" check from firing.
+    streamState.xlen = 0;
+    await vi.advanceTimersByTimeAsync(2_600);
+    await vi.advanceTimersByTimeAsync(2_600);
+    await waitFor(() => {
+      expect(screen.queryByTestId("indexing-progress")).not.toBeInTheDocument();
+    });
+    expect(globalThis.localStorage.getItem(STORAGE_KEY)).toBeNull();
+    vi.useRealTimers();
+  });
+
+  // Wave 6.41.E.fix — Fix D: FLUSHDB heuristic. All samples in window are
+  // xlen=0 AND anchor.anchorXlen > 0 ⇒ clear immediately, no toast.
+  it("(D) hard-clears when anchorXlen > 0 and every sample in the window is zero", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const anchor: IndexingAnchor = {
+      runId: "01HXRUN",
+      rowsTotal: 1000,
+      anchorXlen: 1000,
+      anchorTs: Date.now(),
+      lastSeenAt: Date.now(),
+    };
+    globalThis.localStorage.setItem(STORAGE_KEY, JSON.stringify(anchor));
+    // xlen is already 0 from the start; every sample in the window will be 0.
+    streamState.xlen = 0;
+    vi.stubGlobal("fetch", mockFetch());
+    renderPanel();
+    // Bar appears briefly (anchor restored) then the second xlen=0 poll
+    // triggers D and the bar is hard-cleared.
+    await vi.advanceTimersByTimeAsync(2_600);
+    await waitFor(() => {
+      expect(screen.queryByTestId("indexing-progress")).not.toBeInTheDocument();
+    });
+    expect(globalThis.localStorage.getItem(STORAGE_KEY)).toBeNull();
+    vi.useRealTimers();
+  });
+
+  // Wave 6.41.E.fix — Fix E: indexing bar renders during the generator's
+  // running phase and uses (rowsAdded - xlen) / rowsAdded as the
+  // denominator, not the post-gen peak-xlen anchor.
+  it("(E) renders during run.status='running' with (rowsAdded - xlen)/rowsAdded denominator", async () => {
+    setMockRun({
+      rowsTotal: 1000, rowsDone: 500, elapsedMs: 1000, rowsPerSec: 500,
+      runId: "01HXRUN", status: "running",
+    });
+    streamState.xlen = 100; // indexed = 500 - 100 = 400; pct = 400/500 = 80%
+    vi.stubGlobal("fetch", mockFetch());
+    renderPanel();
+    const bars = await screen.findAllByTestId("indexing-progress");
+    const bar = bars[0]!;
+    const text = within(bar).getByTestId("indexing-progress-text");
+    expect(text.textContent).toMatch(/400 \/ 1,000 indexed/);
+    expect(text.textContent).toMatch(/80%/);
+    const pb = bar.querySelector('[role="progressbar"]') as HTMLElement;
+    expect(pb.getAttribute("aria-valuenow")).toBe("80");
+    // No anchor should be persisted while the in-generation view is active.
+    expect(globalThis.localStorage.getItem(STORAGE_KEY)).toBeNull();
+  });
+
+  // Wave 6.41.E.fix — Fix E: clean transition from the in-generation
+  // denominator to the peak-xlen anchor when the run reaches "done". The
+  // bar must stay visible across the transition.
+  it("(E) transitions cleanly from in-generation view to peak-xlen anchor on run→done", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    setMockRun({
+      rowsTotal: 1000, rowsDone: 1000, elapsedMs: 1000, rowsPerSec: 1000,
+      runId: "01HXRUN", status: "running",
+    });
+    streamState.xlen = 600; // peak observed by the poll
+    vi.stubGlobal("fetch", mockFetch());
+    renderPanel();
+    // Wait for the in-generation view to settle (rowsAdded=1000, xlen=600 ⇒
+    // 40% indexed).
+    await waitFor(() => {
+      const bars = screen.queryAllByTestId("indexing-progress");
+      expect(bars.length).toBeGreaterThan(0);
+      const pb = bars[0]!.querySelector('[role="progressbar"]') as HTMLElement;
+      expect(pb.getAttribute("aria-valuenow")).toBe("40");
+    });
+    // Flip the run to "done" and let the next poll observe xlen=300. The
+    // terminal seed picks max(peak=600, currentXlen=300, rowsTotal=1000) =
+    // 1000 ⇒ anchored pct = (1000-300)/1000 = 70%.
+    setMockRun({
+      rowsTotal: 1000, rowsDone: 1000, elapsedMs: 2000, rowsPerSec: 500,
+      runId: "01HXRUN", status: "done",
+    });
+    streamState.xlen = 300;
+    await vi.advanceTimersByTimeAsync(2_600);
+    await waitFor(() => {
+      const bars = screen.queryAllByTestId("indexing-progress");
+      expect(bars.length).toBeGreaterThan(0);
+      const pb = bars[0]!.querySelector('[role="progressbar"]') as HTMLElement;
+      expect(pb.getAttribute("aria-valuenow")).toBe("70");
+    });
+    const stored = JSON.parse(globalThis.localStorage.getItem(STORAGE_KEY) ?? "null") as IndexingAnchor | null;
+    expect(stored).not.toBeNull();
+    expect(stored!.anchorXlen).toBe(1000);
+    vi.useRealTimers();
+  });
+
+  // Wave 6.41.E.fix — Fix E: edge case rowsAdded === 0 must show 0%, not
+  // NaN or a hidden bar.
+  it("(E) shows 0% (not NaN, not hidden) when run.rowsDone === 0", async () => {
+    setMockRun({
+      rowsTotal: 1000, rowsDone: 0, elapsedMs: 0, rowsPerSec: 0,
+      runId: "01HXRUN", status: "running",
+    });
+    streamState.xlen = 0;
+    vi.stubGlobal("fetch", mockFetch());
+    renderPanel();
+    const bars = await screen.findAllByTestId("indexing-progress");
+    const bar = bars[0]!;
+    const pb = bar.querySelector('[role="progressbar"]') as HTMLElement;
+    expect(pb.getAttribute("aria-valuenow")).toBe("0");
+    const text = within(bar).getByTestId("indexing-progress-text");
+    expect(text.textContent).not.toMatch(/NaN/);
+    expect(text.textContent).toMatch(/0%/);
   });
 });
