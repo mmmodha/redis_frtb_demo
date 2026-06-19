@@ -19,7 +19,7 @@ export class ServiceUnreachableError extends Error {
   }
 }
 
-export type SourceFormat = "csv" | "jsonl" | "parquet";
+export type SourceFormat = "csv" | "jsonl";
 export type SourceOrigin = "upload" | "synthetic";
 export type SourceStatus =
   | "uploaded"

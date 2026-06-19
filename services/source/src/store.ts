@@ -9,7 +9,7 @@ import { ulid } from "ulid";
 import type { InferredColumn } from "./infer/types.ts";
 import type { ColumnMapping } from "./infer/mapping.ts";
 
-export type SourceFormat = "csv" | "jsonl" | "parquet";
+export type SourceFormat = "csv" | "jsonl";
 export type SourceOrigin = "upload" | "synthetic";
 export type SourceStatus = "uploaded" | "inferred" | "mapped" | "ingesting" | "ingested" | "error";
 

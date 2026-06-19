@@ -58,7 +58,6 @@
 .source-row__name { font-size: 1rem; font-weight: 600; color: var(--redis-text-primary); }
 .source-row__meta { display: flex; gap: calc(var(--grid) * 2); align-items: center; flex-wrap: wrap; color: var(--redis-text-secondary); font-size: 0.8125rem; margin-top: 4px; }
 .source-row__format { text-transform: uppercase; letter-spacing: 0.04em; font-size: 0.6875rem; }
-.source-row__parquet-note { color: var(--redis-text-muted); font-size: 0.8125rem; margin: var(--grid) 0 0; }
 .source-row__actions { display: flex; gap: var(--grid); align-items: center; }
 
 .status-pill {

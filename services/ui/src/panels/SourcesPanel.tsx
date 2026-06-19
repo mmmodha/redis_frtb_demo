@@ -167,7 +167,7 @@ export function SourcesPanel() {
       <header className="panel__header">
         <h1>Sources</h1>
         <p className="panel__subhead">
-          Drop CSV / JSONL / Parquet files. The wizard infers columns and maps them onto the
+          Drop CSV / JSONL files. The wizard infers columns and maps them onto the
           active FRTB schema before ingest streams rows into Redis.
         </p>
       </header>
@@ -177,7 +177,7 @@ export function SourcesPanel() {
           data-testid="sources-dropzone"
           role="button"
           tabIndex={0}
-          aria-label="Drop CSV, JSONL or Parquet files here, or click to pick"
+          aria-label="Drop CSV or JSONL files here, or click to pick"
           onDragOver={onDragOver}
           onDragEnter={onDragOver}
           onDragLeave={onDragLeave}
@@ -187,7 +187,7 @@ export function SourcesPanel() {
           className={`sources-dropzone${dragOver ? " is-over" : ""}`}
           data-busy={inflightCount > 0 ? "yes" : "no"}
         >
-          <div className="sources-dropzone__title">Drop CSV / JSONL / Parquet here</div>
+          <div className="sources-dropzone__title">Drop CSV / JSONL here</div>
           <div className="sources-dropzone__hint">
             or <span className="sources-dropzone__link">browse files</span>
             {inflightCount > 0 ? ` · ${inflightCount} uploading…` : ""}
@@ -196,7 +196,7 @@ export function SourcesPanel() {
             ref={fileInputRef}
             type="file"
             multiple
-            accept=".csv,.jsonl,.ndjson,.parquet,text/csv,application/json"
+            accept=".csv,.jsonl,.ndjson,text/csv,application/json"
             className="sources-dropzone__input"
             onChange={(e) => { handleFiles(e.target.files); e.target.value = ""; }}
             aria-hidden="true"
@@ -260,7 +260,6 @@ export function SourcesPanel() {
             {sources.map((s) => {
               const canIngest = READY_TO_INGEST.has(s.status);
               const busy = busyId === s.id;
-              const isParquet = s.format === "parquet";
               return (
                 <li key={s.id} data-testid={`source-row-${s.id}`} className="source-row">
                   <div className="source-row__main">
@@ -279,16 +278,13 @@ export function SourcesPanel() {
                         {s.status}
                       </span>
                     </div>
-                    {isParquet ? (
-                      <p className="source-row__parquet-note">Parquet support coming soon — file stored but not yet inferable.</p>
-                    ) : null}
                   </div>
                   <div className="source-row__actions">
                     <button
                       type="button"
                       className="btn"
                       onClick={() => { void openMapping(s); }}
-                      disabled={busy || isParquet}
+                      disabled={busy}
                     >
                       Configure mapping
                     </button>

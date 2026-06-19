@@ -33,7 +33,6 @@ function formatFromName(name: string): SourceFormat | null {
   const lower = name.toLowerCase();
   if (lower.endsWith(".csv")) return "csv";
   if (lower.endsWith(".jsonl") || lower.endsWith(".ndjson")) return "jsonl";
-  if (lower.endsWith(".parquet")) return "parquet";
   return null;
 }
 
@@ -81,7 +80,6 @@ export function registerSourcesRoutes(app: FastifyInstance, deps: UploadDeps): v
   app.post<{ Params: { id: string } }>("/sources/:id/infer", async (req, reply) => {
     const s = await deps.store.get(req.params.id);
     if (!s) { reply.code(404); return { error: "not found" }; }
-    if (s.format === "parquet") { reply.code(501); return { error: "parquet sampling not implemented in Wave 3" }; }
     const sample = s.format === "csv"
       ? await sampleCsv(s.path, { limit: SAMPLE_LIMIT })
       : await sampleJsonl(s.path, { limit: SAMPLE_LIMIT });
@@ -109,7 +107,6 @@ export function registerSourcesRoutes(app: FastifyInstance, deps: UploadDeps): v
     const s = await deps.store.get(req.params.id);
     if (!s) { reply.code(404); return { error: "not found" }; }
     if (!s.mapping) { reply.code(409); return { error: "mapping not set — POST /sources/:id/mapping first" }; }
-    if (s.format === "parquet") { reply.code(501); return { error: "parquet ingest not implemented in Wave 3" }; }
     await deps.store.update(s.id, { status: "ingesting" });
 
     // Fire-and-forget; surface terminal status via the store. This keeps the

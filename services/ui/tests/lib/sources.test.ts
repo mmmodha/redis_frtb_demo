@@ -147,9 +147,4 @@ describe("sources api client", () => {
     expect(calls[0]!.method).toBe("POST");
     expect(out.status).toBe("ingesting");
   });
-
-  it("inferSource surfaces a parquet-not-implemented (501) as a typed error", async () => {
-    globalThis.fetch = (async () => jsonResponse({ error: "parquet sampling not implemented in Wave 3" }, 501)) as typeof fetch;
-    await expect(inferSource("src-1")).rejects.toThrow(/parquet/i);
-  });
 });
