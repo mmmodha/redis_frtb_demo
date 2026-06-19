@@ -12,6 +12,7 @@
 
 import Fastify, { type FastifyInstance } from "fastify";
 import { Runner, type RunnerConfig, type RunnerSnapshot } from "./runner.ts";
+import { registerSwitchAdminRoutes } from "./admin-active-target.ts";
 
 declare module "fastify" {
   interface FastifyInstance {
@@ -26,6 +27,12 @@ export interface CreateServerOpts {
   fetch?: typeof fetch;
   // Override snapshot tick (ms) for tests. Default is 1000ms (1 Hz).
   snapshotIntervalMs?: number;
+  // Wave 6.43.B.3 — bearer-guarded coordinator endpoints. Token gates the
+  // /admin/active-target/{prepare,commit} pair; commit callback is owned by
+  // index.ts (which holds the watcher), prepare here is wired to runner.stop
+  // so workers are halted before the api flips the active target.
+  internalToken?: string;
+  commitSwitch?: () => Promise<void>;
 }
 
 interface StartBody {
@@ -134,6 +141,14 @@ export async function createServer(opts: CreateServerOpts = {}): Promise<Fastify
   });
 
   app.addHook("onClose", async () => { await runner.stop(); });
+
+  registerSwitchAdminRoutes(app, {
+    internalToken: opts.internalToken,
+    // Prepare = pause workers. Idempotent: runner.stop() is safe to call
+    // when already stopped/idle (see runner.test.ts "stop() is idempotent").
+    prepareSwitch: async () => { await runner.stop(); },
+    commitSwitch: opts.commitSwitch,
+  });
 
   // Wave 5.16v: expose the runner's run state so the active-target watcher
   // (wired in index.ts) can record `running=<bool>` on every swap. The api's

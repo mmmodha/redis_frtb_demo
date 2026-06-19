@@ -20,19 +20,31 @@ const port = Number(process.env.LOADGEN_PORT ?? process.env.PORT ?? process.env.
 const apiBase = process.env.API_BASE ?? process.env.API_URL ?? `http://localhost:${process.env.API_PORT ?? 8080}`;
 
 async function main(): Promise<void> {
+  const token = process.env.INTERNAL_API_TOKEN;
+  // Wave 6.43.B.3 — build the watcher first so commitSwitch can capture it.
+  // When INTERNAL_API_TOKEN is unset (legacy/dev path) commitSwitch stays
+  // undefined and the admin routes degrade to logging-only acks.
+  // `runningProbe` is a mutable closure so the watcher (created before the
+  // app) can still read the live run state once createServer resolves.
+  let runningProbe: () => boolean = () => false;
+  const watcher = token
+    ? createActiveTargetWatcher({
+        apiBase,
+        token,
+        pollMs: Number(process.env.ACTIVE_TARGET_POLL_MS ?? 5000),
+        isRunning: () => runningProbe(),
+      })
+    : null;
+
   const app = await createServer({
     apiBase,
     snapshotIntervalMs: Number(process.env.SNAPSHOT_INTERVAL_MS ?? 1000),
+    internalToken: token,
+    commitSwitch: watcher ? async () => { await watcher.pollOnce(); } : undefined,
   });
+  runningProbe = () => app.loadgenIsRunning();
 
-  const token = process.env.INTERNAL_API_TOKEN;
-  if (token) {
-    const watcher = createActiveTargetWatcher({
-      apiBase,
-      token,
-      pollMs: Number(process.env.ACTIVE_TARGET_POLL_MS ?? 5000),
-      isRunning: () => app.loadgenIsRunning(),
-    });
+  if (watcher) {
     // Best-effort: never block boot on the api being healthy.
     void watcher.start();
     app.addHook("onClose", async () => { await watcher.stop(); });

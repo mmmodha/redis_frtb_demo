@@ -64,6 +64,12 @@ async function main(): Promise<void> {
   const app = await createServer({
     redis: redisLike, store, schema, uploadDir: UPLOAD_DIR, logger: true,
     watcherState: () => watcher.getState(),
+    // Wave 6.43.B.3 — coordinator pushes prepare/commit when the api swaps
+    // active target. Source has no continuous worker loop so prepare is a
+    // no-op ack; commit forces an immediate watcher poll so the next
+    // /sources request hits the new target without waiting out POLL_MS.
+    internalToken: token,
+    commitSwitch: async () => { await watcher.pollOnce(); },
   });
   // Wave 5.98B — bind /healthz BEFORE awaiting watcher.start(). The watcher's
   // initial poll loop can take up to ~30s when Redis isn't reachable, which

@@ -15,6 +15,7 @@ import multipart from "@fastify/multipart";
 import type { Schema } from "@frtb/schema";
 import type { RedisLike, SourceStore } from "./store.ts";
 import { registerSourcesRoutes, type UploadDeps } from "./routes/sources.ts";
+import { registerSwitchAdminRoutes } from "./routes/admin-active-target.ts";
 
 export interface CreateServerOpts {
   redis: RedisLike;
@@ -25,6 +26,14 @@ export interface CreateServerOpts {
   // Wave 5.98B — optional getter for active-target watcher state so /healthz
   // can surface "starting" | "running" | "waiting" without blocking listen().
   watcherState?: () => string;
+  // Wave 6.43.B.3 — coordinator-driven Redis target swap. `internalToken`
+  // guards the prepare/commit endpoints; the callbacks are owned by the
+  // entrypoint (index.ts) which knows the watcher. Source has no continuous
+  // worker loop so prepare is typically a no-op acknowledgment.
+  internalToken?: string;
+  prepareSwitch?: () => Promise<void>;
+  commitSwitch?: () => Promise<void>;
+  prepareTimeoutMs?: number;
 }
 
 export async function createServer(opts: CreateServerOpts): Promise<FastifyInstance> {
@@ -47,6 +56,13 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
     uploadDir: opts.uploadDir,
   };
   registerSourcesRoutes(app, deps);
+
+  registerSwitchAdminRoutes(app, {
+    internalToken: opts.internalToken,
+    prepareSwitch: opts.prepareSwitch,
+    commitSwitch: opts.commitSwitch,
+    prepareTimeoutMs: opts.prepareTimeoutMs,
+  });
 
   return app;
 }
