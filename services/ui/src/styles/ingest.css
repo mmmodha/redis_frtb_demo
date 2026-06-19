@@ -133,6 +133,18 @@
   margin-left: auto;
 }
 
+/* Wave 6.41.E — Indexing progress bar variant. Reuses the generator bar
+   layout primitives; differs only in the accent (text-link blue instead of
+   the hyper red) so the producer vs consumer bars are visually distinct
+   without introducing new CSS variables. */
+.indexing-progress__label {
+  font-size: 0.85em;
+  color: var(--redis-text-secondary);
+}
+.generator-form__progress-fill.indexing-progress__fill {
+  background: var(--redis-text-link, #8AB4C7);
+}
+
 /* Wave 5.20a — collapsible advanced options. Toggle button mirrors the
    shared .btn--secondary tone; the body is hidden by default. */
 .generator-form__advanced {

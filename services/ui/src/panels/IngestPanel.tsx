@@ -17,6 +17,7 @@ import {
   flushDb,
   getGeneratorRunStatus,
   getIngestShards,
+  getStreamStatus,
   listSources,
   preflight,
   preflightAndRebuildIfNeeded,
@@ -28,6 +29,16 @@ import {
   type PreflightResponse,
   type Source,
 } from "../lib/ingest";
+import {
+  clearAnchor,
+  computePct,
+  computeRatePerSec,
+  pushSample,
+  readAnchor,
+  writeAnchor,
+  type IndexingAnchor,
+  type XlenSample,
+} from "../lib/indexingState";
 
 // Wave 5.20a — defensive fallback when dbsize=0 (no rows yet) so the sanity
 // check still produces a meaningful estimate. ~1.5 KB/row is the smoke-run-12
@@ -1007,6 +1018,7 @@ function RunPresetCard(props: {
       {showProgress ? (
         <GeneratorProgress run={trackedRun!} onCancel={onCancelRun} />
       ) : null}
+      <IndexingProgress />
     </PanelCard>
   );
 }
@@ -2085,6 +2097,7 @@ function SyntheticGeneratorCard(props: {
         {run && (run.status === "running" || run.status === "cancelling") ? (
           <GeneratorProgress run={run} onCancel={onCancelRun} />
         ) : null}
+        <IndexingProgress />
         {displayError ? (
           <div className="generator-form__error" role="alert">{displayError}</div>
         ) : null}
@@ -2161,6 +2174,188 @@ function GeneratorProgress(props: { run: GeneratorRunState; onCancel: () => void
     </div>
   );
 }
+
+// Wave 6.41.E — Indexing progress bar. Tracks the consumer-side drain of
+// the input stream (xlen → 0) after the generator has finished producing
+// rows. Polls /admin/stream-status; persists an anchor in localStorage so a
+// tab reload reconstructs % indexed without a server endpoint. Hidden when
+// no anchor exists and xlen == 0.
+const INDEXING_POLL_MS = 2_500;
+const INDEXING_COMPLETE_MS = 3_000;
+const INDEXING_WINDOW = 10;
+
+function formatIntCompact(n: number): string {
+  const abs = Math.abs(n);
+  if (abs >= 1_000_000) return `${(n / 1_000_000).toFixed(abs >= 10_000_000 ? 0 : 1)}M`;
+  if (abs >= 1_000) return `${(n / 1_000).toFixed(abs >= 10_000 ? 0 : 1)}K`;
+  return `${Math.round(n)}`;
+}
+
+function formatEtaSeconds(s: number): string {
+  if (!Number.isFinite(s) || s <= 0) return "—";
+  if (s < 60) return `${Math.round(s)}s`;
+  if (s < 3600) return `${Math.round(s / 60)}m`;
+  if (s < 86_400) return `${Math.round(s / 3600)}h`;
+  return `${Math.round(s / 86_400)}d`;
+}
+
+function IndexingProgress() {
+  const { run } = useGeneratorRun();
+  const [currentXlen, setCurrentXlen] = useState<number | null>(null);
+  const [samples, setSamples] = useState<XlenSample[]>([]);
+  const [anchor, setAnchor] = useState<IndexingAnchor | null>(null);
+  const [completeShownAt, setCompleteShownAt] = useState<number | null>(null);
+  const peakXlenRef = useRef<number>(0);
+  const prevRunStatusRef = useRef<string | null>(null);
+
+  // Mount: restore anchor from localStorage if present.
+  useEffect(() => {
+    const a = readAnchor();
+    if (a) {
+      setAnchor(a);
+      peakXlenRef.current = a.anchorXlen;
+    }
+  }, []);
+
+  // Poll /admin/stream-status. Errors are swallowed — the next tick retries.
+  useEffect(() => {
+    let cancelled = false;
+    const tick = (): void => {
+      getStreamStatus()
+        .then((s) => {
+          if (cancelled) return;
+          const xlen = typeof s.xlen === "number" ? s.xlen : 0;
+          setCurrentXlen(xlen);
+          if (xlen > peakXlenRef.current) peakXlenRef.current = xlen;
+          setSamples((prev) => pushSample(prev, { xlen, ts: Date.now() }, INDEXING_WINDOW));
+        })
+        .catch(() => { /* swallow transient errors */ });
+    };
+    tick();
+    const id = setInterval(tick, INDEXING_POLL_MS);
+    return () => { cancelled = true; clearInterval(id); };
+  }, []);
+
+  // Implicit anchor on mount: xlen > 0 with no prior anchor ⇒ treat the
+  // current xlen as the baseline. ETA stays "unknown" until two samples
+  // accumulate.
+  useEffect(() => {
+    if (anchor !== null) return;
+    if (currentXlen === null || currentXlen <= 0) return;
+    if (run && (run.status === "running" || run.status === "cancelling")) return;
+    const now = Date.now();
+    const a: IndexingAnchor = {
+      runId: null,
+      rowsTotal: currentXlen,
+      anchorXlen: currentXlen,
+      anchorTs: now,
+      lastSeenAt: now,
+    };
+    writeAnchor(a);
+    setAnchor(a);
+  }, [anchor, currentXlen, run]);
+
+  // Generator transitioned to "done" ⇒ seed anchor if none exists yet. Uses
+  // the peak xlen observed so the baseline is not undercut by consumer
+  // drain that started before the producer finished.
+  useEffect(() => {
+    const prev = prevRunStatusRef.current;
+    const status = run?.status ?? null;
+    prevRunStatusRef.current = status;
+    if (prev === "done" || status !== "done") return;
+    if (anchor !== null) return;
+    const baseline = Math.max(
+      peakXlenRef.current,
+      currentXlen ?? 0,
+      run?.rowsTotal ?? 0,
+    );
+    if (baseline <= 0) return;
+    const now = Date.now();
+    const a: IndexingAnchor = {
+      runId: run?.runId ?? null,
+      rowsTotal: baseline,
+      anchorXlen: baseline,
+      anchorTs: now,
+      lastSeenAt: now,
+    };
+    writeAnchor(a);
+    setAnchor(a);
+  }, [run?.status, run?.runId, run?.rowsTotal, anchor, currentXlen]);
+
+  // xlen reached 0 with an active anchor ⇒ render "Indexing complete" for
+  // INDEXING_COMPLETE_MS, then clear the anchor + hide the bar.
+  useEffect(() => {
+    if (anchor === null) return;
+    if (currentXlen === null) return;
+    if (currentXlen > 0) return;
+    if (completeShownAt !== null) return;
+    setCompleteShownAt(Date.now());
+    const t = setTimeout(() => {
+      clearAnchor();
+      setAnchor(null);
+      setCompleteShownAt(null);
+      peakXlenRef.current = 0;
+      setSamples([]);
+    }, INDEXING_COMPLETE_MS);
+    return () => clearTimeout(t);
+  }, [anchor, currentXlen, completeShownAt]);
+
+  if (anchor === null) return null;
+  if (currentXlen === null) return null;
+
+  const showingComplete = completeShownAt !== null;
+  const pct = showingComplete ? 100 : computePct(anchor.anchorXlen, currentXlen);
+  const ratePerSec = computeRatePerSec(samples);
+  const rowsRemaining = Math.max(0, currentXlen);
+  const etaSeconds = !showingComplete && ratePerSec !== null && ratePerSec > 0
+    ? rowsRemaining / ratePerSec
+    : null;
+
+  return (
+    <div
+      className="generator-form__progress indexing-progress"
+      data-testid="indexing-progress"
+      role="status"
+      aria-live="polite"
+    >
+      <div className="indexing-progress__label">Indexing (rows being written into rollups)</div>
+      <div
+        className="generator-form__progress-bar"
+        role="progressbar"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={Math.round(pct)}
+      >
+        <div
+          className="generator-form__progress-fill indexing-progress__fill"
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+      <div className="generator-form__progress-meta">
+        {showingComplete ? (
+          <span data-testid="indexing-complete">Indexing complete</span>
+        ) : (
+          <>
+            <span data-testid="indexing-progress-text">
+              {rowsRemaining.toLocaleString()} rows remaining ({Math.round(pct)}%)
+            </span>
+            <span className="generator-form__progress-stats" data-testid="indexing-progress-stats">
+              {ratePerSec === null ? (
+                "ETA unknown"
+              ) : (
+                <>
+                  {formatIntCompact(ratePerSec)} rows/s · ETA {etaSeconds !== null ? formatEtaSeconds(etaSeconds) : "—"}
+                </>
+              )}
+            </span>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
 
 // Wave 5.20a — pre-submit sanity-check dialog. Reuses .dialog primitives;
 // `variant` selects the yellow-warning or red-block left-border colour.

@@ -3,6 +3,12 @@
 // cross-task ownership stays clean.
 import { apiBase } from "./api";
 
+// Wave 6.41.E — re-export the existing typed client for /admin/stream-status
+// so consumers inside the IngestPanel surface (which already imports from
+// ./ingest) can read xlen without pulling in ./admin directly. The shape
+// stays owned by ./admin; only the import path is widened.
+export { getStreamStatus, type StreamStatusResponse } from "./admin";
+
 export interface Source {
   id: string;
   kind: "synthetic" | "file" | string;
