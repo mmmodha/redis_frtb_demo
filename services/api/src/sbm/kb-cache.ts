@@ -80,14 +80,27 @@ export function combineRollupContentHashes(parts: ReadonlyArray<string>): string
 
 let hitCount = 0;
 let missCount = 0;
+// Wave 6.41.A — counter for buckets whose K_b cache is intentionally
+// bypassed because the request carries an include/exclude filter (the
+// rollup-derived K_b doesn't account for the filter, so serving it would
+// be wrong). Bumped once per skipped bucket by the calc route.
+let skipFilteredCount = 0;
 
 export function __resetKbCacheMetricsForTests(): void {
   hitCount = 0;
   missCount = 0;
+  skipFilteredCount = 0;
 }
 
-export function getKbCacheMetrics(): { hit: number; miss: number } {
-  return { hit: hitCount, miss: missCount };
+export function getKbCacheMetrics(): { hit: number; miss: number; skip_filtered: number } {
+  return { hit: hitCount, miss: missCount, skip_filtered: skipFilteredCount };
+}
+
+// Wave 6.41.A — invoked by the calc route when a request carries an
+// include/exclude filter and the rollup-derived K_b would therefore be
+// stale for this request.
+export function recordKbCacheSkipFiltered(n: number = 1): void {
+  skipFilteredCount += n;
 }
 
 export interface KbCacheHit {

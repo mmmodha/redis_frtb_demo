@@ -41,7 +41,7 @@ describe("Wave 6.39.B — sbm/kb-cache", () => {
     fr.setResponse("HMGET", () => [null, null]);
     const hit = await lookupKbCacheEntry(fr, "kb:{GIRR:USD-IRS}:Delta:default:medium", "abc");
     expect(hit).toBeNull();
-    expect(getKbCacheMetrics()).toEqual({ hit: 0, miss: 1 });
+    expect(getKbCacheMetrics()).toEqual({ hit: 0, miss: 1, skip_filtered: 0 });
   });
 
   it("lookupKbCacheEntry returns hit when content hash matches", async () => {
@@ -49,7 +49,7 @@ describe("Wave 6.39.B — sbm/kb-cache", () => {
     fr.setResponse("HMGET", () => ["12.345", "abc"]);
     const hit = await lookupKbCacheEntry(fr, "kb:{GIRR:USD-IRS}:Delta:default:medium", "abc");
     expect(hit).toEqual({ K_b: 12.345, contentHash: "abc" });
-    expect(getKbCacheMetrics()).toEqual({ hit: 1, miss: 0 });
+    expect(getKbCacheMetrics()).toEqual({ hit: 1, miss: 0, skip_filtered: 0 });
   });
 
   it("lookupKbCacheEntry returns miss when content hash mismatches (content drift)", async () => {
@@ -57,7 +57,7 @@ describe("Wave 6.39.B — sbm/kb-cache", () => {
     fr.setResponse("HMGET", () => ["12.345", "stale-hash"]);
     const hit = await lookupKbCacheEntry(fr, "kb:{GIRR:USD-IRS}:Delta:default:medium", "fresh-hash");
     expect(hit).toBeNull();
-    expect(getKbCacheMetrics()).toEqual({ hit: 0, miss: 1 });
+    expect(getKbCacheMetrics()).toEqual({ hit: 0, miss: 1, skip_filtered: 0 });
   });
 
   it("storeKbCacheEntry writes K_b + content_hash with the configured TTL", async () => {

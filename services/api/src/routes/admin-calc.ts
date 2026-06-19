@@ -192,6 +192,11 @@ export function registerAdminCalcRoutes(
       "# HELP kb_cache_miss_total K_b cache misses since process start.",
       "# TYPE kb_cache_miss_total counter",
       `kb_cache_miss_total ${m.miss}`,
+      // Wave 6.41.A — buckets the cache was bypassed for because the
+      // request carried an include / exclude filter.
+      "# HELP kb_cache_skip_filtered_total Buckets whose K_b cache was bypassed because the request was filtered.",
+      "# TYPE kb_cache_skip_filtered_total counter",
+      `kb_cache_skip_filtered_total ${m.skip_filtered}`,
       "",
     ].join("\n");
     // Wave 6.39.C — append the Layer 4 counters (drift_check_total,

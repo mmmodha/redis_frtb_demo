@@ -5,7 +5,8 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
-    "./rollup-keys": "./src/rollup-keys.ts"
+    "./rollup-keys": "./src/rollup-keys.ts",
+    "./region": "./src/region.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"

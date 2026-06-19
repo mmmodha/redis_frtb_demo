@@ -56,6 +56,20 @@ export interface AggregateBucketsOpts {
       book?: ReadonlyArray<string>;
       trade_id?: ReadonlyArray<string>;
       risk_factor?: ReadonlyArray<string>;
+      // Wave 6.41.A — desk / bucket exclude pushed into the FT.AGGREGATE
+      // query as `-@field:{X|Y}`. region is resolved to desks by the route
+      // before this struct is built, so the kernel only ever sees desks.
+      desk?: ReadonlyArray<string>;
+      bucket?: ReadonlyArray<string>;
+    };
+    // Wave 6.41.A — positive-include push-down. Pushed into the index
+    // query as `@field:{X|Y}`. risk_factor is intentionally absent — the
+    // kernel keeps the existing exclude.risk_factor shape only.
+    include?: {
+      book?: ReadonlyArray<string>;
+      trade_id?: ReadonlyArray<string>;
+      desk?: ReadonlyArray<string>;
+      bucket?: ReadonlyArray<string>;
     };
   };
   // Wave 5.96A.1 — when present, populate ws_components / cross_components /
@@ -212,9 +226,23 @@ export function buildFastPathQuery(
   if (subset && subset.length > 0) {
     parts.push(`@bucket:{${subset.map(escapeTag).join("|")}}`);
   }
+  // Wave 6.41.A — positive-include push-down. `@field:{X|Y}` keeps only
+  // rows whose value is IN the list (TAG `|` is OR). When bucket_subset is
+  // also present, include.bucket combines as another @bucket:{...} clause
+  // and the index parser intersects them.
+  const inc = filters?.include;
+  if (inc) {
+    for (const key of ["book", "trade_id", "desk", "bucket"] as const) {
+      const list = inc[key];
+      if (list && list.length > 0) {
+        parts.push(`@${key}:{${list.map(escapeTag).join("|")}}`);
+      }
+    }
+  }
   const ex = filters?.exclude;
   if (ex) {
-    for (const key of ["book", "trade_id", "risk_factor"] as const) {
+    // Wave 6.41.A — desk + bucket added to the exclude push-down list.
+    for (const key of ["book", "trade_id", "risk_factor", "desk", "bucket"] as const) {
       const list = ex[key];
       if (list && list.length > 0) {
         parts.push(`-@${key}:{${list.map(escapeTag).join("|")}}`);
