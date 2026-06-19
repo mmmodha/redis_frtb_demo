@@ -202,6 +202,27 @@ describe("POST /admin/flush", () => {
     expect(r2.json()).toMatchObject({ cached: false, total_rows: 7, risk_class: { GIRR: 7 } });
   });
 
+  // Wave 6.39.I — regression: /admin/snapshots is registered via
+  // registerAdminL4Routes wired from registerAdminRoutes. Locks in the
+  // route mount so a future refactor of the L4 wiring can't silently break
+  // the UI's SnapshotsCard with a 404. Uses the `getRedis` accessor (not
+  // `activeTarget`) so the test stays decoupled from the active-target
+  // singleton — only the route mount is under test.
+  it("GET /admin/snapshots returns 200 against a full createServer instance", async () => {
+    const fr = fakeRedis();
+    fr.setResponse("HGETALL", (args: unknown[]) => {
+      const key = String(args[0]);
+      if (key === "snap:index") return ["2026-06-18T12:00:00.000Z", "7"];
+      return [];
+    });
+    app = await createServer({ getRedis: () => fr });
+    const res = await app.inject({ method: "GET", url: "/admin/snapshots" });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.snapshots).toHaveLength(1);
+    expect(body.snapshots[0]).toMatchObject({ ts: "2026-06-18T12:00:00.000Z", key_count: 7 });
+  });
+
   it("returns bootstrap.ok=false with error 'schema-missing' when no schema is wired", async () => {
     const fr = fakeRedis();
     const runBootstrap = vi.fn();

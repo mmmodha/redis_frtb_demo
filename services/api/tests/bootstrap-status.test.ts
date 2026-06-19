@@ -17,7 +17,10 @@ import {
   scheduleBootstrap,
   setBootstrapRunnerForTests,
   setDebounceMsForTests,
+  setBootstrapSelfHealCallback,
+  triggerBootstrapSelfHeal,
 } from "../src/bootstrap-status.ts";
+import { translateRedisError } from "../src/redis-errors.ts";
 import { BootstrapPartialError } from "../src/bootstrap.ts";
 import type { ActiveTarget } from "../src/active-target.ts";
 // Wave 6.18k — verify scheduleBootstrap also flips /readyz (server.ts
@@ -231,6 +234,69 @@ describe("bootstrap-status — scheduleBootstrap terminal transitions (Wave 6.18
 // `bootstrap-failed` could coexist with a fresh listener-driven `ready`
 // phase (2026-06-17 VM observation). These tests pin that scheduleBootstrap
 // keeps /readyz and the bootstrap-status phase tracker in agreement.
+// Wave 6.39.I — FLUSHDB self-heal: a runtime FT.AGGREGATE that surfaces
+// "Unknown Index name" / "index not found" (almost always the after-effect
+// of a dev `redis-cli FLUSHDB`) must reset the in-memory `ready` phase and
+// fire the installed callback so scheduleBootstrap recreates idx:sens
+// without a process restart. Guarded so `running` / `partial` snapshots
+// are left alone (no thrash under request bursts).
+describe("bootstrap-status — triggerBootstrapSelfHeal (Wave 6.39.I)", () => {
+  beforeEach(() => {
+    resetBootstrapStatusForTests();
+  });
+
+  it("ready → idle + callback fired: index-not-found error path resets phase and triggers self-heal", () => {
+    markBootstrapStatusReady("primary");
+    expect(getBootstrapStatus().phase).toBe("ready");
+    let calls = 0;
+    setBootstrapSelfHealCallback(() => { calls += 1; });
+
+    const translated = translateRedisError(
+      new Error("SEARCH_INDEX_NOT_FOUND Index not found: idx:sens"),
+      "primary",
+      "ready",
+    );
+
+    expect(translated).not.toBeNull();
+    expect(translated!.status).toBe(412);
+    expect(getBootstrapStatus().phase).toBe("idle");
+    expect(calls).toBe(1);
+  });
+
+  it("running phase is preserved (no thrash) when self-heal triggers mid-bootstrap", () => {
+    markBootstrapStatusRunning("primary");
+    let calls = 0;
+    setBootstrapSelfHealCallback(() => { calls += 1; });
+
+    triggerBootstrapSelfHeal();
+
+    // Phase MUST stay `running` so the in-flight bootstrap completes and
+    // markBootstrapStatusReady lands the terminal snapshot. Callback still
+    // fires (cheap rescheduling on the same generation is harmless).
+    expect(getBootstrapStatus().phase).toBe("running");
+    expect(calls).toBe(1);
+  });
+
+  it("no callback installed: triggerBootstrapSelfHeal still resets phase without throwing", () => {
+    markBootstrapStatusReady("primary");
+    setBootstrapSelfHealCallback(null);
+    expect(() => triggerBootstrapSelfHeal()).not.toThrow();
+    expect(getBootstrapStatus().phase).toBe("idle");
+  });
+
+  it("callback throws → swallowed: translateRedisError still returns the 412 body", () => {
+    markBootstrapStatusReady("primary");
+    setBootstrapSelfHealCallback(() => { throw new Error("callback boom"); });
+    const translated = translateRedisError(
+      new Error("Unknown Index name"),
+      "primary",
+      "ready",
+    );
+    expect(translated).not.toBeNull();
+    expect(translated!.status).toBe(412);
+  });
+});
+
 describe("bootstrap-status — scheduleBootstrap also flips /readyz (Wave 6.18k)", () => {
   beforeEach(() => {
     resetBootstrapStatusForTests();

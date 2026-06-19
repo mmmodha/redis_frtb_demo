@@ -12,6 +12,7 @@ import {
   runDriftCheck,
   __resetDriftResultsForTests,
   getDriftResults,
+  clearDriftResults,
 } from "../src/jobs/drift-detector.ts";
 import { __resetMetricsForTests, getCounter } from "../src/jobs/metrics.ts";
 
@@ -101,6 +102,27 @@ describe("runDriftCheck", () => {
     const results = getDriftResults();
     expect(results).toHaveLength(100);
     expect(getCounter("drift_check_total")).toBe(105);
+  });
+
+  // Wave 6.39.I — production-callable clear wired into the active-target
+  // change listener. Entries collected against the prior target must not
+  // surface on /admin/drift-status after a profile switch (their rc:bucket
+  // refers to data that doesn't exist on the new target).
+  it("clearDriftResults empties the ring buffer after entries accumulate", async () => {
+    const fr = fakeRedis();
+    fr.setResponse("SRANDMEMBER", (args: unknown[]) => {
+      const key = String(args[0]);
+      if (key === "seen:risk_class") return "EQUITY";
+      if (key === "seen:bucket:{EQUITY}") return "1";
+      return null;
+    });
+    fr.setResponse("HGETALL", () => ["sum_ws", "10", "count", "1"]);
+    await runDriftCheck({ redis: fr, sensitivityType: "Delta", recomputeSum: async () => 10 });
+    await runDriftCheck({ redis: fr, sensitivityType: "Delta", recomputeSum: async () => 10 });
+    expect(getDriftResults()).toHaveLength(2);
+
+    clearDriftResults();
+    expect(getDriftResults()).toHaveLength(0);
   });
 
   it("treats zero rollup_sum and zero recomputed_sum as drift_pct = 0", async () => {

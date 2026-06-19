@@ -8,6 +8,7 @@
 // a background bootstrap is in flight or required.
 
 import type { BootstrapPhase } from "./bootstrap-status.ts";
+import { triggerBootstrapSelfHeal } from "./bootstrap-status.ts";
 
 export interface TranslatedError {
   status: number;
@@ -36,6 +37,14 @@ export function translateRedisError(
   // Redis 8.x replaces "Unknown Index name" with
   // "SEARCH_INDEX_NOT_FOUND Index not found: …" — accept both phrasings.
   if (msg.includes("unknown index name") || msg.includes("index not found")) {
+    // Wave 6.39.I — almost always the after-effect of a dev running
+    // `redis-cli FLUSHDB` against the active target: idx:sens is gone but
+    // the in-memory phase tracker still reads "ready", so the next
+    // scheduleBootstrap call no-ops. Drop the phase + re-fire bootstrap
+    // so /readyz lands back at ready without a process restart. Guarded
+    // inside triggerBootstrapSelfHeal so an already-running bootstrap is
+    // left alone — no thrash under request bursts.
+    triggerBootstrapSelfHeal();
     return {
       status: 412,
       body: {

@@ -16,7 +16,10 @@ import {
 import {
   getBootstrapStatus as getBootstrapPhaseStatus,
   scheduleBootstrap,
+  setBootstrapSelfHealCallback,
 } from "./bootstrap-status.ts";
+import { schemaHashKey } from "./lib/sens-index.ts";
+import { clearDriftResults } from "./jobs/drift-detector.ts";
 import { registerPivotRoute } from "./routes/pivot.ts";
 import { registerCalcRoute } from "./routes/calc.ts";
 import { registerSuggestRoutes } from "./routes/suggest.ts";
@@ -314,7 +317,12 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
   // registered before the connections store so the very first profile-switch
   // dispatched by the UI triggers a background bootstrap; the route returns
   // 412 with friendly progress text via translateRedisError until ready.
+  // Wave 6.39.I — also clear the in-memory drift-detector ring buffer so
+  // entries from the previous target don't leak into /admin/drift-status
+  // after a profile switch (the rc:bucket keys refer to data that doesn't
+  // exist on the new target).
   onActiveTargetChange((target) => {
+    clearDriftResults();
     const client = getActiveRedisClient();
     scheduleBootstrap(
       target,
@@ -322,6 +330,32 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
       client as unknown as Parameters<typeof scheduleBootstrap>[1],
       opts.schema,
     );
+  });
+
+  // Wave 6.39.I — install the bootstrap self-heal callback. Fired from
+  // translateRedisError when an FT.AGGREGATE call surfaces "index not
+  // found" (almost always the after-effect of a dev FLUSHDB against the
+  // active target). DELs the persisted schema-hash sentinel and re-arms
+  // scheduleBootstrap so the index is recreated without a process restart.
+  setBootstrapSelfHealCallback(() => {
+    const target = (() => { try { return getActiveTarget(); } catch { return null; } })();
+    if (!target) return;
+    const client = getActiveRedisClient();
+    if (!client) return;
+    // Drop the canonical schema-hash key so bootstrapFrtb's skip-when-
+    // unchanged path can't short-circuit. Best-effort: a missing key (the
+    // common case after FLUSHDB) is a no-op.
+    void (async () => {
+      try {
+        await (client as unknown as { call: (cmd: string, ...args: unknown[]) => Promise<unknown> })
+          .call("DEL", schemaHashKey(target.label));
+      } catch { /* DEL failure must not block self-heal scheduling */ }
+      scheduleBootstrap(
+        target,
+        client as unknown as Parameters<typeof scheduleBootstrap>[1],
+        opts.schema,
+      );
+    })();
   });
 
   registerSourcesProxyRoutes(app, { sourceBase: opts.sourceBase, corsAllowed });

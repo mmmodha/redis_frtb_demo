@@ -58,6 +58,15 @@ export function __resetDriftResultsForTests(): void {
   results.length = 0;
 }
 
+// Wave 6.39.I — production-callable clear. Wired into the active-target
+// change listener so entries from the prior target's keys / buckets stop
+// surfacing on /admin/drift-status after a profile switch. The detector
+// only persists results in this in-memory ring buffer, so there is no
+// Redis state to wipe alongside it.
+export function clearDriftResults(): void {
+  results.length = 0;
+}
+
 // Parse a RESP2 flat key/value HGETALL reply OR a RESP3 map. Returns null
 // for empty/missing hashes so the caller can skip silently rather than
 // recording a false-positive drift.

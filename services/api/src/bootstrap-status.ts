@@ -65,6 +65,13 @@ let status: BootstrapStatusSnapshot = { phase: "idle" };
 let generation = 0;
 let debounceTimer: ReturnType<typeof setTimeout> | null = null;
 let debounceMs = 250;
+// Wave 6.39.I — self-heal callback installed by createServer. Fired when a
+// runtime route detects "Unknown Index name" / "index not found" against
+// FT.AGGREGATE — almost always the after-effect of a dev running `redis-cli
+// FLUSHDB` against the active target. The callback drops the persisted
+// `bootstrap:schema-hash:{label}` key and re-arms `scheduleBootstrap` so
+// /readyz lands back at ready within ~2s without a process restart.
+let selfHealCallback: (() => void) | null = null;
 
 export function getBootstrapStatus(): BootstrapStatusSnapshot {
   return { ...status };
@@ -77,6 +84,7 @@ export function resetBootstrapStatusForTests(): void {
   if (debounceTimer) { clearTimeout(debounceTimer); debounceTimer = null; }
   debounceMs = 250;
   runner = bootstrapFrtb;
+  selfHealCallback = null;
 }
 
 // Test-only seam — shrink the debounce window so unit tests stay fast.
@@ -144,6 +152,29 @@ type BootstrapRunner = (
 let runner: BootstrapRunner = bootstrapFrtb;
 export function setBootstrapRunnerForTests(fn: BootstrapRunner | null): void {
   runner = fn ?? bootstrapFrtb;
+}
+
+// Wave 6.39.I — install a self-heal callback. createServer registers a
+// closure that DELs the persisted schema-hash sentinel and re-invokes
+// scheduleBootstrap against the active target. Pass `null` to clear (test
+// teardown / disable).
+export function setBootstrapSelfHealCallback(cb: (() => void) | null): void {
+  selfHealCallback = cb;
+}
+
+// Wave 6.39.I — invoked from translateRedisError on the index-missing
+// branch. Drops the in-memory `ready` phase so the wired-up self-heal
+// callback's scheduleBootstrap() actually runs (otherwise it short-circuits
+// on the unchanged-target check), then fires the callback. Idempotent: a
+// concurrent in-flight bootstrap (`running` or `partial`) is left alone so
+// rapid request bursts don't thrash the runner.
+export function triggerBootstrapSelfHeal(): void {
+  if (status.phase === "ready") {
+    status = { phase: "idle" };
+  }
+  if (selfHealCallback) {
+    try { selfHealCallback(); } catch { /* callback errors must not break the route */ }
+  }
 }
 
 // Schedule a background bootstrap against `target` using `client`. Debounced
