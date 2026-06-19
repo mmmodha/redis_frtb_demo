@@ -192,6 +192,37 @@ export class InflightConflictError extends Error {
   }
 }
 
+// Wave 6.43.B.4 — switch progress surface read by the in-flight SwitchBanner.
+// Mirrors services/api/src/active-target.ts SwitchStatus shape. Phases for
+// per-service rows include the terminal set the banner uses to decide when
+// to auto-hide.
+export type SwitchServicePhase =
+  | "pending"
+  | "draining"
+  | "drained"
+  | "committed"
+  | "push_failed"
+  | "drain_timeout"
+  | "error";
+
+export interface SwitchServiceState {
+  name: string;
+  phase: SwitchServicePhase;
+  drained_at?: number;
+  committed_at?: number;
+  error?: string;
+}
+
+export interface SwitchStatus {
+  current_switch_id: string | null;
+  phase: "idle" | "prepare" | "draining" | "committed" | string;
+  per_service: SwitchServiceState[];
+}
+
+export function getSwitchStatus(): Promise<SwitchStatus> {
+  return getJson<SwitchStatus>("/internal/redis/active-target/switch-status");
+}
+
 export async function activateConnection(id: string): Promise<ConnectionProfile> {
   const res = await fetch(`${apiBase()}/connections/${id}/activate`, {
     method: "POST",

@@ -634,6 +634,64 @@
   padding: 2px 8px;
 }
 
+/* Wave 6.43.B.4: in-flight switch banner — same amber tone as
+   .lockout-banner, mounted inside the Connections panel above the cluster
+   list while a target switch is in progress. Per-service rows show a
+   phase pill plus a spinner until the row reaches a terminal phase. */
+.switch-banner {
+  display: grid;
+  gap: 4px;
+  margin: 0 0 calc(var(--grid) * 2);
+  padding: calc(var(--grid) * 1.5) calc(var(--grid) * 2);
+  background: rgba(240, 180, 41, 0.12);
+  border: 1px solid rgba(240, 180, 41, 0.55);
+  border-left: 3px solid #f0b429;
+  border-radius: var(--radius);
+  color: var(--redis-text-primary);
+}
+.switch-banner__title { font-size: 0.9375rem; color: #f0b429; }
+.switch-banner__target { font-weight: 700; }
+.switch-banner__id { color: var(--redis-text-secondary); font-family: var(--font-mono); }
+.switch-banner__items {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--grid);
+}
+.switch-banner__item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  color: var(--redis-text-secondary);
+  background: rgba(240, 180, 41, 0.08);
+  border-radius: var(--radius);
+  padding: 2px 8px;
+}
+.switch-banner__svc { color: var(--redis-text-primary); font-weight: 600; }
+.switch-banner__pill {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: var(--radius);
+  font-size: 0.75rem;
+  font-weight: 600;
+  background: rgba(240, 180, 41, 0.18);
+  color: #f0b429;
+}
+.switch-banner__pill--committed {
+  background: rgba(0, 153, 102, 0.18);
+  color: #00a86b;
+}
+.switch-banner__pill--push_failed,
+.switch-banner__pill--drain_timeout,
+.switch-banner__pill--error {
+  background: rgba(220, 56, 45, 0.18);
+  color: #dc382d;
+}
+
 .profile-card__row-error {
   margin: calc(var(--grid)) 0 0;
   padding: calc(var(--grid)) calc(var(--grid) * 1.5);

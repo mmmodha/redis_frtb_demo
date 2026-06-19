@@ -8,6 +8,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { EnterpriseCallout } from "../components/EnterpriseCallout";
 import { PanelCard } from "../components/PanelCard";
+import { SwitchBanner } from "../components/SwitchBanner";
 import { useInflight } from "../hooks/useInflight";
 import {
   activateConnection,
@@ -72,6 +73,12 @@ export function ConnectionsPanel() {
   // the existing profile's id so the "Switch to Edit" button can reopen the
   // dialog on it. Cleared on every dialog open / mode switch.
   const [dialogBanner, setDialogBanner] = useState<{ message: string; existingId: string | null } | null>(null);
+  // Wave 6.43.B.4 — bumped on every successful Activate/Reconnect so the
+  // SwitchBanner re-mounts and starts a fresh polling cycle. The pending
+  // label is the target name the user just asked to switch to and is used
+  // for the banner header until the api confirms the new active target.
+  const [switchTrigger, setSwitchTrigger] = useState<number>(0);
+  const [pendingSwitchLabel, setPendingSwitchLabel] = useState<string | null>(null);
   const inflight = useInflight();
   const lockedOut = inflight.count > 0;
 
@@ -194,10 +201,16 @@ export function ConnectionsPanel() {
   async function onActivate(id: string) {
     setActionBusy((s) => ({ ...s, [id]: true }));
     setRowError((s) => ({ ...s, [id]: null }));
+    // Wave 6.43.B.4 — kick off the in-flight switch banner as soon as the
+    // user clicks Activate so the polling cycle begins within 500ms of the
+    // POST landing.
+    const targetProfile = profiles.find((p) => p.id === id);
     try {
       await activateConnection(id);
       const t = await getActiveTarget().catch(() => null);
       setTarget(t);
+      setPendingSwitchLabel(targetProfile?.name ?? null);
+      setSwitchTrigger((n) => n + 1);
       // Notify the shell so the ActiveTargetPill can re-fetch.
       window.dispatchEvent(new CustomEvent("connections:active-changed"));
     } catch (e) {
@@ -221,10 +234,13 @@ export function ConnectionsPanel() {
     setActionBusy((s) => ({ ...s, [id]: true }));
     setRowError((s) => ({ ...s, [id]: null }));
     setRowSuccess((s) => ({ ...s, [id]: null }));
+    const targetProfile = profiles.find((p) => p.id === id);
     try {
       await activateConnection(id);
       const t = await getActiveTarget().catch(() => null);
       setTarget(t);
+      setPendingSwitchLabel(targetProfile?.name ?? null);
+      setSwitchTrigger((n) => n + 1);
       window.dispatchEvent(new CustomEvent("connections:active-changed"));
       setRowSuccess((s) => ({ ...s, [id]: "Reconnected — bootstrap re-running" }));
     } catch (e) {
@@ -261,6 +277,8 @@ export function ConnectionsPanel() {
           Redis Enterprise cluster profiles — add, test modules + TLS + ACL, set the active target.
         </p>
       </header>
+
+      <SwitchBanner triggerId={switchTrigger} targetLabel={pendingSwitchLabel} />
 
       <div className="connections-panel__callouts">
         <EnterpriseCallout signal="ClusterScaleOut">
