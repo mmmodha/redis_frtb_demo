@@ -16,6 +16,13 @@ import { buildApiError } from "./empty-target";
 //   Equity|FX Delta|Vega: risk_value is { spot: number } or scalar number.
 //   Equity|FX Curvature:  risk_value is { cvr_up: number; cvr_down: number }.
 // Treat everything optional; consumers branch on shape.
+// Wave 6.47.B — `weight` may arrive as either a scalar (Equity / FX / FX-
+// constant-table classes) or a tenor-keyed object (`{ "3M": w, "6M": w, ... }`
+// for GIRR / other `by_tenor` classes). The /pivot route enriches each row
+// from `schema.risk_weights[<ref>]`, which is itself a discriminated union;
+// the union is widened to `unknown` here so consumers can branch on shape
+// (see DrilldownValueCell + the BucketDrilldown weight `<td>` for the two
+// concrete render branches).
 export interface PivotDoc {
   trade_id?: string;
   risk_class?: string;
@@ -23,7 +30,7 @@ export interface PivotDoc {
   sensitivity_type?: string;
   risk_factor?: string;
   book?: string;
-  weight?: number;
+  weight?: number | Record<string, number> | unknown;
   risk_value?: unknown;
   [k: string]: unknown;
 }

@@ -317,7 +317,7 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
     throw new Error("no active redis client and no fallback opts.redis provided");
   };
 
-  registerPivotRoute(app, getRedis);
+  registerPivotRoute(app, getRedis, { schema: opts.schema });
   registerCalcRoute(app, getRedis, { correlations: opts.correlations ?? {}, schema: opts.schema });
   registerSuggestRoutes(app, getRedis, { corsAllowed });
   registerFacetsRoute(app, getRedis, { schema: opts.schema });
