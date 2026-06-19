@@ -3,11 +3,6 @@ import { PanelCard } from "../components/PanelCard";
 import { EnterpriseCallout } from "../components/EnterpriseCallout";
 import { LatencyStrip } from "../components/LatencyStrip";
 import { SuggestCombobox } from "../components/SuggestCombobox";
-import {
-  EMPTY_FILTER_CHIPS_VALUE,
-  FilterChips,
-  type FilterChipsValue,
-} from "../components/FilterChips";
 import { apiBase } from "../lib/api";
 import {
   EmptyTargetError,
@@ -30,12 +25,6 @@ export function PivotPanel(): JSX.Element {
   const [tradeId, setTradeId] = useState<string>("");
   const [riskFactor, setRiskFactor] = useState<string>("");
   const [fuzzy, setFuzzy] = useState<boolean>(true);
-  // Wave 6.41.C — local-only FilterChips state. /pivot does not yet accept
-  // include/desk/region/bucket on the api side, so the chip strip is purely
-  // visual on this panel (held in component state, never serialised onto
-  // the wire). Tracked here so the strip survives re-renders within the
-  // panel and the surface lock with CalcPanel stays parallel.
-  const [includeFilters, setIncludeFilters] = useState<FilterChipsValue>(EMPTY_FILTER_CHIPS_VALUE);
   const limit = DEFAULT_LIMIT;
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
@@ -147,11 +136,6 @@ export function PivotPanel(): JSX.Element {
       <EnterpriseCallout signal="RedisQueryEngine">
         Sub-100ms FT.SEARCH across millions of native-JSON sensitivity docs — no flattening, no JOIN tax.
       </EnterpriseCallout>
-
-      {/* Wave 6.41.C — visual-only chip strip mirrored from CalcPanel. */}
-      <div className="pivot-panel__include-chips" data-testid="pivot-filter-chips">
-        <FilterChips value={includeFilters} onChange={setIncludeFilters} />
-      </div>
 
       <PanelCard
         title="Filters"
