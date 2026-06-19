@@ -1,8 +1,12 @@
-import { describe, it, expect, afterEach, vi } from "vitest";
+import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { CalcPanel } from "../../src/panels/CalcPanel";
 
 const originalFetch = globalThis.fetch;
+
+beforeEach(() => {
+  try { window.localStorage.setItem("frtb:calc:view:v1", "advanced"); } catch { /* ignore */ }
+});
 
 afterEach(() => {
   globalThis.fetch = originalFetch;

@@ -40,6 +40,9 @@ beforeEach(() => {
   globalThis.fetch = suggestFetchMock();
   try {
     window.localStorage.clear();
+    // Wave 6.45.B — pin to Advanced view so the advanced-filters disclosure
+    // assertions below see the pre-6.45.B CalcPanel surface.
+    window.localStorage.setItem("frtb:calc:view:v1", "advanced");
   } catch {
     // best-effort
   }

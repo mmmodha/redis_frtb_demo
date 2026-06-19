@@ -1,9 +1,13 @@
-import { describe, it, expect, afterEach, vi } from "vitest";
+import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { CalcPanel } from "../../src/panels/CalcPanel";
 import type { CalcSbmResponse } from "../../src/lib/calc";
 
 const originalFetch = globalThis.fetch;
+
+beforeEach(() => {
+  try { window.localStorage.setItem("frtb:calc:view:v1", "advanced"); } catch { /* ignore */ }
+});
 
 // Mirrors the helpers in CalcPanel.bucket-subset.test.tsx / .regime.test.tsx —
 // captures the body of every outbound fetch so the test can assert the wire

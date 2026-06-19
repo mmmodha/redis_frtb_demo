@@ -445,6 +445,42 @@ button.drilldown-pill:focus-visible {
   max-width: 72ch;
 }
 
+/* Wave 6.45.B — Simple | Advanced pill toggle. Sits above the calc body
+   and switches between the streamlined SimpleCalcView and the full
+   pre-6.45.B CalcPanel surface. */
+.calc-panel__view-toggle {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  margin: 0 0 calc(var(--grid) * 2);
+  background: var(--redis-surface-2, #1B2024);
+  border: 1px solid var(--redis-border, #2A3338);
+  border-radius: var(--radius, 5px);
+}
+.calc-panel__view-toggle-btn {
+  min-height: 32px;
+  padding: 0 calc(var(--grid) * 2);
+  background: transparent;
+  color: var(--redis-text-secondary, #C8D1D5);
+  border: 0;
+  border-radius: 4px;
+  font-size: 0.875rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 120ms, color 120ms;
+}
+.calc-panel__view-toggle-btn:hover:not(:disabled) {
+  color: var(--redis-text-primary, #F0F4F5);
+}
+.calc-panel__view-toggle-btn:focus-visible {
+  outline: 2px solid var(--redis-text-link, #8AB4C7);
+  outline-offset: 2px;
+}
+.calc-panel__view-toggle-btn--active {
+  background: var(--redis-hyper, #FF4438);
+  color: var(--redis-text-primary, #F0F4F5);
+}
+
 .calc-panel__cta-row {
   display: flex;
   gap: calc(var(--grid) * 1.5);

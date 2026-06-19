@@ -10,6 +10,8 @@ import type { CalcSbmResponse } from "../../src/lib/calc";
 const originalFetch = globalThis.fetch;
 const originalSearch = typeof window !== "undefined" ? window.location.search : "";
 
+
+
 // Mirror of the capture helper in the other CalcPanel test files — records
 // every outbound /calc/sbm request body so individual assertions can dissect
 // them (no fragile URL string-matching).
@@ -57,7 +59,12 @@ function setSearch(search: string) {
 }
 
 beforeEach(() => {
-  vi.stubGlobal("localStorage", makeMemoryStorage());
+  const ls = makeMemoryStorage();
+  // Wave 6.45.B — pin to the Advanced view so the legacy assertions below
+  // (Scenario select, Show Redis commands toggle, advanced-filters) see the
+  // pre-6.45.B CalcPanel surface; the production default is Simple.
+  ls.setItem("frtb:calc:view:v1", "advanced");
+  vi.stubGlobal("localStorage", ls);
   setSearch("");
 });
 

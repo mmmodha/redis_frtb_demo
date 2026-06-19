@@ -1,9 +1,13 @@
-import { describe, it, expect, afterEach, vi } from "vitest";
+import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import { act, render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { CalcPanel } from "../../src/panels/CalcPanel";
 import type { TotalSbmResponse } from "../../src/lib/calc";
 
 const originalFetch = globalThis.fetch;
+
+beforeEach(() => {
+  try { window.localStorage.setItem("frtb:calc:view:v1", "advanced"); } catch { /* ignore */ }
+});
 
 // Wave 5.96B/5.96C — Total SBM card tests. The 27-cell orchestrator is
 // rendered alongside the per-cell Calculate card and surfaces (a) the
