@@ -207,6 +207,27 @@
 }
 .bucket-drilldown__load-more:disabled { opacity: 0.4; cursor: not-allowed; }
 
+/* Wave 6.48.B — group-by control sits between the K_b drilldown content and
+   the rows table, mirroring the .pivot-fuzzy-toggle visual idiom (subtle
+   border, secondary background). */
+.bucket-drilldown__groupby {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0.5rem 0 0.25rem;
+  font-size: 0.8125rem;
+  color: var(--redis-text-secondary, #8a8f99);
+}
+.bucket-drilldown__groupby-select {
+  min-height: 28px;
+  padding: 0 0.5rem;
+  background: var(--redis-bg-secondary, #1a1d24);
+  color: var(--redis-text-primary, #e6e7eb);
+  border: 1px solid var(--redis-border-primary, rgba(255, 255, 255, 0.15));
+  border-radius: var(--radius, 4px);
+  cursor: pointer;
+}
+
 /* Wave 5.96A — per-bucket K_b drilldown: formula + Redis command blocks.
    Sits above the existing tenor-breakdown content; visually grouped with a
    subtle background so the math+command pair reads as one unit. */
