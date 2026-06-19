@@ -5,11 +5,27 @@ import type { CalcSbmResponse } from "../../src/lib/calc";
 
 const originalFetch = globalThis.fetch;
 
-// Capture every fetch body so individual assertions can dissect them.
+// Capture every /calc/sbm POST body so individual assertions can dissect them.
+// Wave 6.41.D — filter out the /calc/sbm/by-desk fetches the new top-N panel
+// fires after each calc lands so the capture list stays focused on the bodies
+// these tests reason about.
+function urlOf(input: RequestInfo | URL): string {
+  return typeof input === "string"
+    ? input
+    : input instanceof URL
+      ? input.toString()
+      : input.url;
+}
+function isCalcSbmCall(input: RequestInfo | URL): boolean {
+  const u = urlOf(input);
+  return u.includes("/calc/sbm") && !u.includes("/calc/sbm/by-desk");
+}
 function mockCalcWithCapture(body: CalcSbmResponse) {
   const sent: Array<unknown> = [];
-  globalThis.fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
-    if (init?.body) sent.push(JSON.parse(String(init.body)));
+  globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (init?.body && isCalcSbmCall(input)) {
+      sent.push(JSON.parse(String(init.body)));
+    }
     return new Response(JSON.stringify(body), {
       headers: { "content-type": "application/json" },
     });
@@ -150,8 +166,10 @@ describe("Wave 5.31a — Calc bucket-subset refine row", () => {
       per_bucket: baseResponse.per_bucket.filter((b) => b.bucket !== "GBP"),
       shard_breakdown: baseResponse.shard_breakdown.filter((s) => s.shard !== "shard-3"),
     };
-    globalThis.fetch = vi.fn(async (_i: RequestInfo | URL, init?: RequestInit) => {
-      if (init?.body) sent.push(JSON.parse(String(init.body)));
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.body && isCalcSbmCall(input)) {
+        sent.push(JSON.parse(String(init.body)));
+      }
       return new Response(JSON.stringify(narrowed), {
         headers: { "content-type": "application/json" },
       });
