@@ -86,44 +86,30 @@ async function probe(redis: RedisLike): Promise<number> {
   // Tests set `testCacheKeyOverride` and exercise the helper against synthetic
   // RedisLike fakes — skip the boot-client path entirely in that mode so a
   // missing active-target singleton cannot stall the unit suite waiting on a
-  // real socket.
-  if (testCacheKeyOverride === null) {
+  // real socket. Production code that has not explicitly activated a profile
+  // (active-target label === "default", i.e. the un-set fallback) is treated
+  // the same way: we have nothing to gain from probing the loopback default.
+  const useBoot = testCacheKeyOverride === null && resolveCacheKey() !== "default";
+  if (useBoot) {
     // Prefer the boot client (offline queue enabled, default ioredis retry
     // budget) for the probe so a pool-member wrapper in mid-recycle does not
     // reject MODULE LIST with "Stream isn't writeable". The boot client is a
     // long-lived singleton keyed on the active target; on a target swap it
     // is disconnected and rebuilt before the next caller observes the change.
     const boot = (() => {
-      try { return getActiveRedisClient(); } catch (e) {
-        // eslint-disable-next-line no-console
-        console.error("[smv] getActiveRedisClient threw:", (e as Error).message);
-        return null;
-      }
+      try { return getActiveRedisClient(); } catch { return null; }
     })();
-    // eslint-disable-next-line no-console
-    console.error("[smv] boot=", boot ? "OK" : "null");
     if (boot) {
       try {
-        const r = await boot.call("MODULE", "LIST");
-        const v = parseModuleList(r);
-        // eslint-disable-next-line no-console
-        console.error("[smv] boot probe ver=", v);
-        return v;
-      } catch (e) {
-        // eslint-disable-next-line no-console
-        console.error("[smv] boot probe threw:", (e as Error).message);
+        return parseModuleList(await boot.call("MODULE", "LIST"));
+      } catch {
+        // Fall through to the RedisLike-based probe below.
       }
     }
   }
   try {
-    const r = await redis.call("MODULE", "LIST");
-    const v = parseModuleList(r);
-    // eslint-disable-next-line no-console
-    console.error("[smv] redis probe ver=", v);
-    return v;
-  } catch (e) {
-    // eslint-disable-next-line no-console
-    console.error("[smv] redis probe threw:", (e as Error).message);
+    return parseModuleList(await redis.call("MODULE", "LIST"));
+  } catch {
     return 0;
   }
 }
