@@ -2249,6 +2249,135 @@ describe("POST /calc/sbm — MVP endpoint", () => {
       expect(res.json().engine).toBe("ft_aggregate");
       expect(fr.calls.some((c) => c.command === "HGETALL")).toBe(false);
     });
+
+    // Wave 6.47.A — the rollup readout silently dropped the `components` opt-in
+    // that the /calc/sbm route already passes, so warm rollup hits returned
+    // intermediates without ws_components / cvr_components and the UI's
+    // per-component breakdown tables disappeared. These tests pin the new
+    // contract: per-tenor (GIRR) breakdowns emitted from the per-tenor map
+    // already in hand; cross_components NOT emitted from the rollup path
+    // (the data is not in the rollup hashes).
+    it("GIRR Delta rollup: per-tenor ws_components emitted with k=tenor", async () => {
+      const fr = fakeRedis();
+      fr.setResponse("FT.AGGREGATE", (args: unknown[]) => {
+        if (args.includes("APPLY")) {
+          throw new Error("fast-path FT.AGGREGATE should not run when rollup is present");
+        }
+        return ftAggregateReply(["USD"]);
+      });
+      const tenorSums: Record<string, number> = { "3M": 2, "6M": 3, "1Y": 4 };
+      fr.setResponse("HGETALL", (args: unknown[]) => {
+        const key = String(args[0]);
+        const m = key.match(/^rollup:\{GIRR:USD\}:Delta:tenor:(.+)$/);
+        if (m) {
+          const t = m[1]!;
+          const ws = tenorSums[t];
+          if (ws === undefined) return [];
+          return ["sum_ws", String(ws), "sum_ws_sq", String(ws * ws), "count", "3"];
+        }
+        return [];
+      });
+      app = await createServer({ redis: fr, schema: fastPathSchema() });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: { risk_class: "GIRR", sensitivity_type: "Delta" },
+      });
+      expect(res.statusCode).toBe(200);
+      const pb = res.json().per_bucket[0];
+      const ws = pb.intermediate.ws_components;
+      expect(Array.isArray(ws)).toBe(true);
+      expect(ws).toEqual([
+        { k: "3M", ws: 2, ws_squared: 4 },
+        { k: "6M", ws: 3, ws_squared: 9 },
+        { k: "1Y", ws: 4, ws_squared: 16 },
+      ]);
+      // cross_components NOT emitted from the rollup path: per-(k,l) data is
+      // not in the rollup hashes; the lazy /calc/sbm/bucket-cross-detail
+      // endpoint covers that surface.
+      expect(pb.intermediate.cross_components).toBeUndefined();
+      expect(pb.intermediate.cross_components_truncated).toBeUndefined();
+      expect(pb.intermediate.cross_components_total_count).toBeUndefined();
+    });
+
+    it("GIRR Curvature rollup: per-tenor cvr_components emitted in tenor order", async () => {
+      // ρ_curv=0 → K_b² = Σ_t CVR_t² regardless of direction. Up direction
+      // wins on magnitude so the picked S_b = Σ up.
+      const fr = fakeRedis();
+      fr.setResponse("FT.AGGREGATE", (args: unknown[]) => {
+        if (args.includes("APPLY")) {
+          throw new Error("fast-path FT.AGGREGATE should not run when rollup is present");
+        }
+        return ftAggregateReply(["USD"]);
+      });
+      const tenorPairs: Record<string, [number, number]> = {
+        "3M": [0.5, 0.2],
+        "6M": [0.7, -0.1],
+        "1Y": [0.9, 0.3],
+      };
+      fr.setResponse("HGETALL", (args: unknown[]) => {
+        const key = String(args[0]);
+        const m = key.match(/^rollup:\{GIRR:USD\}:Curvature:tenor:(.+)$/);
+        if (m) {
+          const t = m[1]!;
+          const pair = tenorPairs[t];
+          if (!pair) return [];
+          const [up, dn] = pair;
+          return [
+            "sum_ws_up", String(up),
+            "sum_ws_up_sq", String(up * up),
+            "sum_ws_down", String(dn),
+            "sum_ws_down_sq", String(dn * dn),
+            "count", "2",
+          ];
+        }
+        return [];
+      });
+      app = await createServer({ redis: fr, schema: fastPathSchema() });
+      const res = await app.inject({
+        method: "POST",
+        url: "/calc/sbm",
+        payload: { risk_class: "GIRR", sensitivity_type: "Curvature" },
+      });
+      expect(res.statusCode).toBe(200);
+      const pb = res.json().per_bucket[0];
+      const cvr = pb.intermediate.curvature.cvr_components;
+      expect(Array.isArray(cvr)).toBe(true);
+      expect(cvr).toEqual([
+        { k: "3M", cvr_up: 0.5, cvr_down: 0.2 },
+        { k: "6M", cvr_up: 0.7, cvr_down: -0.1 },
+        { k: "1Y", cvr_up: 0.9, cvr_down: 0.3 },
+      ]);
+      // Regression — cross_components must NOT appear on the rollup path
+      // even for Curvature (no per-(k,l) data in the rollup hashes).
+      expect(pb.intermediate.cross_components).toBeUndefined();
+    });
+
+    it("tryRollupReadout: components undefined keeps pre-fix behaviour (no breakdowns on intermediate)", async () => {
+      // Direct call exercises the opt-in: when the route omits components
+      // the intermediate must NOT carry ws_components / cvr_components,
+      // preserving every existing caller's response shape.
+      const { tryRollupReadout } = await import("../src/sbm/aggregate-via-index.ts");
+      const fr = fakeRedis();
+      const tenorSums: Record<string, number> = { "3M": 2, "6M": 3, "1Y": 4 };
+      fr.setResponse("HGETALL", (args: unknown[]) => {
+        const key = String(args[0]);
+        const m = key.match(/^rollup:\{GIRR:USD\}:Delta:tenor:(.+)$/);
+        if (m) {
+          const t = m[1]!;
+          const ws = tenorSums[t];
+          if (ws === undefined) return [];
+          return ["sum_ws", String(ws), "sum_ws_sq", String(ws * ws), "count", "3"];
+        }
+        return [];
+      });
+      const out = await tryRollupReadout(fr, fastPathSchema()!, "GIRR", "delta", ["USD"]);
+      expect(out).not.toBeNull();
+      expect(out!).toHaveLength(1);
+      expect(out![0]!.intermediate?.ws_components).toBeUndefined();
+      expect(out![0]!.intermediate?.cross_components).toBeUndefined();
+      expect(out![0]!.intermediate?.curvature?.cvr_components).toBeUndefined();
+    });
   });
   });
 });

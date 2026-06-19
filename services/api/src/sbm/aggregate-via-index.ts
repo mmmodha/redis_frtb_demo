@@ -870,6 +870,12 @@ export async function tryRollupReadout(
   riskClass: string,
   leg: FastLeg,
   buckets: ReadonlyArray<string>,
+  // Wave 6.47.A — opt-in per-component breakdown. perTenor (GIRR) classes
+  // can derive ws_components / cvr_components from the same per-tenor map
+  // the K_b math already iterates; cross_components are intentionally
+  // omitted (the rollup hashes hold no per-(k,l) data — the lazy
+  // /calc/sbm/bucket-cross-detail endpoint covers that surface).
+  components: ComponentsOpts | undefined = undefined,
 ): Promise<BucketResult[] | null> {
   const start = process.hrtime.bigint();
   const rc = riskClass.toUpperCase();
@@ -926,6 +932,11 @@ export async function tryRollupReadout(
       let sumWs: number;
       let sumWsSq: number;
       let count = 0;
+      // Wave 6.47.A — collect per-tenor (ws, ws_squared) so we can emit
+      // ws_components when the caller opted in. Mirrors the field-naming
+      // convention used by buildDeltaVegaComponents (tenor key, not field
+      // alias) so the UI sort on GIRR_TENORS keeps working.
+      const wsComponents: WsComponent[] | null = (components && perTenor) ? [] : null;
       if (perTenor && leg === "delta") {
         // GIRR Delta: ws_squared_sum operates on per-tenor SUMs (Σ_t (sum_ws_t)²),
         // mirroring girr_delta.lua / bucketResultFromRow.
@@ -936,8 +947,10 @@ export async function tryRollupReadout(
           if (!h) return null;
           const ws = Number(h.sum_ws ?? 0);
           sumWs += ws;
-          sumWsSq += ws * ws;
+          const wsSq = ws * ws;
+          sumWsSq += wsSq;
           count += Number(h.count ?? 0);
+          if (wsComponents) wsComponents.push({ k: t, ws, ws_squared: wsSq });
         }
       } else if (perTenor) {
         // GIRR Vega: per-row sum_ws_sq summed across tenors.
@@ -946,9 +959,12 @@ export async function tryRollupReadout(
         for (const t of tenors) {
           const h = tm.get(t);
           if (!h) return null;
-          sumWs += Number(h.sum_ws ?? 0);
-          sumWsSq += Number(h.sum_ws_sq ?? 0);
+          const ws = Number(h.sum_ws ?? 0);
+          const wsSq = Number(h.sum_ws_sq ?? 0);
+          sumWs += ws;
+          sumWsSq += wsSq;
           count += Number(h.count ?? 0);
+          if (wsComponents) wsComponents.push({ k: t, ws, ws_squared: wsSq });
         }
       } else {
         // Scalar classes (Equity / FX): single hash carries all aggregates.
@@ -976,13 +992,23 @@ export async function tryRollupReadout(
           await storeKbCacheEntry(redis, cacheKey, r.K_b, contentHash);
         }
       }
+      const intermediate: BucketIntermediate = {
+        path: "fast",
+        ws_squared_sum: r.ws_squared_sum,
+        cross_term: r.cross_term,
+      };
+      // Wave 6.47.A — attach per-tenor ws breakdown when requested. Scalar
+      // (non-perTenor) classes need a second FT.AGGREGATE grouped by
+      // risk_factor that the rollup path doesn't run, so we deliberately
+      // omit ws_components there rather than emit a half-truth.
+      if (wsComponents) intermediate.ws_components = wsComponents;
       out.push({
         bucket: b,
         K_b: r.K_b,
         S_b: sumWs,
         count,
         ms,
-        intermediate: { path: "fast", ws_squared_sum: r.ws_squared_sum, cross_term: r.cross_term },
+        intermediate,
       });
       continue;
     }
@@ -1010,6 +1036,26 @@ export async function tryRollupReadout(
     const S_b = winnerIsDown
       ? cvrDown.reduce((a, c) => a + c, 0)
       : cvrUp.reduce((a, c) => a + c, 0);
+    const curvatureInter: BucketIntermediate["curvature"] = {
+      k_plus: kbUp,
+      k_minus: kbDown,
+      winner: winnerIsDown ? "minus" : "plus",
+    };
+    // Wave 6.47.A — attach per-tenor CVR breakdown when requested. The
+    // tenor labels come straight from the schema-ordered `tenors` array
+    // the cvrUp/cvrDown vectors were filled from, so the i-th entry
+    // matches the i-th label.
+    if (components) {
+      const cvrComponents: CvrComponent[] = [];
+      for (let i = 0; i < tenors.length; i++) {
+        cvrComponents.push({
+          k: tenors[i]!,
+          cvr_up: cvrUp[i] ?? 0,
+          cvr_down: cvrDown[i] ?? 0,
+        });
+      }
+      curvatureInter.cvr_components = cvrComponents;
+    }
     out.push({
       bucket: b,
       K_b: winnerIsDown ? kbDown : kbUp,
@@ -1020,7 +1066,7 @@ export async function tryRollupReadout(
         path: "fast",
         ws_squared_sum: wsSq,
         cross_term: (winnerIsDown ? kbDownSq : kbUpSq) - wsSq,
-        curvature: { k_plus: kbUp, k_minus: kbDown, winner: winnerIsDown ? "minus" : "plus" },
+        curvature: curvatureInter,
       },
     });
   }
