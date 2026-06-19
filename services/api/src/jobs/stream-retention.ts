@@ -44,6 +44,12 @@ export interface StreamStatus {
   // before it churns through the MAXLEN window.
   retention_hours_now: number;
   retention_hours_at_cap: number;
+  // Wave 6.41.E.fix3 — monotonic consumer-side counter sourced from
+  // `ingest:consumed:<stream>` (the ingest cli publishes it at 1Hz). Drives
+  // the IngestPanel indexing bar so unbounded streams (stream_maxlen=0)
+  // still show drain progress even though xlen never shrinks. 0 on a fresh
+  // cluster (ingest hasn't published yet) or after FLUSHDB.
+  consumed: number;
 }
 
 export async function readStreamStatus(
@@ -60,6 +66,18 @@ export async function readStreamStatus(
     // /admin/stream-status endpoint stays informational on a fresh cluster.
     xlen = 0;
   }
+  // Wave 6.41.E.fix3 — GET the ingest-published consumed counter. Missing
+  // key (fresh cluster, FLUSHDB, ingest not yet running) collapses to 0.
+  let consumed = 0;
+  try {
+    const reply = await redis.call("GET", `ingest:consumed:${opts.streamKey}`);
+    if (reply !== null && reply !== undefined) {
+      const n = Number(reply);
+      consumed = Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0;
+    }
+  } catch {
+    consumed = 0;
+  }
   const peak = opts.peakRatePerSec;
   const retentionHoursNow = peak > 0 ? xlen / peak / 3600 : 0;
   const retentionHoursAtCap = peak > 0 ? opts.maxLen / peak / 3600 : 0;
@@ -70,6 +88,7 @@ export async function readStreamStatus(
     peak_rate_per_sec: peak,
     retention_hours_now: retentionHoursNow,
     retention_hours_at_cap: retentionHoursAtCap,
+    consumed,
   };
 }
 

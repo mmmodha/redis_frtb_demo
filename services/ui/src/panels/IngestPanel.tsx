@@ -36,8 +36,8 @@ import {
   pushSample,
   readAnchor,
   writeAnchor,
+  type ConsumedSample,
   type IndexingAnchor,
-  type XlenSample,
 } from "../lib/indexingState";
 
 // Wave 5.20a — defensive fallback when dbsize=0 (no rows yet) so the sanity
@@ -2175,11 +2175,16 @@ function GeneratorProgress(props: { run: GeneratorRunState; onCancel: () => void
   );
 }
 
-// Wave 6.41.E — Indexing progress bar. Tracks the consumer-side drain of
-// the input stream (xlen → 0) after the generator has finished producing
-// rows. Polls /admin/stream-status; persists an anchor in localStorage so a
-// tab reload reconstructs % indexed without a server endpoint. Hidden when
-// no anchor exists and xlen == 0.
+// Wave 6.41.E — Indexing progress bar.
+// Wave 6.41.E.fix3 — bar data source switched from `xlen` to the
+// strictly-monotonic `consumed` counter (services/ingest publishes
+// `ingest:consumed:<stream>` at 1Hz; api surfaces it via
+// /admin/stream-status). Unbounded streams (stream_maxlen=0) never see
+// xlen shrink, so the prior peak-xlen design pinned the bar at 0% for
+// large/overnight presets. pct = (consumedNow - consumedAtAnchor) /
+// rowsTotal across both in-generation and post-terminal phases — the
+// split branch is gone. xlen is still read from the same response and
+// used purely for the auto-clear heuristics (idle / FLUSHDB).
 const INDEXING_POLL_MS = 2_500;
 const INDEXING_COMPLETE_MS = 3_000;
 const INDEXING_WINDOW = 10;
@@ -2201,19 +2206,19 @@ function formatEtaSeconds(s: number): string {
 
 function IndexingProgress() {
   const { run } = useGeneratorRun();
+  const [currentConsumed, setCurrentConsumed] = useState<number | null>(null);
   const [currentXlen, setCurrentXlen] = useState<number | null>(null);
-  const [samples, setSamples] = useState<XlenSample[]>([]);
+  const [samples, setSamples] = useState<ConsumedSample[]>([]);
   const [anchor, setAnchor] = useState<IndexingAnchor | null>(null);
   const [completeShownAt, setCompleteShownAt] = useState<number | null>(null);
-  const peakXlenRef = useRef<number>(0);
   const prevRunStatusRef = useRef<string | null>(null);
   // Wave 6.41.E.fix (A) — timeout id held in a ref (not state) so re-renders
   // during the 3s "Indexing complete" toast do not cancel it via the effect
   // cleanup path that was the root cause of the stuck-toast bug.
   const completeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Shared reset used by the C/D auto-clear escape hatches and the 3s
-  // completion timeout callback.
+  // Shared reset used by the auto-clear escape hatches and the 3s completion
+  // timeout callback.
   const resetIndexingState = (): void => {
     if (completeTimeoutRef.current !== null) {
       clearTimeout(completeTimeoutRef.current);
@@ -2222,17 +2227,13 @@ function IndexingProgress() {
     clearAnchor();
     setAnchor(null);
     setCompleteShownAt(null);
-    peakXlenRef.current = 0;
     setSamples([]);
   };
 
   // Mount: restore anchor from localStorage if present.
   useEffect(() => {
     const a = readAnchor();
-    if (a) {
-      setAnchor(a);
-      peakXlenRef.current = a.anchorXlen;
-    }
+    if (a) setAnchor(a);
   }, []);
 
   // Unmount: cancel any pending completion timeout to avoid setState on an
@@ -2254,9 +2255,10 @@ function IndexingProgress() {
         .then((s) => {
           if (cancelled) return;
           const xlen = typeof s.xlen === "number" ? s.xlen : 0;
+          const consumed = typeof s.consumed === "number" ? s.consumed : 0;
           setCurrentXlen(xlen);
-          if (xlen > peakXlenRef.current) peakXlenRef.current = xlen;
-          setSamples((prev) => pushSample(prev, { xlen, ts: Date.now() }, INDEXING_WINDOW));
+          setCurrentConsumed(consumed);
+          setSamples((prev) => pushSample(prev, { consumed, xlen, ts: Date.now() }, INDEXING_WINDOW));
         })
         .catch(() => { /* swallow transient errors */ });
     };
@@ -2265,32 +2267,53 @@ function IndexingProgress() {
     return () => { cancelled = true; clearInterval(id); };
   }, []);
 
-  // Implicit anchor: xlen > 0 with no prior anchor AND no run state in the
-  // context ⇒ treat current xlen as the baseline (e.g. page opened after a
-  // background producer is already running). Any run state defers to the
-  // run-transition effect below.
+  // Wave 6.41.E.fix3 — restart detection. If the consumed counter ever
+  // drops below the anchor's baseline, the ingest process restarted (or
+  // FLUSHDB cleared the published key); re-seed `consumedAtAnchor` at the
+  // new value so the bar continues smoothly without going negative.
+  useEffect(() => {
+    if (anchor === null || currentConsumed === null) return;
+    if (currentConsumed >= anchor.consumedAtAnchor) return;
+    const now = Date.now();
+    const next: IndexingAnchor = {
+      ...anchor,
+      consumedAtAnchor: currentConsumed,
+      lastSeenAt: now,
+    };
+    writeAnchor(next);
+    setAnchor(next);
+  }, [anchor, currentConsumed]);
+
+  // Implicit anchor: xlen > 0 with no prior anchor AND no run state ⇒ treat
+  // current xlen as the rowsTotal estimate and seed `consumedAtAnchor` at
+  // the current consumed value. As the consumer drains the leftover work,
+  // pct grows toward 100%. Skipped while a run is active — the run-status
+  // transition below owns anchor creation in that case.
   useEffect(() => {
     if (anchor !== null) return;
     if (currentXlen === null || currentXlen <= 0) return;
+    if (currentConsumed === null) return;
     if (run !== null) return;
     const now = Date.now();
     const a: IndexingAnchor = {
       runId: null,
       rowsTotal: currentXlen,
-      anchorXlen: currentXlen,
+      consumedAtAnchor: currentConsumed,
       anchorTs: now,
       lastSeenAt: now,
     };
     writeAnchor(a);
     setAnchor(a);
-  }, [anchor, currentXlen, run]);
+  }, [anchor, currentXlen, currentConsumed, run]);
 
   // Run-status transitions:
-  //  • running just started ⇒ wipe any stale anchor + samples so the
-  //    in-generation view (E) and the eventual terminal seed both start
-  //    from a clean slate.
-  //  • running/cancelling ⇒ done/cancelled ⇒ seed the peak-xlen anchor for
-  //    the post-gen drain view.
+  //  • running just started ⇒ wipe any stale anchor + samples then seed a
+  //    fresh anchor at the current consumed baseline so the in-generation
+  //    bar grows from 0% toward run.rowsTotal.
+  //  • running/cancelling ⇒ done/cancelled ⇒ leave the existing run anchor
+  //    in place; it already has the correct baseline. If no anchor exists
+  //    (page opened mid-run with localStorage cleared) seed one now using
+  //    `run.rowsTotal` as the denominator.
   useEffect(() => {
     const prev = prevRunStatusRef.current;
     const status = run?.status ?? null;
@@ -2301,41 +2324,77 @@ function IndexingProgress() {
       && prev !== "cancelling";
     if (isStartingRun) {
       resetIndexingState();
+      // Seed the anchor immediately when we have a consumed sample to
+      // anchor against; otherwise the in-generation effect below picks it
+      // up on the next poll.
+      if (currentConsumed !== null && (run?.rowsTotal ?? 0) > 0) {
+        const now = Date.now();
+        const a: IndexingAnchor = {
+          runId: run?.runId ?? null,
+          rowsTotal: run!.rowsTotal,
+          consumedAtAnchor: currentConsumed,
+          anchorTs: now,
+          lastSeenAt: now,
+        };
+        writeAnchor(a);
+        setAnchor(a);
+      }
       return;
     }
     const becomesTerminal = (status === "done" || status === "cancelled")
       && (prev === "running" || prev === "cancelling");
     if (!becomesTerminal) return;
     if (anchor !== null) return;
-    const baseline = Math.max(
-      peakXlenRef.current,
-      currentXlen ?? 0,
-      run?.rowsTotal ?? 0,
-    );
-    if (baseline <= 0) return;
+    if (currentConsumed === null) return;
+    const rowsTotal = run?.rowsTotal ?? 0;
+    if (rowsTotal <= 0) return;
     const now = Date.now();
     const a: IndexingAnchor = {
       runId: run?.runId ?? null,
-      rowsTotal: baseline,
-      anchorXlen: baseline,
+      rowsTotal,
+      consumedAtAnchor: currentConsumed,
       anchorTs: now,
       lastSeenAt: now,
     };
     writeAnchor(a);
     setAnchor(a);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [run?.status, run?.runId, run?.rowsTotal, anchor, currentXlen]);
+  }, [run?.status, run?.runId, run?.rowsTotal, anchor, currentConsumed]);
 
-  // Wave 6.41.E.fix (A) — xlen reached 0 with an active anchor ⇒ show
+  // While a run is active and the anchor is still missing (e.g. first poll
+  // hadn't landed when the run started), seed it as soon as the consumed
+  // sample arrives so the bar appears on the very next render.
+  useEffect(() => {
+    if (anchor !== null) return;
+    const status = run?.status ?? null;
+    if (status !== "running" && status !== "cancelling") return;
+    if (currentConsumed === null) return;
+    const rowsTotal = run?.rowsTotal ?? 0;
+    if (rowsTotal <= 0) return;
+    const now = Date.now();
+    const a: IndexingAnchor = {
+      runId: run?.runId ?? null,
+      rowsTotal,
+      consumedAtAnchor: currentConsumed,
+      anchorTs: now,
+      lastSeenAt: now,
+    };
+    writeAnchor(a);
+    setAnchor(a);
+  }, [anchor, run?.status, run?.runId, run?.rowsTotal, currentConsumed]);
+
+  // Wave 6.41.E.fix (A) — pct reached 100% with an active anchor ⇒ show
   // "Indexing complete" for INDEXING_COMPLETE_MS then clear. The timeout id
   // lives in a ref so the re-render caused by setCompleteShownAt does not
   // cancel the pending timeout via React's effect cleanup.
   useEffect(() => {
     if (anchor === null) return;
-    if (currentXlen === null) return;
-    if (currentXlen > 0) {
-      // xlen bounced above 0 (producer re-appended) — cancel any pending
-      // toast / clear the complete banner.
+    if (currentConsumed === null) return;
+    const indexed = currentConsumed - anchor.consumedAtAnchor;
+    const atTarget = anchor.rowsTotal > 0 && indexed >= anchor.rowsTotal;
+    if (!atTarget) {
+      // Slipped back below target (rare — restart-detection handles the
+      // common case). Cancel any pending toast / clear the complete banner.
       if (completeTimeoutRef.current !== null) {
         clearTimeout(completeTimeoutRef.current);
         completeTimeoutRef.current = null;
@@ -2350,17 +2409,18 @@ function IndexingProgress() {
       clearAnchor();
       setAnchor(null);
       setCompleteShownAt(null);
-      peakXlenRef.current = 0;
       setSamples([]);
     }, INDEXING_COMPLETE_MS);
-  }, [anchor, currentXlen]);
+  }, [anchor, currentConsumed]);
 
   // Wave 6.41.E.fix (C + D) — auto-clear escape hatches that bypass the 3s
   // toast when the stream is clearly idle:
   //  • C: 2+ trailing xlen=0 polls AND no active run ⇒ clear immediately.
-  //  • D: anchor.anchorXlen > 0 AND every sample in the window is xlen=0
+  //  • D: anchor.rowsTotal > 0 AND every sample in the window has xlen=0
   //       (FLUSHDB heuristic — the user wiped the DB while the bar was
   //       mid-drain) ⇒ clear immediately.
+  // xlen is still in the /admin/stream-status response (the bar's pct math
+  // doesn't use it) so these heuristics remain the cleanest idle signal.
   useEffect(() => {
     if (anchor === null) return;
     if (samples.length === 0) return;
@@ -2372,85 +2432,51 @@ function IndexingProgress() {
     }
     const allZero = samples.length >= 2 && samples.every((s) => s.xlen === 0);
     const hardClear = (trailingZeros >= 2 && !runActive)
-      || (allZero && anchor.anchorXlen > 0);
+      || (allZero && anchor.rowsTotal > 0);
     if (!hardClear) return;
     resetIndexingState();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [samples, anchor, run?.status]);
 
-  // Render decision. The bar has three phases:
-  //  • generating — `run.status` is running/cancelling. Denominator is
-  //    `run.rowsTotal` so the bar tracks progress toward the run target
-  //    (Wave 6.41.E.fix2 — producer outruns the consumer ~50×, so the old
-  //    `rowsAdded` denominator stayed pinned near 0% during generation).
-  //  • anchored — `anchor` + first poll observed. Post-gen / reload-restore
-  //    view (existing behaviour).
-  //  • hidden — neither of the above applies.
-  const isGenerating = run?.status === "running" || run?.status === "cancelling";
-  const isAnchored = anchor !== null && currentXlen !== null;
-  if (!isGenerating && !isAnchored) return null;
+  // Render decision. Single phase: bar is visible iff an anchor exists and
+  // we have observed at least one consumed poll. The in-generation /
+  // post-terminal split is gone — both compute pct off the same formula.
+  if (anchor === null || currentConsumed === null) return null;
 
-  let pct: number;
-  let showingComplete = false;
-  let metaContent: JSX.Element;
+  const showingComplete = completeShownAt !== null;
+  const rawIndexed = currentConsumed - anchor.consumedAtAnchor;
+  const indexed = Math.max(0, rawIndexed);
+  const pct = showingComplete
+    ? 100
+    : computePct(anchor.consumedAtAnchor, currentConsumed, anchor.rowsTotal);
+  const denomLabel = anchor.rowsTotal;
+  const ratePerSec = computeRatePerSec(samples);
+  const projectedRemaining = Math.max(0, denomLabel - indexed);
+  const etaSeconds = !showingComplete
+    && denomLabel > 0
+    && ratePerSec !== null
+    && ratePerSec > 0
+    ? projectedRemaining / ratePerSec
+    : null;
 
-  if (isGenerating) {
-    const rowsAdded = run?.rowsDone ?? 0;
-    const rowsTotal = run?.rowsTotal ?? 0;
-    const xlen = currentXlen ?? 0;
-    const indexed = Math.max(0, rowsAdded - xlen);
-    pct = rowsTotal > 0
-      ? Math.max(0, Math.min(100, (indexed / rowsTotal) * 100))
-      : 0;
-    const denomLabel = rowsTotal > 0 ? rowsTotal : rowsAdded;
-    const ratePerSec = computeRatePerSec(samples);
-    const projectedRemaining = Math.max(0, denomLabel - indexed);
-    const etaSeconds = rowsTotal > 0 && ratePerSec !== null && ratePerSec > 0
-      ? projectedRemaining / ratePerSec
-      : null;
-    metaContent = (
-      <>
-        <span data-testid="indexing-progress-text">
-          {indexed.toLocaleString()} / {denomLabel.toLocaleString()} indexed ({Math.round(pct)}%)
-        </span>
-        <span className="generator-form__progress-stats" data-testid="indexing-progress-stats">
-          {ratePerSec === null || rowsTotal <= 0 ? (
-            "ETA unknown"
-          ) : (
-            <>
-              {formatIntCompact(ratePerSec)} rows/s · ETA {etaSeconds !== null ? formatEtaSeconds(etaSeconds) : "—"}
-            </>
-          )}
-        </span>
-      </>
-    );
-  } else {
-    showingComplete = completeShownAt !== null;
-    pct = showingComplete ? 100 : computePct(anchor!.anchorXlen, currentXlen!);
-    const ratePerSec = computeRatePerSec(samples);
-    const rowsRemaining = Math.max(0, currentXlen!);
-    const etaSeconds = !showingComplete && ratePerSec !== null && ratePerSec > 0
-      ? rowsRemaining / ratePerSec
-      : null;
-    metaContent = showingComplete ? (
-      <span data-testid="indexing-complete">Indexing complete</span>
-    ) : (
-      <>
-        <span data-testid="indexing-progress-text">
-          {rowsRemaining.toLocaleString()} rows remaining ({Math.round(pct)}%)
-        </span>
-        <span className="generator-form__progress-stats" data-testid="indexing-progress-stats">
-          {ratePerSec === null ? (
-            "ETA unknown"
-          ) : (
-            <>
-              {formatIntCompact(ratePerSec)} rows/s · ETA {etaSeconds !== null ? formatEtaSeconds(etaSeconds) : "—"}
-            </>
-          )}
-        </span>
-      </>
-    );
-  }
+  const metaContent: JSX.Element = showingComplete ? (
+    <span data-testid="indexing-complete">Indexing complete</span>
+  ) : (
+    <>
+      <span data-testid="indexing-progress-text">
+        {indexed.toLocaleString()} / {denomLabel.toLocaleString()} indexed ({Math.round(pct)}%)
+      </span>
+      <span className="generator-form__progress-stats" data-testid="indexing-progress-stats">
+        {ratePerSec === null || denomLabel <= 0 ? (
+          "ETA unknown"
+        ) : (
+          <>
+            {formatIntCompact(ratePerSec)} rows/s · ETA {etaSeconds !== null ? formatEtaSeconds(etaSeconds) : "—"}
+          </>
+        )}
+      </span>
+    </>
+  );
 
   return (
     <div

@@ -1,11 +1,15 @@
 // Wave 6.41.E — localStorage-backed anchor for the IngestPanel "Indexing"
-// progress bar. The stream length (xlen) is the source of truth for
-// "is indexing in progress"; this module persists the peak xlen we have
-// observed for the most recent generator run so a tab reload / sleep can
-// reconstruct % indexed without a server-side endpoint. Single-anchor
-// design: a new anchor replaces the previous one.
+// progress bar.
+//
+// Wave 6.41.E.fix3 — data source switched from `xlen` to the strictly-
+// monotonic `consumed` counter (`ingest:consumed:<stream>` published by
+// services/ingest at 1Hz; surfaced through /admin/stream-status). Unbounded
+// streams (stream_maxlen=0) never see xlen shrink, so the prior anchor-on-
+// peak-xlen design pinned the bar at 0%. Pct math is now
+// (consumedNow - consumedAtAnchor) / rowsTotal. Storage key bumped to v2;
+// v1 anchors are silently dropped on read (acceptable per the task spec).
 
-export const STORAGE_KEY = "frtb:indexing:anchor:v1";
+export const STORAGE_KEY = "frtb:indexing:anchor:v2";
 export const ANCHOR_TTL_MS = 24 * 60 * 60 * 1000;
 
 export interface IndexingAnchor {
@@ -13,13 +17,13 @@ export interface IndexingAnchor {
   // anchor was created from an implicit mount-time observation (xlen > 0
   // with no prior anchor — e.g. the page was opened after a run completed).
   runId: string | null;
-  // Total rows the producer queued. Mirrors anchorXlen when the anchor is
-  // seeded from the post-terminal xlen; surfaced so the UI can show the
-  // matching label as the generator bar.
+  // Total rows the producer queued. The denominator for the bar: pct grows
+  // toward 100% as `consumedNow - consumedAtAnchor` approaches rowsTotal.
   rowsTotal: number;
-  // Peak xlen observed for this run; the 100% baseline. Pct math is
-  // (anchorXlen - currentXlen) / anchorXlen.
-  anchorXlen: number;
+  // Value of the ingest consumed counter at the moment this anchor was
+  // created. The 0% baseline. Pct math is
+  // (consumedNow - consumedAtAnchor) / rowsTotal.
+  consumedAtAnchor: number;
   // When this anchor was created. Used for TTL eviction.
   anchorTs: number;
   // Most recent time the anchor was touched (poll, refresh). Persisted so a
@@ -47,7 +51,7 @@ export function readAnchor(now: number = Date.now()): IndexingAnchor | null {
   try { parsed = JSON.parse(raw) as Partial<IndexingAnchor>; }
   catch { return null; }
   if (
-    typeof parsed.anchorXlen !== "number"
+    typeof parsed.consumedAtAnchor !== "number"
     || typeof parsed.anchorTs !== "number"
     || typeof parsed.rowsTotal !== "number"
     || typeof parsed.lastSeenAt !== "number"
@@ -61,7 +65,7 @@ export function readAnchor(now: number = Date.now()): IndexingAnchor | null {
   return {
     runId: typeof parsed.runId === "string" ? parsed.runId : null,
     rowsTotal: parsed.rowsTotal,
-    anchorXlen: parsed.anchorXlen,
+    consumedAtAnchor: parsed.consumedAtAnchor,
     anchorTs: parsed.anchorTs,
     lastSeenAt: parsed.lastSeenAt,
   };
@@ -79,42 +83,49 @@ export function clearAnchor(): void {
   try { store.removeItem(STORAGE_KEY); } catch { /* noop */ }
 }
 
-// Clamp to [0, 100]. anchorXlen <= 0 ⇒ nothing to index ⇒ 100%. A
-// currentXlen above anchorXlen (rare — producer is still appending after
-// the anchor was set) clamps to 0% so the bar does not go negative.
-export function computePct(anchorXlen: number, currentXlen: number): number {
-  if (!Number.isFinite(anchorXlen) || anchorXlen <= 0) return 100;
-  const cur = Math.max(0, currentXlen);
-  const indexed = anchorXlen - cur;
+// Clamp to [0, 100]. rowsTotal <= 0 ⇒ nothing to index ⇒ 100%. A
+// consumedNow below consumedAtAnchor (ingest restarted, FLUSHDB) clamps to
+// 0% — callers detect that case separately and re-anchor.
+export function computePct(
+  consumedAtAnchor: number,
+  consumedNow: number,
+  rowsTotal: number,
+): number {
+  if (!Number.isFinite(rowsTotal) || rowsTotal <= 0) return 100;
+  if (!Number.isFinite(consumedAtAnchor) || !Number.isFinite(consumedNow)) return 0;
+  const indexed = consumedNow - consumedAtAnchor;
   if (indexed <= 0) return 0;
-  if (indexed >= anchorXlen) return 100;
-  return (indexed / anchorXlen) * 100;
+  if (indexed >= rowsTotal) return 100;
+  return (indexed / rowsTotal) * 100;
 }
 
-export interface XlenSample { xlen: number; ts: number }
+// Wave 6.41.E.fix3 — per-tick sample of the strictly-monotonic consumed
+// counter (with the matching xlen for the auto-clear heuristics).
+export interface ConsumedSample { consumed: number; xlen: number; ts: number }
 
-// Sliding-window rate computation. Returns rows-per-sec drained between the
-// oldest and newest sample (positive when xlen is shrinking). Returns null
-// when fewer than two samples or no time has elapsed — the caller renders
-// an "ETA unknown" badge in that case.
-export function computeRatePerSec(samples: XlenSample[]): number | null {
+// Sliding-window rate computation. Returns rows-per-sec indexed between the
+// oldest and newest sample (positive when consumed is growing; consumed is
+// monotonic within an ingest process lifetime so the "negative drain"
+// branch from the xlen-based design is no longer needed). Returns null
+// when fewer than two samples or no time has elapsed.
+export function computeRatePerSec(samples: ConsumedSample[]): number | null {
   if (!Array.isArray(samples) || samples.length < 2) return null;
   const first = samples[0]!;
   const last = samples[samples.length - 1]!;
   const elapsedMs = last.ts - first.ts;
   if (elapsedMs <= 0) return null;
-  const drained = first.xlen - last.xlen;
-  if (drained <= 0) return 0;
-  return (drained / elapsedMs) * 1000;
+  const indexed = last.consumed - first.consumed;
+  if (indexed <= 0) return 0;
+  return (indexed / elapsedMs) * 1000;
 }
 
 // Push a new sample into a bounded sliding window. Pure (returns a new
 // array) so React state updates remain referentially honest.
 export function pushSample(
-  samples: XlenSample[],
-  sample: XlenSample,
+  samples: ConsumedSample[],
+  sample: ConsumedSample,
   windowSize = 10,
-): XlenSample[] {
+): ConsumedSample[] {
   const next = samples.concat([sample]);
   if (next.length > windowSize) next.splice(0, next.length - windowSize);
   return next;

@@ -48,6 +48,10 @@ export interface SnapshotSummary { ts: string; key_count: number }
 export interface SnapshotsResponse { snapshots: SnapshotSummary[] }
 
 // GET /admin/stream-status — Wave 6.39.C
+// Wave 6.41.E.fix3 — adds `consumed`, a strictly-monotonic counter sourced
+// from the ingest service (`ingest:consumed:<stream>` key). The IngestPanel
+// indexing bar reads it so unbounded streams (stream_maxlen=0) still show
+// drain progress. Optional for forward/back compat with older api builds.
 export interface StreamStatusResponse {
   stream_key: string;
   xlen: number;
@@ -55,6 +59,7 @@ export interface StreamStatusResponse {
   peak_rate_per_sec: number;
   retention_hours_now: number;
   retention_hours_at_cap: number;
+  consumed?: number;
 }
 
 // POST /admin/reconcile-bucket — Wave 6.39.C

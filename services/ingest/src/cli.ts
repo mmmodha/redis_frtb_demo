@@ -264,9 +264,27 @@ async function main(): Promise<void> {
     );
   }, 5000).unref();
 
+  // Wave 6.41.E.fix3 — publish the aggregated consumed counter to Redis at
+  // 1Hz so /admin/stream-status (and through it, the IngestPanel indexing
+  // bar) can drive its progress off a strictly-monotonic signal instead of
+  // xlen. The key is `ingest:consumed:<stream>`; on restart it resets to
+  // whatever the new process has consumed since boot — the UI detects that
+  // (consumedNow < anchor.consumedAtAnchor) and re-anchors.
+  const CONSUMED_KEY = `ingest:consumed:${STREAM}`;
+  const publishTick = setInterval(() => {
+    const client = activeClient;
+    if (!client) return;
+    const m = shardRuntime.getMulti();
+    const n = m?.stats.consumed ?? 0;
+    void (client as { call: (cmd: string, ...args: unknown[]) => Promise<unknown> })
+      .call("SET", CONSUMED_KEY, String(n))
+      .catch(() => { /* transient redis hiccup — next tick retries */ });
+  }, 1000).unref();
+
   const shutdown = async (sig: string) => {
     log.info({ sig }, "shutting down");
     clearInterval(tick);
+    clearInterval(publishTick);
     state.ready = false;
     const m = shardRuntime.getMulti();
     if (m) await m.stop();
