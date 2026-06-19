@@ -1,11 +1,13 @@
 import type { FastifyInstance } from "fastify";
 import type { Schema } from "@frtb/schema";
 import { seenBucketKey } from "@frtb/calc-shared/rollup-keys";
+import { regionFromDesk } from "@frtb/calc-shared/region";
 import type { RedisLike } from "../redis-like.ts";
 import { getActiveTarget } from "../active-target.ts";
 import { getBootstrapStatus } from "../bootstrap-status.ts";
 import { getSensIndexName } from "../lib/sens-index.ts";
 import { translateRedisError } from "../redis-errors.ts";
+import { recordKbCacheSkipFiltered } from "../sbm/kb-cache.ts";
 import {
   CORRELATION_REGIME_FACTOR,
   reduceCurvatureCharge,
@@ -24,9 +26,14 @@ import {
   FtAggregateFallbackDisabledError,
   LUA_PATH_ENGINE,
   resolveLegFields,
+  resolveRho,
   ROLLUP_PATH_ENGINE,
   tryRollupReadout,
 } from "../sbm/aggregate-via-index.ts";
+// Wave 6.41.B — single-FT.AGGREGATE GROUPBY @desk helper for the by-desk
+// top-N ranking endpoint. Kept in its own module so the precision-contract
+// comment block + LOAD/APPLY argv builder don't bloat the route file.
+import { aggregateByDesk, type ByDeskLeg } from "../sbm/by-desk.ts";
 import {
   calcCacheKey,
   getDataVersion,
@@ -79,7 +86,29 @@ interface CalcBody {
   // per-bucket Lua kernel BEFORE contributing to K_b / S_b. Each list is
   // marshalled into a CSV positional FCALL arg (args 3/4/5). Omitted or empty
   // lists are byte-identical to the pre-5.31c kernel path.
-  exclude?: { book?: string[]; trade_id?: string[]; risk_factor?: string[] };
+  // Wave 6.41.A: extended with desk / region / bucket. region is derived from
+  // the desk TAG via shared/calc/src/region.ts (no index schema change). The
+  // Lua kernel still only honors book/trade_id/risk_factor — the extended
+  // fields are pushed into the FT.AGGREGATE fast-path query.
+  exclude?: {
+    book?: string[];
+    trade_id?: string[];
+    risk_factor?: string[];
+    desk?: string[];
+    region?: string[];
+    bucket?: (string | number)[];
+  };
+  // Wave 6.41.A: positive-include predicate. When ANY of these lists is
+  // non-empty the kernel keeps only rows whose value is IN the corresponding
+  // list. Pushed into FT.AGGREGATE as `@field:{X|Y}`. Region resolves to a
+  // desk-set via shared/calc/src/region.ts before reaching the kernel.
+  include?: {
+    book?: string[];
+    trade_id?: string[];
+    desk?: string[];
+    region?: string[];
+    bucket?: (string | number)[];
+  };
 }
 
 const ALLOWED_REGIME = new Set<CorrelationRegime>(["low", "medium", "high"]);
@@ -90,7 +119,22 @@ const ALLOWED_REGIME = new Set<CorrelationRegime>(["low", "medium", "high"]);
 // across the entire 27-cell matrix.
 interface TotalSbmBody {
   bucket_subset?: string[];
-  exclude?: { book?: string[]; trade_id?: string[]; risk_factor?: string[] };
+  // Wave 6.41.A — exclude / include shape matches CalcBody.
+  exclude?: {
+    book?: string[];
+    trade_id?: string[];
+    risk_factor?: string[];
+    desk?: string[];
+    region?: string[];
+    bucket?: (string | number)[];
+  };
+  include?: {
+    book?: string[];
+    trade_id?: string[];
+    desk?: string[];
+    region?: string[];
+    bucket?: (string | number)[];
+  };
 }
 
 // Wave 5.96B — supported asset classes for the Total SBM orchestrator.
@@ -124,8 +168,95 @@ const MAX_BUCKET_SUBSET = 256;
 // while sitting comfortably above any realistic demo case. Over the cap →
 // 413 Payload Too Large per the locked design decision.
 const MAX_EXCLUDE_LIST = 1000;
-type ExcludeKey = "book" | "trade_id" | "risk_factor";
-const EXCLUDE_KEYS: ExcludeKey[] = ["book", "trade_id", "risk_factor"];
+type ExcludeKey =
+  | "book"
+  | "trade_id"
+  | "risk_factor"
+  | "desk"
+  | "region"
+  | "bucket";
+// Wave 6.41.A — desk / region / bucket added. The Lua FCALL kernel only reads
+// the first three positional CSV args (book/trade_id/risk_factor) since the
+// in-kernel predicate is locked; desk / region / bucket are honored via the
+// FT.AGGREGATE fast-path query only (see buildFastPathQuery extensions).
+const EXCLUDE_KEYS: ExcludeKey[] = [
+  "book",
+  "trade_id",
+  "risk_factor",
+  "desk",
+  "region",
+  "bucket",
+];
+
+// Wave 6.41.A — positive-include predicate. risk_factor intentionally absent
+// (matches the desk-filter scope; per-RF positive include is out of scope
+// for this wave). Region is resolved to a desk-set via shared/calc/src/region.ts
+// before the kernel sees it.
+type IncludeKey = "book" | "trade_id" | "desk" | "region" | "bucket";
+const INCLUDE_KEYS: IncludeKey[] = [
+  "book",
+  "trade_id",
+  "desk",
+  "region",
+  "bucket",
+];
+
+// Wave 6.41.A — empty-CSV initializers + shared validate/marshal so the
+// /calc/sbm, /calc/sbm/total, /calc/sbm/bucket validation stays byte-identical
+// across routes. Each list is comma-joined into a single CSV string after
+// de-dup; missing fields stay "" so the kernel takes the no-filter path.
+function emptyExcludeCsv(): Record<ExcludeKey, string> {
+  return {
+    book: "",
+    trade_id: "",
+    risk_factor: "",
+    desk: "",
+    region: "",
+    bucket: "",
+  };
+}
+function emptyIncludeCsv(): Record<IncludeKey, string> {
+  return { book: "", trade_id: "", desk: "", region: "", bucket: "" };
+}
+function validateAndMarshalCsv<K extends string>(
+  raw: unknown,
+  keys: ReadonlyArray<K>,
+  label: "exclude" | "include",
+  out: Record<K, string>,
+): { status: number; message: string } | null {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    return {
+      status: 400,
+      message: `${label} must be an object with optional ${keys.join("/")} arrays`,
+    };
+  }
+  for (const key of keys) {
+    const list = (raw as Record<string, unknown>)[key];
+    if (list === undefined || list === null) continue;
+    if (!Array.isArray(list)) {
+      return { status: 400, message: `${label}.${key} must be an array of non-empty strings` };
+    }
+    if (list.length > MAX_EXCLUDE_LIST) {
+      return { status: 413, message: `${label}.${key} exceeds maximum of ${MAX_EXCLUDE_LIST} entries` };
+    }
+    const seen = new Set<string>();
+    for (const v of list) {
+      // bucket values may arrive as numbers (Equity / numeric buckets); coerce
+      // to strings so the CSV stays homogeneous downstream.
+      const sv = typeof v === "number" && Number.isFinite(v) ? String(v) : v;
+      if (typeof sv !== "string" || sv.length === 0) {
+        return { status: 400, message: `${label}.${key} must be an array of non-empty strings` };
+      }
+      if (sv.includes(",")) {
+        return { status: 400, message: `${label}.${key} values may not contain commas` };
+      }
+      seen.add(sv);
+    }
+    out[key] = Array.from(seen).join(",");
+  }
+  return null;
+}
 
 interface CalcOpts {
   // Map of risk_class → cross-bucket correlation γ_bc spec. Loaded from
@@ -301,6 +432,9 @@ interface ComputeSbmInput {
   bucket_subset: string[]; // already validated + deduped + uppercased
   regime: CorrelationRegime;
   excludeCsv: Record<ExcludeKey, string>;
+  // Wave 6.41.A — positive-include lists, CSV-marshalled in the same shape
+  // as exclude. Empty string means "no narrowing for this field".
+  includeCsv: Record<IncludeKey, string>;
   forcePath: "lua" | "fast" | null;
   noCache: boolean;
 }
@@ -325,7 +459,7 @@ async function computeSbmCharge(
   input: ComputeSbmInput,
   ctx: ComputeSbmCtx,
 ): Promise<ComputeSbmOutcome> {
-  const { risk_class, leg, bucket_subset, regime, excludeCsv, forcePath, noCache } = input;
+  const { risk_class, leg, bucket_subset, regime, excludeCsv, includeCsv, forcePath, noCache } = input;
   const { redis, schema, correlations, log } = ctx;
   const funcName = funcNameFor(risk_class, leg);
   const corr: CorrelationSpec = correlations[risk_class] ?? { kind: "constant", value: 0 };
@@ -344,12 +478,15 @@ async function computeSbmCharge(
   const t0 = process.hrtime.bigint();
 
   // Wave 5.83C-2 — short-TTL response cache lookup.
+  // Wave 6.41.A — `include` rides in the cache-key payload alongside
+  // `exclude` so a filtered request never collides with the unfiltered one.
   const cacheBody = {
     risk_class,
     sensitivity_type: leg,
     bucket_subset: [...bucket_subset].sort(),
     correlation_regime: regime,
     exclude: excludeCsv,
+    include: includeCsv,
   };
   const dataVersion = await getDataVersion(redis);
   const cacheKey = calcCacheKey({ ...cacheBody, force_path: forcePath }, dataVersion);
@@ -500,20 +637,96 @@ async function computeSbmCharge(
       // or when exclude predicates are set (rollups are pre-aggregated and
       // can't satisfy row-level filters). On any missing rollup the helper
       // returns null and we drop to the FT.AGGREGATE path below.
-      const hasExclude = !!(excludeCsv.book || excludeCsv.trade_id || excludeCsv.risk_factor);
-      const tryRollup = process.env.CALC_ROLLUP_PATH !== "0" && !hasExclude;
+      // Wave 6.41.A — extended filter detection: rollup is pre-aggregated
+      // so ANY include/exclude filter (book / trade_id / risk_factor / desk /
+      // bucket / region) invalidates it. region is resolved to a desk-set
+      // below via the desks discovered from FT.AGGREGATE GROUPBY @desk.
+      const hasExclude = EXCLUDE_KEYS.some((k) => excludeCsv[k] !== "");
+      const hasInclude = INCLUDE_KEYS.some((k) => includeCsv[k] !== "");
+      const hasFilter = hasExclude || hasInclude;
+      const tryRollup = process.env.CALC_ROLLUP_PATH !== "0" && !hasFilter;
+      // Wave 6.41.A — observable bypass counter. Bumped once per (rc, bucket)
+      // we'd otherwise have served from the K_b cache so /metrics proves
+      // the cache-skip-on-filter behavior without poking redis.
+      if (hasFilter && buckets.length > 0) {
+        recordKbCacheSkipFiltered(buckets.length);
+      }
       const legFields = resolveLegFields(schema!, risk_class, leg);
       const perTenor = (schema!.risk_classes[risk_class]?.tenor?.nodes?.length ?? 0) > 0
         && risk_class === "GIRR";
+
+      // Wave 6.41.A — resolve region include / exclude to concrete desk
+      // lists via a one-shot FT.AGGREGATE GROUPBY @desk. region is purely
+      // derived (no @region TAG in the index schema), so the cleanest pushdown
+      // is "discover desks once, map to region, intersect into the desk filter".
+      let resolvedIncludeDesk: string[] = includeCsv.desk ? includeCsv.desk.split(",") : [];
+      let resolvedExcludeDesk: string[] = excludeCsv.desk ? excludeCsv.desk.split(",") : [];
+      if (includeCsv.region || excludeCsv.region) {
+        let allDesks: string[] = [];
+        try {
+          const deskReply = await redis.call(
+            "FT.AGGREGATE", indexName, "*",
+            "GROUPBY", "1", "@desk",
+            "LIMIT", "0", "1000",
+          );
+          if (Array.isArray(deskReply)) {
+            for (let i = 1; i < deskReply.length; i++) {
+              const row = deskReply[i];
+              if (Array.isArray(row)) {
+                for (let j = 0; j < row.length; j += 2) {
+                  if (String(row[j]).replace(/^@/, "") === "desk") {
+                    allDesks.push(String(row[j + 1]));
+                  }
+                }
+              }
+            }
+          }
+        } catch (err) {
+          log.warn({
+            evt: "calc-region-discover-failed",
+            err: err instanceof Error ? err.message : String(err),
+            risk_class,
+          });
+          allDesks = [];
+        }
+        if (includeCsv.region) {
+          const regions = new Set(includeCsv.region.split(","));
+          const matched = allDesks.filter((d) => regions.has(regionFromDesk(d)));
+          // When include.desk is also present, intersect — both narrowings
+          // must hold. Otherwise the matched list IS the include.desk.
+          resolvedIncludeDesk = resolvedIncludeDesk.length > 0
+            ? resolvedIncludeDesk.filter((d) => matched.includes(d))
+            : matched;
+          // Guarantee a non-empty list to avoid the kernel keeping every row
+          // when include.desk is empty. Use a sentinel that matches no desk.
+          if (resolvedIncludeDesk.length === 0) resolvedIncludeDesk = ["__no_match__"];
+        }
+        if (excludeCsv.region) {
+          const regions = new Set(excludeCsv.region.split(","));
+          const matched = allDesks.filter((d) => regions.has(regionFromDesk(d)));
+          const merged = new Set<string>([...resolvedExcludeDesk, ...matched]);
+          resolvedExcludeDesk = Array.from(merged);
+        }
+      }
+
       const excludeFilter = {
         book: excludeCsv.book ? excludeCsv.book.split(",") : [],
         trade_id: excludeCsv.trade_id ? excludeCsv.trade_id.split(",") : [],
         risk_factor: excludeCsv.risk_factor ? excludeCsv.risk_factor.split(",") : [],
+        desk: resolvedExcludeDesk,
+        bucket: excludeCsv.bucket ? excludeCsv.bucket.split(",") : [],
+      };
+      const includeFilter = {
+        book: includeCsv.book ? includeCsv.book.split(",") : [],
+        trade_id: includeCsv.trade_id ? includeCsv.trade_id.split(",") : [],
+        desk: resolvedIncludeDesk,
+        bucket: includeCsv.bucket ? includeCsv.bucket.split(",") : [],
       };
       const buildResolvedCommand = (b: string): string => {
         const perBucketQuery = buildFastPathQuery(risk_class, legFields.sensitivityType, {
           bucketSubset: [b],
           exclude: excludeFilter,
+          include: includeFilter,
         });
         const perBucketArgv = buildFastPathAggregateArgs(perBucketQuery, legFields, perTenor, indexName);
         return formatRedisCommand("FT.AGGREGATE", perBucketArgv);
@@ -551,6 +764,7 @@ async function computeSbmCharge(
           filters: {
             bucketSubset: bucket_subset,
             exclude: excludeFilter,
+            include: includeFilter,
           },
           components: { crossTopN: 10 },
           indexName,
@@ -810,37 +1024,20 @@ export function registerCalcRoute(
     // Missing/empty lists serialise to "" which the Lua kernel treats as
     // "no exclusion" — byte-identical to the pre-5.31c kernel path.
     const excludeRaw = req.body?.exclude;
-    const excludeCsv: Record<ExcludeKey, string> = { book: "", trade_id: "", risk_factor: "" };
-    if (excludeRaw !== undefined && excludeRaw !== null) {
-      if (typeof excludeRaw !== "object" || Array.isArray(excludeRaw)) {
-        reply.code(400);
-        return { error: "exclude must be an object with optional book/trade_id/risk_factor arrays" };
-      }
-      for (const key of EXCLUDE_KEYS) {
-        const list = (excludeRaw as Record<string, unknown>)[key];
-        if (list === undefined || list === null) continue;
-        if (!Array.isArray(list)) {
-          reply.code(400);
-          return { error: `exclude.${key} must be an array of non-empty strings` };
-        }
-        if (list.length > MAX_EXCLUDE_LIST) {
-          reply.code(413);
-          return { error: `exclude.${key} exceeds maximum of ${MAX_EXCLUDE_LIST} entries` };
-        }
-        const seen = new Set<string>();
-        for (const v of list) {
-          if (typeof v !== "string" || v.length === 0) {
-            reply.code(400);
-            return { error: `exclude.${key} must be an array of non-empty strings` };
-          }
-          if (v.includes(",")) {
-            reply.code(400);
-            return { error: `exclude.${key} values may not contain commas` };
-          }
-          seen.add(v);
-        }
-        excludeCsv[key] = Array.from(seen).join(",");
-      }
+    const excludeCsv: Record<ExcludeKey, string> = emptyExcludeCsv();
+    const excludeErr = validateAndMarshalCsv(excludeRaw, EXCLUDE_KEYS, "exclude", excludeCsv);
+    if (excludeErr) {
+      reply.code(excludeErr.status);
+      return { error: excludeErr.message };
+    }
+    // Wave 6.41.A — positive-include predicate, validated with the same
+    // shape and caps as exclude.
+    const includeRaw = req.body?.include;
+    const includeCsv: Record<IncludeKey, string> = emptyIncludeCsv();
+    const includeErr = validateAndMarshalCsv(includeRaw, INCLUDE_KEYS, "include", includeCsv);
+    if (includeErr) {
+      reply.code(includeErr.status);
+      return { error: includeErr.message };
     }
     // Wave 5.96B — delegate to the shared compute helper so /calc/sbm/total
     // can fan out the same logic in-process across (class, leg, scenario)
@@ -852,6 +1049,7 @@ export function registerCalcRoute(
         bucket_subset,
         regime,
         excludeCsv,
+        includeCsv,
         forcePath: req.query?.force_path === "lua" || req.query?.force_path === "fast"
           ? (req.query.force_path as "lua" | "fast")
           : null,
@@ -935,37 +1133,19 @@ export function registerCalcRoute(
       }
 
       const excludeRaw = req.body?.exclude;
-      const excludeCsv: Record<ExcludeKey, string> = { book: "", trade_id: "", risk_factor: "" };
-      if (excludeRaw !== undefined && excludeRaw !== null) {
-        if (typeof excludeRaw !== "object" || Array.isArray(excludeRaw)) {
-          reply.code(400);
-          return { error: "exclude must be an object with optional book/trade_id/risk_factor arrays" };
-        }
-        for (const key of EXCLUDE_KEYS) {
-          const list = (excludeRaw as Record<string, unknown>)[key];
-          if (list === undefined || list === null) continue;
-          if (!Array.isArray(list)) {
-            reply.code(400);
-            return { error: `exclude.${key} must be an array of non-empty strings` };
-          }
-          if (list.length > MAX_EXCLUDE_LIST) {
-            reply.code(413);
-            return { error: `exclude.${key} exceeds maximum of ${MAX_EXCLUDE_LIST} entries` };
-          }
-          const seen = new Set<string>();
-          for (const v of list) {
-            if (typeof v !== "string" || v.length === 0) {
-              reply.code(400);
-              return { error: `exclude.${key} must be an array of non-empty strings` };
-            }
-            if (v.includes(",")) {
-              reply.code(400);
-              return { error: `exclude.${key} values may not contain commas` };
-            }
-            seen.add(v);
-          }
-          excludeCsv[key] = Array.from(seen).join(",");
-        }
+      const excludeCsv: Record<ExcludeKey, string> = emptyExcludeCsv();
+      const excludeErr = validateAndMarshalCsv(excludeRaw, EXCLUDE_KEYS, "exclude", excludeCsv);
+      if (excludeErr) {
+        reply.code(excludeErr.status);
+        return { error: excludeErr.message };
+      }
+      // Wave 6.41.A — positive-include predicate, same shape as exclude.
+      const includeRaw = req.body?.include;
+      const includeCsv: Record<IncludeKey, string> = emptyIncludeCsv();
+      const includeErr = validateAndMarshalCsv(includeRaw, INCLUDE_KEYS, "include", includeCsv);
+      if (includeErr) {
+        reply.code(includeErr.status);
+        return { error: includeErr.message };
       }
 
       const forcePath: "lua" | "fast" | null =
@@ -1010,6 +1190,7 @@ export function registerCalcRoute(
             bucket_subset,
             regime: p.regime,
             excludeCsv,
+            includeCsv,
             forcePath,
             noCache,
           },
@@ -1305,37 +1486,19 @@ export function registerCalcRoute(
       const regime: CorrelationRegime = (scenarioRaw as CorrelationRegime | undefined) ?? "medium";
 
       const excludeRaw = req.body?.exclude;
-      const excludeCsv: Record<ExcludeKey, string> = { book: "", trade_id: "", risk_factor: "" };
-      if (excludeRaw !== undefined && excludeRaw !== null) {
-        if (typeof excludeRaw !== "object" || Array.isArray(excludeRaw)) {
-          reply.code(400);
-          return { error: "exclude must be an object with optional book/trade_id/risk_factor arrays" };
-        }
-        for (const key of EXCLUDE_KEYS) {
-          const list = (excludeRaw as Record<string, unknown>)[key];
-          if (list === undefined || list === null) continue;
-          if (!Array.isArray(list)) {
-            reply.code(400);
-            return { error: `exclude.${key} must be an array of non-empty strings` };
-          }
-          if (list.length > MAX_EXCLUDE_LIST) {
-            reply.code(413);
-            return { error: `exclude.${key} exceeds maximum of ${MAX_EXCLUDE_LIST} entries` };
-          }
-          const seen = new Set<string>();
-          for (const v of list) {
-            if (typeof v !== "string" || v.length === 0) {
-              reply.code(400);
-              return { error: `exclude.${key} must be an array of non-empty strings` };
-            }
-            if (v.includes(",")) {
-              reply.code(400);
-              return { error: `exclude.${key} values may not contain commas` };
-            }
-            seen.add(v);
-          }
-          excludeCsv[key] = Array.from(seen).join(",");
-        }
+      const excludeCsv: Record<ExcludeKey, string> = emptyExcludeCsv();
+      const excludeErr = validateAndMarshalCsv(excludeRaw, EXCLUDE_KEYS, "exclude", excludeCsv);
+      if (excludeErr) {
+        reply.code(excludeErr.status);
+        return { error: excludeErr.message };
+      }
+      // Wave 6.41.A — positive-include predicate, same shape as exclude.
+      const includeRaw = req.body?.include;
+      const includeCsv: Record<IncludeKey, string> = emptyIncludeCsv();
+      const includeErr = validateAndMarshalCsv(includeRaw, INCLUDE_KEYS, "include", includeCsv);
+      if (includeErr) {
+        reply.code(includeErr.status);
+        return { error: includeErr.message };
       }
 
       const forcePath: "lua" | "fast" | null =
@@ -1351,6 +1514,7 @@ export function registerCalcRoute(
           bucket_subset: [bucket],
           regime,
           excludeCsv,
+          includeCsv,
           forcePath,
           noCache,
         },
@@ -1452,8 +1616,14 @@ export function registerCalcRoute(
 
       // Mirror /calc/sbm exclude validation so the per-bucket slice respects
       // the same kernel-side row-exclusion predicates.
+      // Wave 6.41.A — extended exclude (desk / bucket) is forwarded directly
+      // to the FT.AGGREGATE fast path. region is rejected here — this endpoint
+      // is a per-bucket slice and region-to-desk resolution lives only on the
+      // main /calc/sbm path where it pays off.
       const excludeRaw = req.body?.exclude;
-      const excludeArr: Record<ExcludeKey, string[]> = { book: [], trade_id: [], risk_factor: [] };
+      const excludeArr: Record<ExcludeKey, string[]> = {
+        book: [], trade_id: [], risk_factor: [], desk: [], region: [], bucket: [],
+      };
       if (excludeRaw !== undefined && excludeRaw !== null) {
         if (typeof excludeRaw !== "object" || Array.isArray(excludeRaw)) {
           reply.code(400);
@@ -1472,15 +1642,16 @@ export function registerCalcRoute(
           }
           const seen = new Set<string>();
           for (const v of list) {
-            if (typeof v !== "string" || v.length === 0) {
+            const sv = typeof v === "number" && Number.isFinite(v) ? String(v) : v;
+            if (typeof sv !== "string" || sv.length === 0) {
               reply.code(400);
               return { error: `exclude.${key} must be an array of non-empty strings` };
             }
-            if (v.includes(",")) {
+            if (sv.includes(",")) {
               reply.code(400);
               return { error: `exclude.${key} values may not contain commas` };
             }
-            seen.add(v);
+            seen.add(sv);
           }
           excludeArr[key] = Array.from(seen);
         }
@@ -1501,7 +1672,16 @@ export function registerCalcRoute(
           schema: opts.schema,
           riskClass: risk_class,
           leg: leg as Leg,
-          filters: { bucketSubset: [bucket], exclude: excludeArr },
+          filters: {
+            bucketSubset: [bucket],
+            exclude: {
+              book: excludeArr.book,
+              trade_id: excludeArr.trade_id,
+              risk_factor: excludeArr.risk_factor,
+              desk: excludeArr.desk,
+              bucket: excludeArr.bucket,
+            },
+          },
           components: { crossTopN: null },
           indexName,
         });
@@ -1512,6 +1692,217 @@ export function registerCalcRoute(
         const cross = hit.intermediate?.cross_components ?? [];
         return { bucket, cross_components: cross };
       } catch (err) {
+        const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
+        if (translated) {
+          reply.code(translated.status);
+          return translated.body;
+        }
+        throw err;
+      }
+    },
+  );
+
+  // Wave 6.41.B — POST /calc/sbm/by-desk. Returns top-N desks ranked by
+  // |contribution to K_b| using a SINGLE FT.AGGREGATE GROUPBY @desk on
+  // `idx:sens` (no per-desk fanout, no FCALL). The per-desk K_b is the
+  // constant-ρ closed-form approximation described in the precision contract
+  // block at the top of services/api/src/sbm/by-desk.ts — suitable for
+  // ranking, NOT for reporting the Basel-correct desk-level charge.
+  app.post<{
+    Body: {
+      risk_class?: string;
+      sensitivity_type?: string;
+      correlation_regime?: CorrelationRegime;
+      top_n?: number;
+      include?: { book?: string[]; desk?: string[] };
+      exclude?: { book?: string[]; trade_id?: string[]; risk_factor?: string[] };
+    };
+  }>(
+    "/calc/sbm/by-desk",
+    { config: { category: "heavy-calc" } },
+    async (req, reply) => {
+      const t0 = process.hrtime.bigint();
+      const risk_class_raw = req.body?.risk_class;
+      const legRaw = req.body?.sensitivity_type;
+      if (!risk_class_raw || !legRaw) {
+        reply.code(400);
+        return { error: "risk_class and sensitivity_type are required" };
+      }
+      const leg = String(legRaw).toLowerCase();
+      if (!ALLOWED_LEG.has(leg)) {
+        reply.code(400);
+        return { error: `sensitivity_type must be one of: Delta, Vega, Curvature (got ${legRaw})` };
+      }
+      const risk_class = String(risk_class_raw).toUpperCase();
+
+      const regimeRaw = req.body?.correlation_regime;
+      if (regimeRaw !== undefined && regimeRaw !== null) {
+        if (typeof regimeRaw !== "string" || !ALLOWED_REGIME.has(regimeRaw as CorrelationRegime)) {
+          reply.code(400);
+          return { error: "correlation_regime must be one of: low, medium, high" };
+        }
+      }
+      const regime: CorrelationRegime = (regimeRaw as CorrelationRegime | undefined) ?? "medium";
+
+      const topNRaw = req.body?.top_n;
+      let top_n = 10;
+      if (topNRaw !== undefined && topNRaw !== null) {
+        const n = Number(topNRaw);
+        if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
+          reply.code(400);
+          return { error: "top_n must be a positive integer" };
+        }
+        if (n > 50) {
+          reply.code(400);
+          return { error: "top_n exceeds maximum of 50" };
+        }
+        top_n = n;
+      }
+
+      // Wave 6.41.B — local include + exclude validation. Both shapes are
+      // narrowed to the literals the by-desk endpoint accepts (include:
+      // book/desk; exclude: book/trade_id/risk_factor) and kept independent
+      // of the shared EXCLUDE_KEYS / include schema 6.41.A is introducing.
+      // This is the documented coordination contract on this surface — the
+      // by-desk endpoint stays self-contained so 6.41.A can extend the
+      // shared types without churning my code, and vice versa.
+      type ByDeskIncludeKey = "book" | "desk";
+      const BY_DESK_INCLUDE_KEYS: ByDeskIncludeKey[] = ["book", "desk"];
+      const includeRaw = req.body?.include;
+      const includeArr: Record<ByDeskIncludeKey, string[]> = { book: [], desk: [] };
+      if (includeRaw !== undefined && includeRaw !== null) {
+        if (typeof includeRaw !== "object" || Array.isArray(includeRaw)) {
+          reply.code(400);
+          return { error: "include must be an object with optional book/desk arrays" };
+        }
+        for (const key of BY_DESK_INCLUDE_KEYS) {
+          const list = (includeRaw as Record<string, unknown>)[key];
+          if (list === undefined || list === null) continue;
+          if (!Array.isArray(list)) {
+            reply.code(400);
+            return { error: `include.${key} must be an array of non-empty strings` };
+          }
+          if (list.length > MAX_EXCLUDE_LIST) {
+            reply.code(413);
+            return { error: `include.${key} exceeds maximum of ${MAX_EXCLUDE_LIST} entries` };
+          }
+          const seen = new Set<string>();
+          for (const v of list) {
+            if (typeof v !== "string" || v.length === 0) {
+              reply.code(400);
+              return { error: `include.${key} must be an array of non-empty strings` };
+            }
+            seen.add(v);
+          }
+          includeArr[key] = Array.from(seen);
+        }
+      }
+
+      type ByDeskExcludeKey = "book" | "trade_id" | "risk_factor";
+      const BY_DESK_EXCLUDE_KEYS: ByDeskExcludeKey[] = ["book", "trade_id", "risk_factor"];
+      const excludeRaw = req.body?.exclude;
+      const excludeArr: Record<ByDeskExcludeKey, string[]> = { book: [], trade_id: [], risk_factor: [] };
+      if (excludeRaw !== undefined && excludeRaw !== null) {
+        if (typeof excludeRaw !== "object" || Array.isArray(excludeRaw)) {
+          reply.code(400);
+          return { error: "exclude must be an object with optional book/trade_id/risk_factor arrays" };
+        }
+        for (const key of BY_DESK_EXCLUDE_KEYS) {
+          const list = (excludeRaw as Record<string, unknown>)[key];
+          if (list === undefined || list === null) continue;
+          if (!Array.isArray(list)) {
+            reply.code(400);
+            return { error: `exclude.${key} must be an array of non-empty strings` };
+          }
+          if (list.length > MAX_EXCLUDE_LIST) {
+            reply.code(413);
+            return { error: `exclude.${key} exceeds maximum of ${MAX_EXCLUDE_LIST} entries` };
+          }
+          const seen = new Set<string>();
+          for (const v of list) {
+            if (typeof v !== "string" || v.length === 0) {
+              reply.code(400);
+              return { error: `exclude.${key} must be an array of non-empty strings` };
+            }
+            seen.add(v);
+          }
+          excludeArr[key] = Array.from(seen);
+        }
+      }
+
+      if (!opts.schema) {
+        reply.code(503);
+        return {
+          error: "schema-unavailable",
+          hint: "by-desk aggregation requires a schema for ws_* field resolution",
+        };
+      }
+
+      const redis = getRedis();
+      const target_label = getActiveTarget().label;
+      const indexName = await getSensIndexName(redis, target_label);
+
+      // Scale the schema ρ by the correlation-regime factor (capped at 1.0)
+      // so the by-desk K_b approximation respects the MAR21.6 reporting
+      // regime. The factor is applied directly to the scalar ρ rather than
+      // through scaleCorrelationSpec because aggregateByDesk consumes a
+      // pre-resolved number, not the CorrelationSpec union.
+      const baseRho = resolveRho(opts.schema, risk_class, leg as ByDeskLeg);
+      const factor = CORRELATION_REGIME_FACTOR[regime];
+      const rho = Math.max(-1, Math.min(1, baseRho * factor));
+
+      try {
+        const rows = await aggregateByDesk({
+          redis,
+          schema: opts.schema,
+          riskClass: risk_class,
+          leg: leg as ByDeskLeg,
+          indexName,
+          rhoOverride: rho,
+          filters: {
+            include: { book: includeArr.book, desk: includeArr.desk },
+            exclude: {
+              book: excludeArr.book,
+              trade_id: excludeArr.trade_id,
+              risk_factor: excludeArr.risk_factor,
+            },
+          },
+        });
+        // K_b is non-negative (Math.sqrt of a clamped square); total is the
+        // sum of per-desk K_b, used to compute contribution_pct. Sort by
+        // |K_b| desc — equivalent to K_b desc for non-negative values — and
+        // truncate to top_n.
+        const total_K_b = rows.reduce((a, r) => a + r.K_b, 0);
+        const sorted = rows.slice().sort((a, b) => Math.abs(b.K_b) - Math.abs(a.K_b));
+        const topRows = sorted.slice(0, top_n);
+        const desks = topRows.map((r) => ({
+          desk: r.desk,
+          K_b: r.K_b,
+          contribution_pct: total_K_b > 0
+            ? Math.round((r.K_b / total_K_b) * 10000) / 100
+            : 0,
+          count: r.count,
+        }));
+        const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+        return {
+          ok: true,
+          ms: Math.round(ms * 1000) / 1000,
+          desks,
+          total_K_b,
+          cached: false,
+        };
+      } catch (err) {
+        if (err instanceof FtAggregateFallbackDisabledError) {
+          reply.code(412);
+          return {
+            error: "fallback-disabled",
+            risk_class,
+            measure: leg,
+            hint:
+              "FT.AGGREGATE fallback is disabled (CALC_ALLOW_FT_AGGREGATE!=true). " +
+              "Set the flag to true to enable the by-desk aggregation path.",
+          };
+        }
         const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
         if (translated) {
           reply.code(translated.status);
