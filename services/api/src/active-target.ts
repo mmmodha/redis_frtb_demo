@@ -424,8 +424,8 @@ function targetKey(t: ActiveTarget): string {
 // bumped on every successful commit inside `setActiveTarget`. Surfaced via
 // `GET /internal/redis/active-target/full` so pollers (source, loadgen)
 // detect identity changes without diffing every field. Lives here (not in
-// internal-target.ts) so the new switch coordinator can include `version+1`
-// in the prepare PUBLISH payload without an awkward back-import.
+// internal-target.ts) so the switch coordinator can include `version+1` in
+// the prepare HTTP push payload without an awkward back-import.
 let activeTargetVersion = 1;
 
 export function getActiveTargetVersion(): number {
@@ -438,23 +438,33 @@ export function __resetActiveTargetVersionForTests(): void {
 }
 
 // Wave 6.43.B.1 — switch coordinator. The api orchestrates a two-phase
-// prepare/commit handoff: PUBLISH `intent:active-target:prepare` on the OLD
-// client, wait for each known subscriber to ACK `drained` (or the timeout
-// to elapse), commit, then PUBLISH `intent:active-target:commit` on the
-// NEW client. State is per-switch and keyed on a `switch_id` so a late ACK
-// from a superseded switch can be rejected with 409.
+// prepare/commit handoff: parallel HTTP POST to each KNOWN_SERVICES endpoint
+// (`/admin/active-target/prepare`), wait for each service to either ACK
+// `drained` (via the push response OR `/internal/redis/active-target/ack`)
+// or the drain timeout to elapse, commit the identity swap, then parallel
+// HTTP POST to each service's `/admin/active-target/commit`. State is
+// per-switch and keyed on a `switch_id` so a late ACK from a superseded
+// switch can be rejected with 409. HTTP errors (4xx/5xx/network) record
+// `push_failed` for that service and NEVER fail the switch — the 2.5s HTTP
+// polling fallback at `/internal/redis/active-target/full` covers the gap.
 
 const SWITCH_DRAIN_TIMEOUT_DEFAULT_MS = 10_000;
+const SWITCH_PUSH_TIMEOUT_DEFAULT_MS = 2_500;
 const DEFAULT_KNOWN_SERVICES = "ingest,source,loadgen";
-
-export const SWITCH_PREPARE_CHANNEL = "intent:active-target:prepare";
-export const SWITCH_COMMIT_CHANNEL = "intent:active-target:commit";
+const DEFAULT_INTERNAL_API_TOKEN = "dev-internal-token";
+const DEFAULT_SERVICE_HOST = "127.0.0.1";
+const DEFAULT_SERVICE_PORTS: Readonly<Record<string, number>> = {
+  ingest: 8083,
+  source: 8082,
+  loadgen: 8085,
+};
 
 export type ServiceSwitchPhase =
   | "pending"
   | "drained"
   | "committed"
   | "drain_timeout"
+  | "push_failed"
   | "error";
 
 export type SwitchPhase =
@@ -485,6 +495,28 @@ export interface SwitchAckInput {
   error?: string;
 }
 
+// Known-service registry entry resolved from `KNOWN_SERVICES` env. Each name
+// gets a host (`${NAME}_HOST` or DEFAULT_SERVICE_HOST) and a port
+// (`${NAME}_PORT` or the DEFAULT_SERVICE_PORTS table). Names not present in
+// the defaults table fall through to port 0 — the HTTP push will fail
+// immediately and record push_failed.
+export interface KnownService {
+  name: string;
+  host: string;
+  port: number;
+}
+
+// Payload sent on every HTTP push. `target` carries the same identity fields
+// the pre-6.43 pub/sub payload's `next` did so subscribers don't have to
+// re-derive them. `t` is the api-side wall-clock at push time — useful for
+// latency attribution in service logs.
+export interface SwitchPushPayload {
+  switch_id: string;
+  phase: "prepare" | "commit";
+  target: { label: string; version: number };
+  t: number;
+}
+
 interface SwitchRecord {
   switch_id: string;
   startedAt: number;
@@ -509,26 +541,47 @@ function getSwitchDrainTimeoutMs(): number {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : SWITCH_DRAIN_TIMEOUT_DEFAULT_MS;
 }
 
-function getKnownServices(): string[] {
-  const raw = process.env.KNOWN_SERVICES ?? DEFAULT_KNOWN_SERVICES;
-  return raw.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+function getSwitchPushTimeoutMs(): number {
+  const raw = process.env.SWITCH_PUSH_TIMEOUT_MS;
+  if (raw === undefined || raw === "") return SWITCH_PUSH_TIMEOUT_DEFAULT_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : SWITCH_PUSH_TIMEOUT_DEFAULT_MS;
 }
 
-// Test seam — fake the prepare/commit PUBLISH so unit tests can drive the
-// coordinator without opening a real Redis pub/sub. Returns the subscriber
-// count the api should treat the publish as having reached (zero ⇒ skip the
-// drain wait, non-zero ⇒ wait for ACKs or the timeout). Pass `null` to
-// restore the production path (which uses the active Redis client).
-let switchPublisherForTests:
-  | ((channel: string, payload: string, kind: "old" | "new") => Promise<number>)
-  | null = null;
+function resolveKnownService(name: string): KnownService {
+  const upper = name.toUpperCase();
+  const hostEnv = process.env[`${upper}_HOST`];
+  const portEnvRaw = process.env[`${upper}_PORT`];
+  const portEnv = portEnvRaw ? Number(portEnvRaw) : undefined;
+  const port = Number.isFinite(portEnv) && (portEnv as number) > 0
+    ? Math.floor(portEnv as number)
+    : (DEFAULT_SERVICE_PORTS[name] ?? 0);
+  const host = hostEnv && hostEnv.length > 0 ? hostEnv : DEFAULT_SERVICE_HOST;
+  return { name, host, port };
+}
 
-export function __setSwitchPublisherForTests(
-  fn:
-    | ((channel: string, payload: string, kind: "old" | "new") => Promise<number>)
-    | null,
-): void {
-  switchPublisherForTests = fn;
+function getKnownServices(): KnownService[] {
+  const raw = process.env.KNOWN_SERVICES ?? DEFAULT_KNOWN_SERVICES;
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0)
+    .map(resolveKnownService);
+}
+
+// Test seam — replace the per-service HTTP push with a fake so unit tests can
+// drive the coordinator without binding sockets. Pass `null` to restore the
+// production path (real `fetch(...)`).
+export type SwitchPusher = (
+  service: KnownService,
+  phase: "prepare" | "commit",
+  payload: SwitchPushPayload,
+) => Promise<Response>;
+
+let switchPusherForTests: SwitchPusher | null = null;
+
+export function __setSwitchPusherForTests(fn: SwitchPusher | null): void {
+  switchPusherForTests = fn;
 }
 
 // Test seam — wipe the switch registry so tests start from a clean slate.
@@ -652,29 +705,143 @@ function waitForDrain(record: SwitchRecord, timeoutMs: number): Promise<void> {
   });
 }
 
-async function publishSwitchEvent(
-  channel: string,
-  payload: { switch_id: string; next: { label: string; version: number } },
-  kind: "old" | "new",
-): Promise<number> {
-  const body = JSON.stringify(payload);
-  if (switchPublisherForTests) {
-    try { return await switchPublisherForTests(channel, body, kind); }
-    catch { return 0; }
-  }
-  // Tests without an explicit publisher seam skip the real PUBLISH so they
-  // don't hang on lazyConnect to a non-existent Redis. Production goes
-  // through the active client.
-  if (process.env.NODE_ENV === "test") return 0;
-  const c = getActiveRedisClient();
-  if (!c) return 0;
+// HTTP push to a single service's `/admin/active-target/{prepare|commit}`.
+// Bounded by `SWITCH_PUSH_TIMEOUT_MS` via AbortController so a hung server
+// can't keep a connection open past the drain timeout. Bearer token is read
+// per-call so a process that mutates `INTERNAL_API_TOKEN` after start still
+// gets the new value. The caller is responsible for translating the Response
+// (or thrown error) into a switch-status update.
+async function pushSwitchEvent(
+  service: KnownService,
+  phase: "prepare" | "commit",
+  payload: SwitchPushPayload,
+): Promise<Response> {
+  if (switchPusherForTests) return switchPusherForTests(service, phase, payload);
+  const url = `http://${service.host}:${service.port}/admin/active-target/${phase}`;
+  const token = process.env.INTERNAL_API_TOKEN ?? DEFAULT_INTERNAL_API_TOKEN;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), getSwitchPushTimeoutMs());
+  if (typeof timer.unref === "function") timer.unref();
   try {
-    const r = await c.publish(channel, body);
-    const n = Number(r);
-    return Number.isFinite(n) ? n : 0;
-  } catch {
-    return 0;
+    return await fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
   }
+}
+
+// Apply a successful HTTP push response as the matching service ACK. Uses
+// the same per-service state surface that the ACK endpoint feeds via
+// `recordSwitchAck` so callers see one consistent progress view regardless
+// of how the service replied. Guards enforce a strict state machine —
+// `drain_timeout` / `push_failed` / `committed` are terminal and cannot be
+// downgraded by a late push response arriving after the drain wait elapsed.
+function applyPushAck(
+  record: SwitchRecord,
+  serviceName: string,
+  phase: "drained" | "committed",
+): void {
+  if (!currentSwitch || currentSwitch.switch_id !== record.switch_id) return;
+  let sp = currentSwitch.perService.get(serviceName);
+  if (!sp) {
+    sp = { name: serviceName, phase: "pending" };
+    currentSwitch.perService.set(serviceName, sp);
+  }
+  const now = Date.now();
+  if (phase === "drained") {
+    // A drained ACK only applies to a still-pending service. If the drain
+    // wait already elapsed (drain_timeout) or the service failed earlier
+    // (push_failed) or already committed, the original phase stands.
+    if (sp.phase !== "pending") return;
+    sp.phase = "drained";
+    sp.drained_at = now;
+  } else {
+    // committed ACK upgrades from pending / drained only; terminal failure
+    // states (drain_timeout, push_failed, error) and an already-committed
+    // service are NOT overwritten.
+    if (sp.phase !== "pending" && sp.phase !== "drained") return;
+    sp.phase = "committed";
+    sp.committed_at = now;
+  }
+  if (currentSwitch.drainNotify) currentSwitch.drainNotify();
+}
+
+// Mark a service as `push_failed` after a 4xx/5xx/network error. Terminal:
+// `allTerminallyDrained` treats it as non-pending so the drain wait can
+// resolve as soon as every service has either ACKed or failed. Guarded so a
+// late commit-push failure doesn't overwrite a successful drained-ACK that
+// already arrived via the prepare push response.
+function markPushFailed(
+  record: SwitchRecord,
+  serviceName: string,
+  reason: string,
+): void {
+  if (!currentSwitch || currentSwitch.switch_id !== record.switch_id) return;
+  let sp = currentSwitch.perService.get(serviceName);
+  if (!sp) {
+    sp = { name: serviceName, phase: "pending" };
+    currentSwitch.perService.set(serviceName, sp);
+  }
+  // Only a still-pending service transitions to push_failed. drained /
+  // committed / drain_timeout / error are all terminal for this purpose.
+  if (sp.phase !== "pending") return;
+  sp.phase = "push_failed";
+  sp.error = reason;
+  if (currentSwitch.drainNotify) currentSwitch.drainNotify();
+}
+
+function warnPushFailed(
+  service: KnownService,
+  phase: "prepare" | "commit",
+  reason: string,
+): void {
+  if (process.env.NODE_ENV === "test") return;
+  try {
+    // eslint-disable-next-line no-console
+    console.warn(JSON.stringify({
+      evt: "switch-push-failed",
+      service: service.name,
+      host: service.host,
+      port: service.port,
+      phase,
+      reason,
+    }));
+  } catch { /* sink must never break the switch path */ }
+}
+
+// Fan out a prepare or commit push to every known service in parallel. A
+// 2xx response is treated as a service ACK for `ackPhase`; any other status
+// or thrown error records `push_failed` for that service. NEVER throws —
+// the switch must complete even if every service is unreachable.
+async function fanOutSwitchPush(
+  services: KnownService[],
+  ackPhase: "drained" | "committed",
+  payload: SwitchPushPayload,
+  record: SwitchRecord,
+): Promise<void> {
+  await Promise.all(services.map(async (svc) => {
+    try {
+      const res = await pushSwitchEvent(svc, payload.phase, payload);
+      if (res.ok) {
+        applyPushAck(record, svc.name, ackPhase);
+      } else {
+        const reason = `HTTP ${res.status}`;
+        markPushFailed(record, svc.name, reason);
+        warnPushFailed(svc, payload.phase, reason);
+      }
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      markPushFailed(record, svc.name, reason);
+      warnPushFailed(svc, payload.phase, reason);
+    }
+  }));
 }
 
 // Apply the new target to the singleton — the synchronous core of what the
@@ -732,16 +899,18 @@ function commitActiveTargetSync(t: ActiveTarget, creds?: ActiveTargetCreds): voi
 //      because creds rotations are rare. Documented here so a future split
 //      (setActiveTargetCreds) can be added without surprising existing callers.
 //
-// Wave 6.43.B.1 — `setActiveTarget` is now async: it generates a `switch_id`,
-// PUBLISHes `intent:active-target:prepare` on the OLD client, waits for every
-// known subscriber to ACK `drained` (or `SWITCH_DRAIN_TIMEOUT_MS` to elapse —
-// whichever first), commits the identity swap, then PUBLISHes
-// `intent:active-target:commit` on the NEW client. The first-ever set (no
-// prior `override`) skips the prepare phase entirely — there is no OLD client
-// to drain. In NODE_ENV=test without an explicit `__setSwitchPublisherForTests`
-// seam, the prepare/commit PUBLISHes short-circuit to 0 subscribers and the
-// commit fires synchronously, preserving the observable ordering of the
-// pre-6.43 sync setter for the existing test fleet.
+// Wave 6.43.B.1 — `setActiveTarget` is async: it generates a `switch_id`,
+// HTTP-POSTs `/admin/active-target/prepare` to every KNOWN_SERVICES endpoint
+// in parallel, waits for each service to ACK `drained` (via the push
+// response OR `POST /internal/redis/active-target/ack`) or for
+// `SWITCH_DRAIN_TIMEOUT_MS` to elapse — whichever first — commits the
+// identity swap, then HTTP-POSTs `/admin/active-target/commit` to every
+// service. The first-ever set (no prior `override`) skips the prepare phase
+// entirely — services are typically not yet running during boot. In
+// NODE_ENV=test without an explicit `__setSwitchPusherForTests` seam, the
+// HTTP push is short-circuited so the existing test fleet doesn't open
+// real sockets and the commit fires synchronously, preserving the
+// observable ordering of the pre-6.43 sync setter for those tests.
 export async function setActiveTarget(
   t: ActiveTarget,
   creds?: ActiveTargetCreds,
@@ -756,42 +925,47 @@ export async function setActiveTarget(
     next: { label: t.label, version: nextVersion },
     phase: "prepare",
     perService: new Map(
-      knownServices.map((name) => [name, { name, phase: "pending" as ServiceSwitchPhase }]),
+      knownServices.map((s) => [s.name, { name: s.name, phase: "pending" as ServiceSwitchPhase }]),
     ),
   };
   rotateSwitchHistory(record);
 
-  // Skip prepare/drain on the first-ever set — there's no OLD active client
-  // to publish on (env fallback) and no subscribers expected. Same fast path
-  // applies when the test environment hasn't installed a publisher seam: a
-  // real PUBLISH would just hang on lazyConnect to a fake target.
+  // Fast path: first-ever set (no OLD target, services typically not up yet),
+  // tests without a pusher seam (real fetch would 5xx forever against bogus
+  // ports), or an empty KNOWN_SERVICES list (nothing to notify).
   const useFastPath =
     isFirstSwitch ||
-    (switchPublisherForTests === null && process.env.NODE_ENV === "test") ||
+    (switchPusherForTests === null && process.env.NODE_ENV === "test") ||
     knownServices.length === 0;
 
   if (useFastPath) {
     commitActiveTargetSync(t, creds);
     record.phase = "committed";
-    // Best-effort commit publish — fire-and-forget so the caller's sync
-    // call sites still observe the commit before any awaits.
-    void publishSwitchEvent(
-      SWITCH_COMMIT_CHANNEL,
-      { switch_id: switchId, next: { label: t.label, version: activeTargetVersion } },
-      "new",
-    );
     return;
   }
 
-  const subCount = await publishSwitchEvent(
-    SWITCH_PREPARE_CHANNEL,
-    { switch_id: switchId, next: { label: t.label, version: nextVersion } },
-    "old",
+  record.phase = "draining";
+  // Kick off the parallel prepare push; each successful response auto-ACKs
+  // the service as `drained` via `applyPushAck`, each failure marks
+  // `push_failed`. Both are terminal so the drain wait resolves as soon as
+  // every service has settled OR `SWITCH_DRAIN_TIMEOUT_MS` elapses.
+  // Fire-and-forget: we intentionally do NOT await preparePush. Each push
+  // call settles within `SWITCH_PUSH_TIMEOUT_MS` (AbortController-bounded
+  // for real fetch) and updates per-service state via applyPushAck /
+  // markPushFailed; both helpers guard against overwriting terminal phases
+  // so a push that resolves AFTER drain_timeout cannot corrupt the record.
+  void fanOutSwitchPush(
+    knownServices,
+    "drained",
+    {
+      switch_id: switchId,
+      phase: "prepare",
+      target: { label: t.label, version: nextVersion },
+      t: Date.now(),
+    },
+    record,
   );
-  if (subCount > 0) {
-    record.phase = "draining";
-    await waitForDrain(record, getSwitchDrainTimeoutMs());
-  }
+  await waitForDrain(record, getSwitchDrainTimeoutMs());
 
   // Anything still in `pending` after the wait did not drain in time.
   for (const sp of record.perService.values()) {
@@ -800,10 +974,16 @@ export async function setActiveTarget(
   commitActiveTargetSync(t, creds);
   record.phase = "committed";
 
-  await publishSwitchEvent(
-    SWITCH_COMMIT_CHANNEL,
-    { switch_id: switchId, next: { label: t.label, version: activeTargetVersion } },
-    "new",
+  await fanOutSwitchPush(
+    knownServices,
+    "committed",
+    {
+      switch_id: switchId,
+      phase: "commit",
+      target: { label: t.label, version: activeTargetVersion },
+      t: Date.now(),
+    },
+    record,
   );
 }
 
@@ -868,8 +1048,8 @@ export function resetActiveTarget(): void {
   activeTargetVersion = 1;
   // Wave 6.43.B.1 — clear in-flight switch coordination state so a test
   // teardown can't leak per-service ACK history or a pending drain notifier
-  // into the next case. Note: the production `__setSwitchPublisherForTests`
-  // seam is NOT touched here — tests install / uninstall it explicitly.
+  // into the next case. Note: the `__setSwitchPusherForTests` seam is NOT
+  // touched here — tests install / uninstall it explicitly.
   if (currentSwitch?.drainNotify) currentSwitch.drainNotify = undefined;
   currentSwitch = null;
   priorSwitchIds.clear();

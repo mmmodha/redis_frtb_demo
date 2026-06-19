@@ -9,8 +9,10 @@ import { createStore, type ConnectionsStore } from "../src/store.ts";
 import {
   resetActiveTarget,
   setActiveTarget,
-  __setSwitchPublisherForTests,
+  __setSwitchPusherForTests,
   __resetSwitchStateForTests,
+  type KnownService,
+  type SwitchPushPayload,
 } from "../src/active-target.ts";
 import { resetInternalTargetVersionForTests } from "../src/routes/internal-target.ts";
 
@@ -249,7 +251,7 @@ describe("Wave 6.43.B.1 — switch coordinator", () => {
     resetActiveTarget();
     resetInternalTargetVersionForTests();
     __resetSwitchStateForTests();
-    __setSwitchPublisherForTests(null);
+    __setSwitchPusherForTests(null);
     process.env.INTERNAL_API_TOKEN = "test-internal-token";
     process.env.KNOWN_SERVICES = "ingest,source,loadgen";
     store = await freshStore();
@@ -260,7 +262,7 @@ describe("Wave 6.43.B.1 — switch coordinator", () => {
   });
 
   afterEach(async () => {
-    __setSwitchPublisherForTests(null);
+    __setSwitchPusherForTests(null);
     __resetSwitchStateForTests();
     await app.close();
     resetActiveTarget();
@@ -272,43 +274,22 @@ describe("Wave 6.43.B.1 — switch coordinator", () => {
     else process.env.SWITCH_DRAIN_TIMEOUT_MS = originalDrainMs;
   });
 
-  it("happy path: 3 services ACK drained → switch commits and per-service progresses to committed on commit ACKs", async () => {
-    // Capture the switch_id from the prepare publish; deliver ACKs from
-    // three known services so the drain wait resolves quickly.
+  // Build a fake Response without binding to a real `fetch`. `status: 200`
+  // is the default since most tests want the auto-ACK path.
+  function fakeResponse(status = 200): Response {
+    return new Response(null, { status });
+  }
+
+  it("happy path: HTTP prepare push auto-ACKs all 3 services as drained → switch commits and HTTP commit push marks them committed", async () => {
     let switchId: string | null = null;
-    const publishes: Array<{ channel: string; payload: unknown; kind: string }> = [];
-    __setSwitchPublisherForTests(async (channel, payload, kind) => {
-      const parsed = JSON.parse(payload) as { switch_id: string };
-      publishes.push({ channel, payload: JSON.parse(payload), kind });
-      if (channel === "intent:active-target:prepare") {
-        switchId = parsed.switch_id;
-        // Fire ACKs from the three known services on the next tick so the
-        // coordinator has already entered `draining` when they arrive.
-        queueMicrotask(() => {
-          for (const svc of ["ingest", "source", "loadgen"]) {
-            void app.inject({
-              method: "POST",
-              url: "/internal/redis/active-target/ack",
-              headers: AUTH,
-              payload: { switch_id: switchId, service: svc, phase: "drained", ok: true },
-            });
-          }
-        });
-      }
-      return 3;
+    const pushes: Array<{ service: string; phase: string; switch_id: string; port: number }> = [];
+    __setSwitchPusherForTests(async (service: KnownService, phase, payload: SwitchPushPayload) => {
+      pushes.push({ service: service.name, phase, switch_id: payload.switch_id, port: service.port });
+      if (phase === "prepare") switchId = payload.switch_id;
+      return fakeResponse(200);
     });
     await setActiveTarget({ host: "new.host", port: 6379, tls: false, db: 0, label: "new" });
-    // After commit each service reports a commit ACK.
     expect(switchId).not.toBeNull();
-    for (const svc of ["ingest", "source", "loadgen"]) {
-      const r = await app.inject({
-        method: "POST",
-        url: "/internal/redis/active-target/ack",
-        headers: AUTH,
-        payload: { switch_id: switchId, service: svc, phase: "committed", ok: true },
-      });
-      expect(r.statusCode).toBe(200);
-    }
     const status = await app.inject({
       method: "GET",
       url: "/internal/redis/active-target/switch-status",
@@ -322,31 +303,34 @@ describe("Wave 6.43.B.1 — switch coordinator", () => {
       body.per_service.map((s: { name: string; phase: string }) => [s.name, s.phase]),
     );
     expect(phasesByName).toEqual({ ingest: "committed", source: "committed", loadgen: "committed" });
-    expect(publishes.map((p) => p.channel)).toEqual([
-      "intent:active-target:prepare",
-      "intent:active-target:commit",
-    ]);
+    // Each service got exactly one prepare and one commit push, and the
+    // service-to-port mapping resolved via DEFAULT_SERVICE_PORTS.
+    const byService = Object.fromEntries(
+      ["ingest", "source", "loadgen"].map((svc) => [
+        svc,
+        pushes.filter((p) => p.service === svc).map((p) => p.phase).sort(),
+      ]),
+    );
+    expect(byService).toEqual({
+      ingest: ["commit", "prepare"],
+      source: ["commit", "prepare"],
+      loadgen: ["commit", "prepare"],
+    });
+    expect(pushes.find((p) => p.service === "ingest")?.port).toBe(8083);
+    expect(pushes.find((p) => p.service === "source")?.port).toBe(8082);
+    expect(pushes.find((p) => p.service === "loadgen")?.port).toBe(8085);
   });
 
-  it("missing-ACK timeout: 1 service never ACKs → switch commits at the configured timeout, marked drain_timeout", async () => {
+  it("missing-ACK timeout: prepare push to 1 service hangs → switch commits at the configured timeout, marked drain_timeout", async () => {
     process.env.SWITCH_DRAIN_TIMEOUT_MS = "60";
-    let switchId: string | null = null;
-    __setSwitchPublisherForTests(async (channel, payload) => {
-      const parsed = JSON.parse(payload) as { switch_id: string };
-      if (channel === "intent:active-target:prepare") {
-        switchId = parsed.switch_id;
-        queueMicrotask(() => {
-          for (const svc of ["ingest", "source"]) {
-            void app.inject({
-              method: "POST",
-              url: "/internal/redis/active-target/ack",
-              headers: AUTH,
-              payload: { switch_id: switchId, service: svc, phase: "drained", ok: true },
-            });
-          }
-        });
+    // ingest/source return 200 immediately; loadgen's prepare hangs (resolves
+    // after the test's drain window) so it stays pending → drain_timeout.
+    let resolveLoadgenPrepare: ((res: Response) => void) | null = null;
+    __setSwitchPusherForTests(async (service, phase) => {
+      if (service.name === "loadgen" && phase === "prepare") {
+        return new Promise<Response>((resolve) => { resolveLoadgenPrepare = resolve; });
       }
-      return 3;
+      return fakeResponse(200);
     });
     const t0 = Date.now();
     await setActiveTarget({ host: "n2", port: 6379, tls: false, db: 0, label: "n2" });
@@ -365,29 +349,26 @@ describe("Wave 6.43.B.1 — switch coordinator", () => {
     const phasesByName = Object.fromEntries(
       body.per_service.map((s: { name: string; phase: string }) => [s.name, s.phase]),
     );
-    expect(phasesByName.ingest).toBe("drained");
-    expect(phasesByName.source).toBe("drained");
+    expect(phasesByName.ingest).toBe("committed");
+    expect(phasesByName.source).toBe("committed");
     expect(phasesByName.loadgen).toBe("drain_timeout");
+    // Drain the dangling prepare promise — its late 200 must NOT downgrade
+    // the loadgen phase from drain_timeout.
+    if (resolveLoadgenPrepare) (resolveLoadgenPrepare as (r: Response) => void)(fakeResponse(200));
+    await new Promise((r) => setTimeout(r, 10));
+    const status2 = (await app.inject({
+      method: "GET", url: "/internal/redis/active-target/switch-status", headers: AUTH,
+    })).json();
+    expect(
+      status2.per_service.find((s: { name: string }) => s.name === "loadgen").phase,
+    ).toBe("drain_timeout");
   });
 
   it("stale switch_id: ACK is rejected with 409 superseded and status is unchanged", async () => {
     let switchId: string | null = null;
-    __setSwitchPublisherForTests(async (channel, payload) => {
-      const parsed = JSON.parse(payload) as { switch_id: string };
-      if (channel === "intent:active-target:prepare") {
-        switchId = parsed.switch_id;
-        queueMicrotask(() => {
-          for (const svc of ["ingest", "source", "loadgen"]) {
-            void app.inject({
-              method: "POST",
-              url: "/internal/redis/active-target/ack",
-              headers: AUTH,
-              payload: { switch_id: switchId, service: svc, phase: "drained", ok: true },
-            });
-          }
-        });
-      }
-      return 3;
+    __setSwitchPusherForTests(async (_svc, phase, payload) => {
+      if (phase === "prepare") switchId = payload.switch_id;
+      return fakeResponse(200);
     });
     await setActiveTarget({ host: "n1", port: 6379, tls: false, db: 0, label: "n1" });
     const firstSwitchId = switchId;
@@ -449,5 +430,83 @@ describe("Wave 6.43.B.1 — switch coordinator", () => {
       url: "/internal/redis/active-target/switch-status",
     });
     expect(status.statusCode).toBe(401);
+  });
+
+  // Wave 6.43.B.1.rev — HTTP push specifics: parallel fan-out, payload shape,
+  // and resilience when individual pushes fail.
+
+  it("HTTP push: pushes happen in parallel across services for a single phase", async () => {
+    const startTimes: Record<string, number> = {};
+    __setSwitchPusherForTests(async (service, phase) => {
+      if (phase === "prepare") {
+        startTimes[service.name] = Date.now();
+        // Each prepare push waits 40ms — if sequential the total would be
+        // ~120ms across 3 services; parallel keeps the spread small.
+        await new Promise((r) => setTimeout(r, 40));
+      }
+      return new Response(null, { status: 200 });
+    });
+    await setActiveTarget({ host: "h", port: 6379, tls: false, db: 0, label: "h" });
+    const times = ["ingest", "source", "loadgen"].map((n) => startTimes[n]);
+    const spread = Math.max(...times) - Math.min(...times);
+    // All three prepare pushes must have started within a small window of
+    // each other (parallel) — well under the per-push 40ms wait.
+    expect(spread).toBeLessThan(30);
+  });
+
+  it("HTTP push: payload carries switch_id, phase, target.label/version, and timestamp", async () => {
+    const captured: Array<{ phase: string; payload: SwitchPushPayload }> = [];
+    __setSwitchPusherForTests(async (_svc, phase, payload) => {
+      captured.push({ phase, payload });
+      return new Response(null, { status: 200 });
+    });
+    await setActiveTarget({ host: "h", port: 6379, tls: false, db: 0, label: "myprofile" });
+    expect(captured.length).toBe(6); // 3 services × 2 phases
+    const prep = captured.find((c) => c.phase === "prepare")!;
+    expect(prep.payload.switch_id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(prep.payload.phase).toBe("prepare");
+    expect(prep.payload.target.label).toBe("myprofile");
+    expect(typeof prep.payload.target.version).toBe("number");
+    expect(typeof prep.payload.t).toBe("number");
+    const commit = captured.find((c) => c.phase === "commit")!;
+    expect(commit.payload.switch_id).toBe(prep.payload.switch_id);
+    expect(commit.payload.phase).toBe("commit");
+    expect(commit.payload.target.label).toBe("myprofile");
+  });
+
+  it("HTTP push: 5xx response marks the service push_failed but the switch still commits", async () => {
+    __setSwitchPusherForTests(async (service) => {
+      if (service.name === "source") return new Response("boom", { status: 503 });
+      return new Response(null, { status: 200 });
+    });
+    await setActiveTarget({ host: "h", port: 6379, tls: false, db: 0, label: "h" });
+    const status = (await app.inject({
+      method: "GET", url: "/internal/redis/active-target/switch-status", headers: AUTH,
+    })).json();
+    expect(status.phase).toBe("committed");
+    const phasesByName = Object.fromEntries(
+      status.per_service.map((s: { name: string; phase: string; error?: string }) => [s.name, s]),
+    );
+    expect(phasesByName.ingest.phase).toBe("committed");
+    expect(phasesByName.loadgen.phase).toBe("committed");
+    expect(phasesByName.source.phase).toBe("push_failed");
+    expect(phasesByName.source.error).toMatch(/HTTP 503/);
+  });
+
+  it("HTTP push: thrown network error marks push_failed and the switch still commits", async () => {
+    __setSwitchPusherForTests(async (service) => {
+      if (service.name === "loadgen") throw new Error("ECONNREFUSED");
+      return new Response(null, { status: 200 });
+    });
+    await setActiveTarget({ host: "h", port: 6379, tls: false, db: 0, label: "h" });
+    const status = (await app.inject({
+      method: "GET", url: "/internal/redis/active-target/switch-status", headers: AUTH,
+    })).json();
+    expect(status.phase).toBe("committed");
+    const phasesByName = Object.fromEntries(
+      status.per_service.map((s: { name: string; phase: string; error?: string }) => [s.name, s]),
+    );
+    expect(phasesByName.loadgen.phase).toBe("push_failed");
+    expect(phasesByName.loadgen.error).toMatch(/ECONNREFUSED/);
   });
 });
