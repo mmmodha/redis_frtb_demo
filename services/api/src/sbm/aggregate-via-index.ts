@@ -449,6 +449,22 @@ function tenorFromField(f: string): string {
   return parts[parts.length - 1] ?? f;
 }
 
+// Wave 6.39.J — finite-only Number coercion for FT.AGGREGATE row values.
+// `Number(undefined) === NaN` is already caught by the `?? 0` pattern, but
+// `Number("nan")` / `Number("NaN")` is also NaN — RediSearch's SUM reducer
+// can surface that token on Enterprise / Cloud builds when the input
+// columns were sparse-tenor (every contributing row was missing the field).
+// Without a guard the NaN propagates through K_b/S_b → reduceRiskClassCharge,
+// and the response body either ships nulls (Fastify default serializer
+// rewrites NaN to null) or trips a 500 under a strict serializer. Collapse
+// any non-finite value to 0 so a sparse-tenor row resolves to K_b=0 — the
+// same shape the rollup fast-fast path produces when no contributing tenor
+// carries weight. Behaviour on well-formed numeric strings is unchanged.
+function safeNum(v: unknown): number {
+  const n = Number(v ?? 0);
+  return Number.isFinite(n) ? n : 0;
+}
+
 // Wave 5.96A.1 — assemble ws_components + cross_components from per-tenor sums
 // (perTenor classes) or from a per-(bucket, risk_factor) component map
 // (scalar classes). `crossTopN === null` returns all ordered pairs; otherwise
@@ -473,19 +489,19 @@ function buildDeltaVegaComponents(
   if (perTenor) {
     for (const f of list) {
       const k = tenorFromField(f);
-      const wsVal = Number(row[`sum_${prefix}_${f}`] ?? 0);
+      const wsVal = safeNum(row[`sum_${prefix}_${f}`]);
       // Delta perTenor: ws_squared_sum = Σ_tenor (per-tenor sum)² (mirrors
       // girr_delta.lua). Vega perTenor: ws_squared_sum = Σ_tenor (per-row sq).
       const wsSq = prefix === "d"
         ? wsVal * wsVal
-        : Number(row[`sum_${prefix}_${f}_sq`] ?? 0);
+        : safeNum(row[`sum_${prefix}_${f}_sq`]);
       ws.push({ k, ws: wsVal, ws_squared: wsSq });
     }
   } else if (perRf) {
     const f = list[0]!;
     for (const [rf, m] of perRf) {
-      const wsVal = Number(m[`sum_${prefix}_${f}`] ?? 0);
-      const wsSq = Number(m[`sum_${prefix}_${f}_sq`] ?? 0);
+      const wsVal = safeNum(m[`sum_${prefix}_${f}`]);
+      const wsSq = safeNum(m[`sum_${prefix}_${f}_sq`]);
       ws.push({ k: rf, ws: wsVal, ws_squared: wsSq });
     }
     ws.sort((a, b) => (a.k < b.k ? -1 : a.k > b.k ? 1 : 0));
@@ -545,8 +561,8 @@ function buildCurvatureComponents(
       const uf = up[i];
       const df = dn[i];
       const k = uf ? tenorFromField(uf) : df ? tenorFromField(df) : `t${i}`;
-      const cvr_up = uf ? Number(row[`sum_u_${uf}`] ?? 0) : 0;
-      const cvr_down = df ? Number(row[`sum_n_${df}`] ?? 0) : 0;
+      const cvr_up = uf ? safeNum(row[`sum_u_${uf}`]) : 0;
+      const cvr_down = df ? safeNum(row[`sum_n_${df}`]) : 0;
       out.push({ k, cvr_up, cvr_down });
     }
     return out;
@@ -555,8 +571,8 @@ function buildCurvatureComponents(
   const uf = fields.cvrUp?.[0];
   const df = fields.cvrDown?.[0];
   for (const [rf, m] of perRf) {
-    const cvr_up = uf ? Number(m[`sum_u_${uf}`] ?? 0) : 0;
-    const cvr_down = df ? Number(m[`sum_n_${df}`] ?? 0) : 0;
+    const cvr_up = uf ? safeNum(m[`sum_u_${uf}`]) : 0;
+    const cvr_down = df ? safeNum(m[`sum_n_${df}`]) : 0;
     out.push({ k: rf, cvr_up, cvr_down });
   }
   out.sort((a, b) => (a.k < b.k ? -1 : a.k > b.k ? 1 : 0));
@@ -638,7 +654,7 @@ function kbCurvatureForDirection(
     // curvature oracle directly. The sign-split aggregates are unused.
     // Wave 5.96A — also surface ΣCVR² and the residual cross term so the UI
     // formula block can render the same closed-form pieces the kernel sees.
-    const cvr = fields.map((f) => Number(row[`sum_${prefix}_${f}`] ?? 0));
+    const cvr = fields.map((f) => safeNum(row[`sum_${prefix}_${f}`]));
     const kbSq = Math.max(0, kbSquaredForDirection(cvr, rhoCurv));
     const S_b = cvr.reduce((a, b) => a + b, 0);
     const ws_squared_sum = cvr.reduce((acc, x) => acc + x * x, 0);
@@ -654,10 +670,10 @@ function kbCurvatureForDirection(
   //   Σ_{k<0,l<0,k≠l} a_k a_l             = N² − SQN
   //   ψ-gated cross = total − both-negative
   const f = fields[0]!;
-  const S = Number(row[`sum_${prefix}_${f}`] ?? 0);
-  const SQ = Number(row[`sum_${prefix}_${f}_sq`] ?? 0);
-  const N = Number(row[`sum_${prefix}_${f}_neg`] ?? 0);
-  const SQN = Number(row[`sum_${prefix}_${f}_negsq`] ?? 0);
+  const S = safeNum(row[`sum_${prefix}_${f}`]);
+  const SQ = safeNum(row[`sum_${prefix}_${f}_sq`]);
+  const N = safeNum(row[`sum_${prefix}_${f}_neg`]);
+  const SQN = safeNum(row[`sum_${prefix}_${f}_negsq`]);
   const totalCross = S * S - SQ;
   const negCross = N * N - SQN;
   const gatedCross = totalCross - negCross;
@@ -683,7 +699,7 @@ function bucketResultFromRow(
   components: ComponentsOpts | undefined = undefined,
 ): BucketResult {
   const bucket = row.bucket ?? "";
-  const count = Number(row.row_count ?? 0);
+  const count = safeNum(row.row_count);
   const ms = Number(process.hrtime.bigint() - startNs) / 1e6;
   if (leg === "delta" || leg === "vega") {
     const list = (leg === "delta" ? fields.delta : fields.vega) ?? [];
@@ -693,7 +709,7 @@ function bucketResultFromRow(
     if (perTenor && leg === "delta") {
       // GIRR Delta: sum_ws_sq operates on the per-tenor SUMs (not the per-row
       // squared sums) — see girr_delta.lua. Square the per-tenor totals in TS.
-      const wsK = list.map((f) => Number(row[`sum_d_${f}`] ?? 0));
+      const wsK = list.map((f) => safeNum(row[`sum_d_${f}`]));
       sumWs = wsK.reduce((a, b) => a + b, 0);
       sumWsSq = wsK.reduce((acc, x) => acc + x * x, 0);
     } else {
@@ -701,8 +717,8 @@ function bucketResultFromRow(
       sumWs = 0;
       sumWsSq = 0;
       for (const f of list) {
-        sumWs += Number(row[`sum_${prefix}_${f}`] ?? 0);
-        sumWsSq += Number(row[`sum_${prefix}_${f}_sq`] ?? 0);
+        sumWs += safeNum(row[`sum_${prefix}_${f}`]);
+        sumWsSq += safeNum(row[`sum_${prefix}_${f}_sq`]);
       }
     }
     const r = kbFromConstantRho(sumWs, sumWsSq, rho);
