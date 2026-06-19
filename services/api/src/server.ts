@@ -126,6 +126,14 @@ export interface CreateServerOpts {
   // remains queryable via GET /generator/runs/:id/status. Default 30s.
   // Tests dial this down to verify grace-eviction.
   generatorTerminalGraceMs?: number;
+  // Wave 6.44.E — override the `fetch` used by /admin/cancel-all-runs to
+  // call the ingest /ingest/halt-and-flush endpoint. Tests inject a stub
+  // so they can assert the proxy without standing up a real ingest service.
+  generatorFetchImpl?: typeof fetch;
+  // Wave 6.44.E — best-effort window (ms) for cancel flags to propagate
+  // before /admin/cancel-all-runs proxies to ingest. Tests dial this down
+  // so the suite stays fast (no real producer loop to observe the flag).
+  generatorCancelDrainMs?: number;
   // Wave 5.16g — explicit override for the CORS allow-list. When unset the
   // server reads `ALLOWED_ORIGINS` from the environment (comma-separated, or
   // `*` for any origin) and falls back to http://localhost:3000 — the nginx
@@ -318,6 +326,12 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
     sseProgressIntervalMs: opts.generatorSseProgressIntervalMs,
     terminalGraceMs: opts.generatorTerminalGraceMs,
     corsAllowed,
+    // Wave 6.44.E — POST /admin/cancel-all-runs needs the ingest base URL
+    // so it can call /ingest/halt-and-flush after flipping cancel flags.
+    // Falls back to INGEST_URL env var inside the handler.
+    ingestBase: opts.ingestBase,
+    fetchImpl: opts.generatorFetchImpl,
+    cancelDrainMs: opts.generatorCancelDrainMs,
   });
   registerAdminRoutes(app, getRedis, { schema: opts.schema });
 

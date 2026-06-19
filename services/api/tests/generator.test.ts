@@ -1129,25 +1129,54 @@ describe("POST /generator/start/stream (Wave 5.20c) — SSE progress + cancellat
 // `status === "running"`. Tests use the `_testInsertActiveRun` helper to seed
 // the registry deterministically (SSE-driven setup is timing-sensitive and
 // the route's behaviour is a pure scan of a Map).
-describe("POST /admin/cancel-all-runs (Wave 5.44) — admin stop all generator runs", () => {
+describe("POST /admin/cancel-all-runs (Wave 5.44 / 6.44.E) — admin stop all generator runs", () => {
   let app: Awaited<ReturnType<typeof createServer>>;
   beforeEach(() => { _testResetActiveRuns(); });
   afterEach(async () => { if (app) await app.close(); _testResetActiveRuns(); });
 
-  it("returns ok:true with cancelled:0 and empty run_ids when no runs are active", async () => {
+  // Wave 6.44.E — every cancel-all-runs call now also proxies to ingest's
+  // /ingest/halt-and-flush. These tests inject a stub fetch via INGEST_URL
+  // override + a custom server option so we can assert both the cancel
+  // bookkeeping AND the flush summary in the response, without standing up
+  // a real ingest service. cancelDrainMs is dialled down to keep the suite
+  // fast (the detached producer loop is never actually running in-test).
+  const FLUSH_OK = { ok: true, streams_trimmed: 4, docs_cleared: 12, elapsed_ms: 7 };
+
+  function makeIngestFetchStub(reply: { ok: boolean; status?: number; body: unknown }): {
+    impl: typeof fetch;
+    calls: Array<{ url: string; init: RequestInit | undefined }>;
+  } {
+    const calls: Array<{ url: string; init: RequestInit | undefined }> = [];
+    const impl: typeof fetch = async (input, init) => {
+      const url = typeof input === "string" ? input : (input as URL).toString();
+      calls.push({ url, init });
+      return new Response(JSON.stringify(reply.body), {
+        status: reply.status ?? (reply.ok ? 200 : 500),
+        headers: { "content-type": "application/json" },
+      });
+    };
+    return { impl, calls };
+  }
+
+  it("returns ok:true cancelled:0 plus the flush summary when no runs are active", async () => {
     const schema = loadFixtureSchema();
     const fr = pipelineFakeRedis();
-    app = await createServer({ redis: fr, schema });
+    const stub = makeIngestFetchStub({ ok: true, body: FLUSH_OK });
+    app = await createServer({ redis: fr, schema, ingestBase: "http://stub-ingest:8083", generatorFetchImpl: stub.impl, generatorCancelDrainMs: 10 });
 
     const res = await app.inject({ method: "POST", url: "/admin/cancel-all-runs" });
     expect(res.statusCode).toBe(200);
-    expect(res.json()).toEqual({ ok: true, cancelled: 0, run_ids: [] });
+    expect(res.json()).toEqual({ ok: true, cancelled: 0, run_ids: [], flush: FLUSH_OK });
+    expect(stub.calls).toHaveLength(1);
+    expect(stub.calls[0]!.url).toBe("http://stub-ingest:8083/ingest/halt-and-flush");
+    expect((stub.calls[0]!.init as RequestInit).method).toBe("POST");
   });
 
-  it("flips cancelFlag on every running entry and returns each run_id", async () => {
+  it("flips cancelFlag on every running entry and returns each run_id alongside the flush summary", async () => {
     const schema = loadFixtureSchema();
     const fr = pipelineFakeRedis();
-    app = await createServer({ redis: fr, schema });
+    const stub = makeIngestFetchStub({ ok: true, body: FLUSH_OK });
+    app = await createServer({ redis: fr, schema, ingestBase: "http://stub-ingest:8083", generatorFetchImpl: stub.impl, generatorCancelDrainMs: 10 });
 
     const flagA = { cancelled: false };
     const flagB = { cancelled: false };
@@ -1156,10 +1185,11 @@ describe("POST /admin/cancel-all-runs (Wave 5.44) — admin stop all generator r
 
     const res = await app.inject({ method: "POST", url: "/admin/cancel-all-runs" });
     expect(res.statusCode).toBe(200);
-    const body = res.json() as { ok: boolean; cancelled: number; run_ids: string[] };
+    const body = res.json() as { ok: boolean; cancelled: number; run_ids: string[]; flush: typeof FLUSH_OK };
     expect(body.ok).toBe(true);
     expect(body.cancelled).toBe(2);
     expect(body.run_ids.sort()).toEqual(["run-A", "run-B"]);
+    expect(body.flush).toEqual(FLUSH_OK);
 
     expect(_testGetActiveRun("run-A")!.cancelFlag.cancelled).toBe(true);
     expect(_testGetActiveRun("run-B")!.cancelFlag.cancelled).toBe(true);
@@ -1168,7 +1198,8 @@ describe("POST /admin/cancel-all-runs (Wave 5.44) — admin stop all generator r
   it("only cancels entries with status='running' — already-terminal runs are left alone", async () => {
     const schema = loadFixtureSchema();
     const fr = pipelineFakeRedis();
-    app = await createServer({ redis: fr, schema });
+    const stub = makeIngestFetchStub({ ok: true, body: FLUSH_OK });
+    app = await createServer({ redis: fr, schema, ingestBase: "http://stub-ingest:8083", generatorFetchImpl: stub.impl, generatorCancelDrainMs: 10 });
 
     const flagRunning = { cancelled: false };
     const flagDone = { cancelled: false };
@@ -1177,19 +1208,21 @@ describe("POST /admin/cancel-all-runs (Wave 5.44) — admin stop all generator r
 
     const res = await app.inject({ method: "POST", url: "/admin/cancel-all-runs" });
     expect(res.statusCode).toBe(200);
-    const body = res.json() as { ok: boolean; cancelled: number; run_ids: string[] };
+    const body = res.json() as { ok: boolean; cancelled: number; run_ids: string[]; flush: typeof FLUSH_OK };
     expect(body.cancelled).toBe(1);
     expect(body.run_ids).toEqual(["run-live"]);
+    expect(body.flush).toEqual(FLUSH_OK);
 
     expect(_testGetActiveRun("run-live")!.cancelFlag.cancelled).toBe(true);
     // The already-terminal entry is untouched.
     expect(_testGetActiveRun("run-done")!.cancelFlag.cancelled).toBe(false);
   });
 
-  it("is idempotent — a follow-up call after every run is cancelled returns cancelled:0", async () => {
+  it("is idempotent — a follow-up call after every run is cancelled returns cancelled:0 but still flushes", async () => {
     const schema = loadFixtureSchema();
     const fr = pipelineFakeRedis();
-    app = await createServer({ redis: fr, schema });
+    const stub = makeIngestFetchStub({ ok: true, body: FLUSH_OK });
+    app = await createServer({ redis: fr, schema, ingestBase: "http://stub-ingest:8083", generatorFetchImpl: stub.impl, generatorCancelDrainMs: 10 });
 
     _testInsertActiveRun({ run_id: "run-1", status: "running", cancelFlag: { cancelled: false } });
     _testInsertActiveRun({ run_id: "run-2", status: "running", cancelFlag: { cancelled: false } });
@@ -1199,9 +1232,44 @@ describe("POST /admin/cancel-all-runs (Wave 5.44) — admin stop all generator r
 
     // Status is still "running" (the detached loop hasn't observed the flag
     // yet); the route must skip these on the second call so we don't
-    // double-count an already-cancelled run.
+    // double-count an already-cancelled run. The flush still runs and is
+    // idempotent on the ingest side too — DoD #2.
     const second = await app.inject({ method: "POST", url: "/admin/cancel-all-runs" });
     expect(second.statusCode).toBe(200);
-    expect(second.json()).toEqual({ ok: true, cancelled: 0, run_ids: [] });
+    expect(second.json()).toEqual({ ok: true, cancelled: 0, run_ids: [], flush: FLUSH_OK });
+    expect(stub.calls).toHaveLength(2);
+  });
+
+  // Wave 6.44.E DoD #4 — ingest unreachable must NOT 5xx; cancel flags must
+  // still be set and `flush: null` surfaces so the UI can render a partial-
+  // success banner.
+  it("returns flush:null with 200 when ingest is unreachable (cancel flags still set)", async () => {
+    const schema = loadFixtureSchema();
+    const fr = pipelineFakeRedis();
+    const impl: typeof fetch = async () => { throw new Error("ECONNREFUSED stub"); };
+    app = await createServer({ redis: fr, schema, ingestBase: "http://stub-ingest:8083", generatorFetchImpl: impl, generatorCancelDrainMs: 10 });
+
+    _testInsertActiveRun({ run_id: "run-X", status: "running", cancelFlag: { cancelled: false } });
+
+    const res = await app.inject({ method: "POST", url: "/admin/cancel-all-runs" });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { ok: boolean; cancelled: number; run_ids: string[]; flush: unknown };
+    expect(body.ok).toBe(true);
+    expect(body.cancelled).toBe(1);
+    expect(body.run_ids).toEqual(["run-X"]);
+    expect(body.flush).toBeNull();
+    expect(_testGetActiveRun("run-X")!.cancelFlag.cancelled).toBe(true);
+  });
+
+  it("returns flush:null when ingest replies non-2xx (cancel still succeeds)", async () => {
+    const schema = loadFixtureSchema();
+    const fr = pipelineFakeRedis();
+    const stub = makeIngestFetchStub({ ok: false, status: 504, body: { ok: false, error: "halt-and-flush timed out", stage: "drain" } });
+    app = await createServer({ redis: fr, schema, ingestBase: "http://stub-ingest:8083", generatorFetchImpl: stub.impl, generatorCancelDrainMs: 10 });
+
+    const res = await app.inject({ method: "POST", url: "/admin/cancel-all-runs" });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { flush: unknown };
+    expect(body.flush).toBeNull();
   });
 });

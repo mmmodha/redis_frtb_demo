@@ -12,8 +12,9 @@ import { type RedisLike } from "./consumer.ts";
 import { createActiveTargetWatcher, defaultRedisFactory, type ActiveTargetWatcher } from "./active-target-watcher.ts";
 import { parseShardAssignment, shardStreamKey } from "./sharding.ts";
 import { createMultiShardConsumer, ensureGroupsForShards } from "./multi-consumer.ts";
-import { createShardRuntime, type ShardRuntime } from "./shard-runtime.ts";
+import { createShardRuntime, RebuildBusyError, RebuildTimeoutError, type ShardRuntime } from "./shard-runtime.ts";
 import { backfillRollups } from "./backfill-rollups.ts";
+import { performHaltAndFlush } from "./halt-and-flush.ts";
 
 const log = pino({ level: process.env.LOG_LEVEL ?? "info" });
 
@@ -64,27 +65,99 @@ function startHealth(
   // the api proxy can fan out to one upstream. Optional so unit tests that
   // exercise only /healthz can omit it.
   runtime?: ShardRuntime,
+  // Wave 6.44.E — first-chance handler for routes that need access to the
+  // live activeClient / token closure (POST /ingest/halt-and-flush). Runs
+  // before the runtime's handleRequest so the halt route can preempt; the
+  // runtime then keeps owning /ingest/shards + /ingest/status.
+  extraHandler?: (req: http.IncomingMessage, res: http.ServerResponse) => boolean | Promise<boolean>,
 ): http.Server {
   const server = http.createServer((req, res) => {
-    if (runtime && runtime.handleRequest(req, res, { consumed: state.consumed(), errors: state.errors(), ready: state.ready })) {
-      return;
-    }
-    if (req.url === "/healthz") {
-      // Wave 5.97D.1 — liveness only. Always 200 once the process is
-      // accepting HTTP so the compose healthcheck passes before Redis is
-      // wired, matching the api's /healthz semantics. The body's `status`
-      // field still surfaces readiness (`starting` vs `ok`) for callers
-      // that inspect it; the HTTP status code is process-alive.
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ service: "ingest", status: state.ready ? "ok" : "starting", consumed: state.consumed(), errors: state.errors() }));
-      return;
-    }
-    res.writeHead(404); res.end();
+    const handle = async (): Promise<void> => {
+      if (extraHandler) {
+        const claimed = await extraHandler(req, res);
+        if (claimed) return;
+      }
+      if (runtime && runtime.handleRequest(req, res, { consumed: state.consumed(), errors: state.errors(), ready: state.ready })) {
+        return;
+      }
+      if (req.url === "/healthz") {
+        // Wave 5.97D.1 — liveness only. Always 200 once the process is
+        // accepting HTTP so the compose healthcheck passes before Redis is
+        // wired, matching the api's /healthz semantics. The body's `status`
+        // field still surfaces readiness (`starting` vs `ok`) for callers
+        // that inspect it; the HTTP status code is process-alive.
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ service: "ingest", status: state.ready ? "ok" : "starting", consumed: state.consumed(), errors: state.errors() }));
+        return;
+      }
+      res.writeHead(404); res.end();
+    };
+    void handle().catch((err) => {
+      log.error({ err: String(err), url: req.url }, "ingest http handler failed");
+      if (!res.headersSent) { res.writeHead(500); res.end(); }
+    });
   });
   server.listen(port, host, () => {
     log.info({ host, port }, "ingest healthz listening");
   });
   return server;
+}
+
+// Wave 6.44.E — request body reader for the halt-and-flush route. Mirrors
+// the helper inside shard-runtime; kept local here so cli.ts isn't coupled
+// to the runtime's private body reader.
+function readRequestBody(req: http.IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (c: Buffer | string) => chunks.push(typeof c === "string" ? Buffer.from(c) : c));
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
+    req.on("error", reject);
+  });
+}
+
+// Wave 6.44.E — POST /ingest/halt-and-flush handler. Bearer-token guarded
+// by INTERNAL_API_TOKEN (same posture as /ingest/shards inside the api
+// proxy). Captures the live activeClient lazily so a target swap that
+// completes between the request landing and the handler running still
+// flushes against the up-to-date client.
+function makeHaltAndFlushHandler(
+  shardRuntime: ShardRuntime,
+  getActiveClient: () => RedisLike | null,
+  internalToken: string | undefined,
+): (req: http.IncomingMessage, res: http.ServerResponse) => Promise<boolean> {
+  const writeJson = (res: http.ServerResponse, code: number, body: unknown): void => {
+    res.writeHead(code, { "content-type": "application/json" });
+    res.end(JSON.stringify(body));
+  };
+  return async (req, res) => {
+    if (req.url !== "/ingest/halt-and-flush" || req.method !== "POST") return false;
+    if (internalToken) {
+      const auth = req.headers["authorization"];
+      const expected = `Bearer ${internalToken}`;
+      if (auth !== expected) { writeJson(res, 401, { ok: false, error: "unauthorized" }); return true; }
+    }
+    const client = getActiveClient();
+    if (!client) { writeJson(res, 503, { ok: false, error: "no active redis client" }); return true; }
+    // Body is optional; reading drains it so keep-alive sockets don't stall.
+    try { await readRequestBody(req); } catch { /* best-effort */ }
+    const t0 = Date.now();
+    try {
+      const report = await shardRuntime.haltAndFlush(async (snap) => {
+        return performHaltAndFlush(client, STREAM, snap.totalShards);
+      });
+      writeJson(res, 200, { ok: true, ...report, elapsed_ms: Date.now() - t0 });
+    } catch (err) {
+      if (err instanceof RebuildBusyError) {
+        writeJson(res, 409, { ok: false, error: "rebuild in progress" });
+      } else if (err instanceof RebuildTimeoutError) {
+        writeJson(res, 504, { ok: false, error: "halt-and-flush timed out", stage: err.stage });
+      } else {
+        log.error({ err: String(err) }, "halt-and-flush failed");
+        writeJson(res, 500, { ok: false, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+    return true;
+  };
 }
 
 async function main(): Promise<void> {
@@ -195,7 +268,8 @@ async function main(): Promise<void> {
     consumed: () => shardRuntime.getMulti()?.stats.consumed ?? 0,
     errors: () => shardRuntime.getMulti()?.stats.errors ?? 0,
   };
-  const health = startHealth(HEALTH_PORT, HEALTH_HOST, state, shardRuntime);
+  const haltHandler = makeHaltAndFlushHandler(shardRuntime, () => activeClient, internalToken);
+  const health = startHealth(HEALTH_PORT, HEALTH_HOST, state, shardRuntime, haltHandler);
 
   if (SHARD_ASSIGNMENT.length === 0) {
     throw new Error(`SHARD_ASSIGNMENT=${SHARD_ASSIGNMENT_SPEC} resolved to no shards for STREAM_SHARDS=${STREAM_SHARDS}`);

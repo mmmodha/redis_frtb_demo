@@ -9,6 +9,28 @@ import { apiBase } from "./api";
 // stays owned by ./admin; only the import path is widened.
 export { getStreamStatus, type StreamStatusResponse } from "./admin";
 
+// Wave 6.44.D — typed client for GET /admin/index-count. Surfaces the live
+// FT.SEARCH count against the active sens-index so the IngestPanel indexing
+// bar reflects what calc queries actually see rather than the ingest
+// consumed counter (which leads the index by the write lag). Errors on the
+// api side (no active target, index missing during bootstrap) degrade to
+// `{ count: 0, index_name: null }` — the route never 5xx's.
+export interface IndexCountResponse {
+  count: number;
+  index_name: string | null;
+}
+
+export async function getIndexCount(): Promise<IndexCountResponse> {
+  const res = await fetch(`${apiBase()}/admin/index-count`);
+  if (!res.ok) throw new Error(`api /admin/index-count ${res.status}`);
+  const body = (await res.json()) as { count?: unknown; index_name?: unknown };
+  const count = typeof body.count === "number" && Number.isFinite(body.count) && body.count >= 0
+    ? body.count
+    : 0;
+  const index_name = typeof body.index_name === "string" ? body.index_name : null;
+  return { count, index_name };
+}
+
 export interface Source {
   id: string;
   kind: "synthetic" | "file" | string;
@@ -293,10 +315,21 @@ export async function flushDb(): Promise<FlushDbResponse> {
 // `status === "running"`. Used by the IngestPanel "Stop all runs" button.
 // Sends an empty JSON object body to dodge Fastify's FST_ERR_CTP_EMPTY_JSON_BODY
 // when content-type is application/json (same defensive shape as flushDb).
+export interface CancelAllRunsFlushReport {
+  ok: true;
+  streams_trimmed: number;
+  docs_cleared: number;
+  elapsed_ms?: number;
+}
+
 export interface CancelAllGeneratorRunsResponse {
   ok: true;
   cancelled: number;
   run_ids: string[];
+  // Wave 6.44.E — present when the api successfully proxied to ingest's
+  // /ingest/halt-and-flush. `null` when ingest was unreachable; the cancel
+  // flags are still set, so the UI surfaces a partial-success banner.
+  flush: CancelAllRunsFlushReport | null;
 }
 
 export async function cancelAllGeneratorRuns(): Promise<CancelAllGeneratorRunsResponse> {

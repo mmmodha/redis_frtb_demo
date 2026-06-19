@@ -20,6 +20,7 @@ import {
 } from "../src/multi-consumer.ts";
 import type { RedisLike } from "../src/consumer.ts";
 import { createShardRuntime } from "../src/shard-runtime.ts";
+import { performHaltAndFlush } from "../src/halt-and-flush.ts";
 
 interface StubClient {
   reads: string[];
@@ -623,6 +624,169 @@ describe("POST /ingest/shards rebuilds the multi-consumer", () => {
     } finally {
       await new Promise<void>((r) => server.close(() => r()));
     }
+  });
+});
+
+// Wave 6.44.E — halt-and-flush helper + shard-runtime integration.
+//
+// `performHaltAndFlush` is exercised directly against an in-memory client
+// stub so we can assert the exact XTRIM / SCAN / UNLINK call shapes without
+// standing up a real Redis. The runtime test then proves the mutex / drain /
+// respawn ordering: the consumer is stopped BEFORE the caller-supplied
+// flush step runs and a new consumer is spawned AFTER it returns.
+interface HaltFlushStub {
+  client: RedisLike;
+  calls: Array<{ cmd: string; args: string[] }>;
+  keys: Set<string>;
+}
+function makeHaltFlushStub(initialKeys: string[]): HaltFlushStub {
+  const calls: Array<{ cmd: string; args: string[] }> = [];
+  const keys = new Set<string>(initialKeys);
+  const client = {
+    async call(cmd: string, ...args: unknown[]): Promise<unknown> {
+      const upper = cmd.toUpperCase();
+      const strArgs = args.map((a) => String(a));
+      calls.push({ cmd: upper, args: strArgs });
+      if (upper === "XTRIM") return "OK";
+      if (upper === "SCAN") {
+        // Return all current keys in one batch (cursor "0" → done).
+        return ["0", Array.from(keys)];
+      }
+      if (upper === "UNLINK") {
+        let removed = 0;
+        for (const k of strArgs) { if (keys.delete(k)) removed += 1; }
+        return removed;
+      }
+      return null;
+    },
+  };
+  return { client: client as unknown as RedisLike, calls, keys };
+}
+
+describe("performHaltAndFlush", () => {
+  it("XTRIMs every shard stream and UNLINKs every matching sens:* doc", async () => {
+    const stub = makeHaltFlushStub([
+      "sens:abc", "sens:def", "sens:ghi",
+      // Leave one unrelated key in place so the SCAN MATCH filter is tested
+      // by virtue of the in-memory keyset being identical to what SCAN returns.
+      // (The stub returns whatever is in the set; the production client filters
+      // by the MATCH arg — we assert the MATCH arg was passed below.)
+    ]);
+    const report = await performHaltAndFlush(stub.client, "sensitivities:in", 4);
+    expect(report).toEqual({ streams_trimmed: 4, docs_cleared: 3 });
+
+    // Four XTRIMs against the hash-tagged shard keys, MAXLEN 0 each.
+    const xtrims = stub.calls.filter((c) => c.cmd === "XTRIM");
+    expect(xtrims).toHaveLength(4);
+    expect(xtrims.map((c) => c.args)).toEqual([
+      ["sensitivities:in:{0}", "MAXLEN", "0"],
+      ["sensitivities:in:{1}", "MAXLEN", "0"],
+      ["sensitivities:in:{2}", "MAXLEN", "0"],
+      ["sensitivities:in:{3}", "MAXLEN", "0"],
+    ]);
+    // SCAN was invoked with MATCH sens:* (default).
+    const scans = stub.calls.filter((c) => c.cmd === "SCAN");
+    expect(scans).toHaveLength(1);
+    // SCAN args: <cursor> MATCH <pat> COUNT <n>
+    expect(scans[0]!.args[1]).toBe("MATCH");
+    expect(scans[0]!.args[2]).toBe("sens:*");
+    expect(scans[0]!.args[3]).toBe("COUNT");
+    // UNLINK removed the docs.
+    expect(stub.keys.size).toBe(0);
+  });
+
+  it("trims the bare-key stream when totalShards === 1 (legacy fan-out)", async () => {
+    const stub = makeHaltFlushStub([]);
+    const report = await performHaltAndFlush(stub.client, "sensitivities:in", 1);
+    expect(report.streams_trimmed).toBe(1);
+    const xtrims = stub.calls.filter((c) => c.cmd === "XTRIM");
+    expect(xtrims).toHaveLength(1);
+    expect(xtrims[0]!.args[0]).toBe("sensitivities:in");
+  });
+
+  it("is idempotent when no docs match (docs_cleared=0)", async () => {
+    const stub = makeHaltFlushStub([]);
+    const report = await performHaltAndFlush(stub.client, "sensitivities:in", 2);
+    expect(report).toEqual({ streams_trimmed: 2, docs_cleared: 0 });
+  });
+});
+
+describe("shardRuntime.haltAndFlush", () => {
+  it("drains the live consumer BEFORE running the callback and respawns AFTER", async () => {
+    const stub = makeStubClient();
+    let spawnCalls = 0;
+    let stopCalls = 0;
+    const order: string[] = [];
+    const runtime = createShardRuntime({
+      baseStream: "sensitivities:in",
+      initialTotalShards: 2,
+      initialAssignmentSpec: "all",
+      spawn: async (totalShards, assignment) => {
+        spawnCalls += 1;
+        order.push(`spawn#${spawnCalls}`);
+        const streams = assignment.map((s) => shardStreamKey("sensitivities:in", s, totalShards));
+        await ensureGroupsForShards(stub.client, streams, "ingest");
+        const m = createMultiShardConsumer(stub.client, {
+          baseStream: "sensitivities:in", group: "ingest", consumerNameBase: "ingest-host-1",
+          totalShards, assignment, batchSize: 10, blockMs: 5,
+          makeRunnerClient: () => makeStubClient().client, runnerQuitTimeoutMs: 50,
+        });
+        const realStop = m.stop.bind(m);
+        const wrapped: MultiConsumer = { ...m, async stop() { stopCalls += 1; order.push("stop"); return realStop(); } };
+        wrapped.start();
+        return wrapped;
+      },
+    });
+    await runtime.rebuild(); // initial spawn → spawn#1
+    expect(spawnCalls).toBe(1);
+
+    const result = await runtime.haltAndFlush(async (snapshot) => {
+      order.push("between");
+      expect(snapshot.totalShards).toBe(2);
+      return { streams_trimmed: snapshot.totalShards, docs_cleared: 42 };
+    });
+    expect(result).toEqual({ streams_trimmed: 2, docs_cleared: 42 });
+
+    // stop must come before between; spawn#2 must come after between.
+    expect(order).toEqual(["spawn#1", "stop", "between", "spawn#2"]);
+    expect(stopCalls).toBe(1);
+    expect(spawnCalls).toBe(2);
+    // Cleanup so the test doesn't leak a runner.
+    const m = runtime.getMulti();
+    if (m) await m.stop();
+  });
+
+  it("rejects with RebuildBusyError when a rebuild is already in flight", async () => {
+    const stub = makeStubClient();
+    let releaseSpawn: (() => void) | null = null;
+    let spawnCalls = 0;
+    const runtime = createShardRuntime({
+      baseStream: "sensitivities:in",
+      initialTotalShards: 1,
+      initialAssignmentSpec: "all",
+      spawn: async (totalShards, assignment) => {
+        spawnCalls += 1;
+        if (spawnCalls >= 2) await new Promise<void>((r) => { releaseSpawn = r; });
+        const streams = assignment.map((s) => shardStreamKey("sensitivities:in", s, totalShards));
+        await ensureGroupsForShards(stub.client, streams, "ingest");
+        const m = createMultiShardConsumer(stub.client, {
+          baseStream: "sensitivities:in", group: "ingest", consumerNameBase: "ingest-host-1",
+          totalShards, assignment, batchSize: 10, blockMs: 5,
+          makeRunnerClient: () => makeStubClient().client, runnerQuitTimeoutMs: 50,
+        });
+        m.start();
+        return m;
+      },
+    });
+    await runtime.rebuild(); // spawn#1
+    // Kick off a rebuild that will block in spawn#2.
+    const inflight = runtime.rebuild({ totalShards: 2 });
+    await new Promise((r) => setTimeout(r, 20));
+    await expect(runtime.haltAndFlush(async () => undefined)).rejects.toThrow(/rebuild already in progress/);
+    if (releaseSpawn) (releaseSpawn as () => void)();
+    await inflight;
+    const m = runtime.getMulti();
+    if (m) await m.stop();
   });
 });
 

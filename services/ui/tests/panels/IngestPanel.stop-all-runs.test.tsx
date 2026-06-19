@@ -42,10 +42,18 @@ function memoryResponse() {
 interface FetchOpts {
   cancelled?: number;
   run_ids?: string[];
+  // Wave 6.44.E — proxy-to-ingest summary. `null` simulates the ingest-down
+  // path so the partial-success banner can be asserted; the default value
+  // mirrors a real successful flush.
+  flush?: { ok: true; streams_trimmed: number; docs_cleared: number; elapsed_ms?: number } | null;
 }
 
 function mockFetch(opts: FetchOpts = {}) {
-  const { cancelled = 2, run_ids = ["run-A", "run-B"] } = opts;
+  const {
+    cancelled = 2,
+    run_ids = ["run-A", "run-B"],
+    flush = { ok: true as const, streams_trimmed: 4, docs_cleared: 12, elapsed_ms: 7 },
+  } = opts;
   const fetchMock = vi.fn();
   fetchMock.mockImplementation(async (input: RequestInfo, init?: RequestInit) => {
     const url = String(input);
@@ -54,7 +62,7 @@ function mockFetch(opts: FetchOpts = {}) {
     if (url.includes("/observability/keys")) return { ok: true, json: async () => keysResponse(0) };
     if (url.includes("/observability/memory")) return { ok: true, json: async () => memoryResponse() };
     if (url.endsWith("/admin/cancel-all-runs") && method === "POST") {
-      return { ok: true, status: 200, json: async () => ({ ok: true, cancelled, run_ids }) };
+      return { ok: true, status: 200, json: async () => ({ ok: true, cancelled, run_ids, flush }) };
     }
     if (url.endsWith("/generator/runs") && method === "GET") {
       return { ok: true, json: async () => ({ active: [] }) };
@@ -88,7 +96,11 @@ describe("IngestPanel — Stop all runs button (Wave 5.44)", () => {
     const modal = await screen.findByTestId("stop-all-runs-modal");
     expect(modal).toBeInTheDocument();
     expect(within(modal).getByRole("heading", { name: /stop all active generator runs/i })).toBeInTheDocument();
-    expect(within(modal).getByText(/cancels every run currently producing rows/i)).toBeInTheDocument();
+    // Wave 6.44.E — modal copy now warns about the destructive flush
+    // (stream backlog + indexed-row wipe) so the operator can't mistake
+    // this for a soft cancel.
+    expect(within(modal).getByText(/wipes the stream backlog/i)).toBeInTheDocument();
+    expect(within(modal).getByText(/indexed rows/i)).toBeInTheDocument();
     const posted = fetchMock.mock.calls.find(
       (c) => /\/admin\/cancel-all-runs$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",
     );
@@ -121,6 +133,10 @@ describe("IngestPanel — Stop all runs button (Wave 5.44)", () => {
     });
     const banner = await screen.findByTestId("stop-all-runs-banner");
     expect(banner).toHaveTextContent(/stopped 2 runs/i);
+    // Wave 6.44.E — banner now also surfaces the flush summary from the
+    // proxy-to-ingest call so the user sees both halves of the action.
+    expect(banner).toHaveTextContent(/flushed 4 streams/i);
+    expect(banner).toHaveTextContent(/cleared 12 indexed rows/i);
   });
 
   it("banner reads 'No active runs' when the server reports cancelled:0", async () => {
@@ -130,5 +146,20 @@ describe("IngestPanel — Stop all runs button (Wave 5.44)", () => {
     fireEvent.click(within(await screen.findByTestId("stop-all-runs-modal")).getByTestId("stop-all-runs-confirm"));
     const banner = await screen.findByTestId("stop-all-runs-banner");
     expect(banner).toHaveTextContent(/no active runs/i);
+    // The flush still runs even when there were no live runs — DoD #2.
+    expect(banner).toHaveTextContent(/flushed 4 streams/i);
+  });
+
+  // Wave 6.44.E DoD #4 — ingest-down partial success: the cancel still
+  // succeeds, the banner switches to the partial-success copy, and the
+  // panel does NOT raise an error.
+  it("banner reports 'ingest unreachable' when the server returns flush:null", async () => {
+    fetchMock = mockFetch({ cancelled: 1, run_ids: ["run-X"], flush: null });
+    renderPanel();
+    fireEvent.click(await screen.findByTestId("stop-all-runs-btn"));
+    fireEvent.click(within(await screen.findByTestId("stop-all-runs-modal")).getByTestId("stop-all-runs-confirm"));
+    const banner = await screen.findByTestId("stop-all-runs-banner");
+    expect(banner).toHaveTextContent(/stopped 1 run/i);
+    expect(banner).toHaveTextContent(/ingest unreachable/i);
   });
 });

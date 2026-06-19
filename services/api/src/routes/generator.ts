@@ -162,6 +162,19 @@ export interface GeneratorRoutesOpts {
   // queryable via GET /generator/runs/:id/status so a refresh right after
   // completion still surfaces the summary. Tests dial this down.
   terminalGraceMs?: number;
+  // Wave 6.44.E — upstream base URL for the ingest service used by
+  // /admin/cancel-all-runs to call POST /ingest/halt-and-flush after
+  // flipping cancel flags. Falls back to INGEST_URL env var, then to the
+  // compose-internal default at request time.
+  ingestBase?: string;
+  // Wave 6.44.E — override the global `fetch` used to call ingest's
+  // halt-and-flush. Tests inject a stub to assert headers / response wiring
+  // without needing a real upstream.
+  fetchImpl?: typeof fetch;
+  // Wave 6.44.E — best-effort window (ms) we wait for cancel flags to
+  // propagate to status="cancelled" before calling halt-and-flush. Defaults
+  // to 2000; tests dial this down.
+  cancelDrainMs?: number;
 }
 
 const DEFAULT_ROWS = 200;
@@ -670,6 +683,11 @@ export function registerGeneratorRoutes(
 ): void {
   const streamName = opts.streamName ?? "sensitivities:in";
   const corsAllowed = opts.corsAllowed ?? "http://localhost:3000";
+  // Wave 6.44.E — fetch impl + cancel-drain budget are resolved once at
+  // route registration; ingestBase is resolved per-request (read from env
+  // inside the handler) so test setups can poke INGEST_URL before injecting.
+  const cancelFetch: typeof fetch = opts.fetchImpl ?? fetch;
+  const cancelDrainMs = opts.cancelDrainMs ?? 2000;
 
   app.post<{ Body: GeneratorStartBody }>("/generator/start", { config: { category: "heavy-ingest" } }, async (req, reply) => {
     if (!schema) {
@@ -1080,11 +1098,20 @@ export function registerGeneratorRoutes(
     return { ok: true, cancelled: true, run_id: id };
   });
 
-  // Wave 5.44 — admin "stop all runs" escape hatch. Iterates `activeRuns`
-  // and flips the cancel flag on every entry currently `status === "running"`
-  // whose flag isn't already set. Idempotent: a follow-up call returns
-  // cancelled:0 because the previous call already marked the flags. No body
-  // required — Fastify accepts an empty POST and we never read req.body.
+  // Wave 5.44 / 6.44.E — admin "stop all runs" escape hatch. Two-step:
+  //   1) Flip the cancel flag on every entry currently `status === "running"`
+  //      whose flag isn't already set. Idempotent — a follow-up call returns
+  //      cancelled:0 because the previous call already marked the flags.
+  //   2) Wait up to `cancelDrainMs` for those entries to transition to a
+  //      terminal status (the detached producer loops observe the flag at
+  //      batch boundaries), then call POST {ingestBase}/ingest/halt-and-flush
+  //      with the internal bearer token. The ingest endpoint drains the
+  //      MultiConsumer, XTRIMs every shard input stream to MAXLEN 0, and
+  //      SCAN+UNLINKs the `sens:*` doc family so the search-backed Indexing
+  //      progress (6.44.D) drops to 0 immediately. If ingest is unreachable
+  //      the response still returns 200 with `flush: null` (callers see a
+  //      partial-success banner; the cancel flags are already set).
+  // No body required — Fastify accepts an empty POST and we never read req.body.
   app.post("/admin/cancel-all-runs", async () => {
     const run_ids: string[] = [];
     for (const entry of activeRuns.values()) {
@@ -1093,8 +1120,66 @@ export function registerGeneratorRoutes(
         run_ids.push(entry.run_id);
       }
     }
-    return { ok: true, cancelled: run_ids.length, run_ids };
+
+    // Best-effort drain: poll until every entry we just marked transitions to
+    // a terminal status, capped at cancelDrainMs. A producer mid-batch may
+    // emit a few more XADDs before observing the flag; the halt-and-flush
+    // below trims the stream so any post-cancel residue still gets wiped.
+    if (run_ids.length > 0) {
+      const deadline = Date.now() + cancelDrainMs;
+      while (Date.now() < deadline) {
+        let stillRunning = false;
+        for (const id of run_ids) {
+          const e = activeRuns.get(id);
+          if (e && e.status === "running") { stillRunning = true; break; }
+        }
+        if (!stillRunning) break;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    }
+
+    const flush = await callIngestHaltAndFlush(app, opts.ingestBase, cancelFetch);
+    return { ok: true, cancelled: run_ids.length, run_ids, flush };
   });
+}
+
+// Wave 6.44.E — proxy the halt-and-flush call to ingest. Returns the parsed
+// upstream report on success; `null` (with a logged warning) on any failure
+// so the caller can degrade to a partial-success banner without a 5xx. The
+// internal bearer token is read at call time so a dev who rotates
+// INTERNAL_API_TOKEN after process start still gets the new value.
+async function callIngestHaltAndFlush(
+  app: FastifyInstance,
+  ingestBase: string | undefined,
+  fetchImpl: typeof fetch,
+): Promise<{ ok: true; streams_trimmed: number; docs_cleared: number; elapsed_ms?: number } | null> {
+  const base = ingestBase ?? process.env.INGEST_URL
+    ?? `http://localhost:${process.env.INGEST_PORT ?? 8083}`;
+  const token = process.env.INTERNAL_API_TOKEN;
+  const url = `${base.replace(/\/+$/, "")}/ingest/halt-and-flush`;
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (token) headers["authorization"] = `Bearer ${token}`;
+  try {
+    const r = await fetchImpl(url, { method: "POST", headers, body: "{}" });
+    if (!r.ok) {
+      app.log.warn({ evt: "cancel-all-runs.flush", status: r.status, url }, "ingest halt-and-flush returned non-2xx");
+      return null;
+    }
+    const body = (await r.json()) as { ok?: boolean; streams_trimmed?: number; docs_cleared?: number; elapsed_ms?: number };
+    if (body.ok !== true || typeof body.streams_trimmed !== "number" || typeof body.docs_cleared !== "number") {
+      app.log.warn({ evt: "cancel-all-runs.flush", url, body }, "ingest halt-and-flush returned unexpected shape");
+      return null;
+    }
+    return {
+      ok: true,
+      streams_trimmed: body.streams_trimmed,
+      docs_cleared: body.docs_cleared,
+      elapsed_ms: typeof body.elapsed_ms === "number" ? body.elapsed_ms : undefined,
+    };
+  } catch (err) {
+    app.log.warn({ evt: "cancel-all-runs.flush", url, err: String(err) }, "ingest halt-and-flush unreachable");
+    return null;
+  }
 }
 
 // Wave 5.44 — test-only accessors for the module-local activeRuns registry.

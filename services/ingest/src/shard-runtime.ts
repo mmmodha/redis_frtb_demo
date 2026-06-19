@@ -74,6 +74,12 @@ export interface ShardRuntime {
   getMulti(): MultiConsumer | null;
   setMulti(m: MultiConsumer | null): void;
   rebuild(opts?: { totalShards?: number; assignmentSpec?: string }): Promise<ShardSnapshot>;
+  // Wave 6.44.E — drain the live consumer, invoke `between` while the
+  // consumer is stopped (the caller XTRIMs streams + UNLINKs sens:* keys
+  // there), then respawn under the SAME mutex used by rebuild() so a
+  // concurrent POST /ingest/shards still 409s. RebuildBusyError / drain
+  // RebuildTimeoutError surface to the route handler unchanged.
+  haltAndFlush<T>(between: (snapshot: ShardSnapshot) => Promise<T>): Promise<T>;
   handleRequest(req: http.IncomingMessage, res: http.ServerResponse, extras: HandleExtras): boolean;
 }
 
@@ -143,6 +149,40 @@ export function createShardRuntime(opts: ShardRuntimeOptions): ShardRuntime {
       assignment = nextAssignment;
       multi = await withTimeout(opts.spawn(totalShards, assignment), timeoutMs, "spawn");
       return snapshot();
+    } catch (err) {
+      if (err instanceof RebuildTimeoutError) timedOut = true;
+      throw err;
+    } finally {
+      rebuilding = false;
+      rebuildStartedAt = null;
+      if (timedOut) multi = null;
+    }
+  };
+
+  // Wave 6.44.E — same in-flight mutex and timeout budget as rebuild(), but
+  // with a caller-supplied step between drain and respawn so the api's
+  // /admin/cancel-all-runs proxy can XTRIM + SCAN/UNLINK while no consumer
+  // is reading the stream. Respawn uses the live (totalShards, assignment)
+  // so the consumer comes back exactly as it was before the halt.
+  const haltAndFlush = async <T>(between: (snapshot: ShardSnapshot) => Promise<T>): Promise<T> => {
+    if (rebuilding) throw new RebuildBusyError();
+    const timeoutMs = resolveRebuildTimeoutMs();
+    rebuilding = true;
+    rebuildStartedAt = new Date().toISOString();
+    let timedOut = false;
+    try {
+      if (multi) {
+        try {
+          await withTimeout(multi.stop(), timeoutMs, "drain");
+        } catch (err) {
+          if (err instanceof RebuildTimeoutError) throw err;
+          opts.logger?.warn("drain previous consumers failed", { err: String(err) });
+        }
+        multi = null;
+      }
+      const result = await between(snapshot());
+      multi = await withTimeout(opts.spawn(totalShards, assignment), timeoutMs, "spawn");
+      return result;
     } catch (err) {
       if (err instanceof RebuildTimeoutError) timedOut = true;
       throw err;
@@ -227,6 +267,6 @@ export function createShardRuntime(opts: ShardRuntimeOptions): ShardRuntime {
 
   return {
     snapshot, getMulti: () => multi, setMulti: (m) => { multi = m; },
-    rebuild, handleRequest,
+    rebuild, haltAndFlush, handleRequest,
   };
 }
