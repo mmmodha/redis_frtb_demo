@@ -60,10 +60,6 @@ function setSearch(search: string) {
 
 beforeEach(() => {
   const ls = makeMemoryStorage();
-  // Wave 6.45.B — pin to the Advanced view so the legacy assertions below
-  // (Scenario select, Show Redis commands toggle, advanced-filters) see the
-  // pre-6.45.B CalcPanel surface; the production default is Simple.
-  ls.setItem("frtb:calc:view:v1", "advanced");
   vi.stubGlobal("localStorage", ls);
   setSearch("");
 });

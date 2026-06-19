@@ -1,13 +1,9 @@
-import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { CalcPanel } from "../../src/panels/CalcPanel";
 import type { CalcSbmResponse } from "../../src/lib/calc";
 
 const originalFetch = globalThis.fetch;
-
-beforeEach(() => {
-  try { window.localStorage.setItem("frtb:calc:view:v1", "advanced"); } catch { /* ignore */ }
-});
 
 // Capture every /calc/sbm POST body so individual assertions can dissect them.
 // Wave 6.41.D — filter out the /calc/sbm/by-desk fetches the new top-N panel

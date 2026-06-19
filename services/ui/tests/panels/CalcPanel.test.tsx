@@ -1,16 +1,9 @@
-import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { CalcPanel } from "../../src/panels/CalcPanel";
 import type { CalcSbmResponse } from "../../src/lib/calc";
 
 const originalFetch = globalThis.fetch;
-
-// Wave 6.45.B — these tests pre-date the Simple|Advanced toggle and assert
-// against the full pre-6.45.B CalcPanel surface, so force the Advanced view
-// before each render. (Default in production is "simple".)
-beforeEach(() => {
-  try { window.localStorage.setItem("frtb:calc:view:v1", "advanced"); } catch { /* ignore */ }
-});
 
 function mockCalcResponse(body: CalcSbmResponse | { error: string }, status = 200) {
   globalThis.fetch = vi.fn(async () =>
