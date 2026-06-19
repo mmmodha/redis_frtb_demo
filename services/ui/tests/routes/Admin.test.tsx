@@ -1,4 +1,4 @@
-// Wave 6.39.D — Admin route wires all six observability widgets and renders
+// Wave 6.39.D — Admin route wires all five observability widgets and renders
 // them under a top-level page heading.
 
 import { describe, it, expect, afterEach, vi } from "vitest";
@@ -34,10 +34,6 @@ function routeFetch() {
         summary: { total: 1, present: 1, missing: 0 },
       }), { status: 200, headers: { "content-type": "application/json" } });
     }
-    if (url.endsWith("/admin/backfill-status")) {
-      return new Response(JSON.stringify({ total: 0, completed: 0, in_flight: 0, failed: 0, eta_ms: 0, status: "not-implemented" }),
-        { status: 200, headers: { "content-type": "application/json" } });
-    }
     if (url.endsWith("/admin/drift-status")) {
       return new Response(JSON.stringify({ threshold_pct: 0.01, results: [] }),
         { status: 200, headers: { "content-type": "application/json" } });
@@ -65,13 +61,12 @@ describe("<Admin /> route", () => {
     expect(screen.getByRole("heading", { name: /^admin$/i, level: 1 })).toBeInTheDocument();
   });
 
-  it("renders all six admin widgets", async () => {
+  it("renders all five admin widgets", async () => {
     vi.stubGlobal("localStorage", makeMemoryStorage());
     routeFetch();
     const { Admin } = await import("../../src/routes/Admin");
     render(<MemoryRouter><Admin /></MemoryRouter>);
     expect(await screen.findByRole("heading", { name: /^calc coverage$/i, level: 2 })).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: /^backfill$/i, level: 2 })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: /^drift$/i, level: 2 })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: /^snapshots$/i, level: 2 })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: /^stream status$/i, level: 2 })).toBeInTheDocument();

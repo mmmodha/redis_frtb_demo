@@ -20,16 +20,6 @@ export interface CoverageRow {
 export interface CoverageSummary { total: number; present: number; missing: number }
 export interface CalcCoverageResponse { coverage: CoverageRow[]; summary: CoverageSummary }
 
-// GET /admin/backfill-status — Wave 6.39.B (reserved stub)
-export interface BackfillStatusResponse {
-  total: number;
-  completed: number;
-  in_flight: number;
-  failed: number;
-  eta_ms: number;
-  status: string;
-}
-
 // GET /admin/drift-status — Wave 6.39.C
 export interface DriftResult {
   ts: string;
@@ -94,9 +84,6 @@ async function getJson<T>(path: string): Promise<T> {
 
 export function getCalcCoverage(): Promise<CalcCoverageResponse> {
   return getJson<CalcCoverageResponse>("/admin/calc-coverage");
-}
-export function getBackfillStatus(): Promise<BackfillStatusResponse> {
-  return getJson<BackfillStatusResponse>("/admin/backfill-status");
 }
 export function getDriftStatus(): Promise<DriftStatusResponse> {
   return getJson<DriftStatusResponse>("/admin/drift-status");

@@ -86,9 +86,9 @@ export function registerAdminRoutes(
 ): void {
   const runBootstrap = opts.bootstrap ?? bootstrapFrtb;
 
-  // Wave 6.39.B — calc coverage audit + backfill-status stub + /metrics
-  // exposition. Registered under the same surface so a single import
-  // path (registerAdminRoutes) wires every calc-side admin route.
+  // Wave 6.39.B — calc coverage audit + /metrics exposition. Registered
+  // under the same surface so a single import path (registerAdminRoutes)
+  // wires every calc-side admin route.
   registerAdminCalcRoutes(app, getRedis);
 
   // Wave 6.39.C — Layer 4 safety nets (drift-status, snapshots, stream-

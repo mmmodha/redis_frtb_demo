@@ -5,7 +5,6 @@
 import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import {
   getCalcCoverage,
-  getBackfillStatus,
   getDriftStatus,
   getSnapshots,
   getStreamStatus,
@@ -60,13 +59,6 @@ describe("lib/admin", () => {
     expect(calls[0]!.url).toMatch(/\/admin\/calc-coverage$/);
     expect(r.coverage[0]!.risk_class).toBe("GIRR");
     expect(r.summary.present).toBe(1);
-  });
-
-  it("getBackfillStatus GETs /admin/backfill-status", async () => {
-    const calls = mockJson({ total: 0, completed: 0, in_flight: 0, failed: 0, eta_ms: 0, status: "not-implemented" });
-    const r = await getBackfillStatus();
-    expect(calls[0]!.url).toMatch(/\/admin\/backfill-status$/);
-    expect(r.status).toBe("not-implemented");
   });
 
   it("getDriftStatus GETs /admin/drift-status", async () => {

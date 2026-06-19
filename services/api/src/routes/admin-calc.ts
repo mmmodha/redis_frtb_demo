@@ -8,11 +8,6 @@
 //     fast-fast path (Wave 6.14b) vs. fall back to FT.AGGREGATE (which
 //     is now gated by CALC_ALLOW_FT_AGGREGATE — see aggregate-via-index).
 //
-//   GET /admin/backfill-status  — stub for the post-bootstrap rollup
-//     backfill loop. The actual loop is deferred to a follow-up task; the
-//     route is reserved here so the UI can wire the progress card and
-//     operator tooling can confirm the surface is present.
-//
 //   GET /metrics  — Prometheus-style counters for the K_b cache (Wave
 //     6.39.B C3). Plain text, two counters. Kept tiny so we can add more
 //     calc-side counters as they land without restructuring the route.
@@ -168,14 +163,6 @@ export function registerAdminCalcRoutes(
       missing: coverage.filter((r) => !r.rollup_present).length,
     };
     return { coverage, summary };
-  });
-
-  // Backfill-status stub. Surface reserved; the actual scan/backfill loop
-  // is queued as a follow-up (post-bootstrap hook + targeted FT.AGGREGATE
-  // batches). Status string surfaces the deferral so dashboards don't
-  // mis-render the all-zeros body as "100% complete".
-  app.get("/admin/backfill-status", { config: { category: "light" } }, async () => {
-    return { total: 0, completed: 0, in_flight: 0, failed: 0, eta_ms: 0, status: "not-implemented" };
   });
 
   // /metrics — minimal Prometheus exposition for the K_b cache. We keep
