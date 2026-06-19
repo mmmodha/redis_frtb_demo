@@ -4,6 +4,11 @@
 // Wave 6.44.B — anchors are per-active-target. Storage key bumped to v3
 // with a `:{target_label}` suffix; v2 entries are dropped silently on
 // read. read/write/clearAnchor now take a `label: string` argument.
+// Wave 6.44.D — bar data source switched from the ingest consumed counter
+// to the live FT.SEARCH * doc count. Field renamed `consumedAtAnchor` →
+// `indexCountAtAnchor`; sample type renamed `ConsumedSample` →
+// `IndexCountSample` (no more xlen). Storage key bumped to v4 with v3
+// entries dropped silently on read.
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
@@ -16,7 +21,7 @@ import {
   pushSample,
   readAnchor,
   writeAnchor,
-  type ConsumedSample,
+  type IndexCountSample,
   type IndexingAnchor,
 } from "../../src/lib/indexingState";
 
@@ -56,7 +61,7 @@ function anchorAt(ts: number, label: string = LABEL): IndexingAnchor {
   return {
     runId: "01HXRUN",
     rowsTotal: 100,
-    consumedAtAnchor: 50,
+    indexCountAtAnchor: 50,
     anchorTs: ts,
     lastSeenAt: ts,
     targetLabel: label,
@@ -75,20 +80,22 @@ describe("indexingState — anchor persistence", () => {
     expect(localStorage.getItem(storageKeyFor(LABEL))).not.toBeNull();
   });
 
-  it("uses the v3 label-scoped storage key prefix", () => {
-    expect(STORAGE_KEY_PREFIX).toBe("frtb:indexing:anchor:v3:");
-    expect(storageKeyFor("local")).toBe("frtb:indexing:anchor:v3:local");
+  it("uses the v4 label-scoped storage key prefix", () => {
+    expect(STORAGE_KEY_PREFIX).toBe("frtb:indexing:anchor:v4:");
+    expect(storageKeyFor("local")).toBe("frtb:indexing:anchor:v4:local");
   });
 
-  it("silently drops v2 entries left behind by the prior layout", () => {
-    // A v2-shaped entry sat at the old unscoped key. After upgrade, the
-    // v3 reader never consults it; the entry is left in storage and the
-    // v3 read returns null (mirrors the v1→v2 migration precedent).
+  it("silently drops v3 entries left behind by the prior layout", () => {
+    // A v3-shaped entry sat at the old `consumedAtAnchor` key. After
+    // upgrade, the v4 reader never consults it; the entry is left in
+    // storage and the v4 read returns null (mirrors the v2→v3 migration
+    // precedent).
     localStorage.setItem(
-      "frtb:indexing:anchor:v2",
+      "frtb:indexing:anchor:v3:" + LABEL,
       JSON.stringify({
         runId: "x", rowsTotal: 100, consumedAtAnchor: 0,
         anchorTs: Date.now(), lastSeenAt: Date.now(),
+        targetLabel: LABEL,
       }),
     );
     expect(readAnchor(LABEL)).toBeNull();
@@ -139,7 +146,7 @@ describe("indexingState — Wave 6.44.B per-target isolation", () => {
     const onB: IndexingAnchor = {
       runId: "01HXRUN-B",
       rowsTotal: 50,
-      consumedAtAnchor: 10,
+      indexCountAtAnchor: 10,
       anchorTs: onA.anchorTs + 2,
       lastSeenAt: onA.anchorTs + 2,
       targetLabel: "live-standalone",
@@ -174,7 +181,7 @@ describe("indexingState — Wave 6.44.B per-target isolation", () => {
     localStorage.setItem(
       storageKeyFor("local"),
       JSON.stringify({
-        runId: "x", rowsTotal: 100, consumedAtAnchor: 0,
+        runId: "x", rowsTotal: 100, indexCountAtAnchor: 0,
         anchorTs: Date.now(), lastSeenAt: Date.now(),
       }),
     );
@@ -185,17 +192,17 @@ describe("indexingState — Wave 6.44.B per-target isolation", () => {
 });
 
 describe("indexingState — computePct", () => {
-  it("anchor=0, consumed=50M, rowsTotal=100M → 50%", () => {
+  it("anchor=0, indexCount=50M, rowsTotal=100M → 50%", () => {
     expect(computePct(0, 50_000_000, 100_000_000)).toBe(50);
   });
-  it("anchor=1000, consumed=1750, rowsTotal=1000 → 75%", () => {
+  it("anchor=1000, indexCount=1750, rowsTotal=1000 → 75%", () => {
     expect(computePct(1_000, 1_750, 1_000)).toBe(75);
   });
-  it("clamps to 100% when consumed reaches anchor+rowsTotal", () => {
+  it("clamps to 100% when indexCount reaches anchor+rowsTotal", () => {
     expect(computePct(0, 1_000, 1_000)).toBe(100);
     expect(computePct(500, 2_000, 1_000)).toBe(100);
   });
-  it("clamps to 0% when consumed is below the anchor (ingest restart)", () => {
+  it("clamps to 0% when indexCount is below the anchor (index rebuild)", () => {
     expect(computePct(1_000, 500, 1_000)).toBe(0);
   });
   it("returns 100% when rowsTotal <= 0", () => {
@@ -207,26 +214,26 @@ describe("indexingState — computePct", () => {
 describe("indexingState — computeRatePerSec sliding window", () => {
   it("returns null when fewer than two samples", () => {
     expect(computeRatePerSec([])).toBeNull();
-    expect(computeRatePerSec([{ consumed: 100, xlen: 0, ts: 0 }])).toBeNull();
+    expect(computeRatePerSec([{ indexCount: 100, ts: 0 }])).toBeNull();
   });
 
-  it("returns 0 when consumed is not growing (consumer idle)", () => {
-    const samples: ConsumedSample[] = [
-      { consumed: 100, xlen: 50, ts: 0 },
-      { consumed: 100, xlen: 50, ts: 1000 },
-      { consumed: 100, xlen: 60, ts: 2000 },
+  it("returns 0 when indexCount is not growing (indexer idle)", () => {
+    const samples: IndexCountSample[] = [
+      { indexCount: 100, ts: 0 },
+      { indexCount: 100, ts: 1000 },
+      { indexCount: 100, ts: 2000 },
     ];
     expect(computeRatePerSec(samples)).toBe(0);
   });
 
-  it("computes rows/sec across 5 samples (positive delta of consumed)", () => {
-    // consumed grows from 0 to 500 over 5 seconds = 100 rows/s.
-    const samples: ConsumedSample[] = [
-      { consumed:   0, xlen: 1000, ts: 0 },
-      { consumed: 100, xlen:  900, ts: 1000 },
-      { consumed: 200, xlen:  800, ts: 2000 },
-      { consumed: 350, xlen:  650, ts: 3500 },
-      { consumed: 500, xlen:  500, ts: 5000 },
+  it("computes rows/sec across 5 samples (positive delta of indexCount)", () => {
+    // indexCount grows from 0 to 500 over 5 seconds = 100 rows/s.
+    const samples: IndexCountSample[] = [
+      { indexCount:   0, ts: 0 },
+      { indexCount: 100, ts: 1000 },
+      { indexCount: 200, ts: 2000 },
+      { indexCount: 350, ts: 3500 },
+      { indexCount: 500, ts: 5000 },
     ];
     expect(computeRatePerSec(samples)).toBe(100);
   });
@@ -234,16 +241,16 @@ describe("indexingState — computeRatePerSec sliding window", () => {
 
 describe("indexingState — pushSample bounded window", () => {
   it("appends below the window size", () => {
-    const s = pushSample([], { consumed: 1, xlen: 0, ts: 1 }, 3);
-    expect(s).toEqual([{ consumed: 1, xlen: 0, ts: 1 }]);
+    const s = pushSample([], { indexCount: 1, ts: 1 }, 3);
+    expect(s).toEqual([{ indexCount: 1, ts: 1 }]);
   });
   it("evicts the oldest sample once the window is full", () => {
-    let s: ConsumedSample[] = [];
-    for (let i = 0; i < 5; i++) s = pushSample(s, { consumed: i, xlen: 10 - i, ts: i }, 3);
+    let s: IndexCountSample[] = [];
+    for (let i = 0; i < 5; i++) s = pushSample(s, { indexCount: i, ts: i }, 3);
     expect(s).toEqual([
-      { consumed: 2, xlen: 8, ts: 2 },
-      { consumed: 3, xlen: 7, ts: 3 },
-      { consumed: 4, xlen: 6, ts: 4 },
+      { indexCount: 2, ts: 2 },
+      { indexCount: 3, ts: 3 },
+      { indexCount: 4, ts: 4 },
     ]);
   });
 });

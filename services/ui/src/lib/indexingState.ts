@@ -17,8 +17,16 @@
 // same precedent as v1→v2; no migration is written. The anchor body
 // additionally carries `targetLabel` so the IngestPanel render guard can
 // evict in-memory state that lags a live target switch by one render.
+//
+// Wave 6.44.D — data source switched from the ingest `consumed` counter to
+// the live `FT.SEARCH * LIMIT 0 0` count against the active sens-index
+// (surfaced through /admin/index-count). The consumed counter leads the
+// index by the ingest write lag, which made the bar overshoot what a calc
+// query could actually see. Field renamed `consumedAtAnchor` →
+// `indexCountAtAnchor`; storage key bumped to v4. v3 entries are silently
+// dropped on read (same precedent as v1→v2, v2→v3).
 
-export const STORAGE_KEY_PREFIX = "frtb:indexing:anchor:v3:";
+export const STORAGE_KEY_PREFIX = "frtb:indexing:anchor:v4:";
 export const ANCHOR_TTL_MS = 24 * 60 * 60 * 1000;
 
 export function storageKeyFor(label: string): string {
@@ -31,12 +39,12 @@ export interface IndexingAnchor {
   // with no prior anchor — e.g. the page was opened after a run completed).
   runId: string | null;
   // Total rows the producer queued. The denominator for the bar: pct grows
-  // toward 100% as `consumedNow - consumedAtAnchor` approaches rowsTotal.
+  // toward 100% as `indexCountNow - indexCountAtAnchor` approaches rowsTotal.
   rowsTotal: number;
-  // Value of the ingest consumed counter at the moment this anchor was
-  // created. The 0% baseline. Pct math is
-  // (consumedNow - consumedAtAnchor) / rowsTotal.
-  consumedAtAnchor: number;
+  // Wave 6.44.D — value of the FT.SEARCH * doc count at the moment this
+  // anchor was created. The 0% baseline. Pct math is
+  // (indexCountNow - indexCountAtAnchor) / rowsTotal.
+  indexCountAtAnchor: number;
   // When this anchor was created. Used for TTL eviction.
   anchorTs: number;
   // Most recent time the anchor was touched (poll, refresh). Persisted so a
@@ -71,7 +79,7 @@ export function readAnchor(label: string, now: number = Date.now()): IndexingAnc
   try { parsed = JSON.parse(raw) as Partial<IndexingAnchor>; }
   catch { return null; }
   if (
-    typeof parsed.consumedAtAnchor !== "number"
+    typeof parsed.indexCountAtAnchor !== "number"
     || typeof parsed.anchorTs !== "number"
     || typeof parsed.rowsTotal !== "number"
     || typeof parsed.lastSeenAt !== "number"
@@ -85,7 +93,7 @@ export function readAnchor(label: string, now: number = Date.now()): IndexingAnc
   return {
     runId: typeof parsed.runId === "string" ? parsed.runId : null,
     rowsTotal: parsed.rowsTotal,
-    consumedAtAnchor: parsed.consumedAtAnchor,
+    indexCountAtAnchor: parsed.indexCountAtAnchor,
     anchorTs: parsed.anchorTs,
     lastSeenAt: parsed.lastSeenAt,
     targetLabel: typeof parsed.targetLabel === "string" ? parsed.targetLabel : label,
@@ -105,37 +113,40 @@ export function clearAnchor(label: string): void {
 }
 
 // Clamp to [0, 100]. rowsTotal <= 0 ⇒ nothing to index ⇒ 100%. A
-// consumedNow below consumedAtAnchor (ingest restarted, FLUSHDB) clamps to
+// indexCountNow below indexCountAtAnchor (FLUSHDB, index rebuild) clamps to
 // 0% — callers detect that case separately and re-anchor.
 export function computePct(
-  consumedAtAnchor: number,
-  consumedNow: number,
+  indexCountAtAnchor: number,
+  indexCountNow: number,
   rowsTotal: number,
 ): number {
   if (!Number.isFinite(rowsTotal) || rowsTotal <= 0) return 100;
-  if (!Number.isFinite(consumedAtAnchor) || !Number.isFinite(consumedNow)) return 0;
-  const indexed = consumedNow - consumedAtAnchor;
+  if (!Number.isFinite(indexCountAtAnchor) || !Number.isFinite(indexCountNow)) return 0;
+  const indexed = indexCountNow - indexCountAtAnchor;
   if (indexed <= 0) return 0;
   if (indexed >= rowsTotal) return 100;
   return (indexed / rowsTotal) * 100;
 }
 
-// Wave 6.41.E.fix3 — per-tick sample of the strictly-monotonic consumed
-// counter (with the matching xlen for the auto-clear heuristics).
-export interface ConsumedSample { consumed: number; xlen: number; ts: number }
+// Wave 6.44.D — per-tick sample of the live FT.SEARCH * doc count. The
+// previous ConsumedSample shape carried `xlen` for diagnostic continuity
+// but it was never read back by IndexingProgress; with the swap to
+// /admin/index-count there's no longer a free xlen on the wire so the
+// field is dropped.
+export interface IndexCountSample { indexCount: number; ts: number }
 
 // Sliding-window rate computation. Returns rows-per-sec indexed between the
-// oldest and newest sample (positive when consumed is growing; consumed is
-// monotonic within an ingest process lifetime so the "negative drain"
-// branch from the xlen-based design is no longer needed). Returns null
-// when fewer than two samples or no time has elapsed.
-export function computeRatePerSec(samples: ConsumedSample[]): number | null {
+// oldest and newest sample (positive when indexCount is growing). The index
+// doc count is monotonic during a single ingest pass so the "negative drain"
+// branch from the prior xlen-based design is unnecessary. Returns null when
+// fewer than two samples or no time has elapsed.
+export function computeRatePerSec(samples: IndexCountSample[]): number | null {
   if (!Array.isArray(samples) || samples.length < 2) return null;
   const first = samples[0]!;
   const last = samples[samples.length - 1]!;
   const elapsedMs = last.ts - first.ts;
   if (elapsedMs <= 0) return null;
-  const indexed = last.consumed - first.consumed;
+  const indexed = last.indexCount - first.indexCount;
   if (indexed <= 0) return 0;
   return (indexed / elapsedMs) * 1000;
 }
@@ -143,10 +154,10 @@ export function computeRatePerSec(samples: ConsumedSample[]): number | null {
 // Push a new sample into a bounded sliding window. Pure (returns a new
 // array) so React state updates remain referentially honest.
 export function pushSample(
-  samples: ConsumedSample[],
-  sample: ConsumedSample,
+  samples: IndexCountSample[],
+  sample: IndexCountSample,
   windowSize = 10,
-): ConsumedSample[] {
+): IndexCountSample[] {
   const next = samples.concat([sample]);
   if (next.length > windowSize) next.splice(0, next.length - windowSize);
   return next;

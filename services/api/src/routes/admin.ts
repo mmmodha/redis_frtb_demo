@@ -141,6 +141,39 @@ export function registerAdminRoutes(
     recomputeBucketSum,
   });
 
+  // Wave 6.44.D — GET /admin/index-count. Returns the live FT.SEARCH * count
+  // against the active versioned sens-index so the IngestPanel indexing bar
+  // can reflect what a calc query would actually see (vs. the stream-consumed
+  // counter, which leads the index by the ingest-write lag). Bootstrap races
+  // (index briefly missing during rebuild, no active target) degrade to
+  // { ok: true, count: 0, index_name: null } rather than 5xx so the UI's
+  // 2.5s polling loop never surfaces a spurious error.
+  app.get("/admin/index-count", { config: { category: "light" } }, async (req) => {
+    let target_label = "";
+    try { target_label = getActiveTarget().label; } catch { /* no active target */ }
+    if (!target_label) return { ok: true, count: 0, index_name: null };
+    const redis = getRedis(req.poolCategory);
+    let indexName: string;
+    try {
+      indexName = await getSensIndexName(redis, target_label);
+    } catch {
+      return { ok: true, count: 0, index_name: null };
+    }
+    try {
+      const reply = await redis.call("FT.SEARCH", indexName, "*", "LIMIT", "0", "0");
+      let count = 0;
+      if (Array.isArray(reply) && reply.length > 0) {
+        const n = Number(reply[0]);
+        if (Number.isFinite(n) && n >= 0) count = n;
+      } else if (typeof reply === "number" && Number.isFinite(reply) && reply >= 0) {
+        count = reply;
+      }
+      return { ok: true, count, index_name: indexName };
+    } catch {
+      return { ok: true, count: 0, index_name: null };
+    }
+  });
+
   app.post("/admin/flush", { config: { category: "heavy-ingest" } }, async (_req, reply) => {
     let target_label: string;
     try {

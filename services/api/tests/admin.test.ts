@@ -243,3 +243,88 @@ describe("POST /admin/flush", () => {
     expect(runBootstrap).not.toHaveBeenCalled();
   });
 });
+
+// Wave 6.44.D — GET /admin/index-count returns the live FT.SEARCH * doc
+// count against the active versioned sens-index so the IngestPanel
+// indexing bar can reflect what a calc query would actually see (vs. the
+// stream-consumed counter, which leads the index by the ingest-write
+// lag). The route degrades gracefully to `{ count: 0, index_name: null }`
+// on every failure mode (no active target, index missing during
+// bootstrap, FT.SEARCH error) rather than 5xx so the UI's 2.5s polling
+// loop never surfaces a spurious error.
+describe("GET /admin/index-count (Wave 6.44.D)", () => {
+  let app: Awaited<ReturnType<typeof createServer>>;
+  afterEach(async () => {
+    if (app) await app.close();
+    resetActiveTarget();
+  });
+
+  it("returns count parsed from FT.SEARCH * LIMIT 0 0 reply against the active sens-index", async () => {
+    const fr = fakeRedis();
+    // No schema-hash key → getSensIndexName falls back to the unversioned
+    // base "idx:sens". FT.SEARCH replies in the standard RediSearch shape
+    // `[total, ...docs]` — with LIMIT 0 0 it is `[total]`.
+    fr.setResponse("GET", null);
+    fr.setResponse("FT.SEARCH", [42]);
+    app = await createServer({
+      redis: fr,
+      activeTarget: { host: "127.0.0.1", port: 6379, tls: false, db: 0, label: "redis-primary" },
+    });
+    const res = await app.inject({ method: "GET", url: "/admin/index-count" });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.ok).toBe(true);
+    expect(body.count).toBe(42);
+    expect(body.index_name).toBe("idx:sens");
+    // FT.SEARCH was issued exactly once with the index, "*", and LIMIT 0 0.
+    const search = fr.calls.find((c) => c.command === "FT.SEARCH");
+    expect(search).toBeDefined();
+    expect(search!.args).toEqual(["idx:sens", "*", "LIMIT", "0", "0"]);
+  });
+
+  it("returns count:0 with index_name:null when FT.SEARCH errors (index missing during bootstrap)", async () => {
+    const fr = fakeRedis();
+    fr.setResponse("GET", null);
+    fr.setResponse("FT.SEARCH", () => { throw new Error("Unknown Index name"); });
+    app = await createServer({
+      redis: fr,
+      activeTarget: { host: "127.0.0.1", port: 6379, tls: false, db: 0, label: "redis-primary" },
+    });
+    const res = await app.inject({ method: "GET", url: "/admin/index-count" });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ ok: true, count: 0, index_name: null });
+  });
+
+  it("returns count:0 with index_name:null when no active target is set", async () => {
+    const fr = fakeRedis();
+    fr.setResponse("FT.SEARCH", [99]);
+    app = await createServer({
+      redis: fr,
+      activeTarget: { host: "127.0.0.1", port: 6379, tls: false, db: 0, label: "" },
+    });
+    const res = await app.inject({ method: "GET", url: "/admin/index-count" });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ ok: true, count: 0, index_name: null });
+    // FT.SEARCH must NOT have run — the route short-circuits before
+    // touching Redis when there's no active label.
+    expect(fr.calls.find((c) => c.command === "FT.SEARCH")).toBeUndefined();
+  });
+
+  it("resolves the versioned sens-index name when a schema hash is persisted", async () => {
+    const fr = fakeRedis();
+    // 7-char schema hash → getSensIndexName returns "idx:sens:v<hash7>".
+    fr.setResponse("GET", "abc1234");
+    fr.setResponse("FT.SEARCH", [7]);
+    app = await createServer({
+      redis: fr,
+      activeTarget: { host: "127.0.0.1", port: 6379, tls: false, db: 0, label: "redis-primary" },
+    });
+    const res = await app.inject({ method: "GET", url: "/admin/index-count" });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.count).toBe(7);
+    expect(body.index_name).toBe("idx:sens:v" + "abc1234".slice(0, 7));
+    const search = fr.calls.find((c) => c.command === "FT.SEARCH");
+    expect(search!.args[0]).toBe(body.index_name);
+  });
+});
