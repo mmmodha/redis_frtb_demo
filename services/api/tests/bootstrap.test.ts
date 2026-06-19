@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterEach } from "vitest";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadSchema } from "@frtb/schema";
@@ -11,13 +11,17 @@ import {
 } from "../src/bootstrap.ts";
 import { computeSchemaHash } from "../src/lib/schema-hash.ts";
 import {
+  adoptionRecordKey,
   BASE_INDEX_NAME,
   clearSensIndexNameCache,
   getSensIndexName,
+  isAdoptionCompatible,
   LEGACY_HASH_PREFIX,
+  parseFtInfoAttributes,
   schemaHashKey,
   versionedIndexName,
 } from "../src/lib/sens-index.ts";
+import { buildCreateArgs } from "@frtb/rqe";
 import type { RedisLike as NarrowRedisLike } from "../src/redis-like.ts";
 
 // Wave 5.6.3 unit suite. Drives bootstrapFrtb against an in-memory fake — no
@@ -1150,3 +1154,446 @@ describe("bootstrap — Wave 6.18l self-healing stranded versioned index", () =>
   });
 });
 
+
+// Wave 6.44.A — adoption helpers + foreign-versioned-index adoption path.
+// Verifies the structural compatibility predicate in isolation and exercises
+// the bootstrap branch end-to-end against a fake cluster that returns a real
+// FT.INFO `attributes` payload on the foreign versioned name.
+
+describe("isAdoptionCompatible (Wave 6.44.A)", () => {
+  const schema = loadSchema(SCHEMA_PATH);
+  const createArgs = buildCreateArgs(schema);
+
+  function ftInfoFromCreateArgs(args: readonly unknown[]): unknown[] {
+    // Mirror the FT.INFO `attributes` shape from a buildCreateArgs result so
+    // we can perturb individual fields and feed the result back through the
+    // adoption predicate without standing up a real RediSearch.
+    const attrs: unknown[][] = [];
+    let i = 0;
+    while (i < args.length && String(args[i]).toUpperCase() !== "SCHEMA") i++;
+    i++;
+    while (i < args.length) {
+      const path = String(args[i]); i++;
+      let as = path;
+      if (i < args.length && String(args[i]).toUpperCase() === "AS") {
+        i++;
+        as = String(args[i]); i++;
+      }
+      const type = String(args[i]); i++;
+      const attr: unknown[] = ["identifier", path, "attribute", as, "type", type];
+      let sortable = false;
+      while (i < args.length) {
+        const t = String(args[i]).toUpperCase();
+        if (t === "SORTABLE") { sortable = true; i++; }
+        else if (t === "SEPARATOR" && i + 1 < args.length) { attr.push("SEPARATOR", String(args[i + 1])); i += 2; }
+        else break;
+      }
+      if (type.toUpperCase() === "TAG" && !attr.includes("SEPARATOR")) {
+        attr.push("SEPARATOR", ",");
+      }
+      if (sortable) attr.push("SORTABLE");
+      attrs.push(attr);
+    }
+    return ["index_name", "idx:sens:vDEADBEE", "attributes", attrs];
+  }
+
+  it("compatible: identical attributes → { compatible: true }", () => {
+    const info = ftInfoFromCreateArgs(createArgs);
+    const existing = parseFtInfoAttributes(info);
+    expect(isAdoptionCompatible(existing, createArgs)).toEqual({ compatible: true });
+  });
+
+  it("compatible: existing has an extra field beyond expected", () => {
+    const info = ftInfoFromCreateArgs(createArgs) as unknown[];
+    const attrs = info[3] as unknown[][];
+    attrs.push(["identifier", "extra_field", "attribute", "extra_field", "type", "TAG", "SEPARATOR", ","]);
+    const existing = parseFtInfoAttributes(info);
+    expect(isAdoptionCompatible(existing, createArgs)).toEqual({ compatible: true });
+  });
+
+  it("incompatible: type changed on a known field → reason names the field", () => {
+    const info = ftInfoFromCreateArgs(createArgs) as unknown[];
+    const attrs = info[3] as unknown[][];
+    const bucket = attrs.find((a) => a.includes("bucket"));
+    expect(bucket).toBeDefined();
+    const typeIdx = bucket!.indexOf("type");
+    bucket![typeIdx + 1] = "NUMERIC";
+    const existing = parseFtInfoAttributes(info);
+    const result = isAdoptionCompatible(existing, createArgs);
+    expect(result.compatible).toBe(false);
+    if (!result.compatible) expect(result.reason).toMatch(/^type-mismatch:bucket/);
+  });
+
+  it("incompatible: an expected field is missing from existing", () => {
+    const info = ftInfoFromCreateArgs(createArgs) as unknown[];
+    const attrs = info[3] as unknown[][];
+    const filtered = attrs.filter((a) => !a.includes("bucket"));
+    info[3] = filtered;
+    const existing = parseFtInfoAttributes(info);
+    const result = isAdoptionCompatible(existing, createArgs);
+    expect(result.compatible).toBe(false);
+    if (!result.compatible) expect(result.reason).toBe("missing-field:bucket");
+  });
+
+  it("incompatible: sortable flag flipped on a numeric per-tenor field", () => {
+    const info = ftInfoFromCreateArgs(createArgs) as unknown[];
+    const attrs = info[3] as unknown[][];
+    const sortableNumeric = attrs.find(
+      (a) => a.includes("NUMERIC") && a.includes("SORTABLE"),
+    );
+    expect(sortableNumeric).toBeDefined();
+    const idx = sortableNumeric!.indexOf("SORTABLE");
+    sortableNumeric!.splice(idx, 1);
+    const existing = parseFtInfoAttributes(info);
+    const result = isAdoptionCompatible(existing, createArgs);
+    expect(result.compatible).toBe(false);
+    if (!result.compatible) expect(result.reason).toMatch(/^sortable-mismatch:/);
+  });
+
+  it("incompatible: null / unparseable FT.INFO reply", () => {
+    expect(isAdoptionCompatible(null, createArgs)).toEqual({
+      compatible: false,
+      reason: "no-attributes-on-existing-index",
+    });
+    expect(isAdoptionCompatible([], createArgs)).toEqual({
+      compatible: false,
+      reason: "no-attributes-on-existing-index",
+    });
+  });
+});
+
+// Wave 6.44.A — fake cluster that returns a parametrised FT.INFO `attributes`
+// reply for the foreign versioned index so the adoption code path can be
+// exercised without standing up RediSearch. `foreignHash` drives the canned
+// GET response (oldHash). `foreignAttrs` is either:
+//   - "compatible" → echo a full schema mirroring buildCreateArgs
+//   - "incompatible" → echo a single-field schema (missing every other field)
+//   - "missing" → throw "Unknown Index name"
+type AdoptInfoMode = "compatible" | "incompatible" | "missing";
+
+interface AdoptForeignClusterOpts {
+  foreignHash: string;
+  foreignAttrs: AdoptInfoMode;
+  schemaCreateArgs: readonly unknown[];
+  // When true, the initial GET on `bootstrap:schema-hash:{label}` returns null
+  // — simulating a cluster that was pre-populated by a colleague's bootstrap
+  // before *our* api ever ran against it. The FT._LIST scan path is what
+  // discovers the foreign index in this scenario.
+  noHashKey?: boolean;
+}
+
+function fakeClusterForeignAdoption(
+  nodeIds: string[],
+  recorded: RecordedCall[],
+  opts: AdoptForeignClusterOpts,
+): RedisLike {
+  const hashCell = { value: opts.noHashKey ? null : (opts.foreignHash as string | null) };
+  function infoReply(indexName: string): unknown {
+    if (opts.foreignAttrs === "missing") throw new Error("Unknown Index name");
+    // FT.INFO on the legacy unversioned `idx:sens` must miss in this suite —
+    // the foreign cluster only carries the versioned name. Otherwise the
+    // legacy-adopt path swallows the call before the 6.44.A branch can run.
+    if (indexName === BASE_INDEX_NAME) throw new Error("Unknown Index name");
+    if (opts.foreignAttrs === "incompatible") {
+      return [
+        "index_name", indexName,
+        "num_docs", "100",
+        "attributes", [
+          ["identifier", "bucket", "attribute", "bucket", "type", "TAG", "SEPARATOR", ","],
+        ],
+      ];
+    }
+    // compatible — synthesise attributes from the canonical create args.
+    const args = opts.schemaCreateArgs;
+    const attrs: unknown[][] = [];
+    let i = 0;
+    while (i < args.length && String(args[i]).toUpperCase() !== "SCHEMA") i++;
+    i++;
+    while (i < args.length) {
+      const path = String(args[i]); i++;
+      let as = path;
+      if (i < args.length && String(args[i]).toUpperCase() === "AS") {
+        i++;
+        as = String(args[i]); i++;
+      }
+      const type = String(args[i]); i++;
+      const attr: unknown[] = ["identifier", path, "attribute", as, "type", type];
+      let sortable = false;
+      while (i < args.length) {
+        const t = String(args[i]).toUpperCase();
+        if (t === "SORTABLE") { sortable = true; i++; }
+        else if (t === "SEPARATOR" && i + 1 < args.length) { attr.push("SEPARATOR", String(args[i + 1])); i += 2; }
+        else break;
+      }
+      if (type.toUpperCase() === "TAG" && !attr.includes("SEPARATOR")) {
+        attr.push("SEPARATOR", ",");
+      }
+      if (sortable) attr.push("SORTABLE");
+      attrs.push(attr);
+    }
+    return ["index_name", indexName, "num_docs", "100", "attributes", attrs];
+  }
+  const nodes = nodeIds.map((id) => ({
+    async call(command: string, ...args: unknown[]) {
+      const cmd = String(command).toUpperCase();
+      recorded.push({ node: id, command: cmd, args });
+      if (cmd === "FT.INFO") return infoReply(String(args[0]));
+      return "OK";
+    },
+  }));
+  return {
+    nodes: (_role: string) => nodes as unknown as RedisLike[],
+    async call(command: string, ...args: unknown[]) {
+      const cmd = String(command).toUpperCase();
+      recorded.push({ node: "cluster", command: cmd, args });
+      if (cmd === "GET") {
+        // Only the schema-hash key drives the bootstrap decision tree; other
+        // keys (e.g. bootstrap:adopted:*) are write-only in this suite.
+        if (String(args[0]).startsWith("bootstrap:schema-hash:")) return hashCell.value;
+        return null;
+      }
+      if (cmd === "SET") {
+        if (String(args[0]).startsWith("bootstrap:schema-hash:")) hashCell.value = String(args[1]);
+        return "OK";
+      }
+      if (cmd === "FT.INFO") return infoReply(String(args[0]));
+      if (cmd === "FT._LIST") {
+        // Mirror real RediSearch: a foreign versioned index is present unless
+        // the test explicitly marks it missing. Used by the FT._LIST scan
+        // path that runs when no schema-hash key exists yet.
+        return opts.foreignAttrs === "missing"
+          ? []
+          : [`idx:sens:v${opts.foreignHash.slice(0, 7)}`];
+      }
+      if (cmd === "FT.SUGLEN") return 1;
+      if (cmd === "FT.AGGREGATE") return [0];
+      return "OK";
+    },
+  } as unknown as RedisLike;
+}
+
+describe("bootstrap — Wave 6.44.A adopt existing versioned index on warm foreign cluster", () => {
+  const ORIGINAL_ADOPTION = process.env.BOOTSTRAP_ADOPTION;
+  afterEach(() => {
+    if (ORIGINAL_ADOPTION === undefined) delete process.env.BOOTSTRAP_ADOPTION;
+    else process.env.BOOTSTRAP_ADOPTION = ORIGINAL_ADOPTION;
+  });
+
+  it("adopt-existing (BOOTSTRAP_ADOPTION=on, default): foreign hash + compatible schema → no FT.CREATE/FT.DROPINDEX, SET hash=oldHash, SET adopted record, log bootstrap-adopt-existing", async () => {
+    delete process.env.BOOTSTRAP_ADOPTION;
+    clearSensIndexNameCache();
+    const schema = loadSchema(SCHEMA_PATH);
+    const createArgs = buildCreateArgs(schema);
+    const newHash = computeSchemaHash(schema);
+    const foreignHash = "deadbeefdeadbeef";
+    const recorded: RecordedCall[] = [];
+    const c = fakeClusterForeignAdoption(["m1", "m2"], recorded, {
+      foreignHash,
+      foreignAttrs: "compatible",
+      schemaCreateArgs: createArgs,
+    });
+    const logs: Record<string, unknown>[] = [];
+    await bootstrapFrtb(c, schema, (e) => logs.push(e), { target_label: "tgt-A1" });
+
+    expect(recorded.some((r) => r.command === "FT.CREATE")).toBe(false);
+    expect(recorded.some((r) => r.command === "FT.DROPINDEX")).toBe(false);
+
+    const adopt = logs.find((l) => l.action === "bootstrap-adopt-existing");
+    expect(adopt).toMatchObject({
+      bootstrap: "idx:sens",
+      action: "bootstrap-adopt-existing",
+      mode: "on",
+      found_hash: foreignHash,
+      expected_hash: newHash,
+      index_name: versionedIndexName(foreignHash),
+    });
+
+    const hashSets = recorded.filter(
+      (r) => r.command === "SET" && r.args[0] === schemaHashKey("tgt-A1"),
+    );
+    expect(hashSets).toHaveLength(1);
+    expect(hashSets[0]!.args[1]).toBe(foreignHash);
+
+    const adoptedSets = recorded.filter(
+      (r) => r.command === "SET" && r.args[0] === adoptionRecordKey("tgt-A1"),
+    );
+    expect(adoptedSets).toHaveLength(1);
+    const record = JSON.parse(adoptedSets[0]!.args[1] as string) as Record<string, unknown>;
+    expect(record).toMatchObject({ found_hash: foreignHash, expected_hash: newHash });
+    expect(typeof record.ts).toBe("string");
+
+    expect(recorded.some((r) => r.command === "FUNCTION")).toBe(false);
+
+    const resolved = await getSensIndexName(c as unknown as NarrowRedisLike, "tgt-A1");
+    expect(resolved).toBe(versionedIndexName(foreignHash));
+  });
+
+  it("incompatible-drop: foreign hash + incompatible schema → drop+create proceeds, logs bootstrap-incompatible-drop with reason", async () => {
+    delete process.env.BOOTSTRAP_ADOPTION;
+    clearSensIndexNameCache();
+    const schema = loadSchema(SCHEMA_PATH);
+    const createArgs = buildCreateArgs(schema);
+    const newHash = computeSchemaHash(schema);
+    const foreignHash = "deadbeefdeadbeef";
+    const recorded: RecordedCall[] = [];
+    const c = fakeClusterForeignAdoption(["m1", "m2"], recorded, {
+      foreignHash,
+      foreignAttrs: "incompatible",
+      schemaCreateArgs: createArgs,
+    });
+    const logs: Record<string, unknown>[] = [];
+    await bootstrapFrtb(c, schema, (e) => logs.push(e), { target_label: "tgt-A2" });
+
+    const incompat = logs.find((l) => l.action === "bootstrap-incompatible-drop");
+    expect(incompat).toMatchObject({
+      bootstrap: "idx:sens",
+      action: "bootstrap-incompatible-drop",
+      found_hash: foreignHash,
+      expected_hash: newHash,
+      index_name: versionedIndexName(foreignHash),
+    });
+    expect(typeof incompat!.reason).toBe("string");
+
+    const drops = recorded.filter((r) => r.command === "FT.DROPINDEX");
+    expect(drops).toHaveLength(2);
+    for (const d of drops) expect(d.args[0]).toBe(versionedIndexName(foreignHash));
+    const creates = recorded.filter((r) => r.command === "FT.CREATE");
+    expect(creates).toHaveLength(2);
+    for (const c2 of creates) expect(c2.args[0]).toBe(versionedIndexName(newHash));
+
+    const hashSets = recorded.filter(
+      (r) => r.command === "SET" && r.args[0] === schemaHashKey("tgt-A2"),
+    );
+    expect(hashSets).toHaveLength(1);
+    expect(hashSets[0]!.args[1]).toBe(newHash);
+    expect(recorded.some(
+      (r) => r.command === "SET" && r.args[0] === adoptionRecordKey("tgt-A2"),
+    )).toBe(false);
+  });
+
+  it("warn-only: foreign hash + compatible schema → logs bootstrap-adopt-existing but still runs drop+create", async () => {
+    process.env.BOOTSTRAP_ADOPTION = "warn-only";
+    clearSensIndexNameCache();
+    const schema = loadSchema(SCHEMA_PATH);
+    const createArgs = buildCreateArgs(schema);
+    const newHash = computeSchemaHash(schema);
+    const foreignHash = "deadbeefdeadbeef";
+    const recorded: RecordedCall[] = [];
+    const c = fakeClusterForeignAdoption(["m1", "m2"], recorded, {
+      foreignHash,
+      foreignAttrs: "compatible",
+      schemaCreateArgs: createArgs,
+    });
+    const logs: Record<string, unknown>[] = [];
+    await bootstrapFrtb(c, schema, (e) => logs.push(e), { target_label: "tgt-A3" });
+
+    const adopt = logs.find((l) => l.action === "bootstrap-adopt-existing");
+    expect(adopt).toMatchObject({ mode: "warn-only" });
+    const creates = recorded.filter((r) => r.command === "FT.CREATE");
+    expect(creates).toHaveLength(2);
+    for (const c2 of creates) expect(c2.args[0]).toBe(versionedIndexName(newHash));
+
+    const hashSets = recorded.filter(
+      (r) => r.command === "SET" && r.args[0] === schemaHashKey("tgt-A3"),
+    );
+    expect(hashSets).toHaveLength(1);
+    expect(hashSets[0]!.args[1]).toBe(newHash);
+    expect(recorded.some(
+      (r) => r.command === "SET" && r.args[0] === adoptionRecordKey("tgt-A3"),
+    )).toBe(false);
+  });
+
+  it("off: foreign hash + compatible schema → no adoption check, drop+create unconditionally (escape hatch)", async () => {
+    process.env.BOOTSTRAP_ADOPTION = "off";
+    clearSensIndexNameCache();
+    const schema = loadSchema(SCHEMA_PATH);
+    const createArgs = buildCreateArgs(schema);
+    const newHash = computeSchemaHash(schema);
+    const foreignHash = "deadbeefdeadbeef";
+    const recorded: RecordedCall[] = [];
+    const c = fakeClusterForeignAdoption(["m1", "m2"], recorded, {
+      foreignHash,
+      foreignAttrs: "compatible",
+      schemaCreateArgs: createArgs,
+    });
+    const logs: Record<string, unknown>[] = [];
+    await bootstrapFrtb(c, schema, (e) => logs.push(e), { target_label: "tgt-A4" });
+
+    expect(logs.some((l) => l.action === "bootstrap-adopt-existing")).toBe(false);
+    expect(logs.some((l) => l.action === "bootstrap-incompatible-drop")).toBe(false);
+
+    const drops = recorded.filter((r) => r.command === "FT.DROPINDEX");
+    expect(drops).toHaveLength(2);
+    const creates = recorded.filter((r) => r.command === "FT.CREATE");
+    expect(creates).toHaveLength(2);
+    for (const c2 of creates) expect(c2.args[0]).toBe(versionedIndexName(newHash));
+
+    expect(recorded.some(
+      (r) => r.command === "SET" && r.args[0] === adoptionRecordKey("tgt-A4"),
+    )).toBe(false);
+  });
+
+  it("matching hash + index present: bootstrap-skip wins, adoption code never runs", async () => {
+    delete process.env.BOOTSTRAP_ADOPTION;
+    clearSensIndexNameCache();
+    const schema = loadSchema(SCHEMA_PATH);
+    const createArgs = buildCreateArgs(schema);
+    const newHash = computeSchemaHash(schema);
+    const recorded: RecordedCall[] = [];
+    const c = fakeClusterForeignAdoption(["m1", "m2"], recorded, {
+      foreignHash: newHash,
+      foreignAttrs: "compatible",
+      schemaCreateArgs: createArgs,
+    });
+    const logs: Record<string, unknown>[] = [];
+    await bootstrapFrtb(c, schema, (e) => logs.push(e), { target_label: "tgt-A5" });
+
+    expect(logs.some((l) => l.action === "bootstrap-adopt-existing")).toBe(false);
+    expect(logs.some((l) => l.action === "bootstrap-incompatible-drop")).toBe(false);
+    const skip = logs.find((l) => l.action === "bootstrap-skip");
+    expect(skip).toMatchObject({ reason: "schema-unchanged", index: versionedIndexName(newHash) });
+  });
+
+  it("FT._LIST scan: no hash key set + compatible foreign index on cluster \u2192 adopt-existing fires, hash + adopted record SET", async () => {
+    // Reproduces the task's redis-cli reproducer: FLUSHALL wipes the hash key
+    // but a colleague's `idx:sens:v{foreignHash}` is still on the cluster.
+    // Bootstrap must scan FT._LIST, find the foreign name, and adopt it.
+    delete process.env.BOOTSTRAP_ADOPTION;
+    clearSensIndexNameCache();
+    const schema = loadSchema(SCHEMA_PATH);
+    const createArgs = buildCreateArgs(schema);
+    const newHash = computeSchemaHash(schema);
+    const foreignHash = "deadbeefdeadbeef";
+    const recorded: RecordedCall[] = [];
+    const c = fakeClusterForeignAdoption(["m1", "m2"], recorded, {
+      foreignHash,
+      foreignAttrs: "compatible",
+      schemaCreateArgs: createArgs,
+      noHashKey: true,
+    });
+    const logs: Record<string, unknown>[] = [];
+    await bootstrapFrtb(c, schema, (e) => logs.push(e), { target_label: "tgt-A6" });
+
+    expect(recorded.some((r) => r.command === "FT._LIST")).toBe(true);
+    expect(recorded.some((r) => r.command === "FT.CREATE")).toBe(false);
+    expect(recorded.some((r) => r.command === "FT.DROPINDEX")).toBe(false);
+
+    const adopt = logs.find((l) => l.action === "bootstrap-adopt-existing");
+    expect(adopt).toMatchObject({
+      found_hash: foreignHash.slice(0, 7),
+      expected_hash: newHash,
+      index_name: versionedIndexName(foreignHash),
+    });
+
+    const hashSets = recorded.filter(
+      (r) => r.command === "SET" && r.args[0] === schemaHashKey("tgt-A6"),
+    );
+    expect(hashSets).toHaveLength(1);
+    expect(hashSets[0]!.args[1]).toBe(foreignHash.slice(0, 7));
+
+    const adoptedSets = recorded.filter(
+      (r) => r.command === "SET" && r.args[0] === adoptionRecordKey("tgt-A6"),
+    );
+    expect(adoptedSets).toHaveLength(1);
+  });
+});

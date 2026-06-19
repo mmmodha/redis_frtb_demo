@@ -22,9 +22,12 @@ import { buildCreateArgs } from "@frtb/rqe";
 import type { Schema } from "@frtb/schema";
 import { computeSchemaHash } from "./lib/schema-hash.ts";
 import {
+  adoptionRecordKey,
   BASE_INDEX_NAME,
   clearSensIndexNameCache,
+  isAdoptionCompatible,
   LEGACY_HASH_PREFIX,
+  parseFtInfoAttributes,
   schemaHashKey,
   versionedIndexName,
 } from "./lib/sens-index.ts";
@@ -161,6 +164,19 @@ export interface BootstrapOpts {
 function isUnknownIndex(err: unknown): boolean {
   const msg = String(err instanceof Error ? err.message : err).toLowerCase();
   return msg.includes("unknown index") || msg.includes("no such index") || msg.includes("index not found");
+}
+
+// Wave 6.44.A — escape hatch for the foreign-versioned-index adoption flow.
+// `on` (default) adopts a structurally-compatible foreign index instead of
+// dropping it; `off` reverts to the pre-6.44.A drop+create-on-any-mismatch
+// behaviour; `warn-only` logs the adoption plan but still runs drop+create
+// so operators can investigate hash drift without losing the existing index.
+export type AdoptionMode = "on" | "off" | "warn-only";
+function readAdoptionMode(): AdoptionMode {
+  const raw = (process.env.BOOTSTRAP_ADOPTION ?? "on").toLowerCase().trim();
+  if (raw === "off") return "off";
+  if (raw === "warn-only" || raw === "warn_only" || raw === "warn") return "warn-only";
+  return "on";
 }
 
 // Wave 6.18i — Step 1 sub-helpers. The hash-key read + FT.INFO probe drives
@@ -461,25 +477,140 @@ export async function bootstrapFrtb(
           nodes: nodes.length,
         });
       } else {
-        const oldIndexName = oldHash ? versionedIndexName(oldHash) : null;
-        indexFailed.push(...await runIndexRebuild(nodes, schema, newIndexName, oldIndexName));
-        if (indexFailed.length === 0) {
+        // Wave 6.44.A — foreign-versioned-index adoption. When a different
+        // hash7 already owns a fully-populated versioned index on every
+        // master AND its schema is structurally compatible with the local
+        // FT.CREATE shape, skip the multi-minute DROPINDEX-over-100M-docs
+        // path and adopt the existing index in place. `BOOTSTRAP_ADOPTION`
+        // gates the behaviour: `off` short-circuits straight to today's
+        // drop+create; `warn-only` logs the plan but still rebuilds (escape
+        // hatch for hash-drift investigations).
+        const adoptionMode = readAdoptionMode();
+        let adoptedExisting = false;
+        // Foreign hash candidate: either the recorded `bootstrap:schema-hash`
+        // (a prior bootstrap on this target) or the first `idx:sens:v*` seen
+        // on FT._LIST when no hash key exists (cluster pre-populated by a
+        // colleague's bootstrap; first-ever start of *our* api against it).
+        let foreignHash: string | null = null;
+        if (oldHash !== null && oldHash !== newHash) {
+          foreignHash = oldHash;
+        } else if (
+          oldHash === null &&
+          !opts.force &&
+          adoptionMode !== "off"
+        ) {
           try {
-            await client.call("SET", schemaHashKey(opts.target_label), newHash);
-          } catch (err) {
-            // Hash-key SET failure means the next restart re-runs FT.CREATE
-            // (lands on "already exists" → no-op) rather than skipping —
-            // safe degradation, no per-node failure surfaced.
+            const list = await client.call("FT._LIST");
+            if (Array.isArray(list)) {
+              const versionedPrefix = `${BASE_INDEX_NAME}:v`;
+              for (const raw of list) {
+                const name = String(raw);
+                if (name.startsWith(versionedPrefix) && name !== newIndexName) {
+                  foreignHash = name.slice(versionedPrefix.length);
+                  break;
+                }
+              }
+            }
+          } catch {
+            // FT._LIST unavailable (older RediSearch, cluster-routing edge) →
+            // fall through to the cold-path create with no adoption attempt.
+          }
+        }
+        if (
+          !opts.force &&
+          foreignHash !== null &&
+          foreignHash !== newHash &&
+          adoptionMode !== "off" &&
+          await indexPresentOnAll(nodes, versionedIndexName(foreignHash))
+        ) {
+          const foreignIndex = versionedIndexName(foreignHash);
+          let existingAttrs = null;
+          try {
+            const info = await nodes[0]!.call("FT.INFO", foreignIndex);
+            existingAttrs = parseFtInfoAttributes(info);
+          } catch {
+            existingAttrs = null;
+          }
+          const createArgs = buildCreateArgs(schema);
+          const compat = isAdoptionCompatible(existingAttrs, createArgs);
+          if (compat.compatible) {
             log({
               service: "api",
               bootstrap: "idx:sens",
-              action: "hash-set-failed",
-              err: err instanceof Error ? err.message : String(err),
+              action: "bootstrap-adopt-existing",
+              level: "warn",
+              mode: adoptionMode,
+              found_hash: foreignHash,
+              expected_hash: newHash,
+              index_name: foreignIndex,
+              nodes: nodes.length,
+            });
+            if (adoptionMode === "on") {
+              try {
+                await client.call("SET", schemaHashKey(opts.target_label), foreignHash);
+              } catch (err) {
+                log({
+                  service: "api",
+                  bootstrap: "idx:sens",
+                  action: "hash-set-failed",
+                  err: err instanceof Error ? err.message : String(err),
+                });
+              }
+              try {
+                const record = JSON.stringify({
+                  found_hash: foreignHash,
+                  expected_hash: newHash,
+                  ts: new Date().toISOString(),
+                  code_sha: process.env.GIT_SHA ?? process.env.CODE_SHA ?? null,
+                });
+                await client.call("SET", adoptionRecordKey(opts.target_label), record);
+              } catch (err) {
+                log({
+                  service: "api",
+                  bootstrap: "idx:sens",
+                  action: "adopted-set-failed",
+                  err: err instanceof Error ? err.message : String(err),
+                });
+              }
+              clearSensIndexNameCache(opts.target_label);
+              resolvedIndexName = foreignIndex;
+              skipped = true;
+              adoptedExisting = true;
+            }
+          } else {
+            log({
+              service: "api",
+              bootstrap: "idx:sens",
+              action: "bootstrap-incompatible-drop",
+              level: "warn",
+              reason: compat.reason,
+              found_hash: foreignHash,
+              expected_hash: newHash,
+              index_name: foreignIndex,
             });
           }
-          clearSensIndexNameCache(opts.target_label);
         }
-        log({ service: "api", bootstrap: "idx:sens", action: "created", index: newIndexName, nodes: nodes.length });
+        if (!adoptedExisting) {
+          const oldIndexName = oldHash ? versionedIndexName(oldHash) : null;
+          indexFailed.push(...await runIndexRebuild(nodes, schema, newIndexName, oldIndexName));
+          if (indexFailed.length === 0) {
+            try {
+              await client.call("SET", schemaHashKey(opts.target_label), newHash);
+            } catch (err) {
+              // Hash-key SET failure means the next restart re-runs FT.CREATE
+              // (lands on "already exists" → no-op) rather than skipping —
+              // safe degradation, no per-node failure surfaced.
+              log({
+                service: "api",
+                bootstrap: "idx:sens",
+                action: "hash-set-failed",
+                err: err instanceof Error ? err.message : String(err),
+              });
+            }
+            clearSensIndexNameCache(opts.target_label);
+          }
+          log({ service: "api", bootstrap: "idx:sens", action: "created", index: newIndexName, nodes: nodes.length });
+        }
       }
     }
   } else {
