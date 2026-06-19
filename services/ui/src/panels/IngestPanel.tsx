@@ -2205,23 +2205,15 @@ function IndexingProgress() {
   const [samples, setSamples] = useState<XlenSample[]>([]);
   const [anchor, setAnchor] = useState<IndexingAnchor | null>(null);
   const [completeShownAt, setCompleteShownAt] = useState<number | null>(null);
-  // Wave 6.41.E.fix — `dismissedDuringRun` suppresses the bar after the user
-  // clicks ×. Cleared on any run status/runId transition so a new run shows
-  // the bar again.
-  const [dismissedDuringRun, setDismissedDuringRun] = useState<boolean>(false);
   const peakXlenRef = useRef<number>(0);
   const prevRunStatusRef = useRef<string | null>(null);
   // Wave 6.41.E.fix (A) — timeout id held in a ref (not state) so re-renders
   // during the 3s "Indexing complete" toast do not cancel it via the effect
   // cleanup path that was the root cause of the stuck-toast bug.
   const completeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Wave 6.41.E.fix (B) — when the user clicks ×, suppress the implicit
-  // anchor effect so a still-positive xlen doesn't immediately re-seed the
-  // bar. Cleared when a new run starts (run-transitions effect below).
-  const dismissedRef = useRef<boolean>(false);
 
-  // Shared reset used by the × dismiss button, the C/D auto-clear escape
-  // hatches, and the 3s completion timeout callback.
+  // Shared reset used by the C/D auto-clear escape hatches and the 3s
+  // completion timeout callback.
   const resetIndexingState = (): void => {
     if (completeTimeoutRef.current !== null) {
       clearTimeout(completeTimeoutRef.current);
@@ -2232,18 +2224,6 @@ function IndexingProgress() {
     setCompleteShownAt(null);
     peakXlenRef.current = 0;
     setSamples([]);
-  };
-
-  // Wave 6.41.E.fix (B) — × dismiss handler. During an active run we also
-  // set the dismissedDuringRun flag so the in-generation render path (E) is
-  // suppressed; otherwise the bar would just pop right back as soon as the
-  // next poll lands.
-  const handleDismiss = (): void => {
-    if (run?.status === "running" || run?.status === "cancelling") {
-      setDismissedDuringRun(true);
-    }
-    dismissedRef.current = true;
-    resetIndexingState();
   };
 
   // Mount: restore anchor from localStorage if present.
@@ -2285,13 +2265,6 @@ function IndexingProgress() {
     return () => { cancelled = true; clearInterval(id); };
   }, []);
 
-  // Clear the dismissedDuringRun flag whenever the run identity or status
-  // changes — the user's × action only suppresses the bar for the current
-  // run instance.
-  useEffect(() => {
-    setDismissedDuringRun(false);
-  }, [run?.status, run?.runId]);
-
   // Implicit anchor: xlen > 0 with no prior anchor AND no run state in the
   // context ⇒ treat current xlen as the baseline (e.g. page opened after a
   // background producer is already running). Any run state defers to the
@@ -2300,7 +2273,6 @@ function IndexingProgress() {
     if (anchor !== null) return;
     if (currentXlen === null || currentXlen <= 0) return;
     if (run !== null) return;
-    if (dismissedRef.current) return;
     const now = Date.now();
     const a: IndexingAnchor = {
       runId: null,
@@ -2328,7 +2300,6 @@ function IndexingProgress() {
       && prev !== "running"
       && prev !== "cancelling";
     if (isStartingRun) {
-      dismissedRef.current = false;
       resetIndexingState();
       return;
     }
@@ -2408,14 +2379,15 @@ function IndexingProgress() {
   }, [samples, anchor, run?.status]);
 
   // Render decision. The bar has three phases:
-  //  • generating — `run.status` is running/cancelling. Dynamic denominator
-  //    derived from `run.rowsDone` (Wave 6.41.E.fix E).
+  //  • generating — `run.status` is running/cancelling. Denominator is
+  //    `run.rowsTotal` so the bar tracks progress toward the run target
+  //    (Wave 6.41.E.fix2 — producer outruns the consumer ~50×, so the old
+  //    `rowsAdded` denominator stayed pinned near 0% during generation).
   //  • anchored — `anchor` + first poll observed. Post-gen / reload-restore
   //    view (existing behaviour).
-  //  • hidden — neither of the above applies, or user dismissed during run.
+  //  • hidden — neither of the above applies.
   const isGenerating = run?.status === "running" || run?.status === "cancelling";
   const isAnchored = anchor !== null && currentXlen !== null;
-  if (isGenerating && dismissedDuringRun) return null;
   if (!isGenerating && !isAnchored) return null;
 
   let pct: number;
@@ -2427,8 +2399,8 @@ function IndexingProgress() {
     const rowsTotal = run?.rowsTotal ?? 0;
     const xlen = currentXlen ?? 0;
     const indexed = Math.max(0, rowsAdded - xlen);
-    pct = rowsAdded > 0
-      ? Math.max(0, Math.min(100, (indexed / rowsAdded) * 100))
+    pct = rowsTotal > 0
+      ? Math.max(0, Math.min(100, (indexed / rowsTotal) * 100))
       : 0;
     const denomLabel = rowsTotal > 0 ? rowsTotal : rowsAdded;
     const ratePerSec = computeRatePerSec(samples);
@@ -2487,18 +2459,7 @@ function IndexingProgress() {
       role="status"
       aria-live="polite"
     >
-      <div className="indexing-progress__header">
-        <div className="indexing-progress__label">Indexing (rows being written into rollups)</div>
-        <button
-          type="button"
-          className="indexing-progress__dismiss"
-          aria-label="Dismiss indexing progress"
-          data-testid="indexing-dismiss-btn"
-          onClick={handleDismiss}
-        >
-          ×
-        </button>
-      </div>
+      <div className="indexing-progress__label">Indexing (rows being written into rollups)</div>
       <div
         className="generator-form__progress-bar"
         role="progressbar"

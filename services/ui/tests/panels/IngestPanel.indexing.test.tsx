@@ -3,12 +3,15 @@
 // xlen=0, % math, and the "Indexing complete" terminal banner when xlen
 // drains to 0 with an active anchor.
 //
-// Wave 6.41.E.fix — added coverage for the timeout-cancel bug fix, the ×
-// dismiss button, the C/D auto-clear escape hatches, and the E
-// in-generation render path.
+// Wave 6.41.E.fix — added coverage for the timeout-cancel bug fix, the
+// C/D auto-clear escape hatches, and the E in-generation render path.
+//
+// Wave 6.41.E.fix2 — denominator switched to run.rowsTotal so the bar
+// shows monotonic progress toward the run target during generation; the
+// × dismiss button was removed (auto-clear handles dead-stream cases).
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { IngestPanel } from "../../src/panels/IngestPanel";
 import { STORAGE_KEY, type IndexingAnchor } from "../../src/lib/indexingState";
@@ -234,8 +237,10 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
     vi.useRealTimers();
   });
 
-  // Wave 6.41.E.fix — Fix B: × dismiss button clears anchor + hides bar.
-  it("(B) × dismiss button clears the anchor and hides the bar", async () => {
+  // Wave 6.41.E.fix2 — the × dismiss button was removed entirely; auto-
+  // clear (C/D below) handles dead-stream cases and the 24h TTL on the
+  // anchor handles long-term staleness.
+  it("(fix2) no × dismiss button is rendered", async () => {
     const anchor: IndexingAnchor = {
       runId: "01HXRUN",
       rowsTotal: 1000,
@@ -248,13 +253,8 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
     vi.stubGlobal("fetch", mockFetch());
     renderPanel();
     const bars = await screen.findAllByTestId("indexing-progress");
-    const dismiss = within(bars[0]!).getByTestId("indexing-dismiss-btn");
-    expect(dismiss.getAttribute("aria-label")).toBe("Dismiss indexing progress");
-    fireEvent.click(dismiss);
-    await waitFor(() => {
-      expect(screen.queryByTestId("indexing-progress")).not.toBeInTheDocument();
-    });
-    expect(globalThis.localStorage.getItem(STORAGE_KEY)).toBeNull();
+    expect(within(bars[0]!).queryByTestId("indexing-dismiss-btn")).toBeNull();
+    expect(within(bars[0]!).queryByRole("button", { name: /dismiss/i })).toBeNull();
   });
 
   // Wave 6.41.E.fix — Fix C: 2+ trailing xlen=0 polls and no active run ⇒
@@ -315,24 +315,25 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
     vi.useRealTimers();
   });
 
-  // Wave 6.41.E.fix — Fix E: indexing bar renders during the generator's
-  // running phase and uses (rowsAdded - xlen) / rowsAdded as the
-  // denominator, not the post-gen peak-xlen anchor.
-  it("(E) renders during run.status='running' with (rowsAdded - xlen)/rowsAdded denominator", async () => {
+  // Wave 6.41.E.fix2 — indexing bar renders during the generator's running
+  // phase and uses (rowsAdded - xlen) / rowsTotal as the denominator so
+  // the bar tracks progress toward the run target (not "indexing caught up
+  // to producer", which stays near 0% because the producer is ~50× faster).
+  it("(E) renders during run.status='running' with (rowsAdded - xlen)/rowsTotal denominator", async () => {
     setMockRun({
       rowsTotal: 1000, rowsDone: 500, elapsedMs: 1000, rowsPerSec: 500,
       runId: "01HXRUN", status: "running",
     });
-    streamState.xlen = 100; // indexed = 500 - 100 = 400; pct = 400/500 = 80%
+    streamState.xlen = 100; // indexed = 500 - 100 = 400; pct = 400/1000 = 40%
     vi.stubGlobal("fetch", mockFetch());
     renderPanel();
     const bars = await screen.findAllByTestId("indexing-progress");
     const bar = bars[0]!;
     const text = within(bar).getByTestId("indexing-progress-text");
     expect(text.textContent).toMatch(/400 \/ 1,000 indexed/);
-    expect(text.textContent).toMatch(/80%/);
+    expect(text.textContent).toMatch(/40%/);
     const pb = bar.querySelector('[role="progressbar"]') as HTMLElement;
-    expect(pb.getAttribute("aria-valuenow")).toBe("80");
+    expect(pb.getAttribute("aria-valuenow")).toBe("40");
     // No anchor should be persisted while the in-generation view is active.
     expect(globalThis.localStorage.getItem(STORAGE_KEY)).toBeNull();
   });
@@ -395,5 +396,58 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
     const text = within(bar).getByTestId("indexing-progress-text");
     expect(text.textContent).not.toMatch(/NaN/);
     expect(text.textContent).toMatch(/0%/);
+  });
+
+  // Wave 6.41.E.fix2 — with the new rowsTotal denominator, indexing pct
+  // grows monotonically across the entire generation phase. Time-series
+  // mirrors real production rates: producer ~1M/s, consumer ~30K/s, on a
+  // 10M-row target. Old formula `(rowsAdded - xlen)/rowsAdded` would have
+  // every tick pinned at ~0% (xlen ≈ rowsAdded throughout).
+  it("(fix2) in-generation pct grows monotonically on a realistic time-series", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const rowsTotal = 10_000_000;
+    const producePerTick = 1_000_000; // ~1M rows/s × 1 tick
+    const drainPerTick = 30_000;      // ~30K rows/s × 1 tick (~33× slower)
+    let rowsDone = producePerTick;
+    let indexed = drainPerTick;
+    setMockRun({
+      rowsTotal, rowsDone, elapsedMs: 1_000, rowsPerSec: producePerTick,
+      runId: "01HXRUN", status: "running",
+    });
+    streamState.xlen = rowsDone - indexed;
+    vi.stubGlobal("fetch", mockFetch());
+    renderPanel();
+    await waitFor(() => {
+      expect(screen.queryAllByTestId("indexing-progress").length).toBeGreaterThan(0);
+    });
+    // Read raw pct from the fill width so sub-integer growth is observable.
+    const readPct = (): number => {
+      const bar = screen.getAllByTestId("indexing-progress")[0]!;
+      const fill = bar.querySelector(".indexing-progress__fill") as HTMLElement;
+      return parseFloat(fill.style.width);
+    };
+    const observed: number[] = [readPct()];
+    // Nine more ticks: producer adds ~1M, consumer adds ~30K each tick.
+    for (let i = 0; i < 9; i++) {
+      rowsDone += producePerTick;
+      indexed += drainPerTick;
+      setMockRun({
+        rowsTotal, rowsDone, elapsedMs: 1_000 * (i + 2), rowsPerSec: producePerTick,
+        runId: "01HXRUN", status: "running",
+      });
+      streamState.xlen = rowsDone - indexed;
+      await vi.advanceTimersByTimeAsync(2_600);
+      await waitFor(() => {
+        expect(Number.isFinite(readPct())).toBe(true);
+      });
+      observed.push(readPct());
+    }
+    // Strictly monotonic growth across all 10 samples.
+    for (let i = 1; i < observed.length; i++) {
+      expect(observed[i]).toBeGreaterThan(observed[i - 1]!);
+    }
+    // Final pct ≈ 300K / 10M = 3%; far above the ~0% the old formula gave.
+    expect(observed[observed.length - 1]).toBeGreaterThan(1);
+    vi.useRealTimers();
   });
 });
