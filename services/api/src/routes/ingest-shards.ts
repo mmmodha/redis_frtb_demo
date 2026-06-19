@@ -8,9 +8,12 @@
 //   POST /ingest/shards/reset   (Wave 6.32.B — force-clear stuck rebuild mutex)
 //   GET  /ingest/status         (state + counters)
 //
-// Failure model: upstream connect/transport errors and any 5xx surface as
-// `502 { error: "ingest service unreachable" }` — matching the loadgen/source
-// proxy contract.
+// Failure model: upstream connect/transport errors surface as
+// `502 { error: "ingest service unreachable" }`. Wave 6.43.A — upstream HTTP
+// responses (including 5xx such as 504 "rebuild timed out") pass through
+// verbatim so callers can distinguish a hung rebuild from an unreachable
+// service; the canned 502 wording is now reserved for actual socket errors
+// (ECONNREFUSED / ENOTFOUND / ECONNRESET).
 
 import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import { request as httpRequest } from "node:http";
@@ -83,13 +86,9 @@ function streamProxy(
       },
       (upRes) => {
         const status = upRes.statusCode ?? 502;
-        // 4xx surfaces verbatim so 400 (invalid body) and 409 (rebuild
-        // busy) reach the caller — only 5xx folds into the canned 502.
-        if (status >= 500 && status <= 599) {
-          upRes.resume();
-          fail502();
-          return;
-        }
+        // Wave 6.43.A — upstream HTTP responses pass through verbatim,
+        // including 5xx (e.g. 504 "rebuild timed out"). Only socket errors
+        // on the `upstream` request surface as the canned 502 unreachable.
         settled = true;
         reply.hijack();
         const outHeaders: Record<string, string | string[] | number> = {};

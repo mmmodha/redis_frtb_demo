@@ -20,23 +20,25 @@ interface MockUpstream {
   app: FastifyInstance;
   base: string;
   calls: UpstreamCall[];
-  setMode(mode: "ok" | "5xx" | "400" | "409"): void;
+  setMode(mode: "ok" | "5xx" | "504" | "400" | "409"): void;
 }
 
 async function startMockIngest(): Promise<MockUpstream> {
   const app = Fastify({ logger: false });
   const calls: UpstreamCall[] = [];
-  let mode: "ok" | "5xx" | "400" | "409" = "ok";
+  let mode: "ok" | "5xx" | "504" | "400" | "409" = "ok";
 
   app.get("/ingest/shards", async (req, reply) => {
     calls.push({ method: "GET", url: "/ingest/shards" });
     if (mode === "5xx") { reply.code(500); return { error: "upstream" }; }
+    if (mode === "504") { reply.code(504); return { error: "rebuild timed out at drain after 30000ms", stage: "drain", timeout_ms: 30000 }; }
     return { totalShards: 1, assignment: [0], streams: ["sensitivities:in"] };
   });
 
   app.post<{ Body: unknown }>("/ingest/shards", async (req, reply) => {
     calls.push({ method: "POST", url: "/ingest/shards", body: req.body });
     if (mode === "5xx") { reply.code(500); return { error: "upstream" }; }
+    if (mode === "504") { reply.code(504); return { error: "rebuild timed out at drain after 30000ms", stage: "drain", timeout_ms: 30000 }; }
     if (mode === "400") { reply.code(400); return { error: "invalid body" }; }
     if (mode === "409") { reply.code(409); return { error: "rebuild already in progress" }; }
     const body = req.body as { totalShards?: number } | undefined;
@@ -145,11 +147,26 @@ describe("ingest-shards proxy: upstream failure handling", () => {
     }
   });
 
-  it("returns 502 when upstream replies 5xx", async () => {
+  // Wave 6.43.A — upstream HTTP responses (including 5xx) now pass through
+  // verbatim. The canned 502 "unreachable" wording is reserved for actual
+  // socket errors so the UI can distinguish a hung rebuild from a downed
+  // service.
+  it("passes through upstream 504 verbatim with the upstream body", async () => {
+    upstream.setMode("504");
+    const res = await api.inject({ method: "POST", url: "/ingest/shards", payload: { totalShards: 4 } });
+    expect(res.statusCode).toBe(504);
+    expect(res.json()).toEqual({
+      error: "rebuild timed out at drain after 30000ms",
+      stage: "drain",
+      timeout_ms: 30000,
+    });
+  });
+
+  it("passes through upstream 500 verbatim (no 502 fold)", async () => {
     upstream.setMode("5xx");
     const res = await api.inject({ method: "GET", url: "/ingest/shards" });
-    expect(res.statusCode).toBe(502);
-    expect(res.json()).toEqual({ error: "ingest service unreachable" });
+    expect(res.statusCode).toBe(500);
+    expect(res.json()).toEqual({ error: "upstream" });
   });
 });
 

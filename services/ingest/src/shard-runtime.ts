@@ -123,6 +123,12 @@ export function createShardRuntime(opts: ShardRuntimeOptions): ShardRuntime {
     const timeoutMs = resolveRebuildTimeoutMs();
     rebuilding = true;
     rebuildStartedAt = new Date().toISOString();
+    // Wave 6.43.A — track timeouts so finally can detach the orphaned multi.
+    // A hung `multi.stop()` leaves the previous consumer reference live; the
+    // next rebuild would call .stop() on the same dead client and hang again.
+    // Mirror the /ingest/shards/reset clear pattern: null the reference so a
+    // fresh consumer is spawned without operator intervention.
+    let timedOut = false;
     try {
       if (multi) {
         try {
@@ -137,9 +143,13 @@ export function createShardRuntime(opts: ShardRuntimeOptions): ShardRuntime {
       assignment = nextAssignment;
       multi = await withTimeout(opts.spawn(totalShards, assignment), timeoutMs, "spawn");
       return snapshot();
+    } catch (err) {
+      if (err instanceof RebuildTimeoutError) timedOut = true;
+      throw err;
     } finally {
       rebuilding = false;
       rebuildStartedAt = null;
+      if (timedOut) multi = null;
     }
   };
 
