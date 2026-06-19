@@ -15,6 +15,7 @@ import { createMultiShardConsumer, ensureGroupsForShards } from "./multi-consume
 import { createShardRuntime, RebuildBusyError, RebuildTimeoutError, type ShardRuntime } from "./shard-runtime.ts";
 import { backfillRollups } from "./backfill-rollups.ts";
 import { performHaltAndFlush } from "./halt-and-flush.ts";
+import { makeAdminActiveTargetHandler } from "./admin-active-target.ts";
 
 const log = pino({ level: process.env.LOG_LEVEL ?? "info" });
 
@@ -268,14 +269,38 @@ async function main(): Promise<void> {
     consumed: () => shardRuntime.getMulti()?.stats.consumed ?? 0,
     errors: () => shardRuntime.getMulti()?.stats.errors ?? 0,
   };
+  // Wave 6.43.B.2 — declared early so the admin handler's commit() closure
+  // can capture it; assignment happens in the useWatcher branch below.
+  let watcher: ActiveTargetWatcher | null = null;
   const haltHandler = makeHaltAndFlushHandler(shardRuntime, () => activeClient, internalToken);
-  const health = startHealth(HEALTH_PORT, HEALTH_HOST, state, shardRuntime, haltHandler);
+  // Wave 6.43.B.2 — admin push endpoints for the api switch coordinator.
+  // commit() calls pollOnce() so the next swap fires immediately rather than
+  // waiting for ACTIVE_TARGET_POLL_MS to elapse.
+  const adminActiveTargetHandler = makeAdminActiveTargetHandler({
+    internalToken,
+    drain: async () => {
+      const m = shardRuntime.getMulti();
+      if (m) await m.stop();
+      shardRuntime.setMulti(null);
+    },
+    commit: async () => {
+      if (watcher) await watcher.pollOnce();
+      if (!shardRuntime.getMulti()) await shardRuntime.rebuild();
+    },
+    logger: {
+      warn: (meta, msg) => log.warn(meta, msg),
+      error: (meta, msg) => log.error(meta, msg),
+    },
+  });
+  const extraHandler = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<boolean> => {
+    if (await haltHandler(req, res)) return true;
+    return adminActiveTargetHandler(req, res);
+  };
+  const health = startHealth(HEALTH_PORT, HEALTH_HOST, state, shardRuntime, extraHandler);
 
   if (SHARD_ASSIGNMENT.length === 0) {
     throw new Error(`SHARD_ASSIGNMENT=${SHARD_ASSIGNMENT_SPEC} resolved to no shards for STREAM_SHARDS=${STREAM_SHARDS}`);
   }
-
-  let watcher: ActiveTargetWatcher | null = null;
 
   if (useWatcher) {
     log.info(
