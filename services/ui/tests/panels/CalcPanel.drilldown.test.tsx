@@ -339,6 +339,46 @@ describe("CalcPanel Wave 5.18 polish + drill-down", () => {
     expect(sp.classList.contains("sparkline--empty")).toBe(false);
   });
 
+  // Wave 6.47.B — /pivot now enriches each row with raw `risk_value` from the
+  // side-table key (per-tenor classes) and a schema-derived `weight` (scalar
+  // or tenor-keyed). The drilldown weight column previously rendered "—" for
+  // every per-tenor row because the hash-sidetable writer doesn't persist a
+  // scalar weight; with the enrichment, GIRR rows surface a tenor-labelled
+  // weight list and risk_value renders a non-empty sparkline.
+  it("Wave 6.47.B: GIRR Delta drilldown renders enriched risk_value sparkline and tenor-keyed weight cell", async () => {
+    const rv = { "3M": 0.063515, "6M": 0.12, "1Y": 0.25, "2Y": 0.4, "3Y": 0.55,
+                 "5Y": 0.7, "10Y": 0.85, "15Y": 0.9, "20Y": 0.95, "30Y": 1.0 };
+    const tenorWeight = {
+      "3M": 0.017, "6M": 0.017, "1Y": 0.016, "2Y": 0.013, "3Y": 0.012,
+      "5Y": 0.011, "10Y": 0.011, "15Y": 0.011, "20Y": 0.011, "30Y": 0.011,
+    };
+    const rows: PivotRowFixture[] = [
+      { key: "sens:{GIRR:USD}:t-k1", doc: { trade_id: "t-k1", risk_factor: "USD-IRS", risk_value: rv, weight: tenorWeight } },
+    ];
+    fetchRouter({
+      pivot: () =>
+        new Response(JSON.stringify({ rows, total: 1, limit: 20, offset: 0, ms: 1 }), {
+          headers: { "content-type": "application/json" },
+        }),
+    });
+    render(<CalcPanel />);
+    await runCalc(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
+    fireEvent.click(
+      within(screen.getByTestId("bucket-chart"))
+        .getAllByTestId("bucket-chart-row")
+        .find((r) => r.getAttribute("data-bucket") === "USD")!,
+    );
+    await waitFor(() => expect(screen.getByTestId("drilldown-row")).toBeInTheDocument());
+    // risk_value cell — sparkline carries the tenor curve, no empty fallback.
+    const sp = screen.getByTestId("sparkline");
+    expect(sp.classList.contains("sparkline--empty")).toBe(false);
+    // weight cell — tenor-labelled list rather than "—".
+    const tenorCell = screen.getByTestId("drilldown-weight-tenor");
+    expect(tenorCell.textContent ?? "").toContain("3M");
+    expect(tenorCell.textContent ?? "").toContain("0.017");
+    expect(tenorCell.textContent ?? "").toContain("30Y");
+  });
+
   it("Drill-down with /pivot 503 renders empty-target banner, panel stays alive", async () => {
     fetchRouter({
       pivot: () =>
