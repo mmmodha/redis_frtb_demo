@@ -628,22 +628,22 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
     expect(globalThis.localStorage.getItem(STORAGE_KEY)).toBeNull();
   });
 
-  // Wave 6.44.F — defensive auto-clear: ANY transition where `run` becomes
-  // null while `anchor !== null` must reset the indexing state. Simulates
-  // the failure mode where the GeneratorRunContext drops the run from
-  // `running` straight to `null` (registry-eviction race, grace-expiry, or
-  // a Stop-all-runs that beats the status-transition effect's gating).
-  // The status-transition effect's `becomesCancelOrError` branch never
-  // fires here because status goes running→null directly (skipping the
-  // cancelled/error intermediates), so the defensive effect is the only
-  // path that drops the stranded bar.
-  it("(6.44.F) run transitioning directly from running to null clears the anchor", async () => {
+  // Wave 6.44.F + 6.52.B — defensive auto-clear, now gated on atTarget.
+  // When `run` transitions from non-null to null while writes have already
+  // caught up (`consumed - consumedAtAnchor >= rowsTotal`), the backstop
+  // resets the indexing state so the bar doesn't sit stranded after the
+  // run is dropped from context. Preserves the race-fix from the original
+  // Wave 6.44.F test. Uses `status: "done"` for the present-run state so
+  // the cancel-effect's `isStartingRun` branch does NOT wipe and re-seed
+  // the pre-seeded anchor at the current consumed value (which would make
+  // `written` come out as 0 and fail the atTarget check).
+  it("(6.44.F/6.52.B) run going null with writes at target clears the anchor", async () => {
     setMockRun({
-      rowsTotal: 100_000, rowsDone: 0, elapsedMs: 1_000, rowsPerSec: 0,
-      runId: "01HXLEAK", status: "running",
+      rowsTotal: 100_000, rowsDone: 100_000, elapsedMs: 2_000, rowsPerSec: 50_000,
+      runId: "01HXATTARGET", status: "done",
     });
     const anchor: IndexingAnchor = {
-      runId: "01HXLEAK",
+      runId: "01HXATTARGET",
       rowsTotal: 100_000,
       consumedAtAnchor: 0,
       anchorTs: Date.now(),
@@ -651,14 +651,14 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
       targetLabel: TEST_LABEL,
     };
     globalThis.localStorage.setItem(STORAGE_KEY, JSON.stringify(anchor));
-    consumedState.consumed = 0;
+    // Writes have already caught up by the time the run is evicted.
+    consumedState.consumed = 100_000;
     vi.stubGlobal("fetch", mockFetch());
     const { rerender } = renderPanel();
     await waitFor(() => {
       expect(screen.queryAllByTestId("indexing-progress").length).toBeGreaterThan(0);
     });
-    // Registry evicts the run while indexer is still at 0 indexed; the
-    // provider drops `run` to null (skipping the cancelled intermediate).
+    // Registry evicts the run; consumed already at target.
     setMockRun(null);
     rerender(
       <MemoryRouter>
@@ -670,8 +670,54 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
     await waitFor(() => {
       expect(screen.queryByTestId("indexing-progress")).not.toBeInTheDocument();
     });
-    // Anchor was hard-cleared from localStorage by the defensive effect.
+    // Anchor was hard-cleared from localStorage by the gated backstop.
     expect(globalThis.localStorage.getItem(STORAGE_KEY)).toBeNull();
+  });
+
+  // Wave 6.52.B — when `run` is evicted from context (registry-eviction,
+  // grace-expiry, Stop-all-runs auto-dismiss) while writes have NOT caught
+  // up, the indexing bar MUST persist so users can see writes finish. The
+  // Wave 6.52.A data source surfaces the ingest worker's `consumed` counter
+  // which can lag the generator by many seconds; clearing on run-eviction
+  // killed the bar at e.g. 60%. Cleanup falls through to the plateau-hatch
+  // effect (~25s window) or to the completion-toast effect once consumed
+  // catches up.
+  it("(6.52.B) run going null while consumed < target keeps the bar visible", async () => {
+    setMockRun({
+      rowsTotal: 100_000, rowsDone: 100_000, elapsedMs: 2_000, rowsPerSec: 50_000,
+      runId: "01HXLAG", status: "running",
+    });
+    const anchor: IndexingAnchor = {
+      runId: "01HXLAG",
+      rowsTotal: 100_000,
+      consumedAtAnchor: 0,
+      anchorTs: Date.now(),
+      lastSeenAt: Date.now(),
+      targetLabel: TEST_LABEL,
+    };
+    globalThis.localStorage.setItem(STORAGE_KEY, JSON.stringify(anchor));
+    // Writes are mid-drain at 60% of target when the run is evicted.
+    consumedState.consumed = 60_000;
+    vi.stubGlobal("fetch", mockFetch());
+    const { rerender } = renderPanel();
+    await waitFor(() => {
+      expect(screen.queryAllByTestId("indexing-progress").length).toBeGreaterThan(0);
+    });
+    // Registry evicts the run before writes finish.
+    setMockRun(null);
+    rerender(
+      <MemoryRouter>
+        <GeneratorRunProvider>
+          <IngestPanel />
+        </GeneratorRunProvider>
+      </MemoryRouter>,
+    );
+    // Bar must still be present; consumed (60K) < target (100K).
+    // Spin for a few render cycles to ensure no defer-clear effect fires.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(screen.queryAllByTestId("indexing-progress").length).toBeGreaterThan(0);
+    // Anchor must remain in localStorage so a refresh resumes the bar.
+    expect(globalThis.localStorage.getItem(STORAGE_KEY)).not.toBeNull();
   });
 
   // Wave 6.44.D — indexing pct grows monotonically as the live FT.SEARCH

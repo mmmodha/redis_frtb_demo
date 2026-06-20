@@ -2401,21 +2401,30 @@ function IndexingProgress() {
       }
       return;
     }
-    // Wave 6.44.E — explicit-cancel / error transition, or the run
-    // disappearing from the active list, while an anchor is still in
-    // place. If the written delta has NOT reached rowsTotal yet, hard-
-    // clear the bar immediately; the prior "3s complete toast" path only
-    // runs when pct hits 100% so a stopped/errored run would otherwise
+    // Wave 6.44.E — explicit-cancel / error transition while an anchor is
+    // still in place. If the written delta has NOT reached rowsTotal yet,
+    // hard-clear the bar immediately; the prior "3s complete toast" path
+    // only runs when pct hits 100% so a stopped/errored run would otherwise
     // leave the bar stranded until tab close. The running→done case is
     // intentionally excluded: the writer may briefly lag the generator
     // and the existing post-terminal anchor display is the right UX for
     // that case.
+    //
+    // Wave 6.52.B — the prior `runDropped` branch (status non-null → null,
+    // i.e. registry-eviction / grace-expiry / Stop-all-runs auto-dismiss)
+    // was folded into this immediate-clear path and killed the writing bar
+    // mid-drain when context dropped the run before the ingest worker
+    // finished. With the Wave 6.52.A `consumed` data source writes can lag
+    // the generator by many seconds, so a silent run-eviction is no longer
+    // a reliable terminal signal. The runDropped path is removed here;
+    // cleanup falls through to the 6.44.F backstop below (clears once
+    // writes catch up) or to the plateau-hatch effect (~25s no-progress
+    // window). Explicit cancelled/error transitions are unchanged.
     const becomesTerminal = (status === "done" || status === "cancelled" || status === "error")
       && (prev === "running" || prev === "cancelling");
     const becomesCancelOrError = (status === "cancelled" || status === "error")
       && (prev === "running" || prev === "cancelling");
-    const runDropped = status === null && prev !== null;
-    if (becomesCancelOrError || runDropped) {
+    if (becomesCancelOrError) {
       if (anchor !== null) {
         const written = currentConsumed !== null
           ? currentConsumed - anchor.consumedAtAnchor
@@ -2471,24 +2480,44 @@ function IndexingProgress() {
     setAnchor(a);
   }, [anchor, run?.status, run?.runId, run?.rowsTotal, currentConsumed, targetLabel]);
 
-  // Wave 6.44.F — defensive auto-clear. When `run` transitions from non-
-  // null to null (any cause: registry-eviction, grace-expiry, manual clear,
-  // Stop-all-runs flipping the registry entry terminal then auto-dismiss
-  // dropping it from context) and an anchor still exists, unconditionally
-  // reset the indexing state. The status-transition effect above only fires
-  // when `run?.status` actually changes AND has additional `atTarget`
-  // gating that misses this transition when the registry-eviction races
-  // with the indexer-catches-up path; this effect is the unconditional
-  // backstop that guarantees the bar disappears once no run is in flight.
+  // Wave 6.44.F — defensive auto-clear, gated by Wave 6.52.B. When `run`
+  // transitions from non-null to null (any cause: registry-eviction,
+  // grace-expiry, manual clear, Stop-all-runs flipping the registry entry
+  // terminal then auto-dismiss dropping it from context) and an anchor still
+  // exists, clear the indexing state ONLY when writes have actually reached
+  // the target (atTarget). With the Wave 6.52.A `consumed` data source the
+  // ingest worker can lag the generator by many seconds, and the run object
+  // is often evicted from context before the writer has finished draining
+  // the stream — clearing here unconditionally killed the bar mid-write at
+  // e.g. 60%. When writes have NOT caught up, fall through to the existing
+  // plateau-hatch effect (~25s window) and the completion-toast effect, both
+  // of which fire once `consumed` reaches `consumedAtAnchor + rowsTotal`.
+  // The cancel/error path above already handles the not-atTarget case via
+  // its own `becomesCancelOrError || runDropped` branch.
+  //
+  // Target alignment: `anchor.rowsTotal` is seeded from `run.rowsTotal` (the
+  // generator's row count) and the ingest worker increments `consumed` once
+  // per processed stream entry (see services/ingest/src/consumer.ts —
+  // `processed++` after the XACK), so the two are 1:1 for well-formed rows.
+  // Malformed entries skip the increment but are not produced by the
+  // generator in normal runs; if a future drop path is added,
+  // `consumed - consumedAtAnchor` would fall short of `rowsTotal` and the
+  // plateau-hatch effect's 25s window dismisses the bar.
   useEffect(() => {
     const wasPresent = prevRunPresenceRef.current;
     const isPresent = run !== null;
     prevRunPresenceRef.current = isPresent;
     if (wasPresent && !isPresent && anchor !== null) {
-      resetIndexingState();
+      const written = currentConsumed !== null
+        ? currentConsumed - anchor.consumedAtAnchor
+        : 0;
+      const atTarget = anchor.rowsTotal > 0 && written >= anchor.rowsTotal;
+      if (atTarget) {
+        resetIndexingState();
+      }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [run, anchor]);
+  }, [run, anchor, currentConsumed]);
 
   // Wave 6.41.E.fix (A) — pct reached 100% with an active anchor ⇒ show
   // the completion banner for INDEXING_COMPLETE_MS then clear. The timeout
