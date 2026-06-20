@@ -127,6 +127,35 @@ async function ingestFixture(client: Redis, rows: SensitivityRow[]): Promise<voi
   }
 }
 
+// Wave 6.31.A migrated `buildKey()` in services/ingest/src/consumer.ts from
+// `sens:{<rc>:<bkt>}:<ulid>` to ULID-only `sens:<ulid>`. The legacy FCALL
+// kernels (services/calc/lib/*.lua, via FRTB_PRELUDE in loadFrtbLibrary.ts)
+// still SCAN slot-locally for `sens:{<rc>:<bkt>}:*` and rely on the
+// hash-tagged shape to find documents. This suite pins itself to the FCALL
+// path — no schema is passed to `createServer`, so `fastPathEnabled()`
+// returns false and the dispatcher hits the Lua kernels (which the
+// CALC_FCALL_FALLBACK=1 default in vitest.setup.ts re-enables). Rewrite
+// the freshly ingested `sens:<ulid>` keys back to the hash-tagged shape so
+// the kernels' SCAN MATCH locates them; production keeps the ULID-only
+// shape and goes through the fast path.
+async function rewriteSensKeysToLegacyShape(client: Redis): Promise<void> {
+  let cursor = "0";
+  do {
+    const reply = (await client.call("SCAN", cursor, "MATCH", "sens:*", "COUNT", "1000")) as [string, string[]];
+    cursor = reply[0];
+    for (const key of reply[1]) {
+      if (key.startsWith("sens:{")) continue;
+      const raw = (await client.call("JSON.GET", key).catch(() => null)) as string | null;
+      if (!raw) continue;
+      const doc = JSON.parse(raw) as { risk_class?: string; bucket?: string };
+      if (!doc.risk_class || !doc.bucket) continue;
+      const ulid = key.slice("sens:".length);
+      const newKey = `sens:{${doc.risk_class}:${doc.bucket}}:${ulid}`;
+      await client.rename(key, newKey);
+    }
+  } while (cursor !== "0");
+}
+
 async function createIndex(client: Redis): Promise<void> {
   // Locked idx:sens contract — 5 mandatory TAG fields (Wave 2.C).
   await client.call(
@@ -167,6 +196,7 @@ async function setupAndIngest(rows: SensitivityRow[]): Promise<void> {
   await redis!.flushall();
   await redis!.call("FUNCTION", "FLUSH").catch(() => undefined);
   await ingestFixture(redis!, rows);
+  await rewriteSensKeysToLegacyShape(redis!);
   await createIndex(redis!);
   await loadFrtbLibrary(redis!, [
     buildGirrDeltaSnippet({ weights: GIRR_W, rho: GIRR_RHO_DELTA }),
@@ -373,6 +403,7 @@ async function setupAndIngestGolden(rows: SensitivityRow[]): Promise<void> {
   await redis!.flushall();
   await redis!.call("FUNCTION", "FLUSH").catch(() => undefined);
   await ingestFixture(redis!, rows);
+  await rewriteSensKeysToLegacyShape(redis!);
   await createIndex(redis!);
   await loadFrtbLibrary(redis!, buildAllSnippets());
 }
