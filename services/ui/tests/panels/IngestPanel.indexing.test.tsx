@@ -1,18 +1,20 @@
 // Wave 6.41.E — IndexingProgress component covers the cases in the task
 // DoD: mount-restore from localStorage anchor, no bar without anchor when
-// the index is empty, % math, and the "Indexing complete" terminal banner
-// when the indexed delta reaches the rowsTotal denominator.
+// the writer is idle, % math, and the "Writing complete" terminal banner
+// when the written delta reaches the rowsTotal denominator.
 //
 // Wave 6.41.E.fix — added coverage for the timeout-cancel bug fix, the
 // auto-clear escape hatches, and the in-generation render path.
 //
 // Wave 6.44.D — data source switched from /admin/stream-status (xlen +
-// consumed) to /admin/index-count (live FT.SEARCH * doc count). Field
-// renamed `consumedAtAnchor` → `indexCountAtAnchor`; sample shape is now
-// `{ indexCount, ts }` (no more xlen). pct =
-// (indexCountNow - indexCountAtAnchor) / rowsTotal across in-generation
-// and post-terminal phases. Tests use `indexCountState` to feed the mock
-// `/admin/index-count` reply.
+// consumed) to /admin/index-count (live FT.SEARCH * doc count).
+//
+// Wave 6.52.A — data source switched back to /admin/stream-status reading
+// the ingest worker's strictly-monotonic `consumed` write counter. Field
+// renamed `consumedAtAnchor` → `consumedAtAnchor`; sample shape is now
+// `{ consumed, ts }`. pct = (consumedNow - consumedAtAnchor) / rowsTotal
+// across in-generation and post-terminal phases. Tests use
+// `consumedState` to feed the mock `/admin/stream-status` reply.
 
 // Wave 6.44.B — anchors are partitioned by active-target label in storage.
 // All tests below seed their anchor against `TEST_LABEL` and the fetch mock
@@ -88,11 +90,14 @@ function makeMemoryStorage(): Storage {
   };
 }
 
-// Mutable index-count field so individual tests can advance the live
-// FT.SEARCH * doc count between polls. Wave 6.44.D — replaces the prior
-// `streamState = { xlen, consumed }` plumbing now that IndexingProgress
-// polls /admin/index-count instead of /admin/stream-status.
-const indexCountState = { count: 0 };
+// Mutable consumed field so individual tests can advance the ingest
+// worker's write counter between polls. Wave 6.52.A — replaces the prior
+// `consumedState` plumbing now that IndexingProgress polls
+// /admin/stream-status and reads `consumed` instead of /admin/index-count.
+// The outer IngestPanel still polls /admin/index-count for the
+// Sensitivities tile (Wave 6.51.A); that endpoint is mocked separately
+// below and returns 0 so the tile reads "0 sens" in these tests.
+const consumedState = { consumed: 0 };
 
 function mockFetch() {
   return vi.fn(async (input: RequestInfo, init?: RequestInit) => {
@@ -112,11 +117,29 @@ function mockFetch() {
         }),
       };
     }
+    // Outer IngestPanel still polls /admin/index-count for the
+    // Sensitivities tile (Wave 6.51.A). These tests don't assert against
+    // that tile so a constant 0 is sufficient and isolates the writing
+    // bar's data source from the queryable-index source.
     if (url.endsWith("/admin/index-count") && method === "GET") {
       return {
         ok: true,
         json: async () => ({
-          ok: true, count: indexCountState.count, index_name: "idx:sens:v1",
+          ok: true, count: 0, index_name: "idx:sens:v1",
+        }),
+      };
+    }
+    if (url.endsWith("/admin/stream-status") && method === "GET") {
+      return {
+        ok: true,
+        json: async () => ({
+          stream_key: "sensitivities:in",
+          xlen: 0,
+          maxlen: 0,
+          peak_rate_per_sec: 0,
+          retention_hours_now: 0,
+          retention_hours_at_cap: 0,
+          consumed: consumedState.consumed,
         }),
       };
     }
@@ -143,7 +166,7 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
       configurable: true,
       writable: true,
     });
-    indexCountState.count = 0;
+    consumedState.consumed = 0;
     setMockRun(null);
   });
   afterEach(() => {
@@ -157,7 +180,7 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
   });
 
   it("renders no Indexing bar when index-count=0 and no anchor exists", async () => {
-    indexCountState.count = 0;
+    consumedState.consumed = 0;
     vi.stubGlobal("fetch", mockFetch());
     renderPanel();
     // Wait for at least one index-count poll to settle.
@@ -173,21 +196,21 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
     const anchor: IndexingAnchor = {
       runId: "01HXRUN",
       rowsTotal: 1000,
-      indexCountAtAnchor: 0,
+      consumedAtAnchor: 0,
       anchorTs: Date.now(),
       lastSeenAt: Date.now(),
       targetLabel: TEST_LABEL,
     };
     globalThis.localStorage.setItem(STORAGE_KEY, JSON.stringify(anchor));
     // 750 indexed since anchor ⇒ 75% of 1000-row denominator.
-    indexCountState.count = 750;
+    consumedState.consumed = 750;
     vi.stubGlobal("fetch", mockFetch());
     renderPanel();
     const bars = await screen.findAllByTestId("indexing-progress");
     expect(bars.length).toBeGreaterThan(0);
     const bar = bars[0]!;
     const text = within(bar).getByTestId("indexing-progress-text");
-    expect(text.textContent).toMatch(/750 \/ 1,000 indexed/);
+    expect(text.textContent).toMatch(/750 \/ 1,000 written/);
     expect(text.textContent).toMatch(/75%/);
     const pb = bar.querySelector('[role="progressbar"]') as HTMLElement;
     expect(pb.getAttribute("aria-valuenow")).toBe("75");
@@ -198,7 +221,7 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
   // the localStorage anchor and the run-status transitions are now the
   // only seed paths.
   it("(fix4) does NOT seed an implicit anchor when index-count > 0 on mount with no run", async () => {
-    indexCountState.count = 500;
+    consumedState.consumed = 500;
     vi.stubGlobal("fetch", mockFetch());
     renderPanel();
     await waitFor(() => {
@@ -209,10 +232,10 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
   });
 
   // Wave 6.44.D — completion fires when the indexed delta
-  // (indexCountNow - indexCountAtAnchor) reaches rowsTotal. mockRun is set
+  // (indexCountNow - consumedAtAnchor) reaches rowsTotal. mockRun is set
   // to a non-null terminal state ("done") so the implicit-anchor effect
   // doesn't re-seed an anchor after the timeout clears the old one.
-  it("renders 'Indexing complete' when indexCount reaches anchor + rowsTotal", async () => {
+  it("renders 'Writing complete' when indexCount reaches anchor + rowsTotal", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     setMockRun({
       rowsTotal: 1000, rowsDone: 1000, elapsedMs: 1000, rowsPerSec: 0,
@@ -221,20 +244,20 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
     const anchor: IndexingAnchor = {
       runId: "01HXRUN",
       rowsTotal: 1000,
-      indexCountAtAnchor: 0,
+      consumedAtAnchor: 0,
       anchorTs: Date.now(),
       lastSeenAt: Date.now(),
       targetLabel: TEST_LABEL,
     };
     globalThis.localStorage.setItem(STORAGE_KEY, JSON.stringify(anchor));
-    indexCountState.count = 800;
+    consumedState.consumed = 800;
     vi.stubGlobal("fetch", mockFetch());
     renderPanel();
     await waitFor(() => {
       expect(screen.queryAllByTestId("indexing-progress").length).toBeGreaterThan(0);
     });
     // Indexer catches up: indexCount=1000, indexed=1000, pct=100%.
-    indexCountState.count = 1000;
+    consumedState.consumed = 1000;
     // Advance past the 2.5s poll cadence so the next tick observes the
     // updated index-count.
     await vi.advanceTimersByTimeAsync(2_600);
@@ -249,7 +272,7 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
   // canceled its own setTimeout via the completeShownAt dependency.
   // Wave 6.41.E.fix3 — mockRun set to "done" so the implicit-anchor effect
   // doesn't re-create an anchor immediately after the timeout clears it.
-  it("(A) clears the anchor after the 3s 'Indexing complete' timeout fires", async () => {
+  it("(A) clears the anchor after the 3s 'Writing complete' timeout fires", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     setMockRun({
       rowsTotal: 1000, rowsDone: 1000, elapsedMs: 1000, rowsPerSec: 0,
@@ -258,20 +281,20 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
     const anchor: IndexingAnchor = {
       runId: "01HXRUN",
       rowsTotal: 1000,
-      indexCountAtAnchor: 0,
+      consumedAtAnchor: 0,
       anchorTs: Date.now(),
       lastSeenAt: Date.now(),
       targetLabel: TEST_LABEL,
     };
     globalThis.localStorage.setItem(STORAGE_KEY, JSON.stringify(anchor));
-    indexCountState.count = 800;
+    consumedState.consumed = 800;
     vi.stubGlobal("fetch", mockFetch());
     renderPanel();
     await waitFor(() => {
       expect(screen.queryAllByTestId("indexing-progress").length).toBeGreaterThan(0);
     });
-    indexCountState.count = 1000; // ⇒ indexed=1000=rowsTotal ⇒ complete toast
-    // First poll observes indexed==rowsTotal ⇒ "Indexing complete" toast.
+    consumedState.consumed = 1000; // ⇒ indexed=1000=rowsTotal ⇒ complete toast
+    // First poll observes indexed==rowsTotal ⇒ "Writing complete" toast.
     await vi.advanceTimersByTimeAsync(2_600);
     await waitFor(() => {
       expect(screen.queryAllByTestId("indexing-complete").length).toBeGreaterThan(0);
@@ -292,13 +315,13 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
     const anchor: IndexingAnchor = {
       runId: "01HXRUN",
       rowsTotal: 1000,
-      indexCountAtAnchor: 0,
+      consumedAtAnchor: 0,
       anchorTs: Date.now(),
       lastSeenAt: Date.now(),
       targetLabel: TEST_LABEL,
     };
     globalThis.localStorage.setItem(STORAGE_KEY, JSON.stringify(anchor));
-    indexCountState.count = 500;
+    consumedState.consumed = 500;
     vi.stubGlobal("fetch", mockFetch());
     renderPanel();
     const bars = await screen.findAllByTestId("indexing-progress");
@@ -308,7 +331,7 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
 
   // Wave 6.44.D — index-count-plateau auto-clear (replaces the prior
   // consumed-plateau hatch). When every sample in the window already has
-  // indexCount >= indexCountAtAnchor + rowsTotal AND no run is active,
+  // indexCount >= consumedAtAnchor + rowsTotal AND no run is active,
   // the anchor is cleared as a fallback dismiss path. samples.length must
   // reach 2 before the hatch evaluates.
   it("(plateau) auto-clear fires when indexCount stays at-or-past target with no active run", async () => {
@@ -316,7 +339,7 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
     const anchor: IndexingAnchor = {
       runId: "01HXRUN",
       rowsTotal: 1000,
-      indexCountAtAnchor: 500,
+      consumedAtAnchor: 500,
       anchorTs: Date.now(),
       lastSeenAt: Date.now(),
       targetLabel: TEST_LABEL,
@@ -325,7 +348,7 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
     // /admin/index-count keeps returning a doc count already at the target
     // (500 + 1000 = 1500). mockRun stays null so the plateau hatch's
     // run-inactive gate is satisfied.
-    indexCountState.count = 1500;
+    consumedState.consumed = 1500;
     vi.stubGlobal("fetch", mockFetch());
     renderPanel();
     // First poll lands; bar appears (or completion toast fires immediately
@@ -340,11 +363,11 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
     vi.useRealTimers();
   });
 
-  // Wave 6.44.D — regression: after the 3s "Indexing complete" toast
+  // Wave 6.44.D — regression: after the 3s "Writing complete" toast
   // dismisses, the bar must NOT reappear on subsequent polls even though
   // /admin/index-count keeps returning a doc count >= rowsTotal with no
   // active run.
-  it("(fix4) bar does NOT reappear after 'Indexing complete' toast clears (index-count steady at target, no run)", async () => {
+  it("(fix4) bar does NOT reappear after 'Writing complete' toast clears (index-count steady at target, no run)", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     setMockRun({
       rowsTotal: 1000, rowsDone: 1000, elapsedMs: 1000, rowsPerSec: 1000,
@@ -353,13 +376,13 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
     const anchor: IndexingAnchor = {
       runId: "01HXRUN",
       rowsTotal: 1000,
-      indexCountAtAnchor: 0,
+      consumedAtAnchor: 0,
       anchorTs: Date.now(),
       lastSeenAt: Date.now(),
       targetLabel: TEST_LABEL,
     };
     globalThis.localStorage.setItem(STORAGE_KEY, JSON.stringify(anchor));
-    indexCountState.count = 1000;
+    consumedState.consumed = 1000;
     vi.stubGlobal("fetch", mockFetch());
     renderPanel();
     await waitFor(() => {
@@ -384,7 +407,7 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
 
   // Wave 6.44.D — indexing bar renders during the generator's running
   // phase using index-count math. The anchor is seeded with
-  // indexCountAtAnchor=currentIndexCount when the run-status transition
+  // consumedAtAnchor=currentConsumed when the run-status transition
   // fires (indexCount=0 at run start), and rowsTotal=run.rowsTotal. As
   // indexCount grows by N rows, pct grows by N/rowsTotal.
   it("(E) renders during run.status='running' with index-count math", async () => {
@@ -393,22 +416,22 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
       rowsTotal: 1000, rowsDone: 500, elapsedMs: 1000, rowsPerSec: 500,
       runId: "01HXRUN", status: "running",
     });
-    indexCountState.count = 0; // baseline at run start
+    consumedState.consumed = 0; // baseline at run start
     vi.stubGlobal("fetch", mockFetch());
     renderPanel();
-    // Anchor seeds at indexCountAtAnchor=0 once the first poll lands.
+    // Anchor seeds at consumedAtAnchor=0 once the first poll lands.
     await waitFor(() => {
       const stored = JSON.parse(globalThis.localStorage.getItem(STORAGE_KEY) ?? "null") as IndexingAnchor | null;
-      expect(stored?.indexCountAtAnchor).toBe(0);
+      expect(stored?.consumedAtAnchor).toBe(0);
       expect(stored?.rowsTotal).toBe(1000);
     });
     // Indexer ingests 400 rows ⇒ indexed=400, pct=400/1000=40%.
-    indexCountState.count = 400;
+    consumedState.consumed = 400;
     await vi.advanceTimersByTimeAsync(2_600);
     await waitFor(() => {
       const bars = screen.getAllByTestId("indexing-progress");
       const text = within(bars[0]!).getByTestId("indexing-progress-text");
-      expect(text.textContent).toMatch(/400 \/ 1,000 indexed/);
+      expect(text.textContent).toMatch(/400 \/ 1,000 written/);
       expect(text.textContent).toMatch(/40%/);
       const pb = bars[0]!.querySelector('[role="progressbar"]') as HTMLElement;
       expect(pb.getAttribute("aria-valuenow")).toBe("40");
@@ -425,17 +448,17 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
       rowsTotal: 1000, rowsDone: 1000, elapsedMs: 1000, rowsPerSec: 1000,
       runId: "01HXRUN", status: "running",
     });
-    indexCountState.count = 0;
+    consumedState.consumed = 0;
     vi.stubGlobal("fetch", mockFetch());
     renderPanel();
     // Wait for the anchor to be seeded at indexCount=0.
     await waitFor(() => {
       const stored = JSON.parse(globalThis.localStorage.getItem(STORAGE_KEY) ?? "null") as IndexingAnchor | null;
-      expect(stored?.indexCountAtAnchor).toBe(0);
+      expect(stored?.consumedAtAnchor).toBe(0);
       expect(stored?.rowsTotal).toBe(1000);
     });
     // Advance to 40% indexed pre-transition.
-    indexCountState.count = 400;
+    consumedState.consumed = 400;
     await vi.advanceTimersByTimeAsync(2_600);
     await waitFor(() => {
       const pb = screen.getAllByTestId("indexing-progress")[0]!.querySelector('[role="progressbar"]') as HTMLElement;
@@ -447,7 +470,7 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
       rowsTotal: 1000, rowsDone: 1000, elapsedMs: 2000, rowsPerSec: 500,
       runId: "01HXRUN", status: "done",
     });
-    indexCountState.count = 700;
+    consumedState.consumed = 700;
     await vi.advanceTimersByTimeAsync(2_600);
     await waitFor(() => {
       const pb = screen.getAllByTestId("indexing-progress")[0]!.querySelector('[role="progressbar"]') as HTMLElement;
@@ -455,7 +478,7 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
     });
     const stored = JSON.parse(globalThis.localStorage.getItem(STORAGE_KEY) ?? "null") as IndexingAnchor | null;
     expect(stored).not.toBeNull();
-    expect(stored!.indexCountAtAnchor).toBe(0);
+    expect(stored!.consumedAtAnchor).toBe(0);
     expect(stored!.rowsTotal).toBe(1000);
     vi.useRealTimers();
   });
@@ -469,13 +492,13 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
     const anchor: IndexingAnchor = {
       runId: "01HXRUN",
       rowsTotal: 1000,
-      indexCountAtAnchor: 500,
+      consumedAtAnchor: 500,
       anchorTs: Date.now(),
       lastSeenAt: Date.now(),
       targetLabel: TEST_LABEL,
     };
     globalThis.localStorage.setItem(STORAGE_KEY, JSON.stringify(anchor));
-    indexCountState.count = 750; // 250 indexed since anchor ⇒ 25%
+    consumedState.consumed = 750; // 250 indexed since anchor ⇒ 25%
     vi.stubGlobal("fetch", mockFetch());
     renderPanel();
     await waitFor(() => {
@@ -485,13 +508,13 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
       expect(pb.getAttribute("aria-valuenow")).toBe("25");
     });
     // Index rebuild: FT.SEARCH count drops to 50 (well below the 500
-    // baseline). Restart-detection effect re-seeds indexCountAtAnchor=50.
-    indexCountState.count = 50;
+    // baseline). Restart-detection effect re-seeds consumedAtAnchor=50.
+    consumedState.consumed = 50;
     await vi.advanceTimersByTimeAsync(2_600);
     await waitFor(() => {
       const stored = JSON.parse(globalThis.localStorage.getItem(STORAGE_KEY) ?? "null") as IndexingAnchor | null;
       expect(stored).not.toBeNull();
-      expect(stored!.indexCountAtAnchor).toBe(50);
+      expect(stored!.consumedAtAnchor).toBe(50);
     });
     // pct drops to 0% (indexed since new anchor = 0).
     const bars = screen.getAllByTestId("indexing-progress");
@@ -509,24 +532,24 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
     const anchor: IndexingAnchor = {
       runId: "01HXRUN",
       rowsTotal: 10_000,
-      indexCountAtAnchor: 1_000,
+      consumedAtAnchor: 1_000,
       anchorTs,
       lastSeenAt: anchorTs,
       targetLabel: TEST_LABEL,
     };
     globalThis.localStorage.setItem(STORAGE_KEY, JSON.stringify(anchor));
-    indexCountState.count = 4_000; // 3000 indexed since anchor ⇒ 30%
+    consumedState.consumed = 4_000; // 3000 indexed since anchor ⇒ 30%
     vi.stubGlobal("fetch", mockFetch());
     renderPanel();
     const bars = await screen.findAllByTestId("indexing-progress");
     const pb = bars[0]!.querySelector('[role="progressbar"]') as HTMLElement;
     expect(pb.getAttribute("aria-valuenow")).toBe("30");
     const text = within(bars[0]!).getByTestId("indexing-progress-text");
-    expect(text.textContent).toMatch(/3,000 \/ 10,000 indexed/);
+    expect(text.textContent).toMatch(/3,000 \/ 10,000 written/);
     // Anchor in localStorage is unchanged: same baseline, same anchorTs.
     const stored = JSON.parse(globalThis.localStorage.getItem(STORAGE_KEY) ?? "null") as IndexingAnchor | null;
     expect(stored).not.toBeNull();
-    expect(stored!.indexCountAtAnchor).toBe(1_000);
+    expect(stored!.consumedAtAnchor).toBe(1_000);
     expect(stored!.rowsTotal).toBe(10_000);
     expect(stored!.anchorTs).toBe(anchorTs);
   });
@@ -538,7 +561,7 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
     const anchor: IndexingAnchor = {
       runId: "01HXRUN",
       rowsTotal: 1000,
-      indexCountAtAnchor: 0,
+      consumedAtAnchor: 0,
       anchorTs: Date.now(),
       lastSeenAt: Date.now(),
       targetLabel: TEST_LABEL,
@@ -548,7 +571,7 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
       rowsTotal: 1000, rowsDone: 0, elapsedMs: 0, rowsPerSec: 0,
       runId: "01HXRUN", status: "running",
     });
-    indexCountState.count = 0;
+    consumedState.consumed = 0;
     vi.stubGlobal("fetch", mockFetch());
     renderPanel();
     const bars = await screen.findAllByTestId("indexing-progress");
@@ -573,13 +596,13 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
     const anchor: IndexingAnchor = {
       runId: "01HXRUN",
       rowsTotal: 100_000,
-      indexCountAtAnchor: 0,
+      consumedAtAnchor: 0,
       anchorTs: Date.now(),
       lastSeenAt: Date.now(),
       targetLabel: TEST_LABEL,
     };
     globalThis.localStorage.setItem(STORAGE_KEY, JSON.stringify(anchor));
-    indexCountState.count = 30_000; // 30% indexed at cancel time
+    consumedState.consumed = 30_000; // 30% indexed at cancel time
     vi.stubGlobal("fetch", mockFetch());
     const { rerender } = renderPanel();
     await waitFor(() => {
@@ -622,13 +645,13 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
     const anchor: IndexingAnchor = {
       runId: "01HXLEAK",
       rowsTotal: 100_000,
-      indexCountAtAnchor: 0,
+      consumedAtAnchor: 0,
       anchorTs: Date.now(),
       lastSeenAt: Date.now(),
       targetLabel: TEST_LABEL,
     };
     globalThis.localStorage.setItem(STORAGE_KEY, JSON.stringify(anchor));
-    indexCountState.count = 0;
+    consumedState.consumed = 0;
     vi.stubGlobal("fetch", mockFetch());
     const { rerender } = renderPanel();
     await waitFor(() => {
@@ -661,7 +684,7 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
     const anchor: IndexingAnchor = {
       runId: "01HXRUN",
       rowsTotal,
-      indexCountAtAnchor: 0,
+      consumedAtAnchor: 0,
       anchorTs: Date.now(),
       lastSeenAt: Date.now(),
       targetLabel: TEST_LABEL,
@@ -672,7 +695,7 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
       runId: "01HXRUN", status: "running",
     });
     let indexed = drainPerTick;
-    indexCountState.count = indexed;
+    consumedState.consumed = indexed;
     vi.stubGlobal("fetch", mockFetch());
     renderPanel();
     await waitFor(() => {
@@ -688,7 +711,7 @@ describe("<IndexingProgress /> — Wave 6.41.E", () => {
     // Nine more ticks; indexCount advances by ~30K each tick.
     for (let i = 0; i < 9; i++) {
       indexed += drainPerTick;
-      indexCountState.count = indexed;
+      consumedState.consumed = indexed;
       await vi.advanceTimersByTimeAsync(2_600);
       await waitFor(() => {
         expect(Number.isFinite(readPct())).toBe(true);
