@@ -3,12 +3,19 @@
 // decoupled this from the destructive halt-and-flush: the button now hits
 // the non-destructive /admin/stop-runs route and the banner no longer
 // surfaces a flush summary. Use "Flush DB" for the destructive path.
+//
+// Wave 6.53.C — added the snap-to-completion case at the bottom of the
+// file: confirming Stop generators while an indexing anchor is active
+// rewrites the anchor with rowsTotal = (indexCountNow - indexCountAtAnchor)
+// so the bar reaches 100%, the existing "Indexing complete" banner fires,
+// and the 3s auto-clear takes over.
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { IngestPanel } from "../../src/panels/IngestPanel";
 import { GeneratorRunProvider } from "../../src/context/GeneratorRunContext";
+import { readAnchor, storageKeyFor, type IndexingAnchor } from "../../src/lib/indexingState";
 
 vi.mock("../../src/components/PanelCard", () => ({
   PanelCard: ({ title, children, actions }: any) => (
@@ -179,5 +186,73 @@ describe("IngestPanel — Stop generators button (Wave 5.44 / 6.53.A)", () => {
     expect(banner).toHaveTextContent(/stopped 1 generator/i);
     expect(banner.textContent ?? "").not.toMatch(/discarded backlog/i);
     expect(banner.textContent ?? "").not.toMatch(/trimmed/i);
+  });
+
+  // Wave 6.53.C — confirming Stop generators while an indexing anchor is
+  // active snaps the anchor's rowsTotal down to (indexCountNow -
+  // indexCountAtAnchor). That makes atTarget flip to true on the very next
+  // render, the existing "Indexing complete" banner fires, and the 3s
+  // auto-clear takes over — instead of the bar sitting stuck against the
+  // original rowsTotal until the 25s plateau backstop kicks in.
+  it("snaps the indexing anchor to rowsTotal = indexed when an anchor is active", async () => {
+    const TEST_LABEL = "test-label";
+    const INDEX_COUNT_NOW = 45_000;
+    const baseAnchor: IndexingAnchor = {
+      runId: "01HXRUN",
+      rowsTotal: 100_000,
+      indexCountAtAnchor: 1_000,
+      anchorTs: Date.now(),
+      lastSeenAt: Date.now(),
+      targetLabel: TEST_LABEL,
+    };
+    localStorage.setItem(storageKeyFor(TEST_LABEL), JSON.stringify(baseAnchor));
+
+    const fetchMock = vi.fn(async (input: RequestInfo, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      if (url.endsWith("/sources") && method === "GET") return { ok: true, json: async () => [] };
+      if (url.includes("/observability/keys")) return { ok: true, json: async () => keysResponse(0) };
+      if (url.includes("/observability/memory")) return { ok: true, json: async () => memoryResponse() };
+      if (url.endsWith("/redis/active-target") && method === "GET") {
+        return { ok: true, json: async () => ({ host: "h", port: 6379, tls: false, db: 0, label: TEST_LABEL }) };
+      }
+      if (url.endsWith("/admin/index-count") && method === "GET") {
+        return { ok: true, json: async () => ({ ok: true, count: INDEX_COUNT_NOW, index_name: "idx:sens:v1" }) };
+      }
+      if (url.endsWith("/admin/stop-runs") && method === "POST") {
+        return { ok: true, status: 200, json: async () => ({ ok: true, cancelled: 1, run_ids: ["r1"], trim: { streams_trimmed: 1 } }) };
+      }
+      if (url.endsWith("/generator/runs") && method === "GET") return { ok: true, json: async () => ({ active: [] }) };
+      return { ok: true, json: async () => ({}) };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderPanel();
+
+    // Wait for the parent's 1s telemetry poll to land so lastIndexCount
+    // reflects the mocked /admin/index-count=45000 before the helper runs.
+    await waitFor(() => {
+      const polled = fetchMock.mock.calls.find(
+        (c) => /\/admin\/index-count$/.test(String(c[0])),
+      );
+      expect(polled).toBeDefined();
+    });
+
+    fireEvent.click(await screen.findByTestId("stop-all-runs-btn"));
+    fireEvent.click(within(await screen.findByTestId("stop-all-runs-modal")).getByTestId("stop-all-runs-confirm"));
+    await screen.findByTestId("stop-all-runs-banner");
+
+    const snapped = readAnchor(TEST_LABEL);
+    expect(snapped).not.toBeNull();
+    expect(snapped!.rowsTotal).toBe(44_000);
+    expect(snapped!.indexCountAtAnchor).toBe(1_000);
+    expect(snapped!.runId).toBe("01HXRUN");
+    expect(snapped!.targetLabel).toBe(TEST_LABEL);
+
+    // Bonus: the bar reaches 100% and surfaces the "Indexing complete"
+    // banner via the existing completion lifecycle.
+    await screen.findByTestId("indexing-complete");
+
+    localStorage.removeItem(storageKeyFor(TEST_LABEL));
   });
 });

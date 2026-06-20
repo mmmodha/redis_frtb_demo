@@ -380,6 +380,12 @@ export function IngestPanel() {
   const { run: trackedRun, clearRun: clearTrackedRun, startRun, cancelRun } = useGeneratorRun();
   // Wave 5.47b — pre-flight banner + submit gate shared with SyntheticGeneratorCard.
   const preflightHandle = usePreflight();
+  // Wave 6.53.C — active-target label drives the indexing-anchor snap path
+  // in onStopAllConfirm below. Anchors are partitioned by label in storage
+  // (see lib/indexingState.ts), so the snap needs the live label to read /
+  // rewrite the right entry. While the label resolves (first paint before
+  // /redis/active-target lands) it's null and the helper no-ops.
+  const ingestTargetLabel = useActiveTargetLabel();
   // Wave 6.17 — primary preset card state. `presetKey` is the currently
   // staged preset; `presetStep` is the human-readable label for the current
   // automation step (preflight → rebuild → shards → start); `presetError`
@@ -612,6 +618,15 @@ export function IngestPanel() {
       if (trackedRun?.runId && r.run_ids.includes(trackedRun.runId)) {
         clearTrackedRun();
       }
+      // Wave 6.53.C — snap the indexing bar to "complete" via the existing
+      // 3s auto-clear path. Runs whether or not the cancelled list included
+      // the tracked run — the user explicitly asked to stop, so the bar
+      // should clear regardless. `lastIndexCount` is bumped by the existing
+      // 1s telemetry poll so it's the freshest /admin/index-count value
+      // the parent has seen; the helper handles null gracefully.
+      const freshIndexCount = lastIndexCount.current?.count ?? null;
+      const currentAnchor = ingestTargetLabel ? readAnchor(ingestTargetLabel) : null;
+      completeIndexingRunIfActive(freshIndexCount, currentAnchor, ingestTargetLabel);
       window.setTimeout(() => setStopAllBanner(null), 4000);
     } catch (e) {
       setError(`Stop generators failed: ${(e as Error).message}`);
@@ -2259,6 +2274,61 @@ function formatEtaSeconds(s: number): string {
   return `${Math.round(s / 86_400)}d`;
 }
 
+// Wave 6.53.C — bridge event for cross-component anchor updates. When the
+// parent IngestPanel mutates the indexing anchor in storage (currently only
+// the Stop-generators snap path below), dispatch this event so the
+// IndexingProgress component re-reads storage and refreshes its in-memory
+// anchor on the next render. Same-tab 'storage' events do not fire in the
+// browser, so a custom event is required to bridge the parent → child gap.
+const INDEXING_ANCHOR_CHANGED_EVENT = "frtb:indexing-anchor-changed";
+
+function notifyIndexingAnchorChanged(): void {
+  if (typeof window === "undefined") return;
+  try { window.dispatchEvent(new Event(INDEXING_ANCHOR_CHANGED_EVENT)); }
+  catch { /* best-effort; tolerate environments without Event */ }
+}
+
+// Wave 6.53.C — Stop-generators snap-to-completion. When the user confirms
+// "Stop generators" we want the indexing bar to self-clear via the existing
+// "Indexing complete" → 3s auto-clear lifecycle instead of waiting for the
+// 25s plateau backstop. Pure storage-side helper:
+//   • no anchor / no target / no index-count ⇒ clear any stale anchor.
+//   • indexed delta <= 0 (nothing landed) ⇒ clear; do not pretend a 0-row
+//     run "completed".
+//   • otherwise rewrite the anchor with rowsTotal = indexed so the next
+//     render flips atTarget=true, the completion banner fires, and the
+//     existing 3s clear path takes over.
+// The notify event lets IndexingProgress (sibling component) pick up the
+// storage change without a refactor of where the anchor state lives.
+export function completeIndexingRunIfActive(
+  currentIndexCount: number | null,
+  anchor: IndexingAnchor | null,
+  targetLabel: string | null,
+): void {
+  if (!targetLabel) return;
+  if (anchor === null || currentIndexCount === null) {
+    clearAnchor(targetLabel);
+    notifyIndexingAnchorChanged();
+    return;
+  }
+  const indexed = Math.max(0, currentIndexCount - anchor.indexCountAtAnchor);
+  if (indexed <= 0) {
+    clearAnchor(targetLabel);
+    notifyIndexingAnchorChanged();
+    return;
+  }
+  const next: IndexingAnchor = {
+    runId: anchor.runId,
+    rowsTotal: indexed,
+    indexCountAtAnchor: anchor.indexCountAtAnchor,
+    anchorTs: anchor.anchorTs,
+    lastSeenAt: Date.now(),
+    targetLabel: anchor.targetLabel,
+  };
+  writeAnchor(targetLabel, next);
+  notifyIndexingAnchorChanged();
+}
+
 function IndexingProgress() {
   const { run } = useGeneratorRun();
   // Wave 6.44.B — active-target label drives per-target anchor isolation.
@@ -2307,6 +2377,23 @@ function IndexingProgress() {
     }
     const a = readAnchor(targetLabel);
     setAnchor(a);
+  }, [targetLabel]);
+
+  // Wave 6.53.C — re-read the anchor when a same-tab notify fires (Stop
+  // generators snap path rewrites storage from the parent). The custom
+  // event substitutes for the native 'storage' event, which only fires in
+  // OTHER tabs. On a cleared anchor the mount/target effect already covers
+  // the null path on next target change, but this listener also handles the
+  // mid-session clear (helper called with anchor or indexed <= 0) so the
+  // bar disappears immediately rather than waiting for the plateau hatch.
+  useEffect(() => {
+    if (!targetLabel) return;
+    const handler = (): void => {
+      const next = readAnchor(targetLabel);
+      setAnchor(next);
+    };
+    window.addEventListener(INDEXING_ANCHOR_CHANGED_EVENT, handler);
+    return () => window.removeEventListener(INDEXING_ANCHOR_CHANGED_EVENT, handler);
   }, [targetLabel]);
 
   // Unmount: cancel any pending completion timeout to avoid setState on an
