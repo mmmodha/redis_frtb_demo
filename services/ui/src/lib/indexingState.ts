@@ -1,4 +1,4 @@
-// Wave 6.41.E — localStorage-backed anchor for the IngestPanel "Writing"
+// Wave 6.41.E — localStorage-backed anchor for the IngestPanel "Indexing"
 // progress bar.
 //
 // Wave 6.41.E.fix3 — data source switched from `xlen` to the strictly-
@@ -26,17 +26,24 @@
 // `indexCountAtAnchor`; storage key bumped to v4. v3 entries are silently
 // dropped on read (same precedent as v1→v2, v2→v3).
 //
-// Wave 6.52.A — data source switched back to the strictly-monotonic
-// `consumed` counter (/admin/stream-status). The prior index-count source
-// trailed the writes by the FT index lag, leaving the bar lingering after
-// the ingest worker had finished HSETing rows. Now the bar fills and
-// clears in step with the writes themselves. Field renamed
-// `indexCountAtAnchor` → `consumedAtAnchor`; sample shape renamed
-// `IndexCountSample {indexCount, ts}` → `ConsumedSample {consumed, ts}`.
-// Storage key bumped to `frtb:writing:anchor:v1:`; v4 (index-count) entries
-// are silently dropped on read.
+// Wave 6.52.A — data source switched to the ingest worker's `consumed`
+// counter (/admin/stream-status). Field renamed `indexCountAtAnchor` →
+// `consumedAtAnchor`; sample shape `ConsumedSample {consumed, ts}`;
+// storage key bumped to `frtb:writing:anchor:v1:`.
+//
+// Wave 6.52.C — data source reverted back to the live FT.SEARCH count
+// (/admin/index-count). The `consumed` counter is per-worker-process and
+// in-memory (resets on restart) and the generator fans 1 logical row →
+// ~2 stream entries, so it is an unreliable denominator. `index-count`
+// is the ground truth for "sens queryable in Redis"; the anchor model
+// already handles the "show only this run's increment" requirement
+// correctly when paired with `index-count`. Field renamed
+// `consumedAtAnchor` → `indexCountAtAnchor`; sample shape renamed
+// `ConsumedSample {consumed, ts}` → `IndexCountSample {indexCount, ts}`.
+// Storage key bumped to `frtb:indexing:anchor:v2:`; in-flight Wave 6.52.A
+// entries at the v1 writing key are silently dropped on read.
 
-export const STORAGE_KEY_PREFIX = "frtb:writing:anchor:v1:";
+export const STORAGE_KEY_PREFIX = "frtb:indexing:anchor:v2:";
 export const ANCHOR_TTL_MS = 24 * 60 * 60 * 1000;
 
 export function storageKeyFor(label: string): string {
@@ -49,12 +56,12 @@ export interface IndexingAnchor {
   // with no prior anchor — e.g. the page was opened after a run completed).
   runId: string | null;
   // Total rows the producer queued. The denominator for the bar: pct grows
-  // toward 100% as `consumedNow - consumedAtAnchor` approaches rowsTotal.
+  // toward 100% as `indexCountNow - indexCountAtAnchor` approaches rowsTotal.
   rowsTotal: number;
-  // Wave 6.52.A — value of the ingest worker's `consumed` write counter at
-  // the moment this anchor was created. The 0% baseline. Pct math is
-  // (consumedNow - consumedAtAnchor) / rowsTotal.
-  consumedAtAnchor: number;
+  // Wave 6.52.C — value of /admin/index-count (FT.SEARCH * LIMIT 0 0 against
+  // the active sens-index) at the moment this anchor was created. The 0%
+  // baseline. Pct math is (indexCountNow - indexCountAtAnchor) / rowsTotal.
+  indexCountAtAnchor: number;
   // When this anchor was created. Used for TTL eviction.
   anchorTs: number;
   // Most recent time the anchor was touched (poll, refresh). Persisted so a
@@ -89,7 +96,7 @@ export function readAnchor(label: string, now: number = Date.now()): IndexingAnc
   try { parsed = JSON.parse(raw) as Partial<IndexingAnchor>; }
   catch { return null; }
   if (
-    typeof parsed.consumedAtAnchor !== "number"
+    typeof parsed.indexCountAtAnchor !== "number"
     || typeof parsed.anchorTs !== "number"
     || typeof parsed.rowsTotal !== "number"
     || typeof parsed.lastSeenAt !== "number"
@@ -103,7 +110,7 @@ export function readAnchor(label: string, now: number = Date.now()): IndexingAnc
   return {
     runId: typeof parsed.runId === "string" ? parsed.runId : null,
     rowsTotal: parsed.rowsTotal,
-    consumedAtAnchor: parsed.consumedAtAnchor,
+    indexCountAtAnchor: parsed.indexCountAtAnchor,
     anchorTs: parsed.anchorTs,
     lastSeenAt: parsed.lastSeenAt,
     targetLabel: typeof parsed.targetLabel === "string" ? parsed.targetLabel : label,
@@ -122,50 +129,50 @@ export function clearAnchor(label: string): void {
   try { store.removeItem(storageKeyFor(label)); } catch { /* noop */ }
 }
 
-// Clamp to [0, 100]. rowsTotal <= 0 ⇒ nothing to write ⇒ 100%. A
-// consumedNow below consumedAtAnchor (FLUSHDB, counter reset) clamps to
+// Clamp to [0, 100]. rowsTotal <= 0 ⇒ nothing to index ⇒ 100%. An
+// indexCountNow below indexCountAtAnchor (FLUSHDB, index drop) clamps to
 // 0% — callers detect that case separately and re-anchor.
 export function computePct(
-  consumedAtAnchor: number,
-  consumedNow: number,
+  indexCountAtAnchor: number,
+  indexCountNow: number,
   rowsTotal: number,
 ): number {
   if (!Number.isFinite(rowsTotal) || rowsTotal <= 0) return 100;
-  if (!Number.isFinite(consumedAtAnchor) || !Number.isFinite(consumedNow)) return 0;
-  const written = consumedNow - consumedAtAnchor;
-  if (written <= 0) return 0;
-  if (written >= rowsTotal) return 100;
-  return (written / rowsTotal) * 100;
+  if (!Number.isFinite(indexCountAtAnchor) || !Number.isFinite(indexCountNow)) return 0;
+  const indexed = indexCountNow - indexCountAtAnchor;
+  if (indexed <= 0) return 0;
+  if (indexed >= rowsTotal) return 100;
+  return (indexed / rowsTotal) * 100;
 }
 
-// Wave 6.52.A — per-tick sample of the ingest worker's strictly-monotonic
-// `consumed` write counter. The bar fills and clears in step with the
-// writes themselves rather than trailing the FT index lag.
-export interface ConsumedSample { consumed: number; ts: number }
+// Wave 6.52.C — per-tick sample of /admin/index-count (FT.SEARCH * LIMIT
+// 0 0). The bar reflects what a calc query can actually see in the index
+// rather than the per-worker in-memory `consumed` counter.
+export interface IndexCountSample { indexCount: number; ts: number }
 
-// Sliding-window rate computation. Returns rows-per-sec written between the
-// oldest and newest sample (positive when consumed is growing). The
-// consumed counter is monotonic during a single ingest pass so the
-// "negative drain" branch from the prior xlen-based design is unnecessary.
-// Returns null when fewer than two samples or no time has elapsed.
-export function computeRatePerSec(samples: ConsumedSample[]): number | null {
+// Sliding-window rate computation. Returns rows-per-sec indexed between the
+// oldest and newest sample (positive when indexCount is growing). The
+// index count is monotonic during a single ingest pass so the "negative
+// drain" branch from the prior xlen-based design is unnecessary. Returns
+// null when fewer than two samples or no time has elapsed.
+export function computeRatePerSec(samples: IndexCountSample[]): number | null {
   if (!Array.isArray(samples) || samples.length < 2) return null;
   const first = samples[0]!;
   const last = samples[samples.length - 1]!;
   const elapsedMs = last.ts - first.ts;
   if (elapsedMs <= 0) return null;
-  const written = last.consumed - first.consumed;
-  if (written <= 0) return 0;
-  return (written / elapsedMs) * 1000;
+  const indexed = last.indexCount - first.indexCount;
+  if (indexed <= 0) return 0;
+  return (indexed / elapsedMs) * 1000;
 }
 
 // Push a new sample into a bounded sliding window. Pure (returns a new
 // array) so React state updates remain referentially honest.
 export function pushSample(
-  samples: ConsumedSample[],
-  sample: ConsumedSample,
+  samples: IndexCountSample[],
+  sample: IndexCountSample,
   windowSize = 10,
-): ConsumedSample[] {
+): IndexCountSample[] {
   const next = samples.concat([sample]);
   if (next.length > windowSize) next.splice(0, next.length - windowSize);
   return next;
