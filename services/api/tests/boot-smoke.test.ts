@@ -58,6 +58,12 @@ describe("boot-smoke: services/api/src/index.ts loads without ReferenceError", (
     process.env = { ...originalEnv };
     process.env.FRTB_MASTER_KEY = "boot-smoke-test-key";
     process.env.SMOKE = "1";
+    // Wave 6.55.G — index.ts defaults PORT to 8080. Under `pnpm -r exec vitest`
+    // multiple worker processes load this file in parallel; each one would
+    // race to bind :8080 and the loser surfaces EADDRINUSE. Pin to port 0
+    // so the OS hands every worker its own ephemeral port. This mirrors what
+    // every other listen-using test in services/api/tests/ already does.
+    process.env.API_PORT = "0";
     delete process.env.REDIS_URL;
     exitSpy = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
     errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);

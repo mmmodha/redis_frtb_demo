@@ -54,15 +54,22 @@ describe("/connections HTTP routes", () => {
   });
 
   it("GET /connections lists profiles with passwords redacted", async () => {
-    await app.inject({ method: "POST", url: "/connections", payload: { name: "a", host: "h1", port: 1, password: "PA" } });
-    await app.inject({ method: "POST", url: "/connections", payload: { name: "b", host: "h2", port: 2, password: "PB" } });
+    // Wave 6.55.G — password sentinels include lowercase characters so they
+    // cannot collide with a Crockford-base32 ULID id (which is uppercase-only
+    // `[0-9A-HJKMNP-TV-Z]`). The previous "PA"/"PB" sentinels flaked roughly
+    // once per 1024 generated ULIDs when the random tail happened to contain
+    // those two adjacent characters.
+    const pwA = "pa-secret-leak";
+    const pwB = "pb-secret-leak";
+    await app.inject({ method: "POST", url: "/connections", payload: { name: "a", host: "h1", port: 1, password: pwA } });
+    await app.inject({ method: "POST", url: "/connections", payload: { name: "b", host: "h2", port: 2, password: pwB } });
     const res = await app.inject({ method: "GET", url: "/connections" });
     expect(res.statusCode).toBe(200);
     const body = res.json();
     expect(body).toHaveLength(2);
     for (const p of body) expect(p.password).toBe("***");
-    expect(JSON.stringify(body)).not.toContain("PA");
-    expect(JSON.stringify(body)).not.toContain("PB");
+    expect(JSON.stringify(body)).not.toContain(pwA);
+    expect(JSON.stringify(body)).not.toContain(pwB);
   });
 
   it("GET /connections/:id returns 404 for unknown id", async () => {
