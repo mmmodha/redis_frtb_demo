@@ -2340,6 +2340,97 @@ function CvrComponentsBreakdown({
   );
 }
 
+// Wave 6.48.B — BucketDrilldown group-by control. Users can collapse the per-
+// trade table into groups by risk_factor / book / region; each group surfaces
+// its row count and Σ |w·v| exposure (absolute weighted sensitivity) across
+// the 5 known risk_value shapes (number scalar, {spot}, {cvr_up, cvr_down}
+// scalars, per-tenor arrays for GIRR Curvature, tenor-keyed objects for GIRR
+// Delta/Vega). Options whose dimension is absent on every fetched row are
+// disabled with a hover hint so the operator sees what's available.
+type GroupByOption = "none" | "risk_factor" | "book" | "region";
+const GROUP_BY_OPTIONS: Array<{ value: GroupByOption; label: string; dim: string | null }> = [
+  { value: "none", label: "None", dim: null },
+  { value: "risk_factor", label: "Risk Factor", dim: "risk_factor" },
+  { value: "book", label: "Book", dim: "book" },
+  { value: "region", label: "Region", dim: "region" },
+];
+
+// Σ |w · v| for a single row. `weight` may be a scalar or tenor-keyed object
+// (per 6.47.B); `risk_value` matches PivotDoc.risk_value's discriminated union.
+function rowAbsExposure(rv: unknown, weight: unknown): number {
+  const scalarW = typeof weight === "number" && Number.isFinite(weight) ? Math.abs(weight) : 1;
+  if (typeof rv === "number" && Number.isFinite(rv)) return Math.abs(rv) * scalarW;
+  if (!rv || typeof rv !== "object" || Array.isArray(rv)) return 0;
+  const obj = rv as Record<string, unknown>;
+  if (typeof obj.spot === "number" && Number.isFinite(obj.spot)) return Math.abs(obj.spot) * scalarW;
+  if ("cvr_up" in obj || "cvr_down" in obj) {
+    const up = obj.cvr_up;
+    const down = obj.cvr_down;
+    if (Array.isArray(up) || Array.isArray(down)) {
+      let s = 0;
+      for (const v of Array.isArray(up) ? up : []) {
+        if (typeof v === "number" && Number.isFinite(v)) s += Math.abs(v);
+      }
+      for (const v of Array.isArray(down) ? down : []) {
+        if (typeof v === "number" && Number.isFinite(v)) s += Math.abs(v);
+      }
+      return s * scalarW;
+    }
+    const u = typeof up === "number" && Number.isFinite(up) ? Math.abs(up) : 0;
+    const d = typeof down === "number" && Number.isFinite(down) ? Math.abs(down) : 0;
+    return Math.max(u, d) * scalarW;
+  }
+  // Tenor-keyed numeric scalars; pair per-tenor weight if available.
+  const tenorW =
+    weight && typeof weight === "object" && !Array.isArray(weight)
+      ? (weight as Record<string, unknown>)
+      : null;
+  let sum = 0;
+  let any = false;
+  for (const k of Object.keys(obj)) {
+    const v = obj[k];
+    if (typeof v === "number" && Number.isFinite(v)) {
+      any = true;
+      const w =
+        tenorW && typeof tenorW[k] === "number" && Number.isFinite(tenorW[k] as number)
+          ? Math.abs(tenorW[k] as number)
+          : scalarW;
+      sum += Math.abs(v) * w;
+    }
+  }
+  return any ? sum : 0;
+}
+
+// Wave 6.47.B — tenor-keyed weight render. `weight` arrives as
+// `{ "3M": w, "6M": w, ..., "30Y": w }` for GIRR (and other by_tenor classes);
+// render the tenors in canonical GIRR order, falling back to insertion order
+// for any unknown keys.
+function TenorWeightCell({ weight }: { weight: Record<string, number> }) {
+  const knownOrdered = GIRR_TENORS.filter((t) => typeof weight[t] === "number" && Number.isFinite(weight[t]));
+  const extras = Object.keys(weight).filter(
+    (k) => !knownOrdered.includes(k) && typeof weight[k] === "number" && Number.isFinite(weight[k]),
+  );
+  const ordered = [...knownOrdered, ...extras];
+  return (
+    <ul className="drilldown-weight-tenor" data-testid="drilldown-weight-tenor">
+      {ordered.map((t) => (
+        <li key={t}>
+          <span className="drilldown-weight-tenor__label">{t}</span>
+          <span className="drilldown-weight-tenor__value">{Number(weight[t]).toFixed(3)}</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function isTenorWeight(w: unknown): w is Record<string, number> {
+  if (!w || typeof w !== "object" || Array.isArray(w)) return false;
+  for (const v of Object.values(w as Record<string, unknown>)) {
+    if (typeof v === "number" && Number.isFinite(v)) return true;
+  }
+  return false;
+}
+
 function BucketDrilldown({
   bucket,
   riskClass,
@@ -2354,6 +2445,9 @@ function BucketDrilldown({
   onClose: () => void;
 }) {
   const [state, setState] = useState<DrilldownState>({ status: "loading" });
+  // Group-by state resets on bucket change because the parent keys this
+  // component by `${bucket}-...` (see renderDrilldown above).
+  const [groupBy, setGroupBy] = useState<GroupByOption>("none");
   const firstFocusRef = useRef<HTMLButtonElement | null>(null);
   // Wave 5.21e: trade_id pill → JSON drawer state. Track the originating
   // button so focus returns there on close.
@@ -2485,6 +2579,12 @@ function BucketDrilldown({
       ) : null}
       {state.status === "loaded" && state.rows.length > 0 ? (
         <>
+          <BucketDrilldownGroupBy
+            rows={state.rows}
+            value={groupBy}
+            onChange={setGroupBy}
+          />
+          {groupBy === "none" ? (
           <table className="bucket-drilldown__table" aria-label={`trades in bucket ${bucket}`}>
             <thead>
               <tr>
@@ -2527,6 +2627,8 @@ function BucketDrilldown({
                       ? "—"
                       : typeof row.doc.weight === "number"
                       ? formatCharge(row.doc.weight)
+                      : isTenorWeight(row.doc.weight)
+                      ? <TenorWeightCell weight={row.doc.weight as Record<string, number>} />
                       : "—"}
                   </td>
                 </tr>
@@ -2534,6 +2636,9 @@ function BucketDrilldown({
               })}
             </tbody>
           </table>
+          ) : (
+            <BucketDrilldownGroups rows={state.rows} groupBy={groupBy} />
+          )}
           <div className="bucket-drilldown__footer">
             <span data-testid="bucket-drilldown-footer">
               Showing top {state.rows.length} of {state.total} trades · K_b = {formatCharge(k)} · S_b ={" "}
@@ -2558,6 +2663,114 @@ function BucketDrilldown({
     </div>
   );
 }
+
+// Wave 6.48.B — group-by select rendered above the per-trade table. Options
+// disable themselves when the underlying dimension is absent on every fetched
+// row (with a tooltip explaining why) so the operator never picks a no-op
+// grouping.
+function BucketDrilldownGroupBy({
+  rows,
+  value,
+  onChange,
+}: {
+  rows: PivotRow[];
+  value: GroupByOption;
+  onChange: (v: GroupByOption) => void;
+}) {
+  const available = useMemo(() => {
+    const map: Record<string, boolean> = {};
+    for (const opt of GROUP_BY_OPTIONS) {
+      if (!opt.dim) continue;
+      map[opt.dim] = rows.some((r) => {
+        const v = r.doc[opt.dim!];
+        return v !== undefined && v !== null && String(v).length > 0;
+      });
+    }
+    return map;
+  }, [rows]);
+
+  return (
+    <div className="bucket-drilldown__groupby">
+      <label htmlFor="bucket-drilldown-groupby-select">Group by:</label>
+      <select
+        id="bucket-drilldown-groupby-select"
+        className="bucket-drilldown__groupby-select"
+        data-testid="bucket-drilldown-groupby-select"
+        value={value}
+        onChange={(e) => onChange(e.target.value as GroupByOption)}
+      >
+        {GROUP_BY_OPTIONS.map((opt) => {
+          const disabled = opt.dim !== null && !available[opt.dim];
+          return (
+            <option
+              key={opt.value}
+              value={opt.value}
+              disabled={disabled}
+              title={disabled ? "Not present on these rows" : undefined}
+            >
+              {opt.label}
+            </option>
+          );
+        })}
+      </select>
+    </div>
+  );
+}
+
+// Wave 6.48.B — collapsed group view. Σ |w · v| per group across the 5 known
+// `risk_value` shapes; sorted descending by exposure. Formatting uses
+// toPrecision(4) so sub-1 totals render to 4 sig figs (0.3000) and ≥1 totals
+// render to 3 decimal places (1.000 / 3.000 / 6.000), matching the test
+// expectations.
+function BucketDrilldownGroups({ rows, groupBy }: { rows: PivotRow[]; groupBy: GroupByOption }) {
+  const dim = GROUP_BY_OPTIONS.find((o) => o.value === groupBy)?.dim;
+  const groups = useMemo(() => {
+    if (!dim) return [] as Array<{ key: string; count: number; exposure: number }>;
+    const acc = new Map<string, { count: number; exposure: number }>();
+    for (const r of rows) {
+      const raw = r.doc[dim];
+      if (raw === undefined || raw === null) continue;
+      const key = String(raw);
+      const cur = acc.get(key) ?? { count: 0, exposure: 0 };
+      cur.count += 1;
+      cur.exposure += rowAbsExposure(r.doc.risk_value, r.doc.weight);
+      acc.set(key, cur);
+    }
+    return Array.from(acc.entries())
+      .map(([key, v]) => ({ key, count: v.count, exposure: v.exposure }))
+      .sort((a, b) => b.exposure - a.exposure);
+  }, [rows, dim]);
+
+  if (groups.length === 0) {
+    return (
+      <p className="bucket-drilldown__empty" data-testid="drilldown-group-empty">
+        No groups for this dimension.
+      </p>
+    );
+  }
+
+  return (
+    <table className="bucket-drilldown__table bucket-drilldown__groups" aria-label="grouped trades">
+      <thead>
+        <tr>
+          <th>{GROUP_BY_OPTIONS.find((o) => o.value === groupBy)?.label}</th>
+          <th>trades</th>
+          <th>Σ |w · v|</th>
+        </tr>
+      </thead>
+      <tbody>
+        {groups.map((g) => (
+          <tr key={g.key} data-testid="drilldown-group-row" data-group-key={g.key}>
+            <td>{g.key}</td>
+            <td data-testid="drilldown-group-count">{g.count}</td>
+            <td data-testid="drilldown-group-exposure">{g.exposure.toPrecision(4)}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
 
 // Wave 5.21e: side drawer that renders the full JSON document for a trade
 // row. Slides in from the right; non-modal so the page below stays scrollable
