@@ -310,30 +310,25 @@ export async function flushDb(): Promise<FlushDbResponse> {
   return (await res.json()) as FlushDbResponse;
 }
 
-// Wave 5.44 — POST /admin/cancel-all-runs. Iterates the api's in-process
+// Wave 5.44 / 6.53.A — POST /admin/stop-runs. Iterates the api's in-process
 // `activeRuns` registry and flips the cancel flag on every entry currently
-// `status === "running"`. Used by the IngestPanel "Stop all runs" button.
+// `status === "running"`. Used by the IngestPanel "Stop generators" button.
 // Sends an empty JSON object body to dodge Fastify's FST_ERR_CTP_EMPTY_JSON_BODY
 // when content-type is application/json (same defensive shape as flushDb).
-export interface CancelAllRunsFlushReport {
-  ok: true;
-  streams_trimmed: number;
-  docs_cleared: number;
-  elapsed_ms?: number;
-}
-
-export interface CancelAllGeneratorRunsResponse {
+//
+// Wave 6.53.A decoupled this from the destructive halt-and-flush: the api
+// route no longer touches the stream backlog or indexed `sens:*` keys, so
+// the response shape omits the `flush` summary. Use `flushDb()` for the
+// destructive path; the legacy /admin/cancel-all-runs route (still wired
+// on the api for backward compat) is no longer hit from the UI.
+export interface StopAllRunsResponse {
   ok: true;
   cancelled: number;
   run_ids: string[];
-  // Wave 6.44.E — present when the api successfully proxied to ingest's
-  // /ingest/halt-and-flush. `null` when ingest was unreachable; the cancel
-  // flags are still set, so the UI surfaces a partial-success banner.
-  flush: CancelAllRunsFlushReport | null;
 }
 
-export async function cancelAllGeneratorRuns(): Promise<CancelAllGeneratorRunsResponse> {
-  const res = await fetch(`${apiBase()}/admin/cancel-all-runs`, {
+export async function stopAllRuns(): Promise<StopAllRunsResponse> {
+  const res = await fetch(`${apiBase()}/admin/stop-runs`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: "{}",
@@ -344,9 +339,9 @@ export async function cancelAllGeneratorRuns(): Promise<CancelAllGeneratorRunsRe
       const err = (await res.json()) as { error?: string };
       if (err && typeof err.error === "string") detail = `${res.status}: ${err.error}`;
     } catch { /* response body not json */ }
-    throw new Error(`api /admin/cancel-all-runs ${detail}`);
+    throw new Error(`api /admin/stop-runs ${detail}`);
   }
-  return (await res.json()) as CancelAllGeneratorRunsResponse;
+  return (await res.json()) as StopAllRunsResponse;
 }
 
 // Wave 5.47b — GET /admin/preflight. Returns per-check status so the
@@ -371,7 +366,7 @@ export async function preflight(): Promise<PreflightResponse> {
 
 // Wave 5.47b — POST /admin/rebuild-indexes. Re-runs bootstrapFrtb on the
 // active client. Sends body:"{}" to dodge FST_ERR_CTP_EMPTY_JSON_BODY, the
-// same defensive shape flushDb / cancelAllGeneratorRuns use.
+// same defensive shape flushDb / stopAllRuns use.
 export interface RebuildIndexesResponse {
   ok: boolean;
   ms: number;

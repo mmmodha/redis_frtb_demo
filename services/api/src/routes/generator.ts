@@ -1120,45 +1120,60 @@ export function registerGeneratorRoutes(
   // of waiting on the producer's own terminal handler (which may lag if the
   // producer is mid-FCALL). The producer's `.then` will overwrite these
   // fields idempotently when it eventually finishes.
+  // Wave 6.53.A — drain+force-terminal extracted into `drainAndForceTerminal`
+  // so the new /admin/stop-runs route shares the exact same lifecycle
+  // bookkeeping without duplicating the loop.
   // No body required — Fastify accepts an empty POST and we never read req.body.
   app.post("/admin/cancel-all-runs", async () => {
     const run_ids = cancelAllActiveRuns();
-
-    // Best-effort drain: poll until every entry we just marked transitions to
-    // a terminal status, capped at cancelDrainMs. A producer mid-batch may
-    // emit a few more XADDs before observing the flag; the halt-and-flush
-    // below trims the stream so any post-cancel residue still gets wiped.
-    if (run_ids.length > 0) {
-      const deadline = Date.now() + cancelDrainMs;
-      while (Date.now() < deadline) {
-        let stillRunning = false;
-        for (const id of run_ids) {
-          const e = activeRuns.get(id);
-          if (e && e.status === "running") { stillRunning = true; break; }
-        }
-        if (!stillRunning) break;
-        await new Promise((r) => setTimeout(r, 50));
-      }
-      // Wave 6.44.F — drain window expired (or all entries transitioned
-      // naturally). For any entry still running, force-mark terminal so the
-      // status endpoint reflects the cancel immediately. The producer's
-      // own terminal handler will idempotently overwrite these fields if
-      // it eventually finishes.
-      const nowMs = Date.now();
-      for (const id of run_ids) {
-        const e = activeRuns.get(id);
-        if (e && e.status === "running") {
-          e.status = "cancelled";
-          e.stop_reason = "cancelled";
-          e.terminal_at_ms = nowMs;
-          setTimeout(() => { activeRuns.delete(id); }, terminalGraceMs).unref?.();
-        }
-      }
-    }
-
+    await drainAndForceTerminal(run_ids);
     const flush = await callIngestHaltAndFlush(app, opts.ingestBase, cancelFetch);
     return { ok: true, cancelled: run_ids.length, run_ids, flush };
   });
+
+  // Wave 6.53.A — non-destructive admin "stop generators" route. Same
+  // cancel-flag + drain + force-terminal bookkeeping as /admin/cancel-all-runs,
+  // but does NOT call /ingest/halt-and-flush. The destructive flush stays
+  // behind the dedicated "Flush DB" admin path so users who only want to
+  // halt producers don't accidentally wipe the stream backlog + indexed rows.
+  // Response intentionally omits the `flush` field so the UI client type
+  // (services/ui/src/lib/ingest.ts `stopAllRuns`) can't render a misleading
+  // "flushed N streams" summary.
+  app.post("/admin/stop-runs", async () => {
+    const run_ids = cancelAllActiveRuns();
+    await drainAndForceTerminal(run_ids);
+    return { ok: true, cancelled: run_ids.length, run_ids };
+  });
+
+  // Wave 6.53.A — shared drain + force-terminal helper used by both
+  // /admin/cancel-all-runs and /admin/stop-runs. Polls up to `cancelDrainMs`
+  // for entries to transition naturally, then force-marks anything still
+  // running as cancelled (with grace-eviction scheduled) so the status
+  // endpoint reflects the cancel within the bounded window. Closure-bound
+  // to `cancelDrainMs` + `terminalGraceMs` resolved at route registration.
+  async function drainAndForceTerminal(run_ids: string[]): Promise<void> {
+    if (run_ids.length === 0) return;
+    const deadline = Date.now() + cancelDrainMs;
+    while (Date.now() < deadline) {
+      let stillRunning = false;
+      for (const id of run_ids) {
+        const e = activeRuns.get(id);
+        if (e && e.status === "running") { stillRunning = true; break; }
+      }
+      if (!stillRunning) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    const nowMs = Date.now();
+    for (const id of run_ids) {
+      const e = activeRuns.get(id);
+      if (e && e.status === "running") {
+        e.status = "cancelled";
+        e.stop_reason = "cancelled";
+        e.terminal_at_ms = nowMs;
+        setTimeout(() => { activeRuns.delete(id); }, terminalGraceMs).unref?.();
+      }
+    }
+  }
 }
 
 // Wave 6.44.F — extracted helper used by the /admin/cancel-all-runs route
