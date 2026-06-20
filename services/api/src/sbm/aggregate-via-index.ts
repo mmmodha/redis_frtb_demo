@@ -911,13 +911,26 @@ export async function tryRollupReadout(
     return null;
   }
 
-  // Index parsed hashes by bucket (and tenor for perTenor classes). Any
-  // missing hash → bail and fall back to FT.AGGREGATE.
+  // Index parsed hashes by bucket (and tenor for perTenor classes). For
+  // non-perTenor classes a missing base hash → bail and fall back to
+  // FT.AGGREGATE (the only place that knows how to compute K_b without the
+  // rollup). Wave 6.49.A — for perTenor (GIRR) classes the per-tenor
+  // fields are sparse by construction (a 5Y risk factor only writes its
+  // 5Y hash), so a missing `(bucket, tenor)` HGETALL is the normal
+  // representation of "no contributions for that tenor" rather than a
+  // signal to fall back; skip the insertion and let the bucket loop
+  // treat the absent tenor as zero. If every tenor for a bucket comes
+  // back empty the bucket simply has no entry in byBucket and we skip
+  // it below — same answer FT.AGGREGATE would give if the field shape
+  // weren't sparse.
   const byBucket = new Map<string, Map<string, Record<string, string>>>();
   for (let i = 0; i < lookups.length; i++) {
     const parsed = parseHgetall(replies[i]);
-    if (!parsed) return null;
     const l = lookups[i]!;
+    if (!parsed) {
+      if (!perTenor) return null;
+      continue;
+    }
     let tm = byBucket.get(l.bucket);
     if (!tm) { tm = new Map(); byBucket.set(l.bucket, tm); }
     tm.set(l.tenor, parsed);
@@ -926,7 +939,14 @@ export async function tryRollupReadout(
   const out: BucketResult[] = [];
   for (const b of buckets) {
     const tm = byBucket.get(b);
-    if (!tm) return null;
+    if (!tm) {
+      // Wave 6.49.A — perTenor: every tenor empty → bucket has no data,
+      // skip it from the output rather than poisoning the whole readout
+      // (the route's caller already tolerates empty buckets). Non-perTenor:
+      // preserve the existing "no base rollup → fall back" signal.
+      if (perTenor) continue;
+      return null;
+    }
     const ms = Number(process.hrtime.bigint() - start) / 1e6;
     if (leg === "delta" || leg === "vega") {
       let sumWs: number;
@@ -939,31 +959,34 @@ export async function tryRollupReadout(
       const wsComponents: WsComponent[] | null = (components && perTenor) ? [] : null;
       if (perTenor && leg === "delta") {
         // GIRR Delta: ws_squared_sum operates on per-tenor SUMs (Σ_t (sum_ws_t)²),
-        // mirroring girr_delta.lua / bucketResultFromRow.
+        // mirroring girr_delta.lua / bucketResultFromRow. Wave 6.49.A —
+        // sparse per-tenor hashes (a tenor with no contributions in this
+        // bucket) contribute 0 to Σws / Σws²; the per-tenor ws_components
+        // entry still emits with ws=0 so the UI sort over GIRR_TENORS keeps
+        // a stable shape.
         sumWs = 0;
         sumWsSq = 0;
         for (const t of tenors) {
           const h = tm.get(t);
-          if (!h) return null;
-          const ws = Number(h.sum_ws ?? 0);
+          const ws = Number(h?.sum_ws ?? 0);
           sumWs += ws;
           const wsSq = ws * ws;
           sumWsSq += wsSq;
-          count += Number(h.count ?? 0);
+          count += Number(h?.count ?? 0);
           if (wsComponents) wsComponents.push({ k: t, ws, ws_squared: wsSq });
         }
       } else if (perTenor) {
-        // GIRR Vega: per-row sum_ws_sq summed across tenors.
+        // GIRR Vega: per-row sum_ws_sq summed across tenors. Wave 6.49.A —
+        // sparse tenors contribute 0 (same shape as the Delta branch above).
         sumWs = 0;
         sumWsSq = 0;
         for (const t of tenors) {
           const h = tm.get(t);
-          if (!h) return null;
-          const ws = Number(h.sum_ws ?? 0);
-          const wsSq = Number(h.sum_ws_sq ?? 0);
+          const ws = Number(h?.sum_ws ?? 0);
+          const wsSq = Number(h?.sum_ws_sq ?? 0);
           sumWs += ws;
           sumWsSq += wsSq;
-          count += Number(h.count ?? 0);
+          count += Number(h?.count ?? 0);
           if (wsComponents) wsComponents.push({ k: t, ws, ws_squared: wsSq });
         }
       } else {
@@ -1015,15 +1038,17 @@ export async function tryRollupReadout(
     // Curvature perTenor (GIRR): per-tenor sum_ws_up / sum_ws_down vectors
     // drive the ψ-aware K_b ± via kbSquaredForDirection; pick the worse
     // direction per §21.5(3). S_b is the signed Σ_t CVR_t of the winner.
+    // Wave 6.49.A — a sparse tenor (no contributions in this bucket) feeds
+    // 0 into both cvrUp/cvrDown vectors at its schema-ordered slot so the
+    // ψ-gate and tenor labels stay aligned.
     const cvrUp: number[] = [];
     const cvrDown: number[] = [];
     let count = 0;
     for (const t of tenors) {
       const h = tm.get(t);
-      if (!h) return null;
-      cvrUp.push(Number(h.sum_ws_up ?? 0));
-      cvrDown.push(Number(h.sum_ws_down ?? 0));
-      count += Number(h.count ?? 0);
+      cvrUp.push(Number(h?.sum_ws_up ?? 0));
+      cvrDown.push(Number(h?.sum_ws_down ?? 0));
+      count += Number(h?.count ?? 0);
     }
     const kbUpSq = Math.max(0, kbSquaredForDirection(cvrUp, rho));
     const kbDownSq = Math.max(0, kbSquaredForDirection(cvrDown, rho));
@@ -1070,6 +1095,14 @@ export async function tryRollupReadout(
       },
     });
   }
+  // Wave 6.49.A — perTenor: if every requested bucket was skipped (all
+  // tenors empty across the board) the rollup hashes have no coverage at
+  // all for this (rc, leg) — fall back to FT.AGGREGATE rather than
+  // returning an empty rollup that the route would mistake for a
+  // successful "rollup with zero buckets" reply (`if (rollup)` on `[]` is
+  // truthy in JS). Non-perTenor already returned null upstream on a
+  // missing base hash, so this only matters for perTenor.
+  if (perTenor && out.length === 0 && buckets.length > 0) return null;
   return out;
 }
 
