@@ -737,7 +737,7 @@ async function computeSbmCharge(
       let rollup: BucketResult[] | null = null;
       if (tryRollup) {
         try {
-          rollup = await tryRollupReadout(redis, schema!, risk_class, leg, buckets);
+          rollup = await tryRollupReadout(redis, schema!, risk_class, leg, buckets, { crossTopN: 10 });
         } catch (err) {
           log.warn({
             evt: "calc-rollup-failed",
