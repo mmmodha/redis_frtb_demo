@@ -5,11 +5,6 @@ import { CalcByDesk } from "../components/CalcByDesk";
 import { SuggestCombobox } from "../components/SuggestCombobox";
 import type { ShardTiming } from "../components/TimingStrip";
 import {
-  EMPTY_FILTER_CHIPS_VALUE,
-  FilterChips,
-  type FilterChipsValue,
-} from "../components/FilterChips";
-import {
   postBucketCrossDetail,
   postCalcSbm,
   postCalcSbmTotal,
@@ -276,21 +271,6 @@ function BucketChargeChart({
 // which target is active.
 const SHOW_REDIS_COMMANDS_KEY = "calc.show-redis-commands";
 
-// Wave 6.41.C — translate the FilterChips state into the `include` field on
-// CalcSbmRequest / TotalSbmRequest. Each empty list is dropped so the wire
-// body remains byte-identical to pre-6.41 when no chips are selected; a
-// fully-empty result returns `undefined` so the spread call site can skip
-// the field entirely.
-function buildIncludeBody(v: FilterChipsValue): CalcSbmRequestInclude | undefined {
-  const out: CalcSbmRequestInclude = {};
-  if (v.desk.length > 0) out.desk = [...v.desk];
-  if (v.book.length > 0) out.book = [...v.book];
-  if (v.region.length > 0) out.region = [...v.region];
-  if (v.bucket.length > 0) out.bucket = [...v.bucket];
-  return Object.keys(out).length > 0 ? out : undefined;
-}
-type CalcSbmRequestInclude = NonNullable<import("../lib/calc").CalcSbmRequest["include"]>;
-
 // Reads the initial state of `showRedisCommands` from the environment. If the
 // URL carries `?demo=1`, the toggle is force-enabled (and the preference is
 // written back to localStorage) so demo wrappers can flip verbose mode on
@@ -354,10 +334,6 @@ export function CalcPanel() {
   const [excludeBooks, setExcludeBooks] = useState<Set<string>>(new Set());
   const [excludeTrades, setExcludeTrades] = useState<Set<string>>(new Set());
   const [excludeFactors, setExcludeFactors] = useState<Set<string>>(new Set());
-  // Wave 6.41.C — positive-include selection from the FilterChips strip.
-  // Empty arrays are not serialised onto the wire (see buildIncludeBody),
-  // so the default-path body stays byte-identical to pre-6.41.
-  const [includeFilters, setIncludeFilters] = useState<FilterChipsValue>(EMPTY_FILTER_CHIPS_VALUE);
   // Mirrors PivotPanel's fuzzy toggle. `false` ⇒ the exclude comboboxes stop
   // fetching /suggest and the dropdown stays closed; they remain plain text
   // inputs so the user can still commit free-text chips.
@@ -392,24 +368,6 @@ export function CalcPanel() {
       // best-effort — localStorage may be unavailable
     }
   }, [showRedisCommands]);
-
-  // Wave 6.41.C — re-fire /calc/sbm whenever the include-chip selection
-  // changes IF a result is already on screen, so the chip strip behaves as
-  // a live filter rather than a deferred form field. The skip-on-mount ref
-  // keeps the first paint from triggering an extra request before the user
-  // has clicked Calculate.
-  const includeChipsMountedRef = useRef<boolean>(false);
-  useEffect(() => {
-    if (!includeChipsMountedRef.current) {
-      includeChipsMountedRef.current = true;
-      return;
-    }
-    if (result === null) return;
-    void onCalculate();
-    // onCalculate reads riskClass/sensitivityType/etc. via closure; the only
-    // dependency we want to re-trigger on is the include selection.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [includeFilters]);
 
   const excludeTotal = excludeBooks.size + excludeTrades.size + excludeFactors.size;
   // Auto-open Advanced whenever a non-default setting is in play, so the
@@ -464,17 +422,12 @@ export function CalcPanel() {
       if (excludeTrades.size > 0) excludeBody.trade_id = Array.from(excludeTrades);
       if (excludeFactors.size > 0) excludeBody.risk_factor = Array.from(excludeFactors);
       const sendExclude = Object.keys(excludeBody).length > 0;
-      // Wave 6.41.C — positive-include predicate from FilterChips. Each
-      // empty list is dropped so the wire body is identical to pre-6.41
-      // when nothing is selected.
-      const includeBody = buildIncludeBody(includeFilters);
       const r = await postCalcSbm({
         risk_class: riskClass,
         sensitivity_type: sensitivityType,
         ...(subsetArr ? { bucket_subset: subsetArr } : {}),
         ...(scenarioRegime ? { correlation_regime: scenarioRegime } : {}),
         ...(sendExclude ? { exclude: excludeBody } : {}),
-        ...(includeBody ? { include: includeBody } : {}),
       });
       setResult(r);
       setResultContext({ riskClass, sensitivityType });
@@ -509,11 +462,9 @@ export function CalcPanel() {
         bucketSubset !== null &&
         bucketSubset.size < result.per_bucket.length;
       const subsetArr = sendSubset ? Array.from(bucketSubset!) : undefined;
-      const includeBody = buildIncludeBody(includeFilters);
       const r = await postCalcSbmTotal({
         ...(subsetArr ? { bucket_subset: subsetArr } : {}),
         ...(sendExclude ? { exclude: excludeBody } : {}),
-        ...(includeBody ? { include: includeBody } : {}),
       });
       setTotalResult(r);
     } catch (e) {
@@ -617,14 +568,6 @@ export function CalcPanel() {
           >
             {loading ? "Calculating…" : "Calculate SBM risk charge"}
           </button>
-        </div>
-        {/* Wave 6.41.C — positive-include FilterChips strip. Mounts above the
-            Advanced disclosure so the chip state is always visible (the
-            include filter is the most prominent narrowing tool). Selecting
-            or clearing any chip re-fires /calc/sbm via the effect below if a
-            result is already on screen. */}
-        <div className="calc-panel__include-chips" data-testid="calc-filter-chips">
-          <FilterChips value={includeFilters} onChange={setIncludeFilters} />
         </div>
         <AdvancedFilters
           open={advancedOpen}

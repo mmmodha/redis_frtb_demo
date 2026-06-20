@@ -22,9 +22,7 @@ export interface CalcByDeskProps {
   topN?: number;
   include?: { book?: string[]; desk?: string[] };
   exclude?: { book?: string[]; trade_id?: string[]; risk_factor?: string[] };
-  // Optional click handler — wired by the parent to push the desk into a
-  // FilterChips include.desk selection in a follow-up (6.41.C parallel).
-  // When omitted the rows render non-interactive.
+  // Optional click handler — when omitted the rows render non-interactive.
   onDeskClick?: (desk: string) => void;
 }
 
