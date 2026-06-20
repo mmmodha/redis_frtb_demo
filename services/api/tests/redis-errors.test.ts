@@ -1,8 +1,8 @@
 // Wave 6.45.B — unit coverage for translateUnsupportedCombination, the
 // defensive guard that catches RediSearch APPLY+0 / missing-tenor-field
 // errors and surfaces them as a structured 422 `unsupported_combination`
-// payload so /calc/sbm and /calc/sbm/by-desk never bubble a 5xx for a
-// user-driven filter/group-by combination.
+// payload so /calc/sbm never bubbles a 5xx for a user-driven filter /
+// group-by combination.
 
 import { describe, it, expect } from "vitest";
 import { translateUnsupportedCombination } from "../src/redis-errors.ts";

@@ -10,7 +10,6 @@ import {
   buildComponentsAggregateArgs,
   buildFastPathAggregateArgs,
 } from "../src/sbm/aggregate-via-index.ts";
-import { buildByDeskAggregateArgs } from "../src/sbm/by-desk.ts";
 
 // Pull every (expr, AS, alias) APPLY triple out of an FT.AGGREGATE argv as a
 // plain {expr, alias} map keyed by alias — the exact APPLY string is what
@@ -71,20 +70,3 @@ describe("buildComponentsAggregateArgs — APPLY expression branches on searchVe
   });
 });
 
-describe("buildByDeskAggregateArgs — APPLY expression branches on searchVer", () => {
-  it("emits `case(exists(@f),@f,0)` for v8", () => {
-    const argv = buildByDeskAggregateArgs(
-      "@risk_class:{EQUITY}", ["ws_equity_delta"], "idx:sens", 80606,
-    );
-    const clauses = applyClauses(argv);
-    expect(clauses.ws_equity_delta_safe).toBe("case(exists(@ws_equity_delta),@ws_equity_delta,0)");
-  });
-
-  it("emits `@f+0` for v2", () => {
-    const argv = buildByDeskAggregateArgs(
-      "@risk_class:{EQUITY}", ["ws_equity_delta"], "idx:sens", 21027,
-    );
-    const clauses = applyClauses(argv);
-    expect(clauses.ws_equity_delta_safe).toBe("@ws_equity_delta+0");
-  });
-});

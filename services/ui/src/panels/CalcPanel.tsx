@@ -1,7 +1,6 @@
 import { Fragment, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent } from "react";
 import { BlockMath, InlineMath } from "react-katex";
 import { CommandPreview, EnterpriseCallout, PanelCard, Sparkline, TimingStrip } from "../components";
-import { CalcByDesk } from "../components/CalcByDesk";
 import { SuggestCombobox } from "../components/SuggestCombobox";
 import type { ShardTiming } from "../components/TimingStrip";
 import {
@@ -621,17 +620,6 @@ export function CalcPanel() {
           onToggleChart={toggleChart}
           onToggleTable={toggleTable}
           showRedisCommands={showRedisCommands}
-        />
-      ) : null}
-
-      {/* Wave 6.41.D — Top-10 desks ranked by |contribution to K_b|. Mounted
-          as a separate card below the per-bucket breakdown so the by-desk
-          ranking sits alongside the by-bucket view; hidden until the user
-          has run a calc (resultContext pins the risk_class / sensitivity). */}
-      {result && resultContext ? (
-        <CalcByDesk
-          riskClass={resultContext.riskClass}
-          sensitivityType={resultContext.sensitivityType}
         />
       ) : null}
 

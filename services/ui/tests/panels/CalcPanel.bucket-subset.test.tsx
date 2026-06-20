@@ -6,9 +6,6 @@ import type { CalcSbmResponse } from "../../src/lib/calc";
 const originalFetch = globalThis.fetch;
 
 // Capture every /calc/sbm POST body so individual assertions can dissect them.
-// Wave 6.41.D — filter out the /calc/sbm/by-desk fetches the new top-N panel
-// fires after each calc lands so the capture list stays focused on the bodies
-// these tests reason about.
 function urlOf(input: RequestInfo | URL): string {
   return typeof input === "string"
     ? input
@@ -17,8 +14,7 @@ function urlOf(input: RequestInfo | URL): string {
       : input.url;
 }
 function isCalcSbmCall(input: RequestInfo | URL): boolean {
-  const u = urlOf(input);
-  return u.includes("/calc/sbm") && !u.includes("/calc/sbm/by-desk");
+  return urlOf(input).includes("/calc/sbm");
 }
 function mockCalcWithCapture(body: CalcSbmResponse) {
   const sent: Array<unknown> = [];
