@@ -87,11 +87,12 @@ describe("IngestPanel", () => {
     expect(urls.some((u) => /\/observability\/memory/.test(u))).toBe(true);
   });
 
-  it("shows an empty state when dbsize is 0 and no samples", async () => {
+  it("shows an empty state when the sens index is empty", async () => {
     fetchMock.mockImplementation(async (input: RequestInfo) => {
       const url = String(input);
       if (url.includes("/observability/keys")) return { ok: true, json: async () => keysResponse(0) };
       if (url.includes("/observability/memory")) return { ok: true, json: async () => memoryResponse(0) };
+      if (url.includes("/admin/index-count")) return { ok: true, json: async () => ({ count: 0, index_name: null }) };
       return { ok: true, json: async () => ({}) };
     });
     renderPanel();
@@ -109,17 +110,22 @@ describe("IngestPanel", () => {
     await waitFor(() => expect(screen.getByText(/failed to load ingest telemetry/i)).toBeInTheDocument());
   });
 
-  it("renders MetricTiles for Total rows, Rows/sec and Memory", async () => {
+  it("renders MetricTiles for Sensitivities, Rows/sec and Memory", async () => {
     fetchMock.mockImplementation(async (input: RequestInfo) => {
       const url = String(input);
       if (url.includes("/observability/keys")) return { ok: true, json: async () => keysResponse(5000) };
       if (url.includes("/observability/memory")) return { ok: true, json: async () => memoryResponse(2 * 1024 * 1024) };
+      if (url.includes("/admin/index-count")) return { ok: true, json: async () => ({ count: 5000, index_name: "idx:sens:v1" }) };
       return { ok: true, json: async () => ({}) };
     });
     renderPanel();
     await waitFor(() => expect(screen.getAllByTestId("metric-tile").length).toBeGreaterThanOrEqual(3));
-    const labels = screen.getAllByTestId("metric-tile").map((el) => el.getAttribute("data-label"));
-    expect(labels).toEqual(expect.arrayContaining(["Total rows", "Rows/sec", "Memory"]));
+    const tiles = screen.getAllByTestId("metric-tile");
+    const labels = tiles.map((el) => el.getAttribute("data-label"));
+    expect(labels).toEqual(expect.arrayContaining(["Sensitivities", "Rows/sec", "Memory"]));
+    const sens = tiles.find((el) => el.getAttribute("data-label") === "Sensitivities")!;
+    expect(within(sens).getByText("5,000")).toBeInTheDocument();
+    expect(within(sens).getByText("sens")).toBeInTheDocument();
   });
 
   it("renders the literal sens:{risk_class:bucket}:{ulid} keys in the Sample keys panel", async () => {

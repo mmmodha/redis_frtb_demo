@@ -422,7 +422,12 @@ export function IngestPanel() {
 
   const throughput = useRef<ChartSample[]>([]);
   const memorySeries = useRef<ChartSample[]>([]);
-  const lastKeys = useRef<{ t: number; dbsize: number } | null>(null);
+  // Wave 6.51.A — throughput is now derived from FT.SEARCH index-count
+  // deltas (sens/sec) rather than DBSIZE deltas, so the "Rows/sec" tile
+  // reflects sensitivities indexed per second instead of all-keys churn
+  // (rollup:*, processed:*, RediSearch internals, duplicate-hash keys).
+  const lastIndexCount = useRef<{ t: number; count: number } | null>(null);
+  const [indexCount, setIndexCount] = useState<number>(0);
   const [, forceRender] = useState(0);
 
   useEffect(() => {
@@ -443,19 +448,29 @@ export function IngestPanel() {
     let cancelled = false;
     async function tick() {
       try {
-        const [k, m] = await Promise.all([getObservabilityKeys("sens:"), getObservabilityMemory()]);
+        // Wave 6.51.A — index-count alongside keys/memory. Throughput +
+        // the "Sensitivities" tile read from the FT.SEARCH count of the
+        // active sens index (sens written/sec), not DBSIZE. SCAN sample is
+        // still consumed by the "Sample keys (hash-tag locality)" card.
+        const [k, m, ic] = await Promise.all([
+          getObservabilityKeys("sens:"),
+          getObservabilityMemory(),
+          getIndexCount(),
+        ]);
         if (cancelled) return;
         const now = Date.now();
-        if (lastKeys.current) {
-          const dt = (now - lastKeys.current.t) / 1000;
-          const dn = k.dbsize - lastKeys.current.dbsize;
+        const icCount = typeof ic.count === "number" ? ic.count : 0;
+        if (lastIndexCount.current) {
+          const dt = (now - lastIndexCount.current.t) / 1000;
+          const dn = icCount - lastIndexCount.current.count;
           const rate = dt > 0 ? Math.max(0, dn / dt) : 0;
           throughput.current = [...throughput.current, { t: now, v: rate }].slice(-MAX_SAMPLES);
         }
-        lastKeys.current = { t: now, dbsize: k.dbsize };
+        lastIndexCount.current = { t: now, count: icCount };
         memorySeries.current = [...memorySeries.current, { t: now, v: m.used_memory ?? 0 }].slice(-MAX_SAMPLES);
         setKeys(k);
         setMemory(m);
+        setIndexCount(icCount);
         setError(null);
         setLoaded(true);
         forceRender((n) => n + 1);
@@ -507,9 +522,11 @@ export function IngestPanel() {
 
   const activeSource = useMemo(() => sources.find((s) => s.is_active) ?? sources[0], [sources]);
   const rowsPerSec = throughput.current.length > 0 ? throughput.current[throughput.current.length - 1]!.v : 0;
-  const dbsize = keys?.dbsize ?? 0;
   const usedMem = memory?.used_memory ?? 0;
-  const isEmpty = loaded && !error && dbsize === 0 && (keys?.sample.length ?? 0) === 0;
+  // Wave 6.51.A — empty-state heuristic keyed on the same FT.SEARCH count
+  // the user sees in the "Sensitivities" tile so the "Awaiting data" card
+  // appears/disappears in lock-step with that number.
+  const isEmpty = loaded && !error && indexCount === 0;
 
   async function onStartIngest() {
     if (!activeSource) return;
@@ -546,10 +563,16 @@ export function IngestPanel() {
         window.setTimeout(() => setFlushBanner(null), 4000);
       }
       try {
-        const [k, m] = await Promise.all([getObservabilityKeys("sens:"), getObservabilityMemory()]);
+        const [k, m, ic] = await Promise.all([
+          getObservabilityKeys("sens:"),
+          getObservabilityMemory(),
+          getIndexCount(),
+        ]);
         setKeys(k);
         setMemory(m);
-        lastKeys.current = { t: Date.now(), dbsize: k.dbsize };
+        const icCount = typeof ic.count === "number" ? ic.count : 0;
+        setIndexCount(icCount);
+        lastIndexCount.current = { t: Date.now(), count: icCount };
       } catch { /* tolerate transient refresh failure; next poll tick will catch up */ }
       // Wave 5.47b — flush re-bootstraps server-side, so re-run preflight to
       // refresh the banner state (typically clears it). Tolerate failures.
@@ -861,7 +884,7 @@ export function IngestPanel() {
       ) : null}
 
       <div className="metric-row">
-        <MetricTile label="Total rows" value={fmtInt(dbsize)} unit="keys" status={loaded && !error ? "live" : "pending"} />
+        <MetricTile label="Sensitivities" value={fmtInt(indexCount)} unit="sens" status={loaded && !error ? "live" : "pending"} />
         <MetricTile label="Rows/sec" value={fmtInt(rowsPerSec)} unit="rows/s" status={loaded && !error ? (throughput.current.length > 1 ? "live" : "sampled") : "pending"} />
         <MetricTile label="Memory" value={fmtBytes(usedMem)} status={loaded && !error ? "live" : "pending"} />
       </div>
