@@ -1131,18 +1131,21 @@ export function registerGeneratorRoutes(
     return { ok: true, cancelled: run_ids.length, run_ids, flush };
   });
 
-  // Wave 6.53.A — non-destructive admin "stop generators" route. Same
-  // cancel-flag + drain + force-terminal bookkeeping as /admin/cancel-all-runs,
-  // but does NOT call /ingest/halt-and-flush. The destructive flush stays
-  // behind the dedicated "Flush DB" admin path so users who only want to
-  // halt producers don't accidentally wipe the stream backlog + indexed rows.
-  // Response intentionally omits the `flush` field so the UI client type
-  // (services/ui/src/lib/ingest.ts `stopAllRuns`) can't render a misleading
-  // "flushed N streams" summary.
+  // Wave 6.53.A / 6.53.B — non-destructive admin "stop generators" route.
+  // Same cancel-flag + drain + force-terminal bookkeeping as
+  // /admin/cancel-all-runs, but instead of the destructive halt-and-flush
+  // (XTRIM streams + SCAN+UNLINK sens:* docs) it calls the trim-only path
+  // via callIngestHaltAndTrim. The shard runtime drains the consumer's
+  // in-flight XREAD batch before XTRIMming each shard stream, so writes
+  // halt at the next safe boundary while existing sens:* docs stay put.
+  // Response carries `trim: { streams_trimmed } | null` — `null` if ingest
+  // is unreachable, matching the existing flush-tolerance pattern used by
+  // /admin/cancel-all-runs.
   app.post("/admin/stop-runs", async () => {
     const run_ids = cancelAllActiveRuns();
     await drainAndForceTerminal(run_ids);
-    return { ok: true, cancelled: run_ids.length, run_ids };
+    const trim = await callIngestHaltAndTrim(app, opts.ingestBase, cancelFetch);
+    return { ok: true, cancelled: run_ids.length, run_ids, trim };
   });
 
   // Wave 6.53.A — shared drain + force-terminal helper used by both
@@ -1228,6 +1231,43 @@ async function callIngestHaltAndFlush(
     };
   } catch (err) {
     app.log.warn({ evt: "cancel-all-runs.flush", url, err: String(err) }, "ingest halt-and-flush unreachable");
+    return null;
+  }
+}
+
+// Wave 6.53.B — non-destructive variant of callIngestHaltAndFlush used by
+// /admin/stop-runs. POSTs `{ clearDocs: false }` to the same ingest
+// endpoint so the consumer drains and XTRIMs every shard stream, but the
+// SCAN+UNLINK doc-clearing step is skipped — existing sens:* docs stay in
+// Redis. Returns just the `streams_trimmed` count (docs_cleared is always
+// 0 in this path) so the UI banner can summarise the trim without
+// implying a destructive wipe. Returns `null` on any upstream failure,
+// matching the partial-success tolerance pattern of callIngestHaltAndFlush.
+async function callIngestHaltAndTrim(
+  app: FastifyInstance,
+  ingestBase: string | undefined,
+  fetchImpl: typeof fetch,
+): Promise<{ streams_trimmed: number } | null> {
+  const base = ingestBase ?? process.env.INGEST_URL
+    ?? `http://localhost:${process.env.INGEST_PORT ?? 8083}`;
+  const token = process.env.INTERNAL_API_TOKEN;
+  const url = `${base.replace(/\/+$/, "")}/ingest/halt-and-flush`;
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (token) headers["authorization"] = `Bearer ${token}`;
+  try {
+    const r = await fetchImpl(url, { method: "POST", headers, body: JSON.stringify({ clearDocs: false }) });
+    if (!r.ok) {
+      app.log.warn({ evt: "stop-runs.trim", status: r.status, url }, "ingest halt-and-trim returned non-2xx");
+      return null;
+    }
+    const body = (await r.json()) as { ok?: boolean; streams_trimmed?: number };
+    if (body.ok !== true || typeof body.streams_trimmed !== "number") {
+      app.log.warn({ evt: "stop-runs.trim", url, body }, "ingest halt-and-trim returned unexpected shape");
+      return null;
+    }
+    return { streams_trimmed: body.streams_trimmed };
+  } catch (err) {
+    app.log.warn({ evt: "stop-runs.trim", url, err: String(err) }, "ingest halt-and-trim unreachable");
     return null;
   }
 }

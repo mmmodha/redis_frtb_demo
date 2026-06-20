@@ -584,24 +584,30 @@ export function IngestPanel() {
     }
   }
 
-  // Wave 5.44 / 6.53.A — Stop generators confirm handler. POSTs
+  // Wave 5.44 / 6.53.A / 6.53.B — Stop generators confirm handler. POSTs
   // /admin/stop-runs, shows a transient banner with the cancelled count
   // ("No active runs" when N=0), and best-effort clears the locally-tracked
   // generator run if its run_id appears in the cancelled list. The error
   // path reuses the existing telemetry error display; the banner auto-clears
-  // after 4s. Wave 6.53.A removed the destructive flush summary — the api
-  // route no longer touches the stream backlog or indexed rows, so the
-  // banner only reports the cancel count. Use "Flush DB" for the destructive
-  // path.
+  // after 4s. Wave 6.53.B re-added a non-destructive trim step: the api
+  // also XTRIMs every shard input stream so the consumer's backlog drops
+  // to zero (existing sens:* docs stay put). When the api returns a
+  // `trim` summary the banner appends "discarded backlog (N stream(s)
+  // trimmed)"; if ingest was unreachable `trim` is null and the tail is
+  // omitted. Use "Flush DB" for the destructive wipe.
   async function onStopAllConfirm() {
     setStopAllPending(false);
     setStopAllBusy(true);
     setError(null);
     try {
       const r = await stopAllRuns();
-      const banner = r.cancelled === 0
+      let banner = r.cancelled === 0
         ? "No active runs."
         : `Stopped ${r.cancelled} generator${r.cancelled === 1 ? "" : "s"}.`;
+      if (r.trim && typeof r.trim.streams_trimmed === "number") {
+        const n = r.trim.streams_trimmed;
+        banner += ` Discarded backlog (${n} stream${n === 1 ? "" : "s"} trimmed).`;
+      }
       setStopAllBanner(banner);
       if (trackedRun?.runId && r.run_ids.includes(trackedRun.runId)) {
         clearTrackedRun();
@@ -2708,11 +2714,12 @@ function FlushDbConfirmModal(props: {
   );
 }
 
-// Wave 5.44 / 6.53.A — confirmation for "Stop generators". Same dialog
-// shape as FlushDbConfirmModal so the layout stays consistent. Copy
-// reflects the non-destructive semantics introduced in 6.53.A: cancelling
-// active producer runs leaves the stream backlog and indexed rows in place.
-// Use the dedicated "Flush DB" button when a wipe is intended.
+// Wave 5.44 / 6.53.A / 6.53.B — confirmation for "Stop generators". Same
+// dialog shape as FlushDbConfirmModal so the layout stays consistent. Copy
+// reflects the 6.53.B semantics: producers are cancelled AND the in-flight
+// stream backlog is discarded (consumer drains its current XREAD batch
+// then every shard stream is XTRIMmed), but existing sens:* docs in Redis
+// stay put. Use the dedicated "Flush DB" button when a wipe is intended.
 function StopAllRunsConfirmModal(props: {
   onCancel: () => void;
   onConfirm: () => void;
@@ -2723,7 +2730,7 @@ function StopAllRunsConfirmModal(props: {
       <div className="dialog sanity-modal--block" data-testid="stop-all-runs-modal">
         <h2>Stop active generators?</h2>
         <div className="sanity-modal__body">
-          Stops the active generators. Data and stream backlog are kept. Use &apos;Flush DB&apos; to wipe.
+          Stops generators and discards the in-flight stream backlog. Existing sens data in Redis is kept. Use &apos;Flush DB&apos; to wipe.
         </div>
         <div className="dialog__actions">
           <button type="button" className="btn" onClick={onCancel} data-testid="stop-all-runs-cancel">

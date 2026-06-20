@@ -1315,55 +1315,68 @@ describe("POST /admin/cancel-all-runs (Wave 5.44 / 6.44.E) — admin stop all ge
   });
 });
 
-// Wave 6.53.A — POST /admin/stop-runs is the non-destructive split of the
-// /admin/cancel-all-runs escape hatch. It runs the same cancel-flag + drain
-// + force-terminal bookkeeping but must NOT call /ingest/halt-and-flush
-// (the destructive XTRIM + SCAN/UNLINK stays behind /admin/flush). The UI
-// "Stop generators" button hits this route; the legacy /admin/cancel-all-runs
-// stays wired for backward compat with external callers / the admin CLI.
-describe("POST /admin/stop-runs (Wave 6.53.A) — non-destructive stop generators", () => {
+// Wave 6.53.A / 6.53.B — POST /admin/stop-runs is the non-destructive
+// split of the /admin/cancel-all-runs escape hatch. It runs the same
+// cancel-flag + drain + force-terminal bookkeeping. Wave 6.53.B re-added
+// a trim-only call to /ingest/halt-and-flush (body `{ clearDocs: false }`)
+// so the consumer drains its in-flight XREAD batch and XTRIMs every shard
+// stream — writes halt at the next safe boundary while existing sens:*
+// docs stay put. The legacy /admin/cancel-all-runs route (destructive
+// SCAN+UNLINK) stays wired for backward compat.
+describe("POST /admin/stop-runs (Wave 6.53.A / 6.53.B) — non-destructive stop generators", () => {
   let app: Awaited<ReturnType<typeof createServer>>;
   beforeEach(() => { _testResetActiveRuns(); });
   afterEach(async () => { if (app) await app.close(); _testResetActiveRuns(); });
 
-  // Spy fetch — the route must NOT call it. Records every URL so the
-  // assertion can name the offending one if a regression sneaks the
-  // halt-and-flush back in.
-  function makeNoCallFetchStub(): {
+  // Wave 6.53.B — fetch stub that mimics the ingest halt-and-flush
+  // endpoint responding to a `{ clearDocs: false }` trim call. Records
+  // every URL + parsed body so the tests can assert (a) the trim helper
+  // is hit exactly once per route call and (b) it sends clearDocs:false
+  // so ingest skips the destructive SCAN+UNLINK step.
+  const TRIM_OK = { ok: true, streams_trimmed: 4, docs_cleared: 0, elapsed_ms: 3 };
+  function makeTrimFetchStub(reply: { ok: boolean; status?: number; body: unknown } = { ok: true, body: TRIM_OK }): {
     impl: typeof fetch;
-    calls: Array<{ url: string }>;
+    calls: Array<{ url: string; init: RequestInit | undefined; parsedBody: unknown }>;
   } {
-    const calls: Array<{ url: string }> = [];
-    const impl: typeof fetch = async (input) => {
+    const calls: Array<{ url: string; init: RequestInit | undefined; parsedBody: unknown }> = [];
+    const impl: typeof fetch = async (input, init) => {
       const url = typeof input === "string" ? input : (input as URL).toString();
-      calls.push({ url });
-      // Defensive: if the route ever did call us, return a shape that
-      // would surface in the response so the failure is loud.
-      return new Response(JSON.stringify({ ok: true, streams_trimmed: 99, docs_cleared: 99 }), {
-        status: 200,
+      let parsedBody: unknown = null;
+      const raw = init?.body;
+      if (typeof raw === "string" && raw.length > 0) {
+        try { parsedBody = JSON.parse(raw); } catch { parsedBody = raw; }
+      }
+      calls.push({ url, init, parsedBody });
+      return new Response(JSON.stringify(reply.body), {
+        status: reply.status ?? (reply.ok ? 200 : 500),
         headers: { "content-type": "application/json" },
       });
     };
     return { impl, calls };
   }
 
-  it("returns ok:true cancelled:0 with no flush field and no ingest call when no runs are active", async () => {
+  it("returns ok:true cancelled:0 plus the trim summary when no runs are active", async () => {
     const schema = loadFixtureSchema();
     const fr = pipelineFakeRedis();
-    const stub = makeNoCallFetchStub();
+    const stub = makeTrimFetchStub();
     app = await createServer({ redis: fr, schema, ingestBase: "http://stub-ingest:8083", generatorFetchImpl: stub.impl, generatorCancelDrainMs: 10 });
 
     const res = await app.inject({ method: "POST", url: "/admin/stop-runs" });
     expect(res.statusCode).toBe(200);
-    expect(res.json()).toEqual({ ok: true, cancelled: 0, run_ids: [] });
-    // DoD: the destructive path is NOT invoked from /admin/stop-runs.
-    expect(stub.calls).toHaveLength(0);
+    expect(res.json()).toEqual({ ok: true, cancelled: 0, run_ids: [], trim: { streams_trimmed: 4 } });
+    // Wave 6.53.B — the route calls /ingest/halt-and-flush exactly once
+    // with clearDocs:false so the destructive doc-clearing step is
+    // skipped on the ingest side.
+    expect(stub.calls).toHaveLength(1);
+    expect(stub.calls[0]!.url).toBe("http://stub-ingest:8083/ingest/halt-and-flush");
+    expect((stub.calls[0]!.init as RequestInit).method).toBe("POST");
+    expect(stub.calls[0]!.parsedBody).toEqual({ clearDocs: false });
   });
 
-  it("flips cancelFlag on every running entry, returns run_ids, and does NOT call /ingest/halt-and-flush", async () => {
+  it("flips cancelFlag on every running entry, returns run_ids + trim, and posts clearDocs:false to ingest", async () => {
     const schema = loadFixtureSchema();
     const fr = pipelineFakeRedis();
-    const stub = makeNoCallFetchStub();
+    const stub = makeTrimFetchStub();
     app = await createServer({ redis: fr, schema, ingestBase: "http://stub-ingest:8083", generatorFetchImpl: stub.impl, generatorCancelDrainMs: 10 });
 
     const flagA = { cancelled: false };
@@ -1373,27 +1386,31 @@ describe("POST /admin/stop-runs (Wave 6.53.A) — non-destructive stop generator
 
     const res = await app.inject({ method: "POST", url: "/admin/stop-runs" });
     expect(res.statusCode).toBe(200);
-    const body = res.json() as { ok: boolean; cancelled: number; run_ids: string[]; flush?: unknown };
+    const body = res.json() as {
+      ok: boolean; cancelled: number; run_ids: string[];
+      trim: { streams_trimmed: number } | null; flush?: unknown;
+    };
     expect(body.ok).toBe(true);
     expect(body.cancelled).toBe(2);
     expect(body.run_ids.sort()).toEqual(["run-A", "run-B"]);
-    // Response shape must NOT carry a `flush` field — the UI client type
-    // (StopAllRunsResponse) intentionally omits it so a misleading
-    // "flushed N streams" banner can't render.
+    // Wave 6.53.B — `trim` carries the streams_trimmed count from ingest.
+    // The legacy `flush` field is still absent: the destructive
+    // SCAN+UNLINK lives behind /admin/cancel-all-runs and /admin/flush.
+    expect(body.trim).toEqual({ streams_trimmed: 4 });
     expect("flush" in body).toBe(false);
 
     expect(_testGetActiveRun("run-A")!.cancelFlag.cancelled).toBe(true);
     expect(_testGetActiveRun("run-B")!.cancelFlag.cancelled).toBe(true);
 
-    // DoD: no halt-and-flush invocation against ingest, ever.
-    expect(stub.calls.find((c) => /\/ingest\/halt-and-flush$/.test(c.url))).toBeUndefined();
-    expect(stub.calls).toHaveLength(0);
+    // DoD: clearDocs:false ensures ingest skips SCAN+UNLINK on docs.
+    expect(stub.calls).toHaveLength(1);
+    expect(stub.calls[0]!.parsedBody).toEqual({ clearDocs: false });
   });
 
   it("force-marks entries cancelled after drain so /generator/runs/:id/status reports terminal immediately", async () => {
     const schema = loadFixtureSchema();
     const fr = pipelineFakeRedis();
-    const stub = makeNoCallFetchStub();
+    const stub = makeTrimFetchStub();
     app = await createServer({ redis: fr, schema, ingestBase: "http://stub-ingest:8083", generatorFetchImpl: stub.impl, generatorCancelDrainMs: 10 });
 
     _testInsertActiveRun({ run_id: "run-stuck", status: "running", cancelFlag: { cancelled: false } });
@@ -1415,7 +1432,28 @@ describe("POST /admin/stop-runs (Wave 6.53.A) — non-destructive stop generator
     expect(statusBody.status).toBe("cancelled");
     expect(statusBody.stop_reason).toBe("cancelled");
 
-    // Still no halt-and-flush — even after the force-terminal path runs.
-    expect(stub.calls).toHaveLength(0);
+    // Trim still ran with clearDocs:false (no destructive doc-clear).
+    expect(stub.calls).toHaveLength(1);
+    expect(stub.calls[0]!.parsedBody).toEqual({ clearDocs: false });
+  });
+
+  // Wave 6.53.B — partial-success tolerance: when ingest is unreachable
+  // the route must still return 200 with `trim: null` so the UI can
+  // render a partial-success banner (cancel side succeeded; trim is
+  // best-effort). Mirrors the cancel-all-runs `flush: null` pattern.
+  it("returns trim:null when the ingest halt-and-flush call fails (partial-success tolerance)", async () => {
+    const schema = loadFixtureSchema();
+    const fr = pipelineFakeRedis();
+    const stub = makeTrimFetchStub({ ok: false, status: 504, body: { ok: false, error: "halt-and-flush timed out", stage: "drain" } });
+    app = await createServer({ redis: fr, schema, ingestBase: "http://stub-ingest:8083", generatorFetchImpl: stub.impl, generatorCancelDrainMs: 10 });
+
+    _testInsertActiveRun({ run_id: "run-X", status: "running", cancelFlag: { cancelled: false } });
+
+    const res = await app.inject({ method: "POST", url: "/admin/stop-runs" });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { ok: boolean; cancelled: number; trim: unknown };
+    expect(body.ok).toBe(true);
+    expect(body.cancelled).toBe(1);
+    expect(body.trim).toBeNull();
   });
 });

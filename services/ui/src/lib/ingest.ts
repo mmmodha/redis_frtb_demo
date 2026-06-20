@@ -310,21 +310,28 @@ export async function flushDb(): Promise<FlushDbResponse> {
   return (await res.json()) as FlushDbResponse;
 }
 
-// Wave 5.44 / 6.53.A — POST /admin/stop-runs. Iterates the api's in-process
-// `activeRuns` registry and flips the cancel flag on every entry currently
-// `status === "running"`. Used by the IngestPanel "Stop generators" button.
-// Sends an empty JSON object body to dodge Fastify's FST_ERR_CTP_EMPTY_JSON_BODY
-// when content-type is application/json (same defensive shape as flushDb).
+// Wave 5.44 / 6.53.A / 6.53.B — POST /admin/stop-runs. Iterates the api's
+// in-process `activeRuns` registry and flips the cancel flag on every
+// entry currently `status === "running"`. Used by the IngestPanel "Stop
+// generators" button. Sends an empty JSON object body to dodge Fastify's
+// FST_ERR_CTP_EMPTY_JSON_BODY when content-type is application/json (same
+// defensive shape as flushDb).
 //
-// Wave 6.53.A decoupled this from the destructive halt-and-flush: the api
-// route no longer touches the stream backlog or indexed `sens:*` keys, so
-// the response shape omits the `flush` summary. Use `flushDb()` for the
-// destructive path; the legacy /admin/cancel-all-runs route (still wired
-// on the api for backward compat) is no longer hit from the UI.
+// Wave 6.53.A decoupled this from the destructive halt-and-flush.
+// Wave 6.53.B re-added a non-destructive `trim` step: after the cancel
+// drain, the api proxies a `{ clearDocs: false }` call to
+// /ingest/halt-and-flush so the consumer drains its in-flight XREAD batch
+// and XTRIMs every shard stream — writes halt at the next safe boundary
+// while existing sens:* docs stay in place. `trim` is `null` when ingest
+// is unreachable, matching the existing flush-tolerance pattern. Use
+// `flushDb()` for the destructive path; the legacy /admin/cancel-all-runs
+// route (still wired on the api for backward compat) is no longer hit
+// from the UI.
 export interface StopAllRunsResponse {
   ok: true;
   cancelled: number;
   run_ids: string[];
+  trim?: { streams_trimmed: number } | null;
 }
 
 export async function stopAllRuns(): Promise<StopAllRunsResponse> {

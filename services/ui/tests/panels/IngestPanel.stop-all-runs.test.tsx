@@ -45,12 +45,18 @@ function memoryResponse() {
 interface FetchOpts {
   cancelled?: number;
   run_ids?: string[];
+  // Wave 6.53.B — optional trim summary returned by /admin/stop-runs. The
+  // api proxies a `{ clearDocs: false }` call to ingest after the cancel
+  // drain so the consumer's input backlog is XTRIMmed. `null` simulates
+  // ingest being unreachable (banner omits the trim tail).
+  trim?: { streams_trimmed: number } | null;
 }
 
 function mockFetch(opts: FetchOpts = {}) {
   const {
     cancelled = 2,
     run_ids = ["run-A", "run-B"],
+    trim = { streams_trimmed: 4 },
   } = opts;
   const fetchMock = vi.fn();
   fetchMock.mockImplementation(async (input: RequestInfo, init?: RequestInit) => {
@@ -60,7 +66,7 @@ function mockFetch(opts: FetchOpts = {}) {
     if (url.includes("/observability/keys")) return { ok: true, json: async () => keysResponse(0) };
     if (url.includes("/observability/memory")) return { ok: true, json: async () => memoryResponse() };
     if (url.endsWith("/admin/stop-runs") && method === "POST") {
-      return { ok: true, status: 200, json: async () => ({ ok: true, cancelled, run_ids }) };
+      return { ok: true, status: 200, json: async () => ({ ok: true, cancelled, run_ids, trim }) };
     }
     if (url.endsWith("/generator/runs") && method === "GET") {
       return { ok: true, json: async () => ({ active: [] }) };
@@ -94,9 +100,11 @@ describe("IngestPanel — Stop generators button (Wave 5.44 / 6.53.A)", () => {
     const modal = await screen.findByTestId("stop-all-runs-modal");
     expect(modal).toBeInTheDocument();
     expect(within(modal).getByRole("heading", { name: /stop active generators/i })).toBeInTheDocument();
-    // Wave 6.53.A — modal copy makes it explicit that data + stream backlog
-    // are kept and points users at "Flush DB" for the destructive path.
-    expect(within(modal).getByText(/data and stream backlog are kept/i)).toBeInTheDocument();
+    // Wave 6.53.B — modal copy makes it explicit that the in-flight stream
+    // backlog is discarded while existing sens data is kept, and points
+    // users at "Flush DB" for the destructive wipe path.
+    expect(within(modal).getByText(/discards the in-flight stream backlog/i)).toBeInTheDocument();
+    expect(within(modal).getByText(/existing sens data in redis is kept/i)).toBeInTheDocument();
     expect(within(modal).getByText(/flush db/i)).toBeInTheDocument();
     const posted = fetchMock.mock.calls.find(
       (c) => /\/admin\/stop-runs$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",
@@ -117,8 +125,8 @@ describe("IngestPanel — Stop generators button (Wave 5.44 / 6.53.A)", () => {
     expect(posted).toBeUndefined();
   });
 
-  it("Confirm POSTs /admin/stop-runs and shows a banner with the cancelled count (no flush summary)", async () => {
-    fetchMock = mockFetch({ cancelled: 2, run_ids: ["run-A", "run-B"] });
+  it("Confirm POSTs /admin/stop-runs and shows a banner with the cancelled count + trim tail (no destructive flush summary)", async () => {
+    fetchMock = mockFetch({ cancelled: 2, run_ids: ["run-A", "run-B"], trim: { streams_trimmed: 4 } });
     renderPanel();
     fireEvent.click(await screen.findByTestId("stop-all-runs-btn"));
     fireEvent.click(within(await screen.findByTestId("stop-all-runs-modal")).getByTestId("stop-all-runs-confirm"));
@@ -136,20 +144,40 @@ describe("IngestPanel — Stop generators button (Wave 5.44 / 6.53.A)", () => {
     expect(legacyPosted).toBeUndefined();
     const banner = await screen.findByTestId("stop-all-runs-banner");
     expect(banner).toHaveTextContent(/stopped 2 generators/i);
-    // Wave 6.53.A — the banner no longer surfaces a flush summary; the
-    // destructive path lives behind the dedicated "Flush DB" button.
+    // Wave 6.53.B — banner now appends the non-destructive trim tail so
+    // operators see the backlog was discarded. The legacy destructive
+    // "flushed"/"indexed rows" copy must still be absent.
+    expect(banner).toHaveTextContent(/discarded backlog \(4 streams trimmed\)/i);
     expect(banner.textContent ?? "").not.toMatch(/flushed/i);
     expect(banner.textContent ?? "").not.toMatch(/indexed rows/i);
   });
 
-  it("banner reads 'No active runs' when the server reports cancelled:0", async () => {
-    fetchMock = mockFetch({ cancelled: 0, run_ids: [] });
+  it("banner reads 'No active runs' when the server reports cancelled:0 (still surfaces trim tail)", async () => {
+    fetchMock = mockFetch({ cancelled: 0, run_ids: [], trim: { streams_trimmed: 1 } });
     renderPanel();
     fireEvent.click(await screen.findByTestId("stop-all-runs-btn"));
     fireEvent.click(within(await screen.findByTestId("stop-all-runs-modal")).getByTestId("stop-all-runs-confirm"));
     const banner = await screen.findByTestId("stop-all-runs-banner");
     expect(banner).toHaveTextContent(/no active runs/i);
-    // No flush summary even on the empty-runs banner.
+    // Wave 6.53.B — trim is independent of the cancel count: even with no
+    // running producers the consumer-side XTRIM still happens, so the
+    // tail renders ("1 stream trimmed", singular pluralisation).
+    expect(banner).toHaveTextContent(/discarded backlog \(1 stream trimmed\)/i);
+    // No destructive flush summary even on the empty-runs banner.
     expect(banner.textContent ?? "").not.toMatch(/flushed/i);
+  });
+
+  // Wave 6.53.B — when ingest is unreachable the api returns trim:null and
+  // the UI must gracefully omit the trim tail rather than rendering
+  // "null streams trimmed". The cancel-side summary still renders.
+  it("omits the trim tail when the server returns trim:null (ingest unreachable)", async () => {
+    fetchMock = mockFetch({ cancelled: 1, run_ids: ["run-X"], trim: null });
+    renderPanel();
+    fireEvent.click(await screen.findByTestId("stop-all-runs-btn"));
+    fireEvent.click(within(await screen.findByTestId("stop-all-runs-modal")).getByTestId("stop-all-runs-confirm"));
+    const banner = await screen.findByTestId("stop-all-runs-banner");
+    expect(banner).toHaveTextContent(/stopped 1 generator/i);
+    expect(banner.textContent ?? "").not.toMatch(/discarded backlog/i);
+    expect(banner.textContent ?? "").not.toMatch(/trimmed/i);
   });
 });

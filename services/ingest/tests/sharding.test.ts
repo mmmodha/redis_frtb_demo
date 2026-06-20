@@ -709,6 +709,43 @@ describe("performHaltAndFlush", () => {
     const report = await performHaltAndFlush(stub.client, "sensitivities:in", 2);
     expect(report).toEqual({ streams_trimmed: 2, docs_cleared: 0 });
   });
+
+  // Wave 6.53.B — opts.clearDocs:false skips the destructive SCAN+UNLINK
+  // doc-clearing step. Used by /admin/stop-runs so "Stop generators"
+  // halts writes at the next safe boundary (XTRIM streams) without
+  // wiping existing sens:* docs.
+  it("clearDocs:false XTRIMs every shard stream but issues no SCAN/UNLINK", async () => {
+    const stub = makeHaltFlushStub([
+      "sens:abc", "sens:def", "sens:ghi",
+    ]);
+    const report = await performHaltAndFlush(stub.client, "sensitivities:in", 3, { clearDocs: false });
+    expect(report).toEqual({ streams_trimmed: 3, docs_cleared: 0 });
+
+    // Streams were trimmed exactly as in the destructive path.
+    const xtrims = stub.calls.filter((c) => c.cmd === "XTRIM");
+    expect(xtrims).toHaveLength(3);
+    expect(xtrims.map((c) => c.args)).toEqual([
+      ["sensitivities:in:{0}", "MAXLEN", "0"],
+      ["sensitivities:in:{1}", "MAXLEN", "0"],
+      ["sensitivities:in:{2}", "MAXLEN", "0"],
+    ]);
+    // No SCAN, no UNLINK — the docs survive the call.
+    expect(stub.calls.find((c) => c.cmd === "SCAN")).toBeUndefined();
+    expect(stub.calls.find((c) => c.cmd === "UNLINK")).toBeUndefined();
+    expect(stub.keys.size).toBe(3);
+  });
+
+  // Wave 6.53.B — clearDocs:true (default) preserves the destructive
+  // behaviour so /admin/cancel-all-runs and /admin/flush keep wiping
+  // sens:* docs. Explicit true and omitted opts behave identically.
+  it("clearDocs:true (default) still clears docs — backward compat", async () => {
+    const stub = makeHaltFlushStub(["sens:keep-me-1", "sens:keep-me-2"]);
+    const report = await performHaltAndFlush(stub.client, "sensitivities:in", 2, { clearDocs: true });
+    expect(report).toEqual({ streams_trimmed: 2, docs_cleared: 2 });
+    expect(stub.calls.find((c) => c.cmd === "SCAN")).toBeDefined();
+    expect(stub.calls.find((c) => c.cmd === "UNLINK")).toBeDefined();
+    expect(stub.keys.size).toBe(0);
+  });
 });
 
 describe("shardRuntime.haltAndFlush", () => {

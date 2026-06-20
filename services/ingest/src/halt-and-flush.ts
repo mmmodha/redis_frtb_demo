@@ -39,6 +39,12 @@ export interface HaltAndFlushOptions {
   // Match pattern for the doc-clearing SCAN. Defaults to "sens:*". Exposed
   // for tests that need to assert the SCAN argument.
   docMatch?: string;
+  // Wave 6.53.B — when false, skip the SCAN+UNLINK doc-clearing step and
+  // only XTRIM the shard streams. Used by /admin/stop-runs so "Stop
+  // generators" halts writes at the next safe boundary without wiping
+  // existing sens:* docs. Default true preserves the legacy destructive
+  // behaviour for /admin/cancel-all-runs and /admin/flush.
+  clearDocs?: boolean;
 }
 
 const DEFAULT_SCAN_COUNT = 5000;
@@ -125,7 +131,13 @@ export async function performHaltAndFlush(
   const scanCount = opts.scanCount ?? DEFAULT_SCAN_COUNT;
   const unlinkBatchSize = opts.unlinkBatchSize ?? DEFAULT_UNLINK_BATCH;
   const docMatch = opts.docMatch ?? DEFAULT_DOC_MATCH;
+  const clearDocs = opts.clearDocs ?? true;
   const streams_trimmed = await trimShardStreams(client, baseStream, totalShards);
-  const docs_cleared = await clearSensDocs(client, docMatch, scanCount, unlinkBatchSize);
+  // Wave 6.53.B — clearDocs:false skips SCAN+UNLINK entirely so a "stop
+  // generators" call leaves existing sens:* docs in place. Streams are
+  // still trimmed so the consumer's input backlog drops to zero.
+  const docs_cleared = clearDocs
+    ? await clearSensDocs(client, docMatch, scanCount, unlinkBatchSize)
+    : 0;
   return { streams_trimmed, docs_cleared };
 }

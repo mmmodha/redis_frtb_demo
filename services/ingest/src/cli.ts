@@ -140,11 +140,26 @@ function makeHaltAndFlushHandler(
     const client = getActiveClient();
     if (!client) { writeJson(res, 503, { ok: false, error: "no active redis client" }); return true; }
     // Body is optional; reading drains it so keep-alive sockets don't stall.
-    try { await readRequestBody(req); } catch { /* best-effort */ }
+    // Wave 6.53.B — body may carry { clearDocs?: boolean } to flip the
+    // destructive SCAN+UNLINK doc-clearing step. Default true preserves
+    // the legacy /admin/cancel-all-runs + /admin/flush behaviour; the api
+    // proxy's callIngestHaltAndTrim helper posts { clearDocs: false } from
+    // /admin/stop-runs so writes halt at the next safe boundary without
+    // wiping existing sens:* docs.
+    let clearDocs = true;
+    try {
+      const raw = await readRequestBody(req);
+      if (raw.trim().length > 0) {
+        const parsed = JSON.parse(raw) as { clearDocs?: unknown };
+        if (parsed && typeof parsed === "object" && typeof parsed.clearDocs === "boolean") {
+          clearDocs = parsed.clearDocs;
+        }
+      }
+    } catch { /* best-effort: malformed body falls back to default */ }
     const t0 = Date.now();
     try {
       const report = await shardRuntime.haltAndFlush(async (snap) => {
-        return performHaltAndFlush(client, STREAM, snap.totalShards);
+        return performHaltAndFlush(client, STREAM, snap.totalShards, { clearDocs });
       });
       writeJson(res, 200, { ok: true, ...report, elapsed_ms: Date.now() - t0 });
     } catch (err) {
