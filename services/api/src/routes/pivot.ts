@@ -189,7 +189,8 @@ function resolveWeightFromSchema(
 
 export function registerPivotRoute(
   app: FastifyInstance,
-  getRedis: () => RedisLike,
+  // Wave 6.56.D4 — async accessor.
+  getRedis: () => RedisLike | Promise<RedisLike>,
   opts: { schema?: Schema } = {},
 ): void {
   app.get<{ Querystring: PivotQuery }>("/pivot", { config: { category: "heavy-calc" } }, async (req, reply) => {
@@ -212,7 +213,7 @@ export function registerPivotRoute(
 
     // Wave 5.16t — resolve active redis per-request so a profile switch is
     // picked up on the very next /pivot call.
-    const redis = getRedis();
+    const redis = await getRedis();
     const target_label = getActiveTarget().label;
     // Wave 6.18i — resolve to the live versioned `idx:sens:v{hash7}` so
     // FT.SEARCH targets the same index name bootstrap last created.

@@ -677,7 +677,8 @@ async function probeForApi(redis: RedisLike): Promise<ClusterShape> {
 
 export function registerGeneratorRoutes(
   app: FastifyInstance,
-  getRedis: () => RedisLike,
+  // Wave 6.56.D4 — async accessor.
+  getRedis: () => RedisLike | Promise<RedisLike>,
   schema: Schema | undefined,
   opts: GeneratorRoutesOpts = {},
 ): void {
@@ -708,7 +709,7 @@ export function registerGeneratorRoutes(
 
     // Wave 5.16t — resolve active redis per-request so the generator writes
     // to the currently-active profile's stream.
-    const redis = getRedis();
+    const redis = await getRedis();
     const target_label = getActiveTarget().label;
 
     // Wave 5.92A — construct the router only when stream_shards is provided
@@ -788,7 +789,7 @@ export function registerGeneratorRoutes(
     const { rows, resolvedClasses, sensitivity_types, tradePool, factorPool, picker, stopWhen, batchSize, pipelineWindow, workers, profile, streamShards, streamMaxLen, flowControlOptions, deferTrim } = parsed;
 
     const run_id = ulid();
-    const redis = getRedis();
+    const redis = await getRedis();
     const target_label = getActiveTarget().label;
 
     // Wave 5.84C — probe the active redis to surface the resolved plan

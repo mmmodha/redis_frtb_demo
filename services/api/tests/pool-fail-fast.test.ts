@@ -106,10 +106,15 @@ describe("Wave 6.30.B4 — per-command timeout fail-fast", () => {
     process.env.HALF_OPEN_INITIAL_BACKOFF_MS = "60000";
     __setRuntimeClientFactoryForTests(() => stuckClient());
     const t0 = Date.now();
+    const [c1, c2, c3] = await Promise.all([
+      getActiveRedisRuntimeClient(),
+      getActiveRedisRuntimeClient(),
+      getActiveRedisRuntimeClient(),
+    ]);
     const results = await Promise.allSettled([
-      (getActiveRedisRuntimeClient() as unknown as { ping: () => Promise<unknown> }).ping(),
-      (getActiveRedisRuntimeClient() as unknown as { ping: () => Promise<unknown> }).ping(),
-      (getActiveRedisRuntimeClient() as unknown as { ping: () => Promise<unknown> }).ping(),
+      (c1 as unknown as { ping: () => Promise<unknown> }).ping(),
+      (c2 as unknown as { ping: () => Promise<unknown> }).ping(),
+      (c3 as unknown as { ping: () => Promise<unknown> }).ping(),
     ]);
     const elapsed = Date.now() - t0;
     expect(elapsed).toBeLessThan(1_000);
@@ -130,7 +135,7 @@ describe("Wave 6.30.B4 — per-command timeout fail-fast", () => {
     process.env.POOL_MEMBER_FAILURE_THRESHOLD = "3";
     process.env.HALF_OPEN_INITIAL_BACKOFF_MS = "60000";
     __setRuntimeClientFactoryForTests(() => stuckClient());
-    const c = getActiveRedisRuntimeClient()!;
+    const c = (await getActiveRedisRuntimeClient())!;
     await expect(
       (c as unknown as { ping: () => Promise<unknown> }).ping(),
     ).rejects.toThrow(/pool-command-fail-fast/);
@@ -145,14 +150,14 @@ describe("Wave 6.30.B4 — per-command timeout fail-fast", () => {
     process.env.HALF_OPEN_INITIAL_BACKOFF_MS = "60000";
     let builds = 0;
     __setRuntimeClientFactoryForTests(() => (++builds === 1 ? stuckClient() : healthyClient()));
-    const stuckW = getActiveRedisRuntimeClient()!;
+    const stuckW = (await getActiveRedisRuntimeClient())!;
     await expect(
       (stuckW as unknown as { ping: () => Promise<unknown> }).ping(),
     ).rejects.toThrow(/pool-command-fail-fast/);
     expect(__getRuntimePoolForTests("heavy").members[0]!.circuitState).toBe("open");
-    const r1 = await (getActiveRedisRuntimeClient() as unknown as { ping: () => Promise<unknown> }).ping();
-    const r2 = await (getActiveRedisRuntimeClient() as unknown as { ping: () => Promise<unknown> }).ping();
-    const r3 = await (getActiveRedisRuntimeClient() as unknown as { ping: () => Promise<unknown> }).ping();
+    const r1 = await ((await getActiveRedisRuntimeClient()) as unknown as { ping: () => Promise<unknown> }).ping();
+    const r2 = await ((await getActiveRedisRuntimeClient()) as unknown as { ping: () => Promise<unknown> }).ping();
+    const r3 = await ((await getActiveRedisRuntimeClient()) as unknown as { ping: () => Promise<unknown> }).ping();
     expect([r1, r2, r3]).toEqual(["PONG", "PONG", "PONG"]);
   });
 
@@ -162,7 +167,7 @@ describe("Wave 6.30.B4 — per-command timeout fail-fast", () => {
     process.env.HALF_OPEN_INITIAL_BACKOFF_MS = "40";
     let builds = 0;
     __setRuntimeClientFactoryForTests(() => (++builds === 1 ? stuckClient() : healthyClient()));
-    const w = getActiveRedisRuntimeClient()!;
+    const w = (await getActiveRedisRuntimeClient())!;
     await expect(
       (w as unknown as { ping: () => Promise<unknown> }).ping(),
     ).rejects.toThrow(/pool-command-fail-fast/);

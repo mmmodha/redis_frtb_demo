@@ -95,7 +95,12 @@ export interface CreateServerOpts {
   // defaults to heavy. Tests that override `getRedis` may ignore the argument
   // (returning the same fake for both categories is fine and intended for the
   // existing FakeRedis-based suite).
-  getRedis?: (category?: RuntimeCategory) => RedisLike;
+  //
+  // Wave 6.56.D4 — production accessor became async (it awaits pool-member
+  // readiness in `acquireFromPool`); the union return type lets test seams
+  // keep returning a sync fake without rewriting every suite, while the
+  // production wiring in index.ts/server.ts returns a Promise.
+  getRedis?: (category?: RuntimeCategory) => RedisLike | Promise<RedisLike>;
   activeTarget?: ActiveTarget;
   correlations?: Record<string, CorrelationSpec>;
   // Loaded once at boot from $SCHEMA_FILE (see index.ts). Threaded through so
@@ -308,10 +313,13 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
   // handler then calls `getRedis(req.poolCategory)` — never a hardcoded
   // literal — so the choice is visible at hook time for 6.23's semaphore
   // middleware.
-  const getRedis = (category: RuntimeCategory = "heavy-calc"): RedisLike => {
-    if (opts.getRedis) return opts.getRedis(category);
+  // Wave 6.56.D4 — accessor is async because the runtime path now awaits
+  // pool-member readiness; sync test seams (opts.getRedis / opts.redis) are
+  // still accepted and just resolve immediately.
+  const getRedis = async (category: RuntimeCategory = "heavy-calc"): Promise<RedisLike> => {
+    if (opts.getRedis) return await opts.getRedis(category);
     if (opts.redis) return opts.redis;
-    const active = getActiveRedisRuntimeClient(category);
+    const active = await getActiveRedisRuntimeClient(category);
     if (active) return active as unknown as RedisLike;
     // Last-resort: surface a clear error when nothing resolved.
     throw new Error("no active redis client and no fallback opts.redis provided");

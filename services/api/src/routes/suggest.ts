@@ -59,7 +59,8 @@ function isMissingKeyError(err: unknown): boolean {
 
 export function registerSuggestRoutes(
   app: FastifyInstance,
-  getRedis: () => RedisLike,
+  // Wave 6.56.D4 — async accessor.
+  getRedis: () => RedisLike | Promise<RedisLike>,
   _opts: RegisterSuggestOpts = {},
 ): void {
   app.get<{ Querystring: SuggestQuery }>("/suggest", { config: { category: "heavy-calc" } }, async (req, reply) => {
@@ -86,7 +87,7 @@ export function registerSuggestRoutes(
       return { error: "max must be an integer in 1..50" };
     }
 
-    const redis = getRedis();
+    const redis = await getRedis();
     const target_label = getActiveTarget().label;
     const key = `sug:${field}`;
     const t0 = process.hrtime.bigint();

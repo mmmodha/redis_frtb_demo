@@ -86,10 +86,10 @@ afterEach(() => {
 });
 
 describe("Wave 6.22 — failure-threshold circuit open", () => {
-  it("3 consecutive non-fatal failures on one member flips it to open; socket is torn down; pool size stays at 4", () => {
+  it("3 consecutive non-fatal failures on one member flips it to open; socket is torn down; pool size stays at 4", async () => {
     process.env.RUNTIME_REDIS_POOL_SIZE_HEAVY = "4";
     // Materialise all 4 slots so we have a stable reference to slot 0.
-    for (let i = 0; i < 4; i++) getActiveRedisRuntimeClient();
+    for (let i = 0; i < 4; i++) await getActiveRedisRuntimeClient();
     // Each failure recycles the socket, so we have to rebuild via the
     // round-robin path between emissions. Cycle through 4 acquisitions to
     // bring us back to slot 0 after each rebuild. Wave 6.30.B4 — use a
@@ -101,7 +101,7 @@ describe("Wave 6.22 — failure-threshold circuit open", () => {
         .emit("error", nonFatalSocketError());
       // Cycle round-robin back to slot 0 (need 4 acquisitions; the 4th
       // lands on slot 0 since slot 1 just got picked).
-      for (let i = 0; i < 4; i++) getActiveRedisRuntimeClient();
+      for (let i = 0; i < 4; i++) await getActiveRedisRuntimeClient();
     }
     const snap = __getRuntimePoolForTests("heavy");
     expect(snap.members[0]!.circuitState).toBe("open");
@@ -120,10 +120,10 @@ describe("Wave 6.22 — failure-threshold circuit open", () => {
 });
 
 describe("Wave 6.22 — round-robin skips open members", () => {
-  it("with slot 0 open, 6 acquisitions distribute across the 3 remaining slots", () => {
+  it("with slot 0 open, 6 acquisitions distribute across the 3 remaining slots", async () => {
     process.env.RUNTIME_REDIS_POOL_SIZE_HEAVY = "4";
     process.env.POOL_MEMBER_FAILURE_THRESHOLD = "1"; // open on first failure
-    for (let i = 0; i < 4; i++) getActiveRedisRuntimeClient();
+    for (let i = 0; i < 4; i++) await getActiveRedisRuntimeClient();
     const slot0 = __getRuntimePoolForTests("heavy").members[0]!.client!;
     (slot0 as unknown as { emit: (e: string, p: unknown) => void })
       .emit("error", timeoutError());
@@ -131,7 +131,7 @@ describe("Wave 6.22 — round-robin skips open members", () => {
     // Track which wrapper each acquisition returns; with slot 0 skipped,
     // 6 acquisitions should rotate across slots 1, 2, 3 twice.
     const wrappers: Array<Redis | null> = [];
-    for (let i = 0; i < 6; i++) wrappers.push(getActiveRedisRuntimeClient());
+    for (let i = 0; i < 6; i++) wrappers.push(await getActiveRedisRuntimeClient());
     const distinct = new Set(wrappers);
     expect(distinct.size).toBe(3); // only slots 1, 2, 3 are touched
     // Slot 0 wrapper must NOT appear among the acquisitions.
@@ -151,7 +151,7 @@ describe("Wave 6.22 — all-open promotes oldest to half-open", () => {
     process.env.RUNTIME_REDIS_POOL_SIZE_HEAVY = "3";
     process.env.POOL_MEMBER_FAILURE_THRESHOLD = "1";
     process.env.CIRCUIT_BACKOFF_MS = "0"; // skip backoff gating
-    for (let i = 0; i < 3; i++) getActiveRedisRuntimeClient();
+    for (let i = 0; i < 3; i++) await getActiveRedisRuntimeClient();
     const snap0 = __getRuntimePoolForTests("heavy");
     // Open every slot in order so slot 0 ends up the oldest.
     for (let i = 0; i < 3; i++) {
@@ -167,7 +167,7 @@ describe("Wave 6.22 — all-open promotes oldest to half-open", () => {
     }
     // Next acquisition: every member open → oldest (slot 0) goes half-open
     // and gets a fresh client.
-    const w = getActiveRedisRuntimeClient();
+    const w = await getActiveRedisRuntimeClient();
     expect(w).not.toBeNull();
     const snap1 = __getRuntimePoolForTests("heavy");
     expect(snap1.members[0]!.circuitState).toBe("half-open");
@@ -186,7 +186,7 @@ describe("Wave 6.22 — half-open success closes the circuit", () => {
     process.env.POOL_MEMBER_FAILURE_THRESHOLD = "1";
     process.env.CIRCUIT_BACKOFF_MS = "0";
     // Build slots 0 and 1, open both.
-    for (let i = 0; i < 2; i++) getActiveRedisRuntimeClient();
+    for (let i = 0; i < 2; i++) await getActiveRedisRuntimeClient();
     for (let i = 0; i < 2; i++) {
       const c = __getRuntimePoolForTests("heavy").members[i]!.client!;
       (c as unknown as { emit: (e: string, p: unknown) => void })
@@ -194,7 +194,7 @@ describe("Wave 6.22 — half-open success closes the circuit", () => {
       await new Promise<void>((r) => setTimeout(r, 2));
     }
     // All open → next acquisition half-opens slot 0 with a fresh client.
-    const halfOpenWrapper = getActiveRedisRuntimeClient()!;
+    const halfOpenWrapper = (await getActiveRedisRuntimeClient())!;
     expect(__getRuntimePoolForTests("heavy").members[0]!.circuitState).toBe("half-open");
     // Successful command via the wrapper closes the circuit.
     await (halfOpenWrapper as unknown as { ping: () => Promise<unknown> }).ping();
@@ -214,7 +214,7 @@ describe("Wave 6.22 — half-open failure re-opens the circuit", () => {
       makeFakeClient(opts.commandTimeout, () => Promise.reject(timeoutError())));
     // Build 2 slots; flip both to open via a single error emission each
     // (threshold=1).
-    for (let i = 0; i < 2; i++) getActiveRedisRuntimeClient();
+    for (let i = 0; i < 2; i++) await getActiveRedisRuntimeClient();
     for (let slot = 0; slot < 2; slot++) {
       const c = __getRuntimePoolForTests("heavy").members[slot]!.client!;
       (c as unknown as { emit: (e: string, p: unknown) => void })
@@ -224,7 +224,7 @@ describe("Wave 6.22 — half-open failure re-opens the circuit", () => {
     expect(__getRuntimePoolForTests("heavy").members[0]!.circuitState).toBe("open");
     expect(__getRuntimePoolForTests("heavy").members[1]!.circuitState).toBe("open");
     // Promote slot 0 to half-open via the all-open acquisition path.
-    const w = getActiveRedisRuntimeClient()!;
+    const w = (await getActiveRedisRuntimeClient())!;
     expect(__getRuntimePoolForTests("heavy").members[0]!.circuitState).toBe("half-open");
     // Issue a command via the wrapper — it rejects (factory always rejects)
     // and the half-open member immediately re-opens.
@@ -247,7 +247,7 @@ describe("Wave 6.22 — successful command resets failure count", () => {
       nextShouldReject
         ? Promise.reject(nonFatalSocketError())
         : Promise.resolve("ok")));
-    const w = getActiveRedisRuntimeClient()!;
+    const w = (await getActiveRedisRuntimeClient())!;
     // Pattern: fail, fail, success, fail, fail. With threshold=3 and a
     // success in the middle, we never reach 3 consecutive failures.
     for (let i = 0; i < 2; i++) {
@@ -256,11 +256,11 @@ describe("Wave 6.22 — successful command resets failure count", () => {
         (w as unknown as { ping: () => Promise<unknown> }).ping(),
       ).rejects.toBeTruthy();
       // Each failure also recycles the socket; re-acquire to rebuild.
-      getActiveRedisRuntimeClient();
+      await getActiveRedisRuntimeClient();
     }
     // Successful command — failure counter resets to 0.
     nextShouldReject = false;
-    const w2 = getActiveRedisRuntimeClient()!;
+    const w2 = (await getActiveRedisRuntimeClient())!;
     await (w2 as unknown as { ping: () => Promise<unknown> }).ping();
     expect(__getRuntimePoolForTests("heavy").members[0]!.consecutiveFailures).toBe(0);
     expect(__getRuntimePoolForTests("heavy").members[0]!.circuitState).toBe("closed");
@@ -268,7 +268,7 @@ describe("Wave 6.22 — successful command resets failure count", () => {
     nextShouldReject = true;
     for (let i = 0; i < 2; i++) {
       await expect(
-        (getActiveRedisRuntimeClient()! as unknown as { ping: () => Promise<unknown> }).ping(),
+        ((await getActiveRedisRuntimeClient())! as unknown as { ping: () => Promise<unknown> }).ping(),
       ).rejects.toBeTruthy();
     }
     expect(__getRuntimePoolForTests("heavy").members[0]!.circuitState).toBe("closed");
@@ -276,12 +276,12 @@ describe("Wave 6.22 — successful command resets failure count", () => {
 });
 
 describe("Wave 6.22 — heavy pool circuit state does NOT bleed into light", () => {
-  it("opening every heavy member leaves the light pool fully closed", () => {
+  it("opening every heavy member leaves the light pool fully closed", async () => {
     process.env.RUNTIME_REDIS_POOL_SIZE_HEAVY = "2";
     process.env.RUNTIME_REDIS_POOL_SIZE_LIGHT = "2";
     process.env.POOL_MEMBER_FAILURE_THRESHOLD = "1";
-    for (let i = 0; i < 2; i++) getActiveRedisRuntimeClient("heavy");
-    for (let i = 0; i < 2; i++) getActiveRedisRuntimeClient("light");
+    for (let i = 0; i < 2; i++) await getActiveRedisRuntimeClient("heavy");
+    for (let i = 0; i < 2; i++) await getActiveRedisRuntimeClient("light");
     // Open every heavy member.
     for (let i = 0; i < 2; i++) {
       const c = __getRuntimePoolForTests("heavy").members[i]!.client!;
@@ -314,7 +314,7 @@ describe("Wave 6.22 — long-burst recovery", () => {
     const t0 = Date.now();
     let lastErr: unknown;
     for (let i = 0; i < 20; i++) {
-      const c = getActiveRedisRuntimeClient();
+      const c = await getActiveRedisRuntimeClient();
       if (!c) continue;
       try {
         await (c as unknown as { ping: () => Promise<unknown> }).ping();

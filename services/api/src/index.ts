@@ -266,8 +266,10 @@ async function main(): Promise<void> {
   // applies across all categories — it exists only for the brief window
   // before the active-target singleton resolves, where pool isolation is
   // not a concern.
-  const getRedis = (category: RuntimeCategory = "heavy-calc"): RedisLike => {
-    const active = getActiveRedisRuntimeClient(category);
+  // Wave 6.56.D4 — runtime accessor became async; `getActiveRedisRuntimeClient`
+  // now awaits per-member socket readiness inside `acquireFromPool`.
+  const getRedis = async (category: RuntimeCategory = "heavy-calc"): Promise<RedisLike> => {
+    const active = await getActiveRedisRuntimeClient(category);
     return (active ?? redis) as unknown as RedisLike;
   };
   const app = await createServer({ getRedis, correlations, schema, store, logger: true });

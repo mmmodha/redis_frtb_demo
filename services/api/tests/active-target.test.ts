@@ -7,8 +7,10 @@ import {
   getActiveRedisClient,
   getActiveRedisRuntimeClient,
   onActiveTargetChange,
+  __setRuntimeClientFactoryForTests,
   type ActiveTarget,
 } from "../src/active-target.ts";
+import type { Redis } from "ioredis";
 
 describe("active-target singleton", () => {
   beforeEach(() => {
@@ -215,16 +217,27 @@ describe("Wave 6.23 — boot client retains default retry + offline queue (B2 re
     boot?.disconnect();
   });
 
-  it("runtime pool client opts in to fast-fail (retry=1, offline queue off)", () => {
+  it("runtime pool client opts in to fast-fail (retry=1, offline queue off)", async () => {
     setActiveTarget(
       { host: "pool.example.com", port: 6379, tls: false, db: 0, label: "pool-target" },
     );
-    const runtime = getActiveRedisRuntimeClient();
-    expect(runtime).not.toBeNull();
-    // Pool members opt in to fast-fail so a degraded socket surfaces the
-    // error on the next command rather than silently re-queueing.
-    const opts = (runtime as unknown as { options: Record<string, unknown> }).options;
-    expect(opts.maxRetriesPerRequest).toBe(1);
-    expect(opts.enableOfflineQueue).toBe(false);
+    // Wave 6.56.D4 — acquireFromPool now awaits awaitMemberReady before
+    // returning, so we can't issue a real ioredis build against an unresolvable
+    // host without a hang/throw. Verify the wiring by spying on the factory:
+    // acquireFromPool MUST pass `fastFail: true` and the heavy commandTimeout,
+    // which buildClient maps to `maxRetriesPerRequest: 1` + `enableOfflineQueue: false`.
+    let lastOpts: { commandTimeout: number; fastFail?: boolean } | null = null;
+    __setRuntimeClientFactoryForTests((_t, _c, opts) => {
+      lastOpts = opts;
+      return { status: "ready", options: opts, on() { return this; }, disconnect() {} } as unknown as Redis;
+    });
+    try {
+      await getActiveRedisRuntimeClient();
+      expect(lastOpts).not.toBeNull();
+      expect(lastOpts!.commandTimeout).toBe(35_000);
+      expect(lastOpts!.fastFail).toBe(true);
+    } finally {
+      __setRuntimeClientFactoryForTests(null);
+    }
   });
 });

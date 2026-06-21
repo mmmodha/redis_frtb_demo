@@ -65,10 +65,11 @@ afterEach(() => {
 });
 
 describe("Wave 6.21 — round-robin pool distribution", () => {
-  it("distributes 8 acquisitions across 4 heavy pool members evenly", () => {
+  it("distributes 8 acquisitions across 4 heavy pool members evenly", async () => {
     // Acquire 8 times; each should land on a different slot in lockstep
     // round-robin (slot 0, 1, 2, 3, 0, 1, 2, 3).
-    const wrappers = Array.from({ length: 8 }, () => getActiveRedisRuntimeClient());
+    const wrappers: Array<Redis | null> = [];
+    for (let i = 0; i < 8; i++) wrappers.push(await getActiveRedisRuntimeClient());
     // Resolve back to the underlying slot identity by inspecting the pool.
     const snap = __getRuntimePoolForTests("heavy");
     expect(snap.members.length).toBe(4);
@@ -91,7 +92,7 @@ describe("Wave 6.21 — round-robin pool distribution", () => {
 describe("Wave 6.21 — per-member recycle on transient socket error", () => {
   it("marks a member stale on a non-fatal socket error (ECONNRESET) and rebuilds it on the next acquisition; pool size stays at 4", async () => {
     // Acquire enough times to materialise all 4 heavy slots.
-    for (let i = 0; i < 4; i++) getActiveRedisRuntimeClient();
+    for (let i = 0; i < 4; i++) await getActiveRedisRuntimeClient();
     const snapBefore = __getRuntimePoolForTests("heavy");
     const slotZeroClient = snapBefore.members[0]!.client;
     expect(slotZeroClient).not.toBeNull();
@@ -110,7 +111,7 @@ describe("Wave 6.21 — per-member recycle on transient socket error", () => {
     // Advance round-robin until we land on slot 0 again. Pool stays at 4
     // members; slot 0 is rebuilt (new client identity, generation bumps).
     const genBefore = snapBefore.members[0]!.generation;
-    for (let i = 0; i < 4; i++) getActiveRedisRuntimeClient();
+    for (let i = 0; i < 4; i++) await getActiveRedisRuntimeClient();
     const slotZeroInfo = getPoolMemberInfo("heavy", 0);
     expect(slotZeroInfo?.generation).toBe(genBefore + 1);
     expect(__getRuntimePoolForTests("heavy").members.length).toBe(4);
@@ -120,8 +121,8 @@ describe("Wave 6.21 — per-member recycle on transient socket error", () => {
 describe("Wave 6.21 — lockstep invalidation on setActiveTarget", () => {
   it("setActiveTarget rebuilds all 4 heavy + 4 light pool members", async () => {
     // Materialise all slots in both pools.
-    for (let i = 0; i < 4; i++) getActiveRedisRuntimeClient("heavy");
-    for (let i = 0; i < 4; i++) getActiveRedisRuntimeClient("light");
+    for (let i = 0; i < 4; i++) await getActiveRedisRuntimeClient("heavy");
+    for (let i = 0; i < 4; i++) await getActiveRedisRuntimeClient("light");
     const heavyBefore = __getRuntimePoolForTests("heavy");
     const lightBefore = __getRuntimePoolForTests("light");
     // Disable drain grace so the test does not sleep waiting for timers.
@@ -129,8 +130,8 @@ describe("Wave 6.21 — lockstep invalidation on setActiveTarget", () => {
     setActiveTarget({ host: "rotated.example.com", port: 6379, tls: false, db: 0, label: "rotated" });
     // After the swap, the pool slots are blanked synchronously; the very
     // next acquisition per slot rebuilds against the new target.
-    for (let i = 0; i < 4; i++) getActiveRedisRuntimeClient("heavy");
-    for (let i = 0; i < 4; i++) getActiveRedisRuntimeClient("light");
+    for (let i = 0; i < 4; i++) await getActiveRedisRuntimeClient("heavy");
+    for (let i = 0; i < 4; i++) await getActiveRedisRuntimeClient("light");
     const heavyAfter = __getRuntimePoolForTests("heavy");
     const lightAfter = __getRuntimePoolForTests("light");
     for (let i = 0; i < 4; i++) {
@@ -141,9 +142,9 @@ describe("Wave 6.21 — lockstep invalidation on setActiveTarget", () => {
 });
 
 describe("Wave 6.21 — heavy/light pool independence", () => {
-  it("staling a heavy pool member does NOT affect any light pool member", () => {
-    for (let i = 0; i < 4; i++) getActiveRedisRuntimeClient("heavy");
-    for (let i = 0; i < 4; i++) getActiveRedisRuntimeClient("light");
+  it("staling a heavy pool member does NOT affect any light pool member", async () => {
+    for (let i = 0; i < 4; i++) await getActiveRedisRuntimeClient("heavy");
+    for (let i = 0; i < 4; i++) await getActiveRedisRuntimeClient("light");
     const heavySlot0 = __getRuntimePoolForTests("heavy").members[0]!.client!;
     const lightBefore = __getRuntimePoolForTests("light");
     (heavySlot0 as unknown as { emit: (e: string, p: unknown) => void })
@@ -157,8 +158,8 @@ describe("Wave 6.21 — heavy/light pool independence", () => {
 });
 
 describe("Wave 6.21 / 6.40.X — default category is heavy-calc", () => {
-  it("getActiveRedisRuntimeClient() with no argument materialises only the heavy-calc pool", () => {
-    getActiveRedisRuntimeClient();
+  it("getActiveRedisRuntimeClient() with no argument materialises only the heavy-calc pool", async () => {
+    await getActiveRedisRuntimeClient();
     // Wave 6.40.X — default category is now `"heavy-calc"` (was `"heavy"`).
     // Heavy-ingest and light pools stay empty until something opts in.
     expect(__getRuntimePoolForTests("heavy-calc").members.length).toBe(4);
@@ -188,8 +189,8 @@ describe("Wave 6.21 — head-of-line blocking eliminated by pooling", () => {
     // get fast ones. Fire commands on all 10 concurrently; await only the
     // fast 9 (the slow one is intentionally left dangling — without the
     // pool it would block ALL of them).
-    const promises = Array.from({ length: 10 }, (_, i) => {
-      const c = getActiveRedisRuntimeClient()!;
+    const acquired = await Promise.all(Array.from({ length: 10 }, () => getActiveRedisRuntimeClient()));
+    const promises = acquired.map((c, i) => {
       const p = (c as unknown as { get: () => Promise<unknown> }).get();
       return { i, p };
     });
@@ -209,7 +210,7 @@ describe("Wave 6.21 (M6) — graceful drain on setActiveTarget", () => {
     vi.useFakeTimers();
     try {
       // Materialise slot 0 against the original target.
-      const before = getActiveRedisRuntimeClient()!;
+      const before = (await getActiveRedisRuntimeClient())!;
       const oldClient = __getRuntimePoolForTests("heavy").members[0]!.client!;
       let disconnected = false;
       (oldClient as unknown as { disconnect: () => void }).disconnect = () => { disconnected = true; };
@@ -218,7 +219,7 @@ describe("Wave 6.21 (M6) — graceful drain on setActiveTarget", () => {
       // Old client MUST still be alive immediately after the swap (drain grace).
       expect(disconnected).toBe(false);
       // Next acquisition lands on a freshly built client, not the old one.
-      const after = getActiveRedisRuntimeClient()!;
+      const after = (await getActiveRedisRuntimeClient())!;
       expect(after).not.toBe(before);
       // Advance the fake timer past the grace window; old client disconnects.
       vi.advanceTimersByTime(5001);

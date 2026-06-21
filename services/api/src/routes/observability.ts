@@ -336,7 +336,8 @@ export interface RegisterObservabilityOpts {
 
 export function registerObservabilityRoutes(
   app: FastifyInstance,
-  getRedis: (category?: RuntimeCategory) => RedisLike,
+  // Wave 6.56.D4 — async accessor.
+  getRedis: (category?: RuntimeCategory) => RedisLike | Promise<RedisLike>,
   opts: RegisterObservabilityOpts = {},
 ): void {
   const sseIntervalMs = opts.sseIntervalMs ?? 1000;
@@ -357,7 +358,7 @@ export function registerObservabilityRoutes(
     const prefix = req.query.prefix ?? "sens:";
     // Wave 5.16t — resolve active redis per-request so a profile switch is
     // picked up on the very next observability call.
-    const redis = getRedis(req.poolCategory);
+    const redis = await getRedis(req.poolCategory);
     const target_label = getActiveTarget().label;
     const t0 = process.hrtime.bigint();
     try {
@@ -386,7 +387,7 @@ export function registerObservabilityRoutes(
   });
 
   app.get("/observability/memory", { config: { category: "light" } }, async (req, reply) => {
-    const redis = getRedis(req.poolCategory);
+    const redis = await getRedis(req.poolCategory);
     const target_label = getActiveTarget().label;
     const t0 = process.hrtime.bigint();
     try {
@@ -422,7 +423,7 @@ export function registerObservabilityRoutes(
   });
 
   app.get("/observability/shards", { config: { category: "light" } }, async (req, reply) => {
-    const redis = getRedis(req.poolCategory);
+    const redis = await getRedis(req.poolCategory);
     const target_label = getActiveTarget().label;
     try {
       const shards = await readShards(redis, req.log);
@@ -444,7 +445,7 @@ export function registerObservabilityRoutes(
   // summary so an operator can answer "is the api seeing my cluster?". Read
   // only, no metric writes. Standalone targets return empty arrays/maps.
   app.get("/observability/topology", { config: { category: "light" } }, async (req, reply) => {
-    const redis = getRedis(req.poolCategory);
+    const redis = await getRedis(req.poolCategory);
     const target_label = getActiveTarget().label;
     try {
       const topology = await readTopology(redis, req.log);
@@ -476,7 +477,7 @@ export function registerObservabilityRoutes(
         reply.code(400);
         return { error: "invalid metric", target_label };
       }
-      const result = await readHistory(getRedis(req.poolCategory), metricRaw, windowMs, target_label);
+      const result = await readHistory(await getRedis(req.poolCategory), metricRaw, windowMs, target_label);
       return {
         source: result.source,
         metric: metricRaw,
@@ -506,7 +507,7 @@ export function registerObservabilityRoutes(
       if (stopped) return;
       try {
         // Re-resolve per tick so an in-flight stream retargets on profile switch.
-        const shards = await readShards(getRedis(req.poolCategory), req.log);
+        const shards = await readShards(await getRedis(req.poolCategory), req.log);
         reply.raw.write(`data: ${JSON.stringify(shards)}\n\n`);
       } catch {
         // Swallow transient errors; the next tick may recover.

@@ -81,7 +81,8 @@ export interface AdminRoutesOpts {
 
 export function registerAdminRoutes(
   app: FastifyInstance,
-  getRedis: (category?: RuntimeCategory) => RedisLike,
+  // Wave 6.56.D4 — async accessor.
+  getRedis: (category?: RuntimeCategory) => RedisLike | Promise<RedisLike>,
   opts: AdminRoutesOpts = {},
 ): void {
   const runBootstrap = opts.bootstrap ?? bootstrapFrtb;
@@ -152,7 +153,7 @@ export function registerAdminRoutes(
     let target_label = "";
     try { target_label = getActiveTarget().label; } catch { /* no active target */ }
     if (!target_label) return { ok: true, count: 0, index_name: null };
-    const redis = getRedis(req.poolCategory);
+    const redis = await getRedis(req.poolCategory);
     let indexName: string;
     try {
       indexName = await getSensIndexName(redis, target_label);
@@ -186,7 +187,7 @@ export function registerAdminRoutes(
       reply.code(503);
       return { error: "no active target" };
     }
-    const redis = getRedis();
+    const redis = await getRedis();
     const t0 = process.hrtime.bigint();
     try {
       // Wave 6.24 — FLUSHDB clears every key in the active DB, including
@@ -274,7 +275,7 @@ export function registerAdminRoutes(
   // EVALSHA probes); migrate to the light pool so a degraded heavy member
   // (slow calc) cannot stall the UI's pre-Calculate sanity check.
   app.get("/admin/preflight", { config: { category: "light" } }, async (req) => {
-    const redis = getRedis(req.poolCategory);
+    const redis = await getRedis(req.poolCategory);
     const masters = resolveMasterNodes(redis as unknown as BootstrapRedis);
 
     // Wave 6.18i — probe the versioned `idx:sens:v{hash7}` name when the
@@ -375,7 +376,7 @@ export function registerAdminRoutes(
     if (!opts.schema) {
       return { ok: false, ms: 0, bootstrap: { ok: false, error: "schema-missing" } };
     }
-    const redis = getRedis();
+    const redis = await getRedis();
     // Wave 6.16a — keep the active target_label so we can update the
     // bootstrap-status flag on the way out. Pre-rebuild status may be
     // partial (from boot) or anything else; we transition based on

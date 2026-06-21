@@ -117,13 +117,16 @@ async function smembersList(redis: RedisLike, key: string): Promise<string[]> {
 
 export function registerAdminCalcRoutes(
   app: FastifyInstance,
-  getRedis: (category?: RuntimeCategory) => RedisLike,
+  // Wave 6.56.D4 — accessor accepts a Promise-returning runtime resolver so
+  // pool-member readiness can be awaited; tests that pass a sync fake still
+  // match this union.
+  getRedis: (category?: RuntimeCategory) => RedisLike | Promise<RedisLike>,
 ): void {
   // Coverage walk. Pure read-only across discovery sets + rollup HGETALL,
   // so flag as `light` to keep it off the heavy calc pool.
   app.get("/admin/calc-coverage", { config: { category: "light" } }, async (_req, reply) => {
     try { getActiveTarget(); } catch { reply.code(503); return { error: "no active target" }; }
-    const redis = getRedis();
+    const redis = await getRedis();
     const riskClasses = await smembersList(redis, SEEN_RISK_CLASS_KEY);
     const coverage: CoverageRow[] = [];
     for (const rc of riskClasses) {

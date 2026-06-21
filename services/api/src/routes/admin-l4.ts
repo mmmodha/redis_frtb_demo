@@ -60,7 +60,8 @@ function tokenFromRequest(req: FastifyRequest): string | null {
 
 export function registerAdminL4Routes(
   app: FastifyInstance,
-  getRedis: (category?: RuntimeCategory) => RedisLike,
+  // Wave 6.56.D4 — async accessor.
+  getRedis: (category?: RuntimeCategory) => RedisLike | Promise<RedisLike>,
   opts: AdminL4RoutesOpts,
 ): void {
   const adminToken = opts.adminToken ?? process.env.ADMIN_TOKEN ?? "";
@@ -75,13 +76,13 @@ export function registerAdminL4Routes(
   });
 
   app.get("/admin/snapshots", { config: { category: "light" } }, async (req) => {
-    const redis = getRedis(req.poolCategory);
+    const redis = await getRedis(req.poolCategory);
     const snapshots = await listSnapshots(redis);
     return { snapshots };
   });
 
   app.get("/admin/stream-status", { config: { category: "light" } }, async (req) => {
-    const redis = getRedis(req.poolCategory);
+    const redis = await getRedis(req.poolCategory);
     const status = await readStreamStatus(redis, {
       streamKey: streamCfg.streamKey,
       maxLen: streamCfg.maxLen,
@@ -109,7 +110,7 @@ export function registerAdminL4Routes(
       return { error: "sensitivity_type must be Delta | Vega | Curvature" };
     }
     incCounter("reconcile_total");
-    const redis = getRedis(req.poolCategory);
+    const redis = await getRedis(req.poolCategory);
     const rc = rcRaw.toUpperCase();
     const sens = sensRaw as DriftSensitivity;
     const key = rollupKey(rc, bktRaw, sens);

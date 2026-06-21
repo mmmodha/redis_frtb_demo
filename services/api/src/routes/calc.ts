@@ -946,7 +946,8 @@ async function computeSbmCharge(
  */
 export function registerCalcRoute(
   app: FastifyInstance,
-  getRedis: () => RedisLike,
+  // Wave 6.56.D4 — async accessor.
+  getRedis: () => RedisLike | Promise<RedisLike>,
   opts: CalcOpts,
 ): void {
   // Wave 6.01 — read-only listing of the recent-runs ring buffer. Default
@@ -1059,7 +1060,7 @@ export function registerCalcRoute(
         noCache: req.query?.nocache === "1",
       },
       {
-        redis: getRedis(),
+        redis: await getRedis(),
         schema: opts.schema,
         correlations: opts.correlations,
         log: app.log,
@@ -1157,7 +1158,7 @@ export function registerCalcRoute(
           : null;
       const noCache = req.query?.nocache === "1";
 
-      const redis = getRedis();
+      const redis = await getRedis();
       const ctx: ComputeSbmCtx = {
         redis,
         schema: opts.schema,
@@ -1522,7 +1523,7 @@ export function registerCalcRoute(
           noCache,
         },
         {
-          redis: getRedis(),
+          redis: await getRedis(),
           schema: opts.schema,
           correlations: opts.correlations,
           log: app.log,
@@ -1664,7 +1665,7 @@ export function registerCalcRoute(
         reply.code(503);
         return { error: "fast-path schema unavailable", hint: "bucket-cross-detail requires CALC_FAST_PATH" };
       }
-      const redis = getRedis();
+      const redis = await getRedis();
       const target_label = getActiveTarget().label;
       // Wave 6.18i — same versioned-index resolution as /calc/sbm so the
       // bucket-cross-detail endpoint targets the live `idx:sens:v{hash7}`.

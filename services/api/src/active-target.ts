@@ -449,7 +449,13 @@ export function __resetActiveTargetVersionForTests(): void {
 // polling fallback at `/internal/redis/active-target/full` covers the gap.
 
 const SWITCH_DRAIN_TIMEOUT_DEFAULT_MS = 10_000;
-const SWITCH_PUSH_TIMEOUT_DEFAULT_MS = 2_500;
+// Wave 6.56.D3 — raised 2_500 → 5_000. Ingest's commit handler (drain +
+// shardRuntime.rebuild() + the D1 retry schedule 250+500+1000ms) routinely
+// runs past 2.5s under rapid cross-cluster switches, so the API would abort
+// the fetch and mark `per_service[ingest] push_failed: "This operation was
+// aborted"` even though ingest itself completed cleanly. 5s gives headroom
+// for the worst-case commit while still bounded by SWITCH_DRAIN_TIMEOUT.
+const SWITCH_PUSH_TIMEOUT_DEFAULT_MS = 5_000;
 const DEFAULT_KNOWN_SERVICES = "ingest,source,loadgen";
 const DEFAULT_INTERNAL_API_TOKEN = "dev-internal-token";
 const DEFAULT_SERVICE_HOST = "127.0.0.1";
@@ -820,6 +826,13 @@ function warnPushFailed(
 // 2xx response is treated as a service ACK for `ackPhase`; any other status
 // or thrown error records `push_failed` for that service. NEVER throws —
 // the switch must complete even if every service is unreachable.
+//
+// Wave 6.56.D3 — on an AbortError (the per-push fetch timer fired before
+// the service replied), retry the push exactly once. The retry is
+// idempotent because each service's prepare/commit handler is keyed on
+// `switch_id` and is already retry-safe. This catches the rare slow-path
+// where ingest's commit (`shardRuntime.rebuild()` + D1 retry schedule)
+// outruns even the raised 5s budget.
 async function fanOutSwitchPush(
   services: KnownService[],
   ackPhase: "drained" | "committed",
@@ -828,7 +841,16 @@ async function fanOutSwitchPush(
 ): Promise<void> {
   await Promise.all(services.map(async (svc) => {
     try {
-      const res = await pushSwitchEvent(svc, payload.phase, payload);
+      let res: Response;
+      try {
+        res = await pushSwitchEvent(svc, payload.phase, payload);
+      } catch (firstErr) {
+        if (isAbortError(firstErr)) {
+          res = await pushSwitchEvent(svc, payload.phase, payload);
+        } else {
+          throw firstErr;
+        }
+      }
       if (res.ok) {
         applyPushAck(record, svc.name, ackPhase);
       } else {
@@ -842,6 +864,16 @@ async function fanOutSwitchPush(
       warnPushFailed(svc, payload.phase, reason);
     }
   }));
+}
+
+// Wave 6.56.D3 — detect an undici-issued AbortError so the fan-out retry
+// path can pick it up. The thrown value is a DOMException whose `.name` is
+// `"AbortError"` and `.message` is `"This operation was aborted"`.
+function isAbortError(err: unknown): boolean {
+  if (!err) return false;
+  const e = err as { name?: unknown; message?: unknown };
+  if (e.name === "AbortError") return true;
+  return typeof e.message === "string" && e.message === "This operation was aborted";
 }
 
 // Apply the new target to the singleton — the synchronous core of what the
@@ -1219,7 +1251,11 @@ export function getActiveRedisClient(): Redis | null {
 // fast" UX workaround was operators tearing down the singleton. The pool
 // turns that workaround into a built-in behaviour — slow work lands on one
 // member, the other three keep the snapshot UI responsive.
-export function getActiveRedisRuntimeClient(category: RuntimeCategory = "heavy-calc"): Redis | null {
+// Wave 6.56.D4 — async return because `acquireFromPool` now awaits the
+// underlying socket reaching `ready` before publishing the wrapper. The
+// `getRedis` accessor wired in server.ts / index.ts and every route
+// handler that consumes it propagates the await.
+export async function getActiveRedisRuntimeClient(category: RuntimeCategory = "heavy-calc"): Promise<Redis | null> {
   const normalized = normalizeCategory(category);
   const pool = poolForNormalized(normalized);
   return acquireFromPool(pool, normalized);
@@ -1286,7 +1322,12 @@ function ensurePoolSized(pool: Pool, size: number): void {
 // oldest one is transitioned to `half-open` and rebuilt to probe recovery.
 // Returns the recycle-aware Proxy wrapper, NOT the raw ioredis client, so
 // callers automatically participate in the per-member self-heal flow.
-function acquireFromPool(pool: Pool, category: NormalizedCategory): Redis | null {
+// Wave 6.56.D4 — `acquireFromPool` is async because the freshly built
+// client (lazyConnect:true + enableOfflineQueue:false) must reach `ready`
+// before its wrapper is published, otherwise the very first command races
+// the TCP/TLS handshake and throws "Stream isn't writeable". The await
+// uses `awaitMemberReady` — the same readiness bridge `/readyz` relies on.
+async function acquireFromPool(pool: Pool, category: NormalizedCategory): Promise<Redis | null> {
   const t = getActiveTarget();
   const c = overrideCreds;
   const key = targetKey(t);
@@ -1333,6 +1374,20 @@ function acquireFromPool(pool: Pool, category: NormalizedCategory): Redis | null
     ? runtimeClientFactoryForTests(t, c, runtimeOpts)
     : buildClient(t, c, runtimeOpts);
   attachErrorRecycle(built, member);
+  // Wave 6.56.D4 — wait for the socket to reach `ready` BEFORE publishing
+  // the wrapper. Bounded by the runtime command-timeout (~10s default) so a
+  // stuck handshake fails fast and the caller's request errors cleanly
+  // instead of holding the slot indefinitely. On failure, tear down the
+  // half-built socket and surface the error — the next acquisition rebuilds.
+  try {
+    await awaitMemberReady(built, getRuntimeCommandTimeoutMs());
+  } catch (err) {
+    try { built.disconnect(); } catch { /* ignore */ }
+    member.client = null;
+    member.wrapper = null;
+    member.key = "";
+    throw err;
+  }
   member.client = built;
   member.wrapper = wrapWithRecycle(built, member);
   member.key = key;
@@ -1389,7 +1444,12 @@ function shouldRecycle(err: unknown): boolean {
   const e = err as { code?: unknown; message?: unknown };
   if (e.code === "ETIMEDOUT" || e.code === "ECONNRESET" || e.code === "EPIPE") return true;
   const msg = typeof e.message === "string" ? e.message : String(err);
-  return msg.includes("Command timed out");
+  if (msg.includes("Command timed out")) return true;
+  // Wave 6.56.D4 — defence-in-depth: if a not-yet-ready ioredis client ever
+  // reaches a route (`enableOfflineQueue:false` + `lazyConnect:true` race),
+  // recycle the slot so the next acquisition rebuilds and awaits readiness
+  // instead of holding the same broken wrapper forever.
+  return msg.includes("Stream isn't writeable");
 }
 
 // Tear down the underlying socket for `member` so the next acquisition
@@ -1820,19 +1880,24 @@ export async function probeRuntimeRedisReadiness(): Promise<RuntimeReadinessVerd
   if (runtimeReadinessInFlight) return runtimeReadinessInFlight;
   runtimeReadinessInFlight = (async () => {
     try {
-      const all: Redis[] = [];
       // Wave 6.40.X — probe all three categories. heavy-calc / heavy-ingest /
       // light each have their own pool; readiness must verify EVERY pool's
       // members so a stuck ingest pool can fail /readyz independently of calc.
+      // Wave 6.56.D4 — getActiveRedisRuntimeClient is async (it awaits member
+      // readiness internally). Run every acquisition in parallel so the 8+8+4
+      // sockets handshake concurrently rather than ≈20×RTT serially.
+      const acquisitions: Array<Promise<Redis | null>> = [];
       for (const category of ["heavy-calc", "heavy-ingest", "light"] as const) {
         const size = getRuntimePoolSize(category);
         for (let i = 0; i < size; i++) {
-          const c = getActiveRedisRuntimeClient(category);
-          if (!c) throw new Error(`no active runtime client (${category})`);
-          all.push(c);
+          acquisitions.push(getActiveRedisRuntimeClient(category));
         }
       }
-      await Promise.all(all.map(async (c) => {
+      const all = await Promise.all(acquisitions);
+      for (const c of all) {
+        if (!c) throw new Error("no active runtime client");
+      }
+      await Promise.all((all as Redis[]).map(async (c) => {
         await awaitMemberReady(c);
         await c.ping();
       }));
@@ -1856,7 +1921,12 @@ export async function probeRuntimeRedisReadiness(): Promise<RuntimeReadinessVerd
 // without a recognised `status` field (e.g. test fakes, the boot-protection
 // client) fall through to PING directly — preserving the pre-6.36 contract
 // for non-ioredis surfaces.
-async function awaitMemberReady(c: Redis): Promise<void> {
+//
+// Wave 6.56.D4 — optional `timeoutMs` bounds the wait so a stuck handshake
+// (TLS, cluster topology, DNS) cannot pin `acquireFromPool` indefinitely.
+// `/readyz` continues to call without a timeout (its outer probe budget
+// stays the bound).
+async function awaitMemberReady(c: Redis, timeoutMs?: number): Promise<void> {
   const e = c as unknown as {
     status?: string;
     connect?: () => Promise<unknown>;
@@ -1867,14 +1937,14 @@ async function awaitMemberReady(c: Redis): Promise<void> {
   if (typeof e.status !== "string") return;
   if (e.status === "ready") return;
   if (e.status === "wait" && typeof e.connect === "function") {
-    try { await e.connect(); return; }
+    try { await withTimeout(e.connect(), timeoutMs, "awaitMemberReady.connect"); return; }
     catch (err) {
       if (!/already connect(ing|ed)/i.test(String(err))) throw err;
     }
   }
   if (e.status === "ready") return;
   if (typeof e.once !== "function") return;
-  await new Promise<void>((resolve, reject) => {
+  await withTimeout(new Promise<void>((resolve, reject) => {
     let done = false;
     const cleanup = (): void => {
       const off = e.off ?? e.removeListener;
@@ -1885,6 +1955,22 @@ async function awaitMemberReady(c: Redis): Promise<void> {
     const onError = (err: unknown): void => { if (done) return; done = true; cleanup(); reject(err instanceof Error ? err : new Error(String(err))); };
     e.once!("ready", onReady);
     e.once!("error", onError);
+  }), timeoutMs, "awaitMemberReady.ready-event");
+}
+
+// Wave 6.56.D4 — bound `awaitMemberReady`'s underlying promises by an
+// optional deadline so a stuck handshake fails fast and `acquireFromPool`'s
+// caller sees a clean rejection. Passing `undefined`/<=0 keeps the
+// pre-6.56 unbounded behaviour for `/readyz`'s probe path.
+async function withTimeout<T>(p: Promise<T>, timeoutMs: number | undefined, label: string): Promise<T> {
+  if (!timeoutMs || timeoutMs <= 0) return p;
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+    if (typeof timer.unref === "function") timer.unref();
+    p.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (err) => { clearTimeout(timer); reject(err); },
+    );
   });
 }
 

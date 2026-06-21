@@ -63,9 +63,9 @@ afterEach(() => {
 });
 
 describe("Wave 6.40.X — heavy-calc / heavy-ingest pool independence", () => {
-  it("staling a heavy-calc member does NOT touch any heavy-ingest member", () => {
-    for (let i = 0; i < 4; i++) getActiveRedisRuntimeClient("heavy-calc");
-    for (let i = 0; i < 4; i++) getActiveRedisRuntimeClient("heavy-ingest");
+  it("staling a heavy-calc member does NOT touch any heavy-ingest member", async () => {
+    for (let i = 0; i < 4; i++) await getActiveRedisRuntimeClient("heavy-calc");
+    for (let i = 0; i < 4; i++) await getActiveRedisRuntimeClient("heavy-ingest");
     const calcSlot0 = __getRuntimePoolForTests("heavy-calc").members[0]!.client!;
     const ingestBefore = __getRuntimePoolForTests("heavy-ingest");
     (calcSlot0 as unknown as { emit: (e: string, p: unknown) => void })
@@ -80,9 +80,9 @@ describe("Wave 6.40.X — heavy-calc / heavy-ingest pool independence", () => {
     }
   });
 
-  it("staling a heavy-ingest member does NOT touch any heavy-calc member", () => {
-    for (let i = 0; i < 4; i++) getActiveRedisRuntimeClient("heavy-calc");
-    for (let i = 0; i < 4; i++) getActiveRedisRuntimeClient("heavy-ingest");
+  it("staling a heavy-ingest member does NOT touch any heavy-calc member", async () => {
+    for (let i = 0; i < 4; i++) await getActiveRedisRuntimeClient("heavy-calc");
+    for (let i = 0; i < 4; i++) await getActiveRedisRuntimeClient("heavy-ingest");
     const ingestSlot0 = __getRuntimePoolForTests("heavy-ingest").members[0]!.client!;
     const calcBefore = __getRuntimePoolForTests("heavy-calc");
     (ingestSlot0 as unknown as { emit: (e: string, p: unknown) => void })
@@ -94,9 +94,9 @@ describe("Wave 6.40.X — heavy-calc / heavy-ingest pool independence", () => {
     }
   });
 
-  it("member IDs follow the new prefix convention (heavy-calc:N / heavy-ingest:N)", () => {
-    for (let i = 0; i < 4; i++) getActiveRedisRuntimeClient("heavy-calc");
-    for (let i = 0; i < 4; i++) getActiveRedisRuntimeClient("heavy-ingest");
+  it("member IDs follow the new prefix convention (heavy-calc:N / heavy-ingest:N)", async () => {
+    for (let i = 0; i < 4; i++) await getActiveRedisRuntimeClient("heavy-calc");
+    for (let i = 0; i < 4; i++) await getActiveRedisRuntimeClient("heavy-ingest");
     for (let i = 0; i < 4; i++) {
       expect(getPoolMemberInfo("heavy-calc", i)?.id).toBe(`heavy-calc:${i}`);
       expect(getPoolMemberInfo("heavy-ingest", i)?.id).toBe(`heavy-ingest:${i}`);
@@ -105,9 +105,9 @@ describe("Wave 6.40.X — heavy-calc / heavy-ingest pool independence", () => {
 });
 
 describe("Wave 6.40.X — deprecated 'heavy' alias", () => {
-  it("aliases to heavy-calc (same pool, same member identities)", () => {
-    const viaAlias = getActiveRedisRuntimeClient("heavy");
-    const viaCanonical = getActiveRedisRuntimeClient("heavy-calc");
+  it("aliases to heavy-calc (same pool, same member identities)", async () => {
+    const viaAlias = await getActiveRedisRuntimeClient("heavy");
+    const viaCanonical = await getActiveRedisRuntimeClient("heavy-calc");
     expect(viaAlias).not.toBeNull();
     // Both routes land on the same heavy-calc pool — alias and canonical
     // are pointer-equivalent into the underlying member set.
@@ -118,12 +118,12 @@ describe("Wave 6.40.X — deprecated 'heavy' alias", () => {
     expect(viaCanonical).not.toBeNull();
   });
 
-  it("aliased queries do NOT materialise the heavy-ingest pool", () => {
-    getActiveRedisRuntimeClient("heavy");
+  it("aliased queries do NOT materialise the heavy-ingest pool", async () => {
+    await getActiveRedisRuntimeClient("heavy");
     expect(__getRuntimePoolForTests("heavy-ingest").members.length).toBe(0);
   });
 
-  it("emits exactly one structured pool-category-alias warn per process", () => {
+  it("emits exactly one structured pool-category-alias warn per process", async () => {
     // The warn is gated off under NODE_ENV=test to keep vitest output clean;
     // flip the env for the duration of this test so the console.warn fires.
     const prevEnv = process.env.NODE_ENV;
@@ -131,9 +131,9 @@ describe("Wave 6.40.X — deprecated 'heavy' alias", () => {
     try {
       process.env.NODE_ENV = "production";
       __resetAliasWarnForTests();
-      getActiveRedisRuntimeClient("heavy");
-      getActiveRedisRuntimeClient("heavy");
-      getActiveRedisRuntimeClient("heavy");
+      await getActiveRedisRuntimeClient("heavy");
+      await getActiveRedisRuntimeClient("heavy");
+      await getActiveRedisRuntimeClient("heavy");
       expect(warnSpy).toHaveBeenCalledTimes(1);
       const payload = JSON.parse(String(warnSpy.mock.calls[0]![0]));
       expect(payload.evt).toBe("pool-category-alias");

@@ -210,7 +210,8 @@ async function runRollupCountReads(
 
 export function registerFacetsRoute(
   app: FastifyInstance,
-  getRedis: () => RedisLike,
+  // Wave 6.56.D4 — async accessor; routes await per-call.
+  getRedis: () => RedisLike | Promise<RedisLike>,
   opts: { schema?: Schema } = {},
 ): void {
   app.get("/facets", { config: { category: "heavy-calc" } }, async (_req, reply) => {
@@ -222,7 +223,7 @@ export function registerFacetsRoute(
       return { ...cache.body, ms, cached: true };
     }
 
-    const redis = getRedis();
+    const redis = await getRedis();
     const target_label = getActiveTarget().label;
 
     const schema = opts.schema ?? loadFacetsSchema();
@@ -330,7 +331,7 @@ export function registerFacetsRoute(
       const ms = elapsedMs(t0);
       return { ...(deskCache.body as Record<string, unknown>), ms, cached: true };
     }
-    const redis = getRedis();
+    const redis = await getRedis();
     const target_label = getActiveTarget().label;
     const indexName = await getSensIndexName(redis, target_label);
     let reply2: unknown;
@@ -370,7 +371,7 @@ export function registerFacetsRoute(
       const ms = elapsedMs(t0);
       return { ...(regionCache.body as Record<string, unknown>), ms, cached: true };
     }
-    const redis = getRedis();
+    const redis = await getRedis();
     const target_label = getActiveTarget().label;
     const indexName = await getSensIndexName(redis, target_label);
     let reply2: unknown;
@@ -416,7 +417,7 @@ export function registerFacetsRoute(
       const ms = elapsedMs(t0);
       return { ...(bucketCache.body as Record<string, unknown>), ms, cached: true };
     }
-    const redis = getRedis();
+    const redis = await getRedis();
     const target_label = getActiveTarget().label;
     const indexName = await getSensIndexName(redis, target_label);
     let reply2: unknown;

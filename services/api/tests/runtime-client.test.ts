@@ -26,11 +26,27 @@ import {
   getActiveRedisRuntimeClient,
   resetActiveTarget,
   setActiveTarget,
+  __setRuntimeClientFactoryForTests,
 } from "../src/active-target.ts";
+import type { Redis } from "ioredis";
 
 interface ClientWithOptions {
   options: { commandTimeout?: number; host: string; password?: string };
   disconnect: () => void;
+}
+
+// Wave 6.56.D4 — `acquireFromPool` now awaits readiness before publishing the
+// wrapper, so a real ioredis client built against an unresolvable host would
+// hang/throw inside `awaitMemberReady`. Inject a fake factory that mirrors the
+// shape buildClient would produce, recording the `BuildClientOpts` and target
+// passed in so the test still verifies the runtime-vs-boot timeout invariant.
+function makeRecordingFakeFactory(): (t: { host: string }, c: { password?: string }, opts: { commandTimeout: number; fastFail?: boolean }) => Redis {
+  return (t, c, opts) => ({
+    status: "ready",
+    options: { commandTimeout: opts.commandTimeout, host: t.host, password: c.password },
+    on(): unknown { return this; },
+    disconnect(): void { /* no-op */ },
+  } as unknown as Redis);
 }
 
 describe("Wave 6.18f — runtime Redis client (35s) separate from boot client (10s)", () => {
@@ -38,20 +54,22 @@ describe("Wave 6.18f — runtime Redis client (35s) separate from boot client (1
     resetActiveTarget();
     delete process.env.REDIS_URL;
     delete process.env.RUNTIME_REDIS_COMMAND_TIMEOUT_MS;
+    __setRuntimeClientFactoryForTests(makeRecordingFakeFactory());
   });
   afterEach(() => {
     resetActiveTarget();
     delete process.env.RUNTIME_REDIS_COMMAND_TIMEOUT_MS;
+    __setRuntimeClientFactoryForTests(null);
   });
 
-  it("routes resolve to a runtime client with commandTimeout=35_000 while the boot client keeps 10_000", () => {
+  it("routes resolve to a runtime client with commandTimeout=35_000 while the boot client keeps 10_000", async () => {
     setActiveTarget(
       { host: "rs.example.com", port: 12000, tls: true, db: 0, label: "runtime-target" },
       { username: "appuser", password: "PW-PASS" },
     );
 
     const boot = getActiveRedisClient() as unknown as ClientWithOptions;
-    const runtime = getActiveRedisRuntimeClient() as unknown as ClientWithOptions;
+    const runtime = (await getActiveRedisRuntimeClient()) as unknown as ClientWithOptions;
 
     // Both clients are built, both authenticated, but with different timeouts.
     expect(boot.options.commandTimeout).toBe(10_000);
@@ -74,7 +92,7 @@ describe("Wave 6.18f — runtime Redis client (35s) separate from boot client (1
     // pool rotates per acquisition so subsequent calls may return different
     // members, but every returned member must honour the timeout.
     for (let i = 0; i < 8; i++) {
-      const m = getActiveRedisRuntimeClient() as unknown as ClientWithOptions;
+      const m = (await getActiveRedisRuntimeClient()) as unknown as ClientWithOptions;
       expect(m.options.commandTimeout).toBe(35_000);
       expect(m.options.host).toBe("rs.example.com");
       expect(m.options.password).toBe("PW-PASS");
@@ -86,7 +104,7 @@ describe("Wave 6.18f — runtime Redis client (35s) separate from boot client (1
       { username: "appuser", password: "PW-ROTATED" },
     );
     const bootAfter = getActiveRedisClient() as unknown as ClientWithOptions;
-    const runtimeAfter = getActiveRedisRuntimeClient() as unknown as ClientWithOptions;
+    const runtimeAfter = (await getActiveRedisRuntimeClient()) as unknown as ClientWithOptions;
     expect(bootAfter).not.toBe(boot);
     // Post-rotation the pool members are also rebuilt (lazy on next
     // acquisition); whatever pool slot we land on holds a fresh client.
@@ -101,7 +119,7 @@ describe("Wave 6.18f — runtime Redis client (35s) separate from boot client (1
       { host: "rs.example.com", port: 12000, tls: true, db: 0, label: "runtime-target" },
       { username: "appuser", password: "PW-ROTATED" },
     );
-    const runtimeEnv = getActiveRedisRuntimeClient() as unknown as ClientWithOptions;
+    const runtimeEnv = (await getActiveRedisRuntimeClient()) as unknown as ClientWithOptions;
     const bootEnv = getActiveRedisClient() as unknown as ClientWithOptions;
     expect(runtimeEnv.options.commandTimeout).toBe(25_000);
     // The boot client's commandTimeout is hard-coded (Wave 6.18c invariant)
@@ -109,10 +127,7 @@ describe("Wave 6.18f — runtime Redis client (35s) separate from boot client (1
     expect(bootEnv.options.commandTimeout).toBe(10_000);
 
     boot.disconnect();
-    runtime.disconnect();
     bootAfter.disconnect();
-    runtimeAfter.disconnect();
     bootEnv.disconnect();
-    runtimeEnv.disconnect();
   });
 });
