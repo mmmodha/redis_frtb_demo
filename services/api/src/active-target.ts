@@ -460,7 +460,8 @@ const SWITCH_DRAIN_TIMEOUT_DEFAULT_MS = 10_000;
 // shows it uses `timeout_ms: 30000`. Aligning the api budget with ingest's
 // drain budget eliminates the spurious abort. The happy path still
 // resolves in <1s; only the bottlenecked path gets the headroom.
-const SWITCH_PUSH_TIMEOUT_DEFAULT_MS = 30_000;
+// must exceed ingest drain budget (30s) to avoid co-timeout race — Wave 6.57.A
+const SWITCH_PUSH_TIMEOUT_DEFAULT_MS = 60_000;
 const DEFAULT_KNOWN_SERVICES = "ingest,source,loadgen";
 const DEFAULT_INTERNAL_API_TOKEN = "dev-internal-token";
 const DEFAULT_SERVICE_HOST = "127.0.0.1";
