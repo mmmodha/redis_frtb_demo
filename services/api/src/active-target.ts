@@ -449,13 +449,18 @@ export function __resetActiveTargetVersionForTests(): void {
 // polling fallback at `/internal/redis/active-target/full` covers the gap.
 
 const SWITCH_DRAIN_TIMEOUT_DEFAULT_MS = 10_000;
-// Wave 6.56.D3 — raised 2_500 → 5_000. Ingest's commit handler (drain +
-// shardRuntime.rebuild() + the D1 retry schedule 250+500+1000ms) routinely
-// runs past 2.5s under rapid cross-cluster switches, so the API would abort
-// the fetch and mark `per_service[ingest] push_failed: "This operation was
-// aborted"` even though ingest itself completed cleanly. 5s gives headroom
-// for the worst-case commit while still bounded by SWITCH_DRAIN_TIMEOUT.
-const SWITCH_PUSH_TIMEOUT_DEFAULT_MS = 5_000;
+// Wave 6.56.D3.re-fix — raised 5_000 → 30_000 to match ingest's own drain
+// budget. Wave 6.44.V.re4 verification proved 5s is still too short under
+// the S2 (steady-state + switch) and S4 (rapid 5x switches) scenarios: the
+// initial push aborts at 5s, the D3 retry-once (which gets its own fresh
+// AbortController + timer per call via `pushSwitchEvent`) also fires inside
+// the same overloaded window and aborts again, yielding
+// `per_service[ingest] push_failed: "This operation was aborted"` even
+// though ingest's internal `active-target prepare drain timed out` log
+// shows it uses `timeout_ms: 30000`. Aligning the api budget with ingest's
+// drain budget eliminates the spurious abort. The happy path still
+// resolves in <1s; only the bottlenecked path gets the headroom.
+const SWITCH_PUSH_TIMEOUT_DEFAULT_MS = 30_000;
 const DEFAULT_KNOWN_SERVICES = "ingest,source,loadgen";
 const DEFAULT_INTERNAL_API_TOKEN = "dev-internal-token";
 const DEFAULT_SERVICE_HOST = "127.0.0.1";
@@ -830,9 +835,15 @@ function warnPushFailed(
 // Wave 6.56.D3 — on an AbortError (the per-push fetch timer fired before
 // the service replied), retry the push exactly once. The retry is
 // idempotent because each service's prepare/commit handler is keyed on
-// `switch_id` and is already retry-safe. This catches the rare slow-path
-// where ingest's commit (`shardRuntime.rebuild()` + D1 retry schedule)
-// outruns even the raised 5s budget.
+// `switch_id` and is already retry-safe.
+//
+// Wave 6.56.D3.re-fix — every call to `pushSwitchEvent` constructs its own
+// AbortController and `setTimeout(controller.abort, SWITCH_PUSH_TIMEOUT_MS)`
+// internally, so the retry below gets a FULL fresh `SWITCH_PUSH_TIMEOUT_MS`
+// budget independent of the initial attempt. Combined with the 30s timeout
+// default this catches the slow-path where ingest's commit
+// (`shardRuntime.rebuild()` + D1 retry schedule 250+500+1000ms) runs longer
+// than a single push budget under rapid back-to-back switches.
 async function fanOutSwitchPush(
   services: KnownService[],
   ackPhase: "drained" | "committed",
