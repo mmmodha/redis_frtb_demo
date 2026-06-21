@@ -292,7 +292,34 @@ async function main(): Promise<void> {
     scheduleBootstrap(target, getActiveRedisClient(), schema);
   }
 
-  await app.listen({ port: PORT, host: HOST });
+  try {
+    await app.listen({ port: PORT, host: HOST });
+  } catch (err) {
+    // Wave 6.56 — when the bind fails because something is already on the
+    // port, log the owning pid + command so the operator can identify the
+    // orphan in one log line (companion to scripts/run-local.sh
+    // `kill_api_orphans`, which prevents the orphan in the first place).
+    // Best-effort: lsof failures fall through to the rethrow below.
+    if (err && typeof err === "object" && (err as { code?: string }).code === "EADDRINUSE") {
+      try {
+        const { execFileSync } = await import("node:child_process");
+        const owner = execFileSync(
+          "lsof",
+          ["-nP", `-iTCP:${PORT}`, "-sTCP:LISTEN"],
+          { encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "ignore"] },
+        ).trim();
+        console.error(JSON.stringify({
+          service: "api",
+          status: "eaddrinuse",
+          port: PORT,
+          owner,
+        }));
+      } catch {
+        // lsof unavailable / failed — fall through to the rethrow below.
+      }
+    }
+    throw err;
+  }
   console.log(JSON.stringify({ service: "api", status: "ready", port: PORT, target: target.label }));
 
   // Wave 6.39.C-fix — wire Layer 4 background jobs (drift detector,

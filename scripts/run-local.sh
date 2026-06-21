@@ -950,6 +950,88 @@ cmd_stop_one() {
   return 1
 }
 
+# Wave 6.56 — best-effort read of one env var from a pid's environment
+# block, portable across macOS (ps eww) and Linux (/proc/<pid>/environ).
+# Returns empty when the var is unset or the platform offers no readable
+# environ surface. Used by kill_api_orphans for diagnostic logging only;
+# must never block the restart path.
+read_pid_env() {
+  local pid="$1" var="$2" line=''
+  if [[ -r "/proc/${pid}/environ" ]]; then
+    line="$(tr '\0' '\n' < "/proc/${pid}/environ" 2>/dev/null \
+      | grep "^${var}=" | head -n1)"
+    line="${line#${var}=}"
+  elif command -v ps >/dev/null 2>&1; then
+    line="$(ps eww -p "${pid}" 2>/dev/null | tail -n +2 \
+      | tr ' ' '\n' | grep "^${var}=" | head -n1)"
+    line="${line#${var}=}"
+  fi
+  printf '%s' "${line}"
+}
+
+# Wave 6.56 — broad orphan kill for the api service. The existing
+# stop_service path only kills the pid recorded in `.run/pids/api.pid` and
+# the foreign listener bound to PORTS[api]; it does NOT catch orphan api
+# processes that survived a previous restart with stale REDIS_URL env (the
+# lip-veil-spring NXDOMAIN noise observed in Wave 6.56.F).
+# Pattern catches both the tsx source-mode entrypoint and the @frtb/api
+# npm wrapper bash. SIGTERM first; escalate to SIGKILL only with --force,
+# matching the spec's no-SIGKILL operational rule.
+kill_api_orphans() {
+  command -v pgrep >/dev/null 2>&1 || return 0
+  local pidf; pidf="$(pid_file "api")"
+  local current=''
+  if [[ -f "${pidf}" ]]; then
+    current="$(tr -d '[:space:]' < "${pidf}" 2>/dev/null || echo '')"
+  fi
+  local pattern='services/api/src/index|@frtb/api start'
+  local raw; raw="$(pgrep -f "${pattern}" 2>/dev/null || true)"
+  [[ -z "${raw}" ]] && return 0
+  local orphans=() pid
+  while IFS= read -r pid; do
+    [[ -z "${pid}" ]] && continue
+    [[ "${pid}" == "$$" ]] && continue
+    [[ "${pid}" == "${PPID}" ]] && continue
+    [[ -n "${current}" ]] && [[ "${pid}" == "${current}" ]] && continue
+    orphans+=("${pid}")
+  done <<< "${raw}"
+  [[ ${#orphans[@]} -eq 0 ]] && return 0
+  warn "  api: detected ${#orphans[@]} orphan api process(es); cleaning up"
+  for pid in "${orphans[@]}"; do
+    local stale_url; stale_url="$(read_pid_env "${pid}" REDIS_URL 2>/dev/null || true)"
+    if [[ -n "${stale_url}" ]]; then
+      info "    orphan pid ${pid} (stale REDIS_URL=${stale_url})"
+    else
+      info "    orphan pid ${pid}"
+    fi
+    kill -TERM "${pid}" 2>/dev/null || true
+  done
+  sleep 2
+  local survived=()
+  for pid in "${orphans[@]}"; do
+    if pid_alive "${pid}"; then
+      survived+=("${pid}")
+    fi
+  done
+  if [[ ${#survived[@]} -gt 0 ]]; then
+    if [[ "${OPT_FORCE_KILL}" == "1" ]]; then
+      warn "  api: ${#survived[@]} orphan(s) ignored SIGTERM, --force set → SIGKILL"
+      for pid in "${survived[@]}"; do
+        kill -KILL "${pid}" 2>/dev/null || true
+      done
+      sleep 0.5
+    else
+      warn "  api: ${#survived[@]} orphan(s) survived SIGTERM (pids: ${survived[*]}); re-run with --force to escalate"
+    fi
+  fi
+  local killed=0
+  for pid in "${orphans[@]}"; do
+    pid_alive "${pid}" || killed=$(( killed + 1 ))
+  done
+  ok "  api: killed ${killed} orphan api process(es)"
+  return 0
+}
+
 cmd_restart() {
   # Wave 6.18d/e hardening — single-target restart (`restart <svc>`). Drives
   # the existing single-target stop/start globals so the bulk path is unchanged
@@ -962,10 +1044,16 @@ cmd_restart() {
     STOP_TARGET="${RESTART_TARGET}"
     START_TARGET="${RESTART_TARGET}"
     cmd_stop || true
+    # Wave 6.56 — broad orphan kill for api on the restart path. See
+    # kill_api_orphans for the rationale.
+    if [[ "${RESTART_TARGET}" == "api" ]]; then
+      kill_api_orphans
+    fi
     cmd_start
     return $?
   fi
   cmd_stop || true
+  kill_api_orphans
   cmd_start
 }
 
