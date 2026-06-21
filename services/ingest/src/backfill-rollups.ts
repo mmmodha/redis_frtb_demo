@@ -1,13 +1,21 @@
 #!/usr/bin/env node
-// Wave 6.14c — one-shot rollup backfill. Walks every `sens:*` JSON doc per
-// master node, accumulates the per-(rc, bkt, sens) (and per-tenor) sums in
-// memory, then HSETs the rollup hash keys. Idempotent: HSET overwrites with
-// the same fields, so re-running on the same corpus is a no-op.
+// Wave 6.14c — one-shot rollup backfill. Walks every `sens:*` doc per master
+// node, accumulates the per-(rc, bkt, sens) (and per-tenor) sums in memory,
+// then HSETs the rollup hash keys. Idempotent: HSET overwrites with the same
+// fields, so re-running on the same corpus is a no-op.
 //
 // Accumulating in memory before any write avoids racing with a live
 // consumer — a concurrent HINCRBYFLOAT on a fresh row would double-apply if
 // we HINCRBYFLOAT'd during the SCAN; HSET on the post-scan totals is the
 // authoritative replacement.
+//
+// Storage-format aware (Wave 6.55.H-fix): the default storage flipped from
+// JSON to `hash-sidetable` in Wave 6.38.A, so `sens:<ulid>` is a HASH on
+// fresh deployments and a JSON doc on the legacy `json` / `json-shadow-hash`
+// variants. backfillRollups now TYPE-discriminates per key and reconstructs
+// the in-memory doc shape (`weighted_value` / `weighted_value_per_tenor` /
+// `weighted_cvr_{up,down}{_per_tenor}`) from the flat `ws_<class>_<leg>…`
+// HASH fields written by `flattenDocForHash`.
 
 import { fileURLToPath } from "node:url";
 import { Redis } from "ioredis";
@@ -106,11 +114,99 @@ function bumpCurv(map: Map<string, CurvatureAcc>, key: string, up: number, down:
   map.set(key, a);
 }
 
-// Cluster-aware SCAN + JSON.GET per master, accumulate everything into the
-// in-memory maps, then HSET each rollup hash via the cluster client (the
-// `{rc:bkt}` hash-tag routes every write to the matching shard). Returns a
-// report of scanned/written/error counts; never throws on per-row failures
-// so a single corrupt doc can't abort the whole rebuild.
+// Wave 6.38.A — leg names used in the flat HASH field shape
+// `ws_<class_lower>_<leg>[_<tenor>]`. Mirrors `legsForSensType` in consumer.ts.
+function legsForSensType(sens: string): readonly string[] {
+  if (sens === "Curvature") return ["cvr_up", "cvr_down"];
+  if (sens === "Delta") return ["delta"];
+  if (sens === "Vega") return ["vega"];
+  return [];
+}
+
+// Reconstructs the in-memory doc shape (the one accumulateRollup expects)
+// from the flat `ws_<class>_<leg>[_<tenor>]` fields written by
+// flattenDocForHash. For per-tenor classes (GIRR), the scalar
+// `weighted_value` / `weighted_cvr_*` is intentionally omitted from the HASH
+// to save bytes; here we recompute it as Σ per-tenor — symmetric with
+// enrichDoc, which writes the same Σ to the JSON doc.
+function reconstructDocFromHash(fields: Record<string, string>): Record<string, unknown> {
+  const doc: Record<string, unknown> = { ...fields };
+  const rc = typeof fields.risk_class === "string" ? fields.risk_class : undefined;
+  const sens = typeof fields.sensitivity_type === "string" ? fields.sensitivity_type : undefined;
+  if (!rc || !sens) return doc;
+  const lower = rc.toLowerCase();
+  if (sens === "Curvature") {
+    const upScalar = `ws_${lower}_cvr_up`;
+    const downScalar = `ws_${lower}_cvr_down`;
+    const upPrefix = `${upScalar}_`;
+    const downPrefix = `${downScalar}_`;
+    const upPerTenor: Record<string, number> = {};
+    const downPerTenor: Record<string, number> = {};
+    for (const f of Object.keys(fields)) {
+      if (f === upScalar || f === downScalar) continue;
+      if (f.startsWith(upPrefix)) {
+        const v = Number(fields[f]);
+        if (Number.isFinite(v)) upPerTenor[f.slice(upPrefix.length)] = v;
+      } else if (f.startsWith(downPrefix)) {
+        const v = Number(fields[f]);
+        if (Number.isFinite(v)) downPerTenor[f.slice(downPrefix.length)] = v;
+      }
+    }
+    const upKeys = Object.keys(upPerTenor);
+    const downKeys = Object.keys(downPerTenor);
+    if (upKeys.length > 0 && downKeys.length > 0) {
+      doc.weighted_cvr_up_per_tenor = upPerTenor;
+      doc.weighted_cvr_down_per_tenor = downPerTenor;
+      doc.weighted_cvr_up = upKeys.reduce((a, t) => a + upPerTenor[t]!, 0);
+      doc.weighted_cvr_down = downKeys.reduce((a, t) => a + downPerTenor[t]!, 0);
+    } else {
+      if (fields[upScalar] !== undefined) doc.weighted_cvr_up = Number(fields[upScalar]);
+      if (fields[downScalar] !== undefined) doc.weighted_cvr_down = Number(fields[downScalar]);
+    }
+    return doc;
+  }
+  const leg = legsForSensType(sens)[0];
+  if (!leg) return doc;
+  const scalarField = `ws_${lower}_${leg}`;
+  const tenorPrefix = `${scalarField}_`;
+  const perTenor: Record<string, number> = {};
+  for (const f of Object.keys(fields)) {
+    if (f === scalarField) continue;
+    if (f.startsWith(tenorPrefix)) {
+      const v = Number(fields[f]);
+      if (Number.isFinite(v)) perTenor[f.slice(tenorPrefix.length)] = v;
+    }
+  }
+  const tenorKeys = Object.keys(perTenor);
+  if (tenorKeys.length > 0) {
+    doc.weighted_value_per_tenor = perTenor;
+    doc.weighted_value = tenorKeys.reduce((a, t) => a + perTenor[t]!, 0);
+  } else if (fields[scalarField] !== undefined) {
+    doc.weighted_value = Number(fields[scalarField]);
+  }
+  return doc;
+}
+
+// Parses an HGETALL reply (ioredis returns a flat string[] for raw `call`).
+function hgetallReplyToMap(reply: unknown): Record<string, string> | null {
+  if (!Array.isArray(reply)) return null;
+  const out: Record<string, string> = {};
+  for (let i = 0; i < reply.length; i += 2) {
+    const k = reply[i];
+    const v = reply[i + 1];
+    if (typeof k !== "string" || typeof v !== "string") return null;
+    out[k] = v;
+  }
+  return out;
+}
+
+// Cluster-aware SCAN per master with per-key TYPE discrimination: HASH keys
+// (default `hash-sidetable` / `hash-encoded` storage) go through HGETALL +
+// reconstructDocFromHash; JSON keys (legacy `json` / `json-shadow-hash`) go
+// through JSON.GET + JSON.parse. Accumulate everything in memory, then HSET
+// each rollup hash via the cluster client (the `{rc:bkt}` hash-tag routes
+// every write to the matching shard). Never throws on per-row failures so
+// a single corrupt doc can't abort the whole rebuild.
 export async function backfillRollups(
   client: RedisLike,
   opts?: { match?: string; count?: number },
@@ -139,12 +235,22 @@ export async function backfillRollups(
       for (const k of keys) {
         report.scanned++;
         try {
-          const raw = await node.call("JSON.GET", k);
-          if (typeof raw !== "string") { report.errors++; continue; }
-          let doc: Record<string, unknown>;
-          try { doc = JSON.parse(raw) as Record<string, unknown>; }
-          catch { report.errors++; continue; }
-          accumulateRollup(doc, scalar, curvature);
+          const type = await node.call("TYPE", k);
+          if (type === "hash") {
+            const hReply = await node.call("HGETALL", k);
+            const fields = hgetallReplyToMap(hReply);
+            if (!fields) { report.errors++; continue; }
+            accumulateRollup(reconstructDocFromHash(fields), scalar, curvature);
+          } else if (type === "ReJSON-RL") {
+            const raw = await node.call("JSON.GET", k);
+            if (typeof raw !== "string") { report.errors++; continue; }
+            let doc: Record<string, unknown>;
+            try { doc = JSON.parse(raw) as Record<string, unknown>; }
+            catch { report.errors++; continue; }
+            accumulateRollup(doc, scalar, curvature);
+          } else {
+            report.errors++;
+          }
         } catch {
           report.errors++;
         }

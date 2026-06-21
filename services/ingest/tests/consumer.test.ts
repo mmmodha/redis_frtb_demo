@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as wait } from "node:timers/promises";
+import { createServer as netCreateServer, type AddressInfo } from "node:net";
 import { Redis } from "ioredis";
 import { monotonicFactory } from "ulid";
 import { resolve } from "node:path";
@@ -80,7 +81,25 @@ function spawnRedis(port: number, dir: string): ChildProcess {
   return p;
 }
 
-const PORT = 16410;
+// Wave 6.55.H-fix — OS-allocated ephemeral port (was hardcoded 16410, which
+// collided with services/calc/tests/girr-vega-bucket.test.ts when both files
+// ran in the same parallel vitest worker pool). The port is finalised inside
+// beforeAll before spawnRedis, after a small bind→close handshake that lets
+// the OS pick a free port. Tiny race window (port could be re-claimed before
+// Redis binds) is tolerated — far less collision-prone than fixed ports.
+async function allocateFreePort(): Promise<number> {
+  return await new Promise((resolveFn, rejectFn) => {
+    const srv = netCreateServer();
+    srv.unref();
+    srv.on("error", rejectFn);
+    srv.listen(0, "127.0.0.1", () => {
+      const addr = srv.address() as AddressInfo | null;
+      const port = addr?.port ?? 0;
+      srv.close((err) => (err ? rejectFn(err) : resolveFn(port)));
+    });
+  });
+}
+let PORT = 16410;
 let proc: ChildProcess | undefined;
 let tmp: string;
 let redis: Redis;
@@ -94,6 +113,7 @@ let jsonAvailable = STACK_BUNDLED_PRESENT;
 
 beforeAll(async () => {
   tmp = mkdtempSync(join(tmpdir(), "frtb-ingest-redis-"));
+  try { PORT = await allocateFreePort(); } catch { /* fall back to default */ }
   proc = spawnRedis(PORT, tmp);
   // 60 × 100ms = 6s — redis-stack-server with modules loads slower than vanilla
   // redis-server (Wave 5.73e).

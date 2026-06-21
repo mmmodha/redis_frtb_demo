@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as wait } from "node:timers/promises";
+import { createServer as netCreateServer, type AddressInfo } from "node:net";
 import { Redis } from "ioredis";
 import { loadSchema } from "@frtb/schema";
 import { bootstrapFrtb } from "../src/bootstrap.ts";
@@ -15,7 +16,22 @@ import { bootstrapFrtb } from "../src/bootstrap.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SCHEMA_PATH = resolve(HERE, "..", "..", "..", "config", "schema", "frtb-default.yaml");
-const PORT = 16411;
+// Wave 6.55.H-fix — OS-allocated ephemeral port (was hardcoded 16411, which
+// collided with services/calc/tests/girr-delta-bucket.test.ts in the parallel
+// vitest worker pool).
+async function allocateFreePort(): Promise<number> {
+  return await new Promise((resolveFn, rejectFn) => {
+    const srv = netCreateServer();
+    srv.unref();
+    srv.on("error", rejectFn);
+    srv.listen(0, "127.0.0.1", () => {
+      const addr = srv.address() as AddressInfo | null;
+      const port = addr?.port ?? 0;
+      srv.close((err) => (err ? rejectFn(err) : resolveFn(port)));
+    });
+  });
+}
+let PORT = 16411;
 
 let proc: ChildProcess | undefined;
 let tmp: string;
@@ -61,6 +77,7 @@ async function tryBoot(binary: string, port: number, dir: string): Promise<Child
 
 beforeAll(async () => {
   tmp = mkdtempSync(join(tmpdir(), "frtb-api-bootstrap-"));
+  try { PORT = await allocateFreePort(); } catch { /* fall back to default */ }
   for (const bin of ["redis-stack-server", "redis-server"]) {
     proc = await tryBoot(bin, PORT, tmp);
     if (!proc) continue;

@@ -36,9 +36,11 @@ describe("rqe-index-cli — argument parsing + offline subcommands", () => {
     const code = await runCli(["print"], cap.io);
     expect(code).toBe(0);
     const line = cap.out.join("\n");
-    expect(line).toMatch(/^FT\.CREATE idx:sens ON JSON PREFIX 1 sens: SCHEMA /);
+    // Wave 6.38.A — idx:sens is `ON HASH` with two PREFIXes (`sens:` parent +
+    // `sensh:` json-shadow-hash mirror) and a defence-in-depth FILTER.
+    expect(line).toMatch(/^FT\.CREATE idx:sens ON HASH PREFIX 2 sens: sensh: FILTER exists\(@risk_class\) SCHEMA /);
     for (const tag of ["risk_class", "bucket", "sensitivity_type", "book", "trade_id"]) {
-      expect(line).toMatch(new RegExp(`\\$\\.${tag} AS ${tag} TAG`));
+      expect(line).toMatch(new RegExp(`(^| )${tag} AS ${tag} TAG( |$)`));
     }
   });
 
