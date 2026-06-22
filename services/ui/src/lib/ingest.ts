@@ -155,6 +155,13 @@ export interface BulkIngestRunStatus {
   bulk_loader_base: string;
   rows_per_sec: number;
   error?: string;
+  // Wave 7.0.6.22 — bulk-load backpressure aggregates surfaced on the wire
+  // shape of GET /ingest/bulk/runs/:id. All three are optional so older api
+  // builds still type-check; the IngestPanel uses them as a fallback when
+  // /load/status is temporarily unavailable.
+  throttled?: boolean;
+  retries_total?: number;
+  throttled_at_ms?: number | null;
 }
 
 // Wave 7.0.6.15 — GET /admin/host-info. Surfaces the host CPU count + the
@@ -219,6 +226,13 @@ export interface BulkLoadStatus {
   dispatcher: { in_flight: number; high_water: number } | null;
   body_drain_errors: number;
   workers: BulkLoadStatusWorker[];
+  // Wave 7.0.6.22 — backpressure surface read by the IngestPanel rate-gauge.
+  // All three are optional so older bulk-loader builds (pre-6.22) still
+  // type-check; the panel treats `undefined` as the same graceful-default
+  // values as the load-status fetch helper.
+  throttled?: boolean;
+  headroom_pct?: number | null;
+  recent_429_count?: number;
 }
 
 export async function startBulkIngest(config: BulkIngestConfig): Promise<BulkIngestStartResponse> {

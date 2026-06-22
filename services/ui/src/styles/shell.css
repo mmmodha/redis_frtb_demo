@@ -453,6 +453,11 @@
 }
 .pill--ok { color: #5BD37B; background: rgba(91, 211, 123, 0.12); }
 .pill--err { color: var(--redis-hyper); background: rgba(255, 68, 56, 0.12); }
+/* Wave 7.0.6.21 — amber pill variant used by the IngestPanel RateGauge
+   "recovering" throttle chip. Hex literal mirrors the existing amber tone
+   already used elsewhere in the codebase (.panel-callout--amber,
+   .bucket-chart__bar-fill[data-tone="amber"]) so no new color is introduced. */
+.pill--warn { color: #f0b429; background: rgba(240, 180, 41, 0.12); }
 
 .dialog-backdrop {
   position: fixed; inset: 0;

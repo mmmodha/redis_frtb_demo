@@ -201,6 +201,23 @@
   border-radius: 3px;
 }
 
+/* Wave 7.0.6.21 — RateGauge surface used by the bulk-ingest middle lane.
+   Lives in the same .phase-progress row so the three-row stack reads as a
+   single rhythm; the headline + capacity bar tones reuse the existing
+   palette literals (red / amber / green) already used by the calc + bucket
+   chart surfaces, so no new color tokens are introduced. */
+.rate-gauge__headline {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-size: 1rem;
+  color: var(--redis-text-primary);
+  letter-spacing: 0.02em;
+}
+.rate-gauge__capacity-fill[data-tone="ok"]   { background: #5BD37B; }
+.rate-gauge__capacity-fill[data-tone="warn"] { background: #f0b429; }
+.rate-gauge__capacity-fill[data-tone="err"]  { background: var(--redis-hyper, #ff4438); }
+.rate-gauge__chip { margin-left: auto; }
+
 /* Wave 5.20a — collapsible advanced options. Toggle button mirrors the
    shared .btn--secondary tone; the body is hidden by default. */
 .generator-form__advanced {

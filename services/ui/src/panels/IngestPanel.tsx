@@ -3,6 +3,11 @@ import { EnterpriseCallout } from "../components/EnterpriseCallout";
 import { MetricTile } from "../components/MetricTile";
 import { PanelCard } from "../components/PanelCard";
 import { PhaseProgress } from "../components/PhaseProgress";
+import { RateGauge } from "./RateGauge";
+import {
+  pushPhaseRateSample,
+  meanPhaseRate,
+} from "../lib/rate-smoothing";
 import {
   useGeneratorRun,
   type GeneratorRunState,
@@ -212,23 +217,16 @@ export function readStreamOverride(): boolean {
   }
 }
 
-// Wave 7.0.6.18 — fixed-window rolling-buffer helpers used to smooth the
-// bulk-run rps counters (5-sample mean). Exported for unit tests; the
-// IngestPanel polling tick is the only production caller.
-export const PHASE_RATE_WINDOW = 5;
-export function pushPhaseRateSample(buf: number[], next: number): number[] {
-  if (!Number.isFinite(next) || next < 0) return buf;
-  const out = buf.length >= PHASE_RATE_WINDOW
-    ? [...buf.slice(buf.length - PHASE_RATE_WINDOW + 1), next]
-    : [...buf, next];
-  return out;
-}
-export function meanPhaseRate(buf: number[]): number {
-  if (buf.length === 0) return 0;
-  let sum = 0;
-  for (const v of buf) sum += v;
-  return sum / buf.length;
-}
+// Wave 7.0.6.18 / 7.0.6.21 — fixed-window rolling-buffer helpers used to
+// smooth the bulk-run rps counters (5-sample mean). Implementation now
+// lives in ../lib/rate-smoothing.ts so the RateGauge and PhaseProgress
+// surfaces share one source of truth; re-exported here for backward compat
+// with the existing tests + callers that import from this module.
+export {
+  PHASE_RATE_WINDOW,
+  pushPhaseRateSample,
+  meanPhaseRate,
+} from "../lib/rate-smoothing";
 
 interface ChartSample { t: number; v: number }
 
@@ -1098,6 +1096,7 @@ export function IngestPanel() {
         streamOverride={streamOverride}
         smoothedGenRps={smoothedGenRps}
         smoothedIngestRps={smoothedIngestRps}
+        indexCount={indexCount}
         workers={workers}
         onWorkersChange={setWorkers}
         hostInfo={hostInfo}
@@ -1314,6 +1313,10 @@ function RunPresetCard(props: {
   // computed on the existing 1s polling tick rather than per-render here.
   smoothedGenRps: number;
   smoothedIngestRps: number;
+  // Wave 7.0.6.21 — live FT.SEARCH * doc count against the active sens
+  // index. Already polled by the IngestPanel telemetry tick; threaded down
+  // here so the bulk-ingest Indexing lane can render without a second poll.
+  indexCount: number;
   // Wave 7.0.6.15 — worker_threads fan-out controls. `workers` is the
   // current slider value; `hostInfo` is the cached /admin/host-info response
   // used to cap the slider at recommended_max_workers and to render the
@@ -1322,7 +1325,7 @@ function RunPresetCard(props: {
   onWorkersChange: (n: number) => void;
   hostInfo: HostInfo | null;
 }) {
-  const { presetKey, onSelect, onStart, startDisabled, inflight, runStatus, step, error, trackedRun, onCancelRun, ingestMode, onModeChange, bulkRun, bulkLoad, onCancelBulkRun, streamOverride, smoothedGenRps, smoothedIngestRps, workers, onWorkersChange, hostInfo } = props;
+  const { presetKey, onSelect, onStart, startDisabled, inflight, runStatus, step, error, trackedRun, onCancelRun, ingestMode, onModeChange, bulkRun, bulkLoad, onCancelBulkRun, streamOverride, smoothedGenRps, smoothedIngestRps, indexCount, workers, onWorkersChange, hostInfo } = props;
   // Wave 7.0.6.15 — cap the slider at the host's recommended_max_workers
   // when /admin/host-info is available; failsafe to 8 when the call errored
   // (hostInfo === null) so the operator can still bump above 1.
@@ -1467,6 +1470,10 @@ function RunPresetCard(props: {
           onCancel={onCancelBulkRun}
           smoothedGenRps={smoothedGenRps}
           smoothedIngestRps={smoothedIngestRps}
+          indexCount={indexCount}
+          throttled={(bulkLoad?.throttled ?? bulkRun!.throttled ?? false) === true}
+          headroomPct={typeof bulkLoad?.headroom_pct === "number" ? bulkLoad.headroom_pct : 1}
+          recent429Count={bulkLoad?.recent_429_count ?? 0}
         />
       ) : null}
       <IndexingProgress />
@@ -1485,18 +1492,39 @@ function RunPresetCard(props: {
 // polling tick (5-sample mean) and threaded through props; status text
 // (running / done / error) is appended to the meta line, and a single
 // Cancel button sits on the Generation bar.
+// Wave 7.0.6.21 — three-lane layout: Generation (progress %) → Ingest
+// (RateGauge, no denominator) → Indexing (progress %, denominator =
+// generated count, not the original requested total — indexing trails
+// generation, never the original target). The middle lane is a rate gauge
+// rather than a progress bar because the bulk-loader has no exact "rows it
+// will eventually have flushed" denominator at request time, which is what
+// produced the historical >100% Ingest bar.
 function BulkIngestProgress(props: {
   run: BulkIngestRunStatus;
   load: BulkLoadStatus | null;
   onCancel: () => void;
   smoothedGenRps: number;
   smoothedIngestRps: number;
+  // Indexing-lane inputs. `indexCount` is the live FT.SEARCH * doc count
+  // against the active sens-index (already polled by the IngestPanel
+  // telemetry tick via getIndexCount); the lane only renders once the
+  // generator has produced rows so the denominator is non-zero.
+  indexCount: number;
+  // Backpressure inputs for the RateGauge throttle chip. Sourced primarily
+  // from /load/status; we fall back to the BulkRunRecord aggregates from
+  // /ingest/bulk/runs/:id when /load/status is unavailable so the chip
+  // still flips on 429 storms during a partial outage.
+  throttled: boolean;
+  headroomPct: number;
+  recent429Count: number;
 }) {
-  const { run, load, onCancel, smoothedGenRps, smoothedIngestRps } = props;
+  const { run, load, onCancel, smoothedGenRps, smoothedIngestRps, indexCount, throttled, headroomPct, recent429Count } = props;
   const total = run.rows_total;
   const sent = run.rows_sent;
-  const flushed = (load?.workers ?? []).reduce((acc, w) => acc + (w.flushed ?? 0), 0);
   const cancellable = run.status === "running";
+  const dispatcher = load?.dispatcher ?? null;
+  const inFlight = dispatcher?.in_flight ?? 0;
+  const highWater = dispatcher?.high_water ?? 0;
   return (
     <div className="bulk-progress" data-testid="bulk-progress">
       <PhaseProgress
@@ -1509,13 +1537,25 @@ function BulkIngestProgress(props: {
         onCancel={cancellable ? onCancel : undefined}
         testIdPrefix="phase-progress-generation"
       />
-      <PhaseProgress
+      <RateGauge
         label="Ingest (bulk-loader → redis)"
-        done={flushed}
-        total={total}
-        ratePerSec={smoothedIngestRps}
+        rps={smoothedIngestRps}
+        smoothedRps={smoothedIngestRps}
+        inFlight={inFlight}
+        high_water={highWater}
+        throttled={throttled}
+        headroomPct={headroomPct}
+        recent429Count={recent429Count}
+        testId="rate-gauge-ingest"
+      />
+      <PhaseProgress
+        label="Indexing (redis → ft.search)"
+        done={Math.min(indexCount, sent)}
+        total={sent}
+        ratePerSec={0}
         status={run.status}
-        testIdPrefix="phase-progress-ingest"
+        testIdPrefix="phase-progress-indexing"
+        unit="indexed"
       />
     </div>
   );
