@@ -9,6 +9,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { createServer } from "../src/server.ts";
 import { createWorkerPool, type WorkerPool } from "../src/pool.ts";
 import { createDispatcher, type DispatcherHandle, type Row } from "../src/dispatcher.ts";
+import { createBulkLoaderState, type BulkLoaderState } from "../src/swap-target.ts";
 import { FakeClient } from "./helpers/fake-client.ts";
 import { FakeWriteClient } from "./helpers/fake-write-client.ts";
 import type { FastifyInstance } from "fastify";
@@ -487,6 +488,144 @@ describe("/load/rows — Wave 7.0.5.A body-drain error counter", () => {
       expect(events.length).toBe(1);
       expect(events[0]?.level).toBe("warn");
       expect((events[0]?.obj as { evt?: string }).evt).toBe("bulk-load-body-parse-error");
+    } finally {
+      await localApp.close(); await dispatcher.stop(); await localPool.stop();
+    }
+  });
+});
+
+describe("Wave 7.0.6.17 — target_stale fail-loud + new /load/status fields", () => {
+  async function buildWithState(staleInit?: { reason: string }): Promise<{
+    app: FastifyInstance; pool: WorkerPool; dispatcher: DispatcherHandle; state: BulkLoaderState;
+  }> {
+    const writeClients = [new FakeWriteClient(), new FakeWriteClient()];
+    const fakePool: FakeClient[] = [];
+    const localPool = createWorkerPool({
+      size: 2,
+      redisFactory: () => { const c = new FakeClient(); fakePool.push(c); return c; },
+      heartbeatMs: 60_000, logger: { info: () => { } },
+    });
+    fakePool[0]!.becomeReady();
+    fakePool[1]!.becomeReady();
+    const dispatcher = createDispatcher({
+      workerClients: writeClients, batchSize: 1, idleFlushMs: 0, highWater: 64,
+    });
+    const state = createBulkLoaderState({
+      pool: localPool, dispatcher, checkpointer: null,
+      bootstrapCheckpoints: new Map(),
+      boundTarget: { host: "127.0.0.1", port: 12000, label: "localcluster" },
+      boundVersion: 3, targetWatcher: "enabled",
+    });
+    if (staleInit) {
+      state.targetStale = true;
+      state.targetStaleReason = staleInit.reason;
+    }
+    const localApp = await createServer({ state });
+    await localApp.ready();
+    return { app: localApp, pool: localPool, dispatcher, state };
+  }
+  function makeRow(id: string): Row {
+    return { id, risk_class: "GIRR", bucket: "USD", sensitivity_type: "Delta", risk_value: { "3M": 0.1 } };
+  }
+
+  it("/load/status surfaces bound_target, target_stale, target_watcher, target_swap_count", async () => {
+    const { app: a, pool: p, dispatcher: d } = await buildWithState();
+    try {
+      const res = await a.inject({ method: "GET", url: "/load/status" });
+      expect(res.statusCode).toBe(200);
+      const body = res.json() as {
+        bound_target: { host: string; port: number; label: string };
+        target_stale: boolean; target_stale_reason: string | null;
+        api_active_target: unknown; target_swap_count: number;
+        last_swap_error: string | null; target_watcher: string;
+        accepting: boolean; oom_rejected_total: number;
+        workers: Array<{ oom_rejected: number | null }>;
+      };
+      expect(body.bound_target).toEqual({ host: "127.0.0.1", port: 12000, label: "localcluster" });
+      expect(body.target_stale).toBe(false);
+      expect(body.target_stale_reason).toBeNull();
+      expect(body.api_active_target).toBeNull();
+      expect(body.target_swap_count).toBe(0);
+      expect(body.last_swap_error).toBeNull();
+      expect(body.target_watcher).toBe("enabled");
+      expect(body.accepting).toBe(true);
+      expect(body.oom_rejected_total).toBe(0);
+      expect(body.workers.every((w) => w.oom_rejected === 0)).toBe(true);
+    } finally {
+      await a.close(); await d.stop(); await p.stop();
+    }
+  });
+
+  it("/load/rows returns 503 with the stale-target reason when target_stale=true", async () => {
+    const reason = "stale target: bulk-loader bound to localcluster but api active-target is cloud";
+    const { app: a, pool: p, dispatcher: d } = await buildWithState({ reason });
+    try {
+      const res = await a.inject({
+        method: "POST", url: "/load/rows",
+        headers: { "content-type": "application/json" },
+        payload: JSON.stringify([makeRow("u1")]),
+      });
+      expect(res.statusCode).toBe(503);
+      const body = res.json() as { accepted: number; reason: string };
+      expect(body.accepted).toBe(0);
+      expect(body.reason).toBe(reason);
+    } finally {
+      await a.close(); await d.stop(); await p.stop();
+    }
+  });
+
+  it("/healthz returns 503 + status=degraded with target_stale=true when bound target diverged", async () => {
+    const reason = "stale target: bulk-loader bound to localcluster but api active-target is cloud";
+    const { app: a, pool: p, dispatcher: d } = await buildWithState({ reason });
+    try {
+      const res = await a.inject({ method: "GET", url: "/healthz" });
+      expect(res.statusCode).toBe(503);
+      const body = res.json() as { status: string; target_stale: boolean; reason: string };
+      expect(body.status).toBe("degraded");
+      expect(body.target_stale).toBe(true);
+      expect(body.reason).toBe(reason);
+    } finally {
+      await a.close(); await d.stop(); await p.stop();
+    }
+  });
+
+  it("oom_rejected_total sums per-worker oom_rejected when the dispatcher is wired", async () => {
+    const writeClients = [new FakeWriteClient(), new FakeWriteClient()];
+    const OOM_MSG = "OOM command not allowed when used memory > 'maxmemory'.";
+    writeClients[0]!.nextReplies = [[new Error(OOM_MSG), null]];
+    writeClients[1]!.nextReplies = [[new Error(OOM_MSG), null]];
+    const fakePool: FakeClient[] = [];
+    const localPool = createWorkerPool({
+      size: 2,
+      redisFactory: () => { const c = new FakeClient(); fakePool.push(c); return c; },
+      heartbeatMs: 60_000, logger: { info: () => { } },
+    });
+    fakePool[0]!.becomeReady();
+    fakePool[1]!.becomeReady();
+    const dispatcher = createDispatcher({
+      workerClients: writeClients, batchSize: 1, idleFlushMs: 0, highWater: 64, maxRetries: 1,
+    });
+    const state = createBulkLoaderState({
+      pool: localPool, dispatcher, checkpointer: null,
+      bootstrapCheckpoints: new Map(),
+      boundTarget: { host: "127.0.0.1", port: 12000, label: "localcluster" },
+      targetWatcher: "enabled",
+    });
+    const localApp = await createServer({ state });
+    await localApp.ready();
+    try {
+      await dispatcher.enqueue(makeRow("u1"));
+      await dispatcher.enqueue(makeRow("u2"));
+      await dispatcher.drain();
+      const res = await localApp.inject({ method: "GET", url: "/load/status" });
+      const body = res.json() as {
+        oom_rejected_total: number;
+        workers: Array<{ id: number; oom_rejected: number | null; errors: number | null }>;
+      };
+      expect(body.oom_rejected_total).toBe(2);
+      expect(body.workers[0]?.oom_rejected).toBe(1);
+      expect(body.workers[1]?.oom_rejected).toBe(1);
+      expect(body.workers[0]?.errors).toBe(1);
     } finally {
       await localApp.close(); await dispatcher.stop(); await localPool.stop();
     }

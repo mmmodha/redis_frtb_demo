@@ -64,6 +64,11 @@ export interface WorkerMetrics {
   // row id (ULID). Lex-monotonic; persisted by the checkpointer so resumed
   // generators can skip rows whose `_id <= lastUlid`.
   lastUlid: string | null;
+  // Wave 7.0.6.17 — additive OOM counter. Increments alongside `errors`
+  // whenever the pipeline reply matches the Redis OOM string so operators
+  // can tell a memory-cap symptom apart from generic write failures without
+  // grepping logs. NEVER mutated independently of `errors`.
+  oomRejected: number;
 }
 
 export interface WorkerOptions {
@@ -86,6 +91,9 @@ export interface WorkerOptions {
   // missing from the map (or with empty tenor lists) emit byte-identical
   // HSET argv to the unpadded path — scalar legs (EQUITY/FX) stay untouched.
   tenorsByClass?: ReadonlyMap<string, readonly string[]>;
+  // Wave 7.0.6.17 — OOM warn rate-limiter window in milliseconds. Defaults
+  // to 1000ms; tests can shrink this to keep the suite fast.
+  oomLogWindowMs?: number;
 }
 
 export interface WorkerHandle {
@@ -121,6 +129,25 @@ export function isPermanentError(err: Error): boolean {
   const m = err.message || "";
   return /^WRONGTYPE/.test(m) || /syntax error/i.test(m) || /Protocol error/i.test(m);
 }
+
+// Wave 7.0.6.17 — Redis returns this EXACT string when `maxmemory` is reached
+// and the eviction policy can't free enough memory for the next write. Match
+// stops at the optional trailing period so both pre- and post-7.0 Redis
+// builds (which differ on whether the period is appended) trip the same
+// branch. Treated as a TRANSIENT error so the row stays on the existing
+// retry → dead-letter ladder; the OOM counter is additive on top.
+const OOM_REPLY_PATTERN = /^OOM command not allowed when used memory > 'maxmemory'\.?$/;
+export function isOomError(err: Error): boolean {
+  return OOM_REPLY_PATTERN.test(err.message || "");
+}
+
+// Wave 7.0.6.17 — per-worker OOM warn rate-limiter window. The first OOM in
+// a fresh window logs full row + err detail; subsequent OOMs inside the
+// window are silently counted and folded into a single summary line emitted
+// when the next OOM arrives after the window closes (or by flushOomWindow
+// on worker stop). 1s window matches the spec; configurable via the worker
+// options so tests can shrink it to keep runs fast.
+const DEFAULT_OOM_LOG_WINDOW_MS = 1_000;
 
 // Flattens a slim row into the HSET field-value argv. NUMERIC fields follow
 // `s_<class>_<leg>[_<tenor>]` per the Wave 7.0.0.B lazy-math contract:
@@ -253,6 +280,7 @@ export function createWorker(opts: WorkerOptions): WorkerHandle {
   const now = opts.now ?? Date.now;
   const log = opts.logger;
   const tenorsByClass = opts.tenorsByClass;
+  const oomLogWindowMs = opts.oomLogWindowMs ?? DEFAULT_OOM_LOG_WINDOW_MS;
 
   if (!Number.isInteger(batchSize) || batchSize < 1) {
     throw new Error(`createWorker(${id}): batchSize must be a positive integer`);
@@ -272,11 +300,45 @@ export function createWorker(opts: WorkerOptions): WorkerHandle {
     lastFlushLatencyMs: null,
     lastFlushAt: null,
     lastUlid: null,
+    oomRejected: 0,
   };
 
   let stopped = false;
   let flushPromise: Promise<void> | null = null;
   let idleTimer: NodeJS.Timeout | null = null;
+
+  // Wave 7.0.6.17 — OOM warn rate-limiter state. Held per-worker so each
+  // worker's burst is summarised independently and a quiet worker still
+  // gets a full first-occurrence warn even if a noisy peer is mid-window.
+  let oomWindowStart = 0;
+  let oomWindowCount = 0;
+
+  function flushOomWindow(): void {
+    if (oomWindowCount <= 0) return;
+    log?.warn?.(
+      { worker_id: id, count: oomWindowCount, window_ms: oomLogWindowMs },
+      "OOM rejected (sustained)",
+    );
+    oomWindowCount = 0;
+    oomWindowStart = 0;
+  }
+
+  function recordOomLog(row: Row, err: Error): void {
+    const ts = now();
+    if (oomWindowStart === 0 || ts - oomWindowStart >= oomLogWindowMs) {
+      // Window closed (or first OOM ever) — flush the previous window's
+      // summary, then log the new first occurrence in full detail.
+      flushOomWindow();
+      oomWindowStart = ts;
+      oomWindowCount = 1;
+      log?.warn?.(
+        { worker_id: id, key: `sens:${row.id}`, err: err.message },
+        "OOM rejected",
+      );
+      return;
+    }
+    oomWindowCount++;
+  }
 
   function clearIdle(): void {
     if (idleTimer != null) {
@@ -403,6 +465,14 @@ export function createWorker(opts: WorkerOptions): WorkerHandle {
         continue;
       }
       metrics.errors++;
+      // Wave 7.0.6.17 — additive OOM counter + rate-limited warn. The row
+      // still flows through the existing transient retry → dead-letter
+      // ladder so a momentary memory-cap spike can self-heal between
+      // attempts; the counter just makes the symptom self-diagnostic.
+      if (isOomError(err)) {
+        metrics.oomRejected++;
+        recordOomLog(entry.row, err);
+      }
       if (isPermanentError(err)) {
         await deadLetter(entry.row, err);
         onSettle?.(1);
@@ -451,6 +521,9 @@ export function createWorker(opts: WorkerOptions): WorkerHandle {
     stopped = true;
     await drain();
     clearIdle();
+    // Wave 7.0.6.17 — emit the trailing OOM window summary so an operator
+    // tearing down the worker mid-burst still sees the final count.
+    flushOomWindow();
   }
 
   return {

@@ -447,6 +447,12 @@ export function registerAdminRoutes(
   // the bulk-loader pool size (env-driven knob) and the active Redis target's
   // master-shard count when it's a cluster. Shards is `null` on standalone
   // or when no active target is set so the UI can render "N/A".
+  //
+  // Wave 7.0.6.17 — additive bulk_loader_* fields surface the bulk-loader's
+  // bound target, target_stale flag, and target_watcher state by polling
+  // the bulk-loader's /load/status. Bounded by a 200ms timeout so a
+  // partially-booted bulk-loader cannot stall the UI's host-info refresh;
+  // all four bulk_loader_* fields collapse to `null` on timeout / 5xx.
   app.get("/admin/host-info", { config: { category: "light" } }, async (req) => {
     const cores = Math.max(1, availableParallelism());
     const recommended_max_workers = Math.max(1, cores - 2);
@@ -467,6 +473,11 @@ export function registerAdminRoutes(
         // builds) — both map to "no shards reported".
       }
     }
+
+    // Wave 7.0.6.17 — poll bulk-loader /load/status. Defaults to localhost
+    // :8086 so dev (run-local.sh) "just works"; env-overridable for
+    // production where the bulk-loader runs on a different host.
+    const blStatus = await fetchBulkLoaderStatus();
     return {
       cores,
       recommended_max_workers,
@@ -474,6 +485,47 @@ export function registerAdminRoutes(
       bulk_loader_pool_size,
       shards,
       target_label: target_label || null,
+      // Wave 7.0.6.17 — additive UI-banner fields. All null when the
+      // bulk-loader is unreachable or its /load/status response is
+      // missing fields (legacy bulk-loader builds).
+      bulk_loader_bound_target: blStatus?.bound_target ?? null,
+      bulk_loader_target_stale: blStatus?.target_stale ?? null,
+      bulk_loader_target_watcher: blStatus?.target_watcher ?? null,
     };
   });
+}
+
+// Wave 7.0.6.17 — best-effort bulk-loader /load/status poll bounded by a
+// 200ms timeout. Returns null on any failure so the host-info caller can
+// surface `bulk_loader_* = null`. Exported for tests.
+const BULK_LOADER_STATUS_TIMEOUT_MS = 200;
+export interface BulkLoaderStatusFields {
+  bound_target: { host: string; port: number; label: string } | null;
+  target_stale: boolean | null;
+  target_watcher: "enabled" | "disabled" | null;
+}
+
+async function fetchBulkLoaderStatus(): Promise<BulkLoaderStatusFields | null> {
+  const base = process.env.BULK_LOADER_URL
+    ?? `http://localhost:${process.env.BULK_LOADER_PORT ?? 8086}`;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), BULK_LOADER_STATUS_TIMEOUT_MS);
+  if (typeof timer.unref === "function") timer.unref();
+  try {
+    const r = await fetch(`${base}/load/status`, { signal: ctrl.signal });
+    if (!r.ok) return null;
+    const body = (await r.json()) as Record<string, unknown>;
+    const bound = body.bound_target as { host?: unknown; port?: unknown; label?: unknown } | undefined;
+    const bound_target = bound && typeof bound.host === "string" && typeof bound.port === "number"
+      ? { host: bound.host, port: bound.port, label: String(bound.label ?? "") }
+      : null;
+    const target_stale = typeof body.target_stale === "boolean" ? body.target_stale : null;
+    const tw = body.target_watcher;
+    const target_watcher = tw === "enabled" || tw === "disabled" ? tw : null;
+    return { bound_target, target_stale, target_watcher };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
 }

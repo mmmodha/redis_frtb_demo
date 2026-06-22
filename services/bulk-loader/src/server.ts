@@ -21,9 +21,15 @@ import Fastify, { type FastifyInstance } from "fastify";
 import type { WorkerPool } from "./pool.ts";
 import type { DispatcherHandle, Row } from "./dispatcher.ts";
 import type { CheckpointRecord } from "./checkpoint.ts";
+import { createBulkLoaderState, type BulkLoaderState } from "./swap-target.ts";
 
 export interface CreateServerOpts {
-  pool: WorkerPool;
+  // Wave 7.0.6.17 — preferred: pass a `state` holder so the active-target
+  // watcher can atomically swap the pool/dispatcher/checkpointer references
+  // under the live HTTP listener. Legacy callers (existing tests) may still
+  // pass `pool` + `dispatcher` directly; a default state is constructed.
+  state?: BulkLoaderState;
+  pool?: WorkerPool;
   dispatcher?: DispatcherHandle;
   logger?: boolean;
   // Wave 7.0.1.C — initial accepting state. Defaults to true so a freshly
@@ -42,6 +48,23 @@ export interface CreateServerOpts {
 }
 
 export async function createServer(opts: CreateServerOpts): Promise<FastifyInstance> {
+  // Wave 7.0.6.17 — every request reads pool / dispatcher / bootstrap
+  // checkpoints THROUGH `state`. swapTarget mutates these fields in place,
+  // so a /load/rows that arrives mid-swap sees the new pool the moment the
+  // swap completes, and an accepting=false flipped at the top of swapTarget
+  // surfaces immediately as a 503.
+  const state: BulkLoaderState = opts.state ?? createBulkLoaderState({
+    pool: opts.pool ?? throwMissingPool(),
+    dispatcher: opts.dispatcher ?? null,
+    checkpointer: null,
+    bootstrapCheckpoints: opts.bootstrapCheckpoints ?? new Map<number, CheckpointRecord>(),
+    // No identity available to legacy callers; surface zero-values so
+    // /load/status still parses but the UI banner just shows blanks.
+    boundTarget: { host: "", port: 0, label: "" },
+    boundVersion: null,
+    targetWatcher: "disabled",
+    accepting: opts.accepting,
+  });
   const app = Fastify({ logger: opts.logger ?? false });
   // Wave 7.0.1.C — NDJSON content-type parser. We keep the raw string and
   // split on newlines below so single-line JSON-arrays sent with the wrong
@@ -52,16 +75,30 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
     (_req, body, done) => done(null, body),
   );
 
-  let accepting = opts.accepting !== false;
   // Wave 7.0.5.A — observable counter of /load/rows body-parse failures.
   // Surfaced via /load/status so operators can detect malformed-producer
   // traffic that the old code path discarded into a 400 with no signal.
   let bodyDrainErrors = 0;
-  const bootstrapCheckpoints = opts.bootstrapCheckpoints ?? new Map<number, CheckpointRecord>();
 
   app.get("/healthz", async (_req, reply) => {
-    const s = opts.pool.status();
-    const healthy = opts.pool.isHealthy();
+    const s = state.pool.status();
+    const healthy = state.pool.isHealthy();
+    // Wave 7.0.6.17 — fail-loud on stale target. /healthz must reflect the
+    // stale state so run-local.sh status, k8s liveness probes, and any other
+    // health-aware harness sees the degraded verdict instead of green-while-
+    // bound-to-wrong-DB. Reason is included verbatim so the operator sees
+    // exactly why writes are rejected.
+    if (state.targetStale) {
+      reply.code(503);
+      return {
+        service: "bulk-loader",
+        status: "degraded",
+        connected: s.connected,
+        pool_size: s.poolSize,
+        target_stale: true,
+        reason: state.targetStaleReason ?? "stale target",
+      };
+    }
     reply.code(healthy ? 200 : 503);
     return {
       service: "bulk-loader",
@@ -72,17 +109,20 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
   });
 
   app.get("/load/status", async () => {
-    const s = opts.pool.status();
+    const s = state.pool.status();
     // Wave 7.0.1.B — merge per-worker write metrics onto each pool worker
     // entry so operators see a single combined view. last_flush_at is
     // sourced from the dispatcher (the actual flush timestamp) when present.
-    const d = opts.dispatcher?.status();
+    const d = state.dispatcher?.status();
     const dispatcherMetricsById = new Map<number, ReturnType<DispatcherHandle["status"]>["workers"][number]>();
     if (d) {
       for (const m of d.workers) dispatcherMetricsById.set(m.id, m);
     }
+    let oomTotal = 0;
     const workers = s.workers.map((w) => {
       const m = dispatcherMetricsById.get(w.id);
+      const oom = m?.oomRejected ?? 0;
+      oomTotal += oom;
       return {
         ...w,
         last_flush_at: m?.lastFlushAt ?? w.last_flush_at,
@@ -92,6 +132,10 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
         retries: m?.retries ?? null,
         dead_lettered: m?.deadLettered ?? null,
         last_flush_latency_ms: m?.lastFlushLatencyMs ?? null,
+        // Wave 7.0.6.17 — additive per-worker OOM counter. Null when no
+        // dispatcher is wired so the existing null-for-all-metrics contract
+        // holds; integer (possibly zero) when wired.
+        oom_rejected: m ? oom : null,
       };
     });
     return {
@@ -101,6 +145,19 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
         ? { in_flight: d.inFlight, high_water: d.highWater }
         : null,
       body_drain_errors: bodyDrainErrors,
+      // Wave 7.0.6.17 — target identity + swap observability. UI banner
+      // reads bound_target + api_active_target to render divergence; ops
+      // tools read target_swap_count + last_swap_error to confirm a
+      // operator-triggered switch landed.
+      bound_target: { ...state.boundTarget },
+      target_stale: state.targetStale,
+      target_stale_reason: state.targetStaleReason,
+      api_active_target: state.apiActiveTarget ? { ...state.apiActiveTarget } : null,
+      target_swap_count: state.targetSwapCount,
+      last_swap_error: state.lastSwapError,
+      target_watcher: state.targetWatcher,
+      accepting: state.accepting,
+      oom_rejected_total: oomTotal,
       workers,
     };
   });
@@ -110,11 +167,11 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
   // restarted after a bulk-loader crash sees the persisted state and a
   // generator restarted mid-run sees the freshest in-process state.
   app.get("/load/checkpoints", async () => {
-    const live = opts.dispatcher?.status().workers ?? [];
+    const live = state.dispatcher?.status().workers ?? [];
     const liveById = new Map<number, (typeof live)[number]>();
     for (const m of live) liveById.set(m.id, m);
     const ids = new Set<number>();
-    for (const id of bootstrapCheckpoints.keys()) ids.add(id);
+    for (const id of state.bootstrapCheckpoints.keys()) ids.add(id);
     for (const m of live) ids.add(m.id);
     const sorted = [...ids].sort((a, b) => a - b);
     const out: Array<{
@@ -127,7 +184,7 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
     let resumeUlid: string | null = null;
     for (const id of sorted) {
       const liveM = liveById.get(id);
-      const boot = bootstrapCheckpoints.get(id);
+      const boot = state.bootstrapCheckpoints.get(id);
       // Live state supersedes bootstrap once the worker has flushed even
       // one row in the current process — its lastUlid is by construction
       // >= the persisted value.
@@ -172,29 +229,41 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
     // to true so producers can verify the bulk-loader is ready to ingest
     // before sending /load/rows traffic. The dispatcher is constructed at
     // boot; this endpoint does not (re)create it.
-    accepting = true;
+    state.accepting = true;
     reply.code(202);
-    return { accepted: true, accepting };
+    return { accepted: true, accepting: state.accepting };
   });
 
   app.post("/load/stop", async (_req, reply) => {
     // Wave 7.0.1.C — drain side of the lifecycle. Flips accepting to false
     // so subsequent /load/rows requests get 503. Already-queued rows
     // continue to flush through the dispatcher's worker buffers.
-    accepting = false;
+    state.accepting = false;
     reply.code(202);
-    return { accepted: true, accepting };
+    return { accepted: true, accepting: state.accepting };
   });
 
   app.post("/load/rows", async (req, reply) => {
     // Wave 7.0.1.C — row ingest entry point. The dispatcher is required;
     // an unwired server (no 7.0.1.B dispatcher) cannot accept rows.
-    const d = opts.dispatcher;
+    const d = state.dispatcher;
     if (!d) {
       reply.code(503);
       return { accepted: 0, reason: "no dispatcher wired" };
     }
-    if (!accepting) {
+    // Wave 7.0.6.17 — fail-loud on stale target. Refuse writes whenever
+    // the bulk-loader is bound to a Redis target the api no longer
+    // considers active AND the watcher cannot/has not reconciled. Checked
+    // BEFORE the `accepting` flag so the operator-facing 503 reason names
+    // the divergence instead of the generic "call /load/start".
+    if (state.targetStale) {
+      reply.code(503);
+      return {
+        accepted: 0,
+        reason: state.targetStaleReason ?? "stale target",
+      };
+    }
+    if (!state.accepting) {
       reply.code(503);
       return { accepted: 0, reason: "bulk-loader not accepting (call /load/start)" };
     }
@@ -255,6 +324,10 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
   });
 
   return app;
+}
+
+function throwMissingPool(): never {
+  throw new Error("createServer: opts.pool or opts.state is required");
 }
 
 // Wave 7.0.1.C — body parser shared by /load/rows. Accepts NDJSON (one

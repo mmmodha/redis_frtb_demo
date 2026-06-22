@@ -327,6 +327,74 @@ function usePreflight(): PreflightHandle {
   return { state, runPreflight, rebuild, ensureFresh };
 }
 
+// Wave 7.0.6.17 — bulk-loader target divergence banner.
+//
+// The bulk-loader resolves its Redis target at boot and either follows the
+// api's switches via the active-target watcher (when INTERNAL_API_TOKEN is
+// set) OR fails loud when the api's active target diverges. This banner
+// surfaces both conditions to the operator so they don't accidentally
+// "Start ingest" against the wrong DB.
+//
+// Render rules:
+//   * unknown — hostInfo missing, or either bulk_loader_bound_target/
+//     ingestTargetLabel is null → render nothing. Banner stays hidden.
+//   * stale  — host_info.bulk_loader_target_stale === true → red stale
+//     banner with the bound vs api labels and the restart hint.
+//   * diverged — labels differ but not yet flagged stale → orange "Watcher
+//     should re-bind" banner (if watcher enabled) or red "restart"
+//     instruction (watcher disabled).
+//   * aligned — labels match → render nothing.
+export function isBulkLoaderTargetDivergent(
+  hostInfo: HostInfo | null,
+  ingestTargetLabel: string | null,
+): boolean {
+  if (!hostInfo) return false;
+  const bound = hostInfo.bulk_loader_bound_target;
+  if (!bound || !ingestTargetLabel) return false;
+  if (hostInfo.bulk_loader_target_stale) return true;
+  return bound.label !== ingestTargetLabel;
+}
+
+function BulkLoaderTargetBanner(props: {
+  hostInfo: HostInfo | null;
+  ingestTargetLabel: string | null;
+}) {
+  const { hostInfo, ingestTargetLabel } = props;
+  if (!isBulkLoaderTargetDivergent(hostInfo, ingestTargetLabel)) return null;
+  const bound = hostInfo!.bulk_loader_bound_target!;
+  const stale = hostInfo!.bulk_loader_target_stale === true;
+  const watcherEnabled = hostInfo!.bulk_loader_target_watcher === "enabled";
+  const apiLabel = ingestTargetLabel!;
+  let message: string;
+  if (stale) {
+    message =
+      `Bulk loader is bound to ${bound.label} but the api active-target is ${apiLabel}. ` +
+      "Writes are being rejected (503) to prevent landing rows in the wrong DB. " +
+      "Restart the bulk-loader process or set INTERNAL_API_TOKEN to enable the active-target watcher.";
+  } else if (watcherEnabled) {
+    message =
+      `Bulk loader is bound to ${bound.label}. Switching to ${apiLabel} via the api but writes ` +
+      `will still go to ${bound.label}. Watcher is enabled — should re-bind automatically; if ` +
+      "persists >30s, restart the bulk-loader process manually.";
+  } else {
+    message =
+      `Bulk loader is bound to ${bound.label}. Switching to ${apiLabel} via the api but writes ` +
+      `will still go to ${bound.label}. Restart the bulk-loader process to redirect.`;
+  }
+  return (
+    <div
+      className={`bulk-loader-target-banner${stale ? " bulk-loader-target-banner--stale" : " bulk-loader-target-banner--diverged"}`}
+      role={stale ? "alert" : "status"}
+      data-testid="bulk-loader-target-banner"
+      data-stale={stale ? "true" : "false"}
+      data-watcher={hostInfo!.bulk_loader_target_watcher ?? "unknown"}
+    >
+      <strong>{stale ? "Bulk loader target is stale." : "Bulk loader target diverged."}</strong>{" "}
+      {message}
+    </div>
+  );
+}
+
 function PreflightBanner(props: { state: PreflightState; onRebuild: () => void }) {
   const { state, onRebuild } = props;
   const r = state.result;
@@ -797,7 +865,13 @@ export function IngestPanel() {
   // run reaches a terminal status (so back-to-back clicks don't stack).
   const presetRunInflight = trackedRun?.status === "running" || trackedRun?.status === "cancelling";
   const bulkRunInflight = bulkRun?.status === "running";
-  const presetStartDisabled = presetInflight || presetRunInflight || bulkRunInflight;
+  // Wave 7.0.6.17 — lock Start when the bulk-loader is bound to a target
+  // the api no longer considers active. The banner above explains the
+  // remediation; disabling the button prevents the operator from issuing
+  // /ingest/bulk/start that would either be 503'd or silently land in the
+  // wrong DB while the watcher is still re-binding.
+  const targetDivergent = isBulkLoaderTargetDivergent(hostInfo, ingestTargetLabel);
+  const presetStartDisabled = presetInflight || presetRunInflight || bulkRunInflight || targetDivergent;
 
   // Wave 6.12b — Apply handler for the ingest fan-out card. POST returns
   // the new snapshot synchronously, so the displayed value updates straight
@@ -892,6 +966,12 @@ export function IngestPanel() {
           {lastAction ? <div className="ingest-controls__action">{lastAction}</div> : null}
         </div>
       </PanelCard>
+
+      {/* Wave 7.0.6.17 — divergence banner above the preset surface. Visible
+          whenever the bulk-loader's bound target diverges from the api's
+          active-target label, so the operator sees the misalignment before
+          Start ingest is even clickable. */}
+      <BulkLoaderTargetBanner hostInfo={hostInfo} ingestTargetLabel={ingestTargetLabel} />
 
       {/* Wave 6.17 — primary preset surface. Five fixed presets wire all
           dials (rows / fan-out / maxlen / defer_trim) and auto-align the

@@ -389,4 +389,78 @@ describe("GET /admin/host-info", () => {
     // No CLUSTER call when there's no active target.
     expect(fr.calls.find((c) => c.command === "CLUSTER")).toBeUndefined();
   });
+
+  // Wave 7.0.6.17 — additive bulk_loader_* fields fetched from
+  // bulk-loader's /load/status. Mock global fetch so the tests don't need
+  // a running bulk-loader; verify null-on-error and pass-through-on-ok.
+  it("Wave 7.0.6.17 — populates bulk_loader_bound_target / target_stale / target_watcher from /load/status", async () => {
+    const fr = fakeRedis();
+    fr.setResponse("CLUSTER", "cluster_enabled:0\r\n");
+    const fetchSpy = vi.fn(async () =>
+      new Response(JSON.stringify({
+        bound_target: { host: "127.0.0.1", port: 12000, label: "localcluster" },
+        target_stale: false,
+        target_watcher: "enabled",
+      }), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", fetchSpy);
+    try {
+      app = await createServer({
+        redis: fr,
+        activeTarget: { host: "127.0.0.1", port: 6379, tls: false, db: 0, label: "redis-primary" },
+      });
+      const res = await app.inject({ method: "GET", url: "/admin/host-info" });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.bulk_loader_bound_target).toEqual({ host: "127.0.0.1", port: 12000, label: "localcluster" });
+      expect(body.bulk_loader_target_stale).toBe(false);
+      expect(body.bulk_loader_target_watcher).toBe("enabled");
+      // Existing fields untouched.
+      expect(body.cores).toBeGreaterThanOrEqual(1);
+      expect(body.bulk_loader_pool_size).toBe(32);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("Wave 7.0.6.17 — bulk_loader_* fields collapse to null on bulk-loader timeout / 5xx", async () => {
+    const fr = fakeRedis();
+    fr.setResponse("CLUSTER", "cluster_enabled:0\r\n");
+    const fetchSpy = vi.fn(async () => new Response("server down", { status: 503 }));
+    vi.stubGlobal("fetch", fetchSpy);
+    try {
+      app = await createServer({
+        redis: fr,
+        activeTarget: { host: "127.0.0.1", port: 6379, tls: false, db: 0, label: "redis-primary" },
+      });
+      const res = await app.inject({ method: "GET", url: "/admin/host-info" });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.bulk_loader_bound_target).toBeNull();
+      expect(body.bulk_loader_target_stale).toBeNull();
+      expect(body.bulk_loader_target_watcher).toBeNull();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("Wave 7.0.6.17 — bulk_loader_* null on AbortError / network failure", async () => {
+    const fr = fakeRedis();
+    fr.setResponse("CLUSTER", "cluster_enabled:0\r\n");
+    const fetchSpy = vi.fn(async () => { throw new Error("ECONNREFUSED"); });
+    vi.stubGlobal("fetch", fetchSpy);
+    try {
+      app = await createServer({
+        redis: fr,
+        activeTarget: { host: "127.0.0.1", port: 6379, tls: false, db: 0, label: "redis-primary" },
+      });
+      const res = await app.inject({ method: "GET", url: "/admin/host-info" });
+      const body = res.json();
+      expect(body.bulk_loader_bound_target).toBeNull();
+      expect(body.bulk_loader_target_stale).toBeNull();
+      expect(body.bulk_loader_target_watcher).toBeNull();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 });

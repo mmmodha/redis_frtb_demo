@@ -159,6 +159,17 @@ export interface BulkIngestRunStatus {
 
 // Wave 7.0.6.15 — GET /admin/host-info. Surfaces the host CPU count + the
 // recommended worker cap so the IngestPanel slider can default safely.
+//
+// Wave 7.0.6.17 — additive bulk_loader_* fields surfaced from the
+// bulk-loader's /load/status. All three collapse to null when the
+// bulk-loader is unreachable; the UI banner treats null as "unknown" and
+// only renders divergence when both target_label and bulk_loader_bound_target
+// are populated AND their labels differ.
+export interface HostInfoBulkLoaderTarget {
+  host: string;
+  port: number;
+  label: string;
+}
 export interface HostInfo {
   cores: number;
   recommended_max_workers: number;
@@ -166,6 +177,9 @@ export interface HostInfo {
   bulk_loader_pool_size: number;
   shards: number | null;
   target_label: string | null;
+  bulk_loader_bound_target: HostInfoBulkLoaderTarget | null;
+  bulk_loader_target_stale: boolean | null;
+  bulk_loader_target_watcher: "enabled" | "disabled" | null;
 }
 
 export async function getHostInfo(): Promise<HostInfo> {

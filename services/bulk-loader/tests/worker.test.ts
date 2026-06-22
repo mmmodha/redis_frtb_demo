@@ -9,7 +9,7 @@
 //   • Per-worker metrics: queued, flushed, errors, dead_lettered, last latency.
 
 import { describe, it, expect } from "vitest";
-import { createWorker, rowToHashFields, isPermanentError, type Row } from "../src/worker.ts";
+import { createWorker, rowToHashFields, isPermanentError, isOomError, type Row } from "../src/worker.ts";
 import { FakeWriteClient } from "./helpers/fake-write-client.ts";
 
 function girrDeltaPerTenor(id: string, tenors: Record<string, number>): Row {
@@ -356,6 +356,126 @@ describe("createWorker — error handling", () => {
     expect(w.metrics().flushed).toBe(2);
     expect(w.metrics().deadLettered).toBe(0);
     await w.stop();
+  });
+});
+
+describe("Wave 7.0.6.17 — isOomError + oom_rejected counter", () => {
+  const OOM_MSG = "OOM command not allowed when used memory > 'maxmemory'.";
+  const OOM_MSG_NO_PERIOD = "OOM command not allowed when used memory > 'maxmemory'";
+
+  it("isOomError matches the exact Redis OOM string (with + without trailing period)", () => {
+    expect(isOomError(new Error(OOM_MSG))).toBe(true);
+    expect(isOomError(new Error(OOM_MSG_NO_PERIOD))).toBe(true);
+    expect(isOomError(new Error("OOM something else"))).toBe(false);
+    expect(isOomError(new Error("ERR generic"))).toBe(false);
+    expect(isOomError(new Error("Connection is closed."))).toBe(false);
+  });
+
+  it("increments oom_rejected alongside errors when the pipeline reply matches OOM", async () => {
+    const client = new FakeWriteClient();
+    const w = createWorker({ id: 0, client, batchSize: 1, idleFlushMs: 0, maxRetries: 1 });
+    client.nextReplies = [[new Error(OOM_MSG), null]];
+    w.push({
+      id: "uOOM", risk_class: "GIRR", bucket: "USD", sensitivity_type: "Delta",
+      risk_value: { "3M": 0.1 },
+    });
+    await w.drain();
+    const m = w.metrics();
+    expect(m.errors).toBe(1);
+    expect(m.oomRejected).toBe(1);
+    // OOM is transient → with maxRetries=1, the first attempt counts as the
+    // only attempt and the row is dead-lettered.
+    expect(m.deadLettered).toBe(1);
+    await w.stop();
+  });
+
+  it("does NOT increment oom_rejected for generic ReplyError or network errors", async () => {
+    const client = new FakeWriteClient();
+    const w = createWorker({ id: 0, client, batchSize: 2, idleFlushMs: 0, maxRetries: 1 });
+    client.nextReplies = [
+      [new Error("WRONGTYPE Operation against a key"), null],
+      [new Error("Connection is closed."), null],
+    ];
+    w.push({ id: "u1", risk_class: "GIRR", bucket: "USD", sensitivity_type: "Delta", risk_value: { "3M": 0.1 } });
+    w.push({ id: "u2", risk_class: "GIRR", bucket: "USD", sensitivity_type: "Delta", risk_value: { "3M": 0.1 } });
+    await w.drain();
+    const m = w.metrics();
+    expect(m.errors).toBe(2);
+    expect(m.oomRejected).toBe(0);
+    await w.stop();
+  });
+
+  it("rate-limits identical OOM warns to one full + one summary per window", async () => {
+    const client = new FakeWriteClient();
+    const warns: Array<{ obj: object; msg: string }> = [];
+    const logger = {
+      warn: (obj: object, msg: string) => { warns.push({ obj, msg }); },
+    };
+    // 50ms window so the test can cross it without sleeping forever.
+    const windowMs = 50;
+    const w = createWorker({
+      id: 0, client, batchSize: 1, idleFlushMs: 0,
+      maxRetries: 1, logger, oomLogWindowMs: windowMs,
+    });
+    for (let i = 0; i < 5; i++) {
+      client.nextReplies = [[new Error(OOM_MSG), null]];
+      w.push({
+        id: `u${i}`, risk_class: "GIRR", bucket: "USD", sensitivity_type: "Delta",
+        risk_value: { "3M": 0.1 },
+      });
+      await w.drain();
+    }
+    // First OOM logs full detail; the next four are folded silently into the
+    // same 50ms window. Dead-letter XADD warnings only fire when XADD itself
+    // throws — FakeWriteClient.call returns "1-0" so we never see those here.
+    const oomWarns = warns.filter((w) => w.msg === "OOM rejected");
+    const summaryWarns = warns.filter((w) => w.msg === "OOM rejected (sustained)");
+    expect(oomWarns.length).toBe(1);
+    expect(summaryWarns.length).toBe(0); // window still open
+    expect(w.metrics().oomRejected).toBe(5);
+
+    // Cross the window, then trigger one more OOM — the prior summary fires.
+    await new Promise((r) => setTimeout(r, windowMs + 10));
+    client.nextReplies = [[new Error(OOM_MSG), null]];
+    w.push({
+      id: "uLate", risk_class: "GIRR", bucket: "USD", sensitivity_type: "Delta",
+      risk_value: { "3M": 0.1 },
+    });
+    await w.drain();
+    const summary2 = warns.filter((w) => w.msg === "OOM rejected (sustained)");
+    expect(summary2.length).toBe(1);
+    // count = total occurrences in the closed window (5 = 1 full-detail + 4 folded).
+    expect((summary2[0]?.obj as { count?: number }).count).toBe(5);
+    // Plus a fresh full-detail warn for the new first occurrence.
+    const oomWarns2 = warns.filter((w) => w.msg === "OOM rejected");
+    expect(oomWarns2.length).toBe(2);
+
+    await w.stop();
+  });
+
+  it("stop() flushes any pending OOM window summary", async () => {
+    const client = new FakeWriteClient();
+    const warns: Array<{ obj: object; msg: string }> = [];
+    const logger = {
+      warn: (obj: object, msg: string) => { warns.push({ obj, msg }); },
+    };
+    const w = createWorker({
+      id: 0, client, batchSize: 1, idleFlushMs: 0,
+      maxRetries: 1, logger, oomLogWindowMs: 60_000,
+    });
+    for (let i = 0; i < 3; i++) {
+      client.nextReplies = [[new Error(OOM_MSG), null]];
+      w.push({
+        id: `u${i}`, risk_class: "GIRR", bucket: "USD", sensitivity_type: "Delta",
+        risk_value: { "3M": 0.1 },
+      });
+      await w.drain();
+    }
+    await w.stop();
+    const summaryWarns = warns.filter((w) => w.msg === "OOM rejected (sustained)");
+    expect(summaryWarns.length).toBe(1);
+    // 3 OOMs total in the window: 1 full-detail + 2 folded into the summary.
+    expect((summaryWarns[0]?.obj as { count?: number }).count).toBe(3);
   });
 });
 
