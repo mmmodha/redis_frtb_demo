@@ -506,6 +506,35 @@ describe("parseRladminShards", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0].shard_id).toBe("redis:1");
   });
+
+  // Wave 7.0.6.5 — parser extension: capture key_count when the header
+  // contains a KEYS / OBJECTS / NUM_KEYS column (rladmin variants emit one
+  // of those). Snapshots without the column leave key_count undefined.
+  it("captures key_count from a KEYS column when present", () => {
+    const text = [
+      "SHARD:ID  NODE:ID  ROLE     NAME  SLOTS         USED_MEMORY  KEYS",
+      "redis:1   node:1   master   db:1  0-8191        100MB        1,250,000",
+      "redis:2   node:2   master   db:1  8192-16383    100MB        1,260,000",
+    ].join("\n");
+    const rows = parseRladminShards(text);
+    expect(rows).toHaveLength(2);
+    expect(rows[0].key_count).toBe(1250000);
+    expect(rows[1].key_count).toBe(1260000);
+  });
+
+  it("also accepts OBJECTS as the key-count header", () => {
+    const text = [
+      "SHARD:ID  NODE:ID  ROLE     NAME  SLOTS         USED_MEMORY  OBJECTS",
+      "redis:1   node:1   master   db:1  0-8191        100MB        42",
+    ].join("\n");
+    const rows = parseRladminShards(text);
+    expect(rows[0].key_count).toBe(42);
+  });
+
+  it("leaves key_count undefined when the header lacks a keys column", () => {
+    const rows = parseRladminShards(RLADMIN_INFO_SHARDS_TWO_MASTERS);
+    for (const r of rows) expect(r.key_count).toBeUndefined();
+  });
 });
 
 // Wave 7.0.4.A — snapshot envelope is JSON SET at `ops:per-shard-snapshot`
