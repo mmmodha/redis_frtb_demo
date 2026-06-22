@@ -77,6 +77,29 @@ Outputs one JSON line on stdout (`rollups_written` / `empty_groups` /
 `errors` / `elapsed_ms`) and per-`(rc, sens)` progress on stderr.
 Run-time budget: < 5 min on 10M docs / 2-shard cluster.
 
+## finalise-seen-sets.mjs (Wave 7.0.3.B)
+
+Post-load seen-set finalisation — materialises the discovery sets
+(`seen:risk_class`, `seen:bucket:<rc>`, `seen:sens_type:<rc>:<bucket>`)
+from bulk-loaded `sens:*` docs via a single FT.AGGREGATE GROUPBY against
+`idx:sens:slim`. Writes **tag-free** keys (drops `{...}` vs the legacy
+incremental path) so the seen-set family spreads across every shard
+instead of pinning each `(rc, bucket)` onto one slot.
+
+```bash
+REDIS_URL='rediss://…' \
+  node --env-file=.env.local scripts/finalise-seen-sets.mjs
+```
+
+Run AFTER `finalise-rollups.mjs` on a tag-free bulk-loaded DB. Idempotent:
+SADD on an already-populated set is a no-op. Distinct from the legacy
+`materialize-seen-sets.mjs` which writes hash-tagged key names for the
+pre-Wave-7.0 stream-replay path.
+
+Outputs one JSON line on stdout (`triples` / `risk_classes` / `buckets` /
+`sens_types` / `errors` / `elapsed_ms`) and per-step progress on stderr.
+Run-time: a single FT.AGGREGATE round-trip plus one SADD pipeline.
+
 ## Other helpers
 
 - `_check-xlen.mjs` — XLEN + XPENDING across the 16 hash-tag shard streams.
