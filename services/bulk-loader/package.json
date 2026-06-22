@@ -1,0 +1,25 @@
+{
+  "name": "@frtb/bulk-loader",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "FRTB SBM PoV — bulk writer skeleton: pool of non-cluster ioredis connections to the Enterprise proxy endpoint, heartbeat-only until the write path lands in Wave 7.0.1.B",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "tsx src/index.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@frtb/redis-client": "*",
+    "fastify": "^5.8.5",
+    "ioredis": "^5.10.1",
+    "tsx": "^4.22.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.19",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.8"
+  }
+}

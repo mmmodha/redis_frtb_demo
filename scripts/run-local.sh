@@ -35,8 +35,8 @@ ENV_EXAMPLE_REL=".env.example"
 
 # Service catalogue (parallel arrays — bash 3.2). Iteration order = start order.
 # api must come first (others depend on it), ui must come last (depends on api healthy).
-SERVICES=( api source ingest calc loadgen ui )
-PORTS=(    8080 8082    8083    8084 8085    3000 )
+SERVICES=( api source ingest calc loadgen bulk-loader ui )
+PORTS=(    8080 8082    8083    8084 8085    8086        3000 )
 
 # One-shot tools (CLI utilities, no /healthz, not started by bulk `start`).
 # Invoked explicitly via `scripts/run-local.sh start <tool> [-- ...extra]`.
@@ -106,14 +106,15 @@ hdr()  { printf '\n%s\n' "${C_BOLD}${C_CYAN}$*${C_RESET}"; }
 # ---------------------------------------------------------------------------
 service_entry_cmd() {
   case "$1" in
-    api)       echo 'npm run -w @frtb/api start' ;;
-    source)    echo 'npm run -w @frtb/source start' ;;
-    ingest)    echo 'npm run -w @frtb/ingest start' ;;
-    calc)      echo 'npm run -w @frtb/calc start' ;;
-    loadgen)   echo 'npm run -w @frtb/loadgen start' ;;
-    generator) echo 'npm run -w @frtb/generator start' ;;
-    ui)        echo 'npm run -w @frtb/ui start' ;;
-    *)         echo '' ;;
+    api)         echo 'npm run -w @frtb/api start' ;;
+    source)      echo 'npm run -w @frtb/source start' ;;
+    ingest)      echo 'npm run -w @frtb/ingest start' ;;
+    calc)        echo 'npm run -w @frtb/calc start' ;;
+    loadgen)     echo 'npm run -w @frtb/loadgen start' ;;
+    bulk-loader) echo 'npm run -w @frtb/bulk-loader start' ;;
+    generator)   echo 'npm run -w @frtb/generator start' ;;
+    ui)          echo 'npm run -w @frtb/ui start' ;;
+    *)           echo '' ;;
   esac
 }
 
@@ -145,14 +146,15 @@ svc_port_for() {
 # port in .env.local without touching the catalogue here.
 svc_port_env_var() {
   case "$1" in
-    api)       echo API_PORT ;;
-    source)    echo SOURCE_PORT ;;
-    ingest)    echo INGEST_PORT ;;
-    calc)      echo CALC_PORT ;;
-    loadgen)   echo LOADGEN_PORT ;;
-    generator) echo GENERATOR_PORT ;;
-    ui)        echo UI_PORT ;;
-    *)         echo "" ;;
+    api)         echo API_PORT ;;
+    source)      echo SOURCE_PORT ;;
+    ingest)      echo INGEST_PORT ;;
+    calc)        echo CALC_PORT ;;
+    loadgen)     echo LOADGEN_PORT ;;
+    bulk-loader) echo BULK_LOADER_PORT ;;
+    generator)   echo GENERATOR_PORT ;;
+    ui)          echo UI_PORT ;;
+    *)           echo "" ;;
   esac
 }
 
