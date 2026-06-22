@@ -738,8 +738,11 @@ export function IngestPanel() {
   return (
     <div className="panel ingest-panel">
       <header className="panel__header">
-        <h1>Ingest</h1>
-        <p className="panel__subhead">Live throughput, memory growth and key locality for streaming sensitivities into Redis Enterprise.</p>
+        <h1>Ingest — live tail</h1>
+        {/* Wave 7.0.6 — copy distinguishes the live-tail stream consumer
+            (sens-only HSETs; ≤ 5K rps) from the bulk-loader baseline path
+            that owns rollup/seen materialisation post-load. */}
+        <p className="panel__subhead">Live-tail stream consumer — writes only <code>sens:*</code> HSETs into Redis Enterprise (rollup / seen / processed materialisation is owned by the bulk-loaded baseline).</p>
       </header>
 
       <div className="ingest-panel__callouts">
@@ -752,11 +755,11 @@ export function IngestPanel() {
       </div>
 
       <PanelCard
-        title="Ingest controls"
+        title="Live-tail ingest controls"
         actions={
           activeSource ? (
             <button type="button" onClick={onStartIngest} disabled={busy} className="btn btn--primary">
-              Start ingest
+              Start live tail
             </button>
           ) : null
         }

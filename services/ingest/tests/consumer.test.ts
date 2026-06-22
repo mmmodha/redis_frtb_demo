@@ -1171,6 +1171,137 @@ describe("processBatch seen:* SADD integration [Wave 6.24]", () => {
   });
 });
 
+// Wave 7.0.6 — live-tail mode gates every legacy write path off so the
+// consumer writes ONLY sens:* (and the slot-co-located {sens:*}:tenors
+// side-table). The bulk-loader path owns rollup/seen/processed finalisation
+// post-load. Asserted on both the non-atomic processBatch path (json /
+// json-shadow-hash storage variants) and the atomic processBatchAtomic
+// path (hash-sidetable / hash-encoded variants).
+describe("processBatch live-tail mode [Wave 7.0.6]", () => {
+  integration("liveTailMode=true → only sens:* keys exist; no rollup/seen/processed/sug keys", async () => {
+    await ensureGroup(redis, "sensitivities:in", "ingest");
+    const combos = [
+      { rc: "GIRR", bkt: "USD-IRS", sens: "Delta" },
+      { rc: "EQUITY", bkt: "1", sens: "Delta" },
+      { rc: "FX", bkt: "EURUSD", sens: "Vega" },
+    ];
+    const ulid = monotonicFactory();
+    for (const c of combos) {
+      for (let i = 0; i < 4; i++) {
+        await redis.xadd(
+          "sensitivities:in", "*",
+          "risk_class", c.rc,
+          "bucket", c.bkt,
+          "_hash_tag", `${c.rc}:${c.bkt}`,
+          "_id", ulid(),
+          "payload", JSON.stringify({
+            sensitivity_type: c.sens,
+            risk_value: c.sens === "Vega" ? { "1Y": 0.1 } : { spot: 0.1 },
+            book: "RATES_LDN", trade_id: "T1", risk_factor: "RF1",
+          }),
+        );
+      }
+    }
+    // hash-sidetable → processBatchAtomic path under createConsumer; here we
+    // exercise the non-atomic processBatch directly with json-shadow-hash so
+    // both write paths are covered by this suite (the atomic path has its
+    // own assertion below).
+    await processBatch(redis, {
+      stream: "sensitivities:in",
+      group: "ingest",
+      consumerName: "live-tail-test",
+      batchSize: 100,
+      schema: SCHEMA,
+      storageFormat: "json-shadow-hash",
+      liveTailMode: true,
+    });
+    // SMEMBERS / EXISTS on the legacy keys MUST be empty — no rollup, no
+    // seen, no processed marker, no suggester. Confirmed via SCAN so any
+    // unexpected key bypassing the gate surfaces in the assertion below.
+    const keys: string[] = [];
+    let cursor = "0";
+    do {
+      const reply = (await redis.scan(cursor, "COUNT", "1000")) as [string, string[]];
+      cursor = reply[0];
+      keys.push(...reply[1]);
+    } while (cursor !== "0");
+    const forbidden = keys.filter((k) =>
+      k.startsWith("rollup:") || k.startsWith("seen:") || k.startsWith("processed:") || k.startsWith("sug:"),
+    );
+    expect(forbidden).toEqual([]);
+    // sens:* and the shadow sensh:* keys (json-shadow-hash) are the only
+    // expected non-stream key shapes; both belong to the sens-only contract.
+    const docKeys = keys.filter((k) => k.startsWith("sens:") || k.startsWith("sensh:"));
+    expect(docKeys.length).toBeGreaterThan(0);
+  });
+
+  integration("processBatchAtomic liveTailMode=true → only sens:* + {sens:*}:tenors; no legacy keys", async () => {
+    await ensureGroup(redis, "sensitivities:in", "ingest");
+    const { processBatchAtomic } = await import("../src/consumer.ts");
+    const ulid = monotonicFactory();
+    for (let i = 0; i < 6; i++) {
+      await redis.xadd(
+        "sensitivities:in", "*",
+        "risk_class", "EQUITY", "bucket", "1",
+        "_hash_tag", "EQUITY:1",
+        "_id", ulid(),
+        "payload", JSON.stringify({
+          sensitivity_type: "Delta",
+          risk_value: { spot: 1.5 },
+          book: "EQ_NYC", trade_id: "TE1", risk_factor: "AAPL",
+        }),
+      );
+    }
+    await processBatchAtomic(redis, {
+      stream: "sensitivities:in",
+      group: "ingest",
+      consumerName: "live-tail-atomic",
+      batchSize: 100,
+      schema: SCHEMA,
+      storageFormat: "hash-sidetable",
+      liveTailMode: true,
+    });
+    const keys: string[] = [];
+    let cursor = "0";
+    do {
+      const reply = (await redis.scan(cursor, "COUNT", "1000")) as [string, string[]];
+      cursor = reply[0];
+      keys.push(...reply[1]);
+    } while (cursor !== "0");
+    const forbidden = keys.filter((k) =>
+      k.startsWith("rollup:") || k.startsWith("seen:") || k.startsWith("processed:") || k.startsWith("sug:"),
+    );
+    expect(forbidden).toEqual([]);
+    const docKeys = keys.filter((k) => k.startsWith("sens:") || k.startsWith("{sens:"));
+    expect(docKeys.length).toBeGreaterThan(0);
+  });
+
+  integration("liveTailMode=false (default) → legacy rollup/seen writes still fire (regression guard)", async () => {
+    await ensureGroup(redis, "sensitivities:in", "ingest");
+    const ulid = monotonicFactory();
+    await redis.xadd(
+      "sensitivities:in", "*",
+      "risk_class", "EQUITY", "bucket", "1",
+      "_hash_tag", "EQUITY:1",
+      "_id", ulid(),
+      "payload", JSON.stringify({
+        sensitivity_type: "Delta", risk_value: { spot: 1.0 },
+      }),
+    );
+    await processBatch(redis, {
+      stream: "sensitivities:in",
+      group: "ingest",
+      consumerName: "legacy-default",
+      batchSize: 100,
+      schema: SCHEMA,
+      // liveTailMode omitted → falls through to legacy behaviour.
+    });
+    // Legacy mode still populates rollup/seen — guards against the 7.0.6
+    // gate flipping on accidentally for callers that don't opt in.
+    expect(await redis.smembers(SEEN_RISK_CLASS_KEY)).toContain("EQUITY");
+  });
+});
+
 // Wave 6.38.A — STORAGE_FORMAT writer dispatch + 4-variant ingest. The pure-
 // helper suite asserts that `writeDocForStorage` emits the right pipelined
 // commands per variant against the recording stub. The integration suite

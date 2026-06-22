@@ -107,6 +107,25 @@ export interface ConsumerOptions {
   // FT.SEARCH layer (`hash-*` and `json-shadow-hash` populate idx:sens; the
   // legacy `json` variant is the customer escape hatch and bypasses idx:sens).
   storageFormat?: StorageFormat;
+  // Wave 7.0.6 — live-tail mode. When true the consumer writes ONLY the
+  // `sens:<ulid>` HSET (and its sidetable companion) per row and skips every
+  // legacy rollup-hash / seen-set / processed-marker write path. The bulk
+  // loader owns rollup/seen materialisation post-load (Phase 3 finalisation,
+  // tag-free keys); live-tail just appends rows and relies on calc / lazy-math
+  // FT.AGGREGATE over `idx:sens:slim` to compute everything on demand. The
+  // flag defaults to false so the legacy write paths remain available for
+  // parity testing and the pre-7.0.6 contract is preserved when unset.
+  liveTailMode?: boolean;
+}
+
+// Wave 7.0.6 — resolve `LIVE_TAIL_MODE` env into a boolean. Accepts `1` /
+// `true` (case-insensitive) as true; everything else (including unset) is
+// false. Kept outside ConsumerOptions resolution so the cli / tests share one
+// canonical parser.
+export function resolveLiveTailMode(value: string | undefined): boolean {
+  if (!value) return false;
+  const v = value.trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes" || v === "on";
 }
 
 export interface ConsumerStats {
@@ -703,6 +722,12 @@ export async function processBatch(
   // `if (profile)` branch below is skipped when undefined so the hot path
   // stays byte-identical to pre-6.15a behaviour.
   const profile = opts.profile;
+  // Wave 7.0.6 — when live-tail mode is enabled, skip the rollup-hash and
+  // seen-set writes (the bulk loader owns those keys; live-tail just appends
+  // sens:<ulid> rows). Resolved once per batch — opts wins, env fallback
+  // mirrors the cli wiring so unit-test stubs that omit the flag fall back
+  // to the same env that production reads.
+  const liveTail = opts.liveTailMode ?? resolveLiveTailMode(process.env.LIVE_TAIL_MODE);
   const fetchStart = profile ? process.hrtime.bigint() : 0n;
   const reply = (await (client as Redis).xreadgroup(
     "GROUP", opts.group, opts.consumerName,
@@ -752,25 +777,35 @@ export async function processBatch(
       // the JSON.SET so the whole apply is one round-trip per row; placed
       // before XACK so a HINCRBYFLOAT pipeline-level failure rolls back the
       // ack and the row is redelivered.
-      emitRollupHincrs(pipeline as unknown as PipelineLike, doc);
-      // Wave 6.24 — also SADD this row's (rc, bkt, sens_type) into the
-      // materialized discovery sets so calc / facets can answer "which
-      // (rc, bkt) tuples have data?" without an FT.AGGREGATE on idx:sens.
-      // Same pipeline as JSON.SET / HINCRBYFLOAT so a SADD failure rolls
-      // back the ack alongside its peers.
-      emitSeenSadds(pipeline as unknown as PipelineLike, doc);
+      // Wave 7.0.6 — both rollup and seen-set writes are gated off in
+      // live-tail mode; the bulk loader's finalisation step is the sole
+      // writer of those tag-free keys post-load.
+      if (!liveTail) {
+        emitRollupHincrs(pipeline as unknown as PipelineLike, doc);
+        // Wave 6.24 — also SADD this row's (rc, bkt, sens_type) into the
+        // materialized discovery sets so calc / facets can answer "which
+        // (rc, bkt) tuples have data?" without an FT.AGGREGATE on idx:sens.
+        // Same pipeline as JSON.SET / HINCRBYFLOAT so a SADD failure rolls
+        // back the ack alongside its peers.
+        emitSeenSadds(pipeline as unknown as PipelineLike, doc);
+      }
       // Wave 5.30a — autocomplete suggester live-populate. INCR bumps the
       // score on duplicate values so frequent terms rank higher in FT.SUGGET.
       // Pipelined alongside JSON.SET (and before XACK) so a SUGADD failure
       // rolls back the ack and the row is redelivered.
-      if (doc.book) {
-        pipeline.call("FT.SUGADD", "sug:book", String(doc.book), "1", "INCR");
-      }
-      if (doc.trade_id) {
-        pipeline.call("FT.SUGADD", "sug:trade_id", String(doc.trade_id), "1", "INCR");
-      }
-      if (doc.risk_factor) {
-        pipeline.call("FT.SUGADD", "sug:risk_factor", String(doc.risk_factor), "1", "INCR");
+      // Wave 7.0.6 — gated off in live-tail mode (sug:* keys are out of
+      // scope for the sens-only contract; the bulk-loader / post-load
+      // finalisation step owns suggester population on the new path).
+      if (!liveTail) {
+        if (doc.book) {
+          pipeline.call("FT.SUGADD", "sug:book", String(doc.book), "1", "INCR");
+        }
+        if (doc.trade_id) {
+          pipeline.call("FT.SUGADD", "sug:trade_id", String(doc.trade_id), "1", "INCR");
+        }
+        if (doc.risk_factor) {
+          pipeline.call("FT.SUGADD", "sug:risk_factor", String(doc.risk_factor), "1", "INCR");
+        }
       }
       pipeline.xack(opts.stream, opts.group, entryId);
       if (profile) {
@@ -1016,6 +1051,13 @@ export async function processBatchAtomic(
   const markerTtl = opts.processedMarkerTtlSec
     ?? (Number(process.env.STREAM_RETENTION_SEC ?? "") || DEFAULT_STREAM_RETENTION_SEC);
 
+  // Wave 7.0.6 — when live-tail mode is enabled, Phase 2 (rollup HINCRBYFLOATs,
+  // sens-type SADD, processed-marker SET) and the Phase 3 seen-set SADDs are
+  // gated off. Only the Phase 1 sens-slot MULTI (parent HSET + sidetable HSET)
+  // and the tail XACK + best-effort SUGADD survive. The bulk loader's Phase 3
+  // finalisation step is the sole writer of tag-free rollup/seen keys post-load.
+  const liveTail = opts.liveTailMode ?? resolveLiveTailMode(process.env.LIVE_TAIL_MODE);
+
   let processed = 0;
   for (const [, entries] of reply) {
     if (entries.length === 0) continue;
@@ -1072,9 +1114,14 @@ export async function processBatchAtomic(
       // sens-type SADD, and the idempotency-marker SET live here; everything
       // is slot-tagged on `{<rc>:<bkt>}`. The marker is checked under WATCH
       // so concurrent replays short-circuit deterministically.
+      // Wave 7.0.6 — entirely skipped in live-tail mode (no rollup writes,
+      // no sens-type SADD, no processed-marker SET); the bulk loader owns
+      // those keys post-load via its tag-free finalisation step.
       let phase2Committed = false;
       let phase2Attempts = 0;
-      if (riskClass && bucket && sensType) {
+      if (liveTail) {
+        phase2Committed = true;
+      } else if (riskClass && bucket && sensType) {
         const markerKey = processedMarkerKey(riskClass, bucket, entryId);
         while (phase2Attempts <= MAX_WATCH_RETRIES) {
           await (client as Redis).watch(markerKey);
@@ -1128,8 +1175,10 @@ export async function processBatchAtomic(
       // a no-op on already-acked entries. SUGADD is best-effort and lives in
       // its own try/catch below for back-compat.
       const tail = client.pipeline();
-      if (riskClass) tail.call("SADD", SEEN_RISK_CLASS_KEY, riskClass);
-      if (riskClass && bucket) tail.call("SADD", seenBucketKey(riskClass), bucket);
+      // Wave 7.0.6 — seen-set SADDs are gated off in live-tail mode; only
+      // the XACK survives so the consumer-group PEL drains.
+      if (!liveTail && riskClass) tail.call("SADD", SEEN_RISK_CLASS_KEY, riskClass);
+      if (!liveTail && riskClass && bucket) tail.call("SADD", seenBucketKey(riskClass), bucket);
       tail.xack(opts.stream, opts.group, entryId);
       try {
         await tail.exec();
@@ -1140,7 +1189,10 @@ export async function processBatchAtomic(
         throw err;
       }
       processed++;
-      await emitSuggestersAfterCommit(client, doc);
+      // Wave 7.0.6 — suggester writes (sug:*) are out of scope for the
+      // sens-only live-tail contract; the bulk-loader path owns autocomplete
+      // population post-load.
+      if (!liveTail) await emitSuggestersAfterCommit(client, doc);
     }
   }
   return processed;

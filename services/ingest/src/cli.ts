@@ -8,7 +8,7 @@ import { Redis, Cluster } from "ioredis";
 import { createRedisClient } from "@frtb/redis-client";
 import { loadSchema, type Schema } from "@frtb/schema";
 import pino from "pino";
-import { type RedisLike } from "./consumer.ts";
+import { resolveLiveTailMode, type RedisLike } from "./consumer.ts";
 import { createActiveTargetWatcher, defaultRedisFactory, type ActiveTargetWatcher } from "./active-target-watcher.ts";
 import { parseShardAssignment, shardStreamKey } from "./sharding.ts";
 import { createMultiShardConsumer, ensureGroupsForShards } from "./multi-consumer.ts";
@@ -180,6 +180,18 @@ async function main(): Promise<void> {
   const redisUrl = process.env.REDIS_URL;
   const apiUrl = process.env.API_URL;
   const internalToken = process.env.INTERNAL_API_TOKEN;
+
+  // Wave 7.0.6 — live-tail mode log line. processBatch / processBatchAtomic
+  // resolve the same env var per batch, so the actual write-path gating is
+  // already in effect; this is purely operator-visible breadcrumb so the
+  // boot log makes it obvious whether the consumer is running in sens-only
+  // mode or the legacy rollup-and-seen mode.
+  if (resolveLiveTailMode(process.env.LIVE_TAIL_MODE)) {
+    log.info(
+      { liveTailMode: true },
+      "ingest LIVE_TAIL_MODE=1 — sens-only writes (rollup/seen/processed/suggester gated off; bulk loader owns those keys post-load)",
+    );
+  }
 
   // Wave 6.14c — one-shot rollup backfill. Walks the existing sens:* docs
   // and rebuilds the per-bucket rollup hashes via HSET (idempotent). Runs
