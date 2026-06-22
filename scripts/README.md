@@ -100,6 +100,30 @@ Outputs one JSON line on stdout (`triples` / `risk_classes` / `buckets` /
 `sens_types` / `errors` / `elapsed_ms`) and per-step progress on stderr.
 Run-time: a single FT.AGGREGATE round-trip plus one SADD pipeline.
 
+## calc-smoke-1k.mjs (Wave 7.0.6.7)
+
+Tiny end-to-end smoke that validates the post-Wave-6.6 tag-free key shapes
+(`rollup:<rc>:<bkt>:<sens>[:tenor:<t>]`, `seen:bucket:<rc>`,
+`seen:sens_type:<rc>:<bkt>`) actually drive `/calc/sbm` to a non-zero charge
+on a real 1K-row dataset. Catches deploy mismatches (writer on tag-free,
+reader on tag-wrapped) that unit parity tests can't see.
+
+```bash
+REDIS_URL='redis://…' node scripts/calc-smoke-1k.mjs \
+  [--redis URL] [--api-base URL] [--rows N] [--risk-class RC] [--sens TYPE]
+```
+
+Flow: FLUSHDB → POST `/api/admin/flush` (rebuilds indexes) → HSET 1000 slim
+`sens:<id>` docs across GIRR + EQUITY × {Delta, Vega, Curvature} × 3 buckets
+→ `finalise-rollups.mjs` → `finalise-seen-sets.mjs` → POST `/api/calc/sbm` →
+assert HTTP 200, `per_bucket` non-empty, at least one bucket with K_b > 0,
+no NaN/null/undefined, total charge > 0 and finite.
+
+Defaults: `--api-base http://localhost:3000` (UI proxy, forwards `/api/*` to
+the underlying API on :8080), `--risk-class GIRR`, `--sens Delta`,
+`--rows 1000`. Exits 0 with `smoke OK · risk_class=… · sens=… · buckets=… ·
+total_charge=…`; non-zero with the full response body dumped to stderr.
+
 ## Other helpers
 
 - `_check-xlen.mjs` — XLEN + XPENDING across the 16 hash-tag shard streams.
