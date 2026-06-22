@@ -30,15 +30,32 @@ interface FakeCall {
   headers: Record<string, string>;
 }
 
-function fakeFetch(replies: Array<{ status: number; delayMs?: number; throwErr?: Error }>): {
+function fakeFetch(
+  replies: Array<{ status: number; delayMs?: number; throwErr?: Error }>,
+  opts: { checkpointsBody?: unknown; checkpointsStatus?: number } = {},
+): {
   impl: typeof fetch;
   calls: FakeCall[];
 } {
   const calls: FakeCall[] = [];
   let i = 0;
+  const checkpointsBody = opts.checkpointsBody ?? { resume_ulid: null, workers: [] };
+  const checkpointsStatus = opts.checkpointsStatus ?? 200;
   const impl = (async (url: string, init: RequestInit) => {
+    const u = String(url);
+    const method = ((init?.method ?? "GET") + "").toUpperCase();
+    // Wave 7.0.5.A — /load/checkpoints is fetched once on first add(). It
+    // is OUT-OF-BAND from the POST reply queue so existing test cases keep
+    // their reply ordering. Tests that exercise resume override
+    // `checkpointsBody`.
+    if (method === "GET" && u.endsWith("/load/checkpoints")) {
+      return new Response(JSON.stringify(checkpointsBody), {
+        status: checkpointsStatus,
+        headers: { "content-type": "application/json" },
+      });
+    }
     calls.push({
-      url: String(url),
+      url: u,
       body: String(init.body),
       headers: (init.headers ?? {}) as Record<string, string>,
     });
@@ -309,6 +326,162 @@ describe("resolveBulkLoadTarget — Wave 7.0.1.C env wiring", () => {
   it("throws on garbage (not a recognised boolean and not http(s))", () => {
     expect(() => resolveBulkLoadTarget("ftp://x")).toThrow(/BULK_LOAD_TARGET/);
     expect(() => resolveBulkLoadTarget("not-a-url")).toThrow(/BULK_LOAD_TARGET/);
+  });
+});
+
+describe("createHttpProducer — Wave 7.0.5.A resume from /load/checkpoints", () => {
+  it("skips rows whose _id <= resume_ulid and counts them in rowsSkipped", async () => {
+    const { impl, calls } = fakeFetch(
+      [{ status: 202 }],
+      { checkpointsBody: { resume_ulid: "01HZB00000000000000000", workers: [] } },
+    );
+    const infos: Array<{ obj: object; msg: string }> = [];
+    const p = createHttpProducer({
+      url: "http://bulk:8086", batchSize: 1, fetchImpl: impl,
+      logger: { info: (obj, msg) => infos.push({ obj, msg }) },
+    });
+    // Below watermark — skipped.
+    await p.add(row("01HZA00000000000000000"));
+    // Equal to watermark — skipped (already persisted).
+    await p.add(row("01HZB00000000000000000"));
+    // Above watermark — accepted.
+    await p.add(row("01HZC00000000000000000"));
+    await p.close();
+    expect(p.rowsSkipped).toBe(2);
+    expect(p.rowsSent).toBe(1);
+    expect(calls.length).toBe(1);
+    const parsed = JSON.parse(calls[0]!.body) as Array<{ id: string }>;
+    expect(parsed[0]!.id).toBe("01HZC00000000000000000");
+    expect(p.resumeUlid).toBe("01HZB00000000000000000");
+    // Single resume-load info log.
+    const resumeLog = infos.find((x) => (x.obj as { evt?: string }).evt === "bulk-load-resume");
+    expect(resumeLog).toBeDefined();
+  });
+
+  it("fetches /load/checkpoints only once across many add() calls", async () => {
+    let checkpointCalls = 0;
+    const impl = (async (url: string, init: RequestInit) => {
+      const u = String(url);
+      if (u.endsWith("/load/checkpoints")) {
+        checkpointCalls++;
+        return new Response(JSON.stringify({ resume_ulid: null, workers: [] }), { status: 200 });
+      }
+      void init;
+      return new Response("{}", { status: 202 });
+    }) as unknown as typeof fetch;
+    const p = createHttpProducer({ url: "http://bulk:8086", batchSize: 1, fetchImpl: impl });
+    await p.add(row("a"));
+    await p.add(row("b"));
+    await p.add(row("c"));
+    await p.close();
+    expect(checkpointCalls).toBe(1);
+  });
+
+  it("runs from row zero when /load/checkpoints returns 4xx (best-effort)", async () => {
+    const impl = (async (url: string) => {
+      const u = String(url);
+      if (u.endsWith("/load/checkpoints")) {
+        return new Response("not found", { status: 404 });
+      }
+      return new Response("{}", { status: 202 });
+    }) as unknown as typeof fetch;
+    const p = createHttpProducer({ url: "http://bulk:8086", batchSize: 1, fetchImpl: impl });
+    await p.add(row("01HZA00000000000000000"));
+    await p.close();
+    expect(p.rowsSkipped).toBe(0);
+    expect(p.rowsSent).toBe(1);
+    expect(p.resumeUlid).toBeNull();
+  });
+
+  it("survives a network failure on the checkpoint fetch", async () => {
+    const impl = (async (url: string) => {
+      const u = String(url);
+      if (u.endsWith("/load/checkpoints")) throw new Error("ECONNREFUSED");
+      return new Response("{}", { status: 202 });
+    }) as unknown as typeof fetch;
+    const warns: object[] = [];
+    const p = createHttpProducer({
+      url: "http://bulk:8086", batchSize: 1, fetchImpl: impl,
+      logger: { warn: (obj) => warns.push(obj) },
+    });
+    await p.add(row("a"));
+    await p.close();
+    expect(p.rowsSent).toBe(1);
+    expect(warns.find((o) => (o as { evt?: string }).evt === "bulk-load-resume-failed")).toBeDefined();
+  });
+
+  it("opts out of resume fetch when resumeFromCheckpoints=false", async () => {
+    let checkpointCalls = 0;
+    const impl = (async (url: string) => {
+      const u = String(url);
+      if (u.endsWith("/load/checkpoints")) { checkpointCalls++; return new Response("{}", { status: 200 }); }
+      return new Response("{}", { status: 202 });
+    }) as unknown as typeof fetch;
+    const p = createHttpProducer({
+      url: "http://bulk:8086", batchSize: 1, fetchImpl: impl,
+      resumeFromCheckpoints: false,
+    });
+    await p.add(row("a"));
+    await p.close();
+    expect(checkpointCalls).toBe(0);
+    expect(p.rowsSent).toBe(1);
+  });
+});
+
+describe("createHttpProducer — Wave 7.0.5.A HTTP_PRODUCER_MAX_RETRIES cap", () => {
+  it("abandons a batch after maxRetries consecutive 429s; increments hardErrors", async () => {
+    const replies = new Array(50).fill({ status: 429 });
+    const { impl } = fakeFetch(replies);
+    const warns: Array<{ obj: object; msg: string }> = [];
+    const p = createHttpProducer({
+      url: "http://bulk:8086", batchSize: 1, maxRetries: 3, fetchImpl: impl,
+      sleep: async () => {}, random: () => 0,
+      logger: { warn: (obj, msg) => warns.push({ obj, msg }) },
+    });
+    await p.add(row("a"));
+    await expect(p.close()).rejects.toThrow(/exceeded 3 retries/);
+    expect(p.hardErrors).toBe(1);
+    const hard = warns.find((w) => (w.obj as { evt?: string }).evt === "bulk-load-hard-error");
+    expect(hard).toBeDefined();
+  });
+
+  it("abandons a batch after maxRetries 5xx responses", async () => {
+    const replies = new Array(50).fill({ status: 503 });
+    const { impl } = fakeFetch(replies);
+    const p = createHttpProducer({
+      url: "http://bulk:8086", batchSize: 1, maxRetries: 2, fetchImpl: impl,
+      sleep: async () => {}, random: () => 0,
+    });
+    await p.add(row("a"));
+    await expect(p.close()).rejects.toThrow(/exceeded 2 retries/);
+    expect(p.hardErrors).toBe(1);
+  });
+
+  it("abandons a batch after maxRetries network-level failures", async () => {
+    const replies = new Array(50).fill({ status: 0, throwErr: new Error("ECONNRESET") });
+    const { impl } = fakeFetch(replies);
+    const p = createHttpProducer({
+      url: "http://bulk:8086", batchSize: 1, maxRetries: 4, fetchImpl: impl,
+      sleep: async () => {}, random: () => 0,
+    });
+    await p.add(row("a"));
+    await expect(p.close()).rejects.toThrow(/exceeded 4 retries/);
+    expect(p.hardErrors).toBe(1);
+  });
+
+  it("default maxRetries is 50 (HTTP_PRODUCER_MAX_RETRIES contract)", async () => {
+    // Verify the default is actually 50 by succeeding at attempt 51 (= 50
+    // retries after the initial attempt) — anything lower would abandon.
+    const replies = [...new Array(50).fill({ status: 429 }), { status: 202 }];
+    const { impl } = fakeFetch(replies);
+    const p = createHttpProducer({
+      url: "http://bulk:8086", batchSize: 1, fetchImpl: impl,
+      sleep: async () => {}, random: () => 0,
+    });
+    await p.add(row("a"));
+    await p.close();
+    expect(p.rowsSent).toBe(1);
+    expect(p.hardErrors).toBe(0);
   });
 });
 

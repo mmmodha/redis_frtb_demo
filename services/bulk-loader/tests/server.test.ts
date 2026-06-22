@@ -324,3 +324,171 @@ describe("POST /load/rows — Wave 7.0.1.C", () => {
     expect(res.statusCode).toBe(503);
   });
 });
+
+describe("GET /load/checkpoints — Wave 7.0.5.A", () => {
+  async function buildWithDispatcher(): Promise<{
+    app: FastifyInstance; pool: WorkerPool; dispatcher: DispatcherHandle; clients: FakeWriteClient[];
+  }> {
+    const writeClients = [new FakeWriteClient(), new FakeWriteClient()];
+    const fakePool: FakeClient[] = [];
+    const localPool = createWorkerPool({
+      size: 2,
+      redisFactory: () => { const c = new FakeClient(); fakePool.push(c); return c; },
+      heartbeatMs: 60_000,
+      logger: { info: () => {} },
+    });
+    fakePool[0]!.becomeReady();
+    fakePool[1]!.becomeReady();
+    const dispatcher = createDispatcher({
+      workerClients: writeClients, batchSize: 1, idleFlushMs: 0, highWater: 64,
+    });
+    const localApp = await createServer({ pool: localPool, dispatcher });
+    await localApp.ready();
+    return { app: localApp, pool: localPool, dispatcher, clients: writeClients };
+  }
+  function makeRow(id: string): Row {
+    return { id, risk_class: "GIRR", bucket: "USD", sensitivity_type: "Delta", risk_value: { "3M": 0.1 } };
+  }
+
+  it("returns empty workers + null resume_ulid when no checkpoints + no live writes", async () => {
+    const { app: a, pool: p, dispatcher: d } = await buildWithDispatcher();
+    try {
+      const res = await a.inject({ method: "GET", url: "/load/checkpoints" });
+      expect(res.statusCode).toBe(200);
+      const body = res.json() as { resume_ulid: string | null; workers: Array<{ id: number; source: string }> };
+      expect(body.resume_ulid).toBeNull();
+    } finally {
+      await a.close(); await d.stop(); await p.stop();
+    }
+  });
+
+  it("reports live worker watermark after a flush", async () => {
+    const { app: a, pool: p, dispatcher: d } = await buildWithDispatcher();
+    try {
+      await d.enqueue(makeRow("01HZA00000000000000000"));
+      await d.enqueue(makeRow("01HZB00000000000000000"));
+      await d.drain();
+      const res = await a.inject({ method: "GET", url: "/load/checkpoints" });
+      const body = res.json() as {
+        resume_ulid: string | null;
+        workers: Array<{ id: number; rows_written: number; last_ulid: string | null; source: string }>;
+      };
+      expect(body.resume_ulid).toBe("01HZB00000000000000000");
+      const live = body.workers.filter((w) => w.source === "live");
+      expect(live.length).toBeGreaterThan(0);
+      const total = live.reduce((s, w) => s + w.rows_written, 0);
+      expect(total).toBe(2);
+    } finally {
+      await a.close(); await d.stop(); await p.stop();
+    }
+  });
+
+  it("falls back to bootstrap checkpoints when no live writes happened", async () => {
+    const writeClients = [new FakeWriteClient()];
+    const fakePool: FakeClient[] = [];
+    const localPool = createWorkerPool({
+      size: 1,
+      redisFactory: () => { const c = new FakeClient(); fakePool.push(c); return c; },
+      heartbeatMs: 60_000,
+      logger: { info: () => {} },
+    });
+    fakePool[0]!.becomeReady();
+    const dispatcher = createDispatcher({
+      workerClients: writeClients, batchSize: 1, idleFlushMs: 0, highWater: 64,
+    });
+    const bootstrap = new Map([
+      [0, { rows_written: 42, last_ulid: "01HZBOOT0000000000000A", last_updated: 1700000000000 }],
+    ]);
+    const localApp = await createServer({ pool: localPool, dispatcher, bootstrapCheckpoints: bootstrap });
+    await localApp.ready();
+    try {
+      const res = await localApp.inject({ method: "GET", url: "/load/checkpoints" });
+      const body = res.json() as {
+        resume_ulid: string | null;
+        workers: Array<{ id: number; rows_written: number; last_ulid: string | null; source: string }>;
+      };
+      expect(body.resume_ulid).toBe("01HZBOOT0000000000000A");
+      const w = body.workers.find((x) => x.id === 0);
+      expect(w?.source).toBe("bootstrap");
+      expect(w?.rows_written).toBe(42);
+    } finally {
+      await localApp.close(); await dispatcher.stop(); await localPool.stop();
+    }
+  });
+
+  it("live state supersedes bootstrap once a worker flushes a row", async () => {
+    const writeClients = [new FakeWriteClient()];
+    const fakePool: FakeClient[] = [];
+    const localPool = createWorkerPool({
+      size: 1,
+      redisFactory: () => { const c = new FakeClient(); fakePool.push(c); return c; },
+      heartbeatMs: 60_000,
+      logger: { info: () => {} },
+    });
+    fakePool[0]!.becomeReady();
+    const dispatcher = createDispatcher({
+      workerClients: writeClients, batchSize: 1, idleFlushMs: 0, highWater: 64,
+    });
+    const bootstrap = new Map([
+      [0, { rows_written: 1, last_ulid: "01HZBOOT00000000000000", last_updated: 1700000000000 }],
+    ]);
+    const localApp = await createServer({ pool: localPool, dispatcher, bootstrapCheckpoints: bootstrap });
+    await localApp.ready();
+    try {
+      await dispatcher.enqueue(makeRow("01HZLIVE00000000000000"));
+      await dispatcher.drain();
+      const res = await localApp.inject({ method: "GET", url: "/load/checkpoints" });
+      const body = res.json() as {
+        resume_ulid: string | null;
+        workers: Array<{ id: number; last_ulid: string | null; source: string }>;
+      };
+      expect(body.workers[0]?.source).toBe("live");
+      expect(body.workers[0]?.last_ulid).toBe("01HZLIVE00000000000000");
+      expect(body.resume_ulid).toBe("01HZLIVE00000000000000");
+    } finally {
+      await localApp.close(); await dispatcher.stop(); await localPool.stop();
+    }
+  });
+});
+
+describe("/load/rows — Wave 7.0.5.A body-drain error counter", () => {
+  it("increments body_drain_errors and invokes logEvent on parse failure", async () => {
+    const writeClients = [new FakeWriteClient()];
+    const fakePool: FakeClient[] = [];
+    const localPool = createWorkerPool({
+      size: 1,
+      redisFactory: () => { const c = new FakeClient(); fakePool.push(c); return c; },
+      heartbeatMs: 60_000,
+      logger: { info: () => {} },
+    });
+    fakePool[0]!.becomeReady();
+    const dispatcher = createDispatcher({
+      workerClients: writeClients, batchSize: 1, idleFlushMs: 0, highWater: 64,
+    });
+    const events: Array<{ level: string; obj: object; msg: string }> = [];
+    const localApp = await createServer({
+      pool: localPool, dispatcher,
+      logEvent: (level, obj, msg) => events.push({ level, obj, msg }),
+    });
+    await localApp.ready();
+    try {
+      const before = await localApp.inject({ method: "GET", url: "/load/status" });
+      expect((before.json() as { body_drain_errors: number }).body_drain_errors).toBe(0);
+
+      const bad = await localApp.inject({
+        method: "POST", url: "/load/rows",
+        headers: { "content-type": "text/plain" },
+        payload: "garbage",
+      });
+      expect(bad.statusCode).toBe(400);
+
+      const after = await localApp.inject({ method: "GET", url: "/load/status" });
+      expect((after.json() as { body_drain_errors: number }).body_drain_errors).toBe(1);
+      expect(events.length).toBe(1);
+      expect(events[0]?.level).toBe("warn");
+      expect((events[0]?.obj as { evt?: string }).evt).toBe("bulk-load-body-parse-error");
+    } finally {
+      await localApp.close(); await dispatcher.stop(); await localPool.stop();
+    }
+  });
+});

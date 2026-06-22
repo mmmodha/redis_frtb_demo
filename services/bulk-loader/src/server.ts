@@ -20,6 +20,7 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import type { WorkerPool } from "./pool.ts";
 import type { DispatcherHandle, Row } from "./dispatcher.ts";
+import type { CheckpointRecord } from "./checkpoint.ts";
 
 export interface CreateServerOpts {
   pool: WorkerPool;
@@ -29,6 +30,15 @@ export interface CreateServerOpts {
   // booted bulk-loader is ready to ingest without an explicit /load/start.
   // /load/start and /load/stop flip this at runtime.
   accepting?: boolean;
+  // Wave 7.0.5.A — bootstrap checkpoints loaded from Redis at boot. Used by
+  // /load/checkpoints to surface the resume watermark to a freshly-spawned
+  // generator before the in-process workers have written anything new.
+  bootstrapCheckpoints?: ReadonlyMap<number, CheckpointRecord>;
+  // Wave 7.0.5.A — structured-log sink so /load/rows body-parse errors are
+  // visible to operators instead of being silently swallowed into the 400
+  // response. Increments the body_drain_errors counter surfaced by
+  // /load/status when invoked.
+  logEvent?: (level: "warn" | "info", obj: object, msg: string) => void;
 }
 
 export async function createServer(opts: CreateServerOpts): Promise<FastifyInstance> {
@@ -43,6 +53,11 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
   );
 
   let accepting = opts.accepting !== false;
+  // Wave 7.0.5.A — observable counter of /load/rows body-parse failures.
+  // Surfaced via /load/status so operators can detect malformed-producer
+  // traffic that the old code path discarded into a 400 with no signal.
+  let bodyDrainErrors = 0;
+  const bootstrapCheckpoints = opts.bootstrapCheckpoints ?? new Map<number, CheckpointRecord>();
 
   app.get("/healthz", async (_req, reply) => {
     const s = opts.pool.status();
@@ -85,8 +100,71 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
       dispatcher: d
         ? { in_flight: d.inFlight, high_water: d.highWater }
         : null,
+      body_drain_errors: bodyDrainErrors,
       workers,
     };
+  });
+
+  // Wave 7.0.5.A — checkpoint snapshot. Merges any bootstrap checkpoints
+  // loaded from Redis at boot with the live worker watermarks so a generator
+  // restarted after a bulk-loader crash sees the persisted state and a
+  // generator restarted mid-run sees the freshest in-process state.
+  app.get("/load/checkpoints", async () => {
+    const live = opts.dispatcher?.status().workers ?? [];
+    const liveById = new Map<number, (typeof live)[number]>();
+    for (const m of live) liveById.set(m.id, m);
+    const ids = new Set<number>();
+    for (const id of bootstrapCheckpoints.keys()) ids.add(id);
+    for (const m of live) ids.add(m.id);
+    const sorted = [...ids].sort((a, b) => a - b);
+    const out: Array<{
+      id: number;
+      rows_written: number;
+      last_ulid: string | null;
+      last_updated: number | null;
+      source: "live" | "bootstrap";
+    }> = [];
+    let resumeUlid: string | null = null;
+    for (const id of sorted) {
+      const liveM = liveById.get(id);
+      const boot = bootstrapCheckpoints.get(id);
+      // Live state supersedes bootstrap once the worker has flushed even
+      // one row in the current process — its lastUlid is by construction
+      // >= the persisted value.
+      const liveActive = liveM && (liveM.lastUlid !== null || liveM.flushed > 0);
+      if (liveActive && liveM) {
+        out.push({
+          id,
+          rows_written: liveM.flushed,
+          last_ulid: liveM.lastUlid,
+          last_updated: liveM.lastFlushAt,
+          source: "live",
+        });
+        if (liveM.lastUlid !== null && (resumeUlid === null || liveM.lastUlid > resumeUlid)) {
+          resumeUlid = liveM.lastUlid;
+        }
+      } else if (boot) {
+        out.push({
+          id,
+          rows_written: boot.rows_written,
+          last_ulid: boot.last_ulid,
+          last_updated: boot.last_updated,
+          source: "bootstrap",
+        });
+        if (boot.last_ulid !== null && (resumeUlid === null || boot.last_ulid > resumeUlid)) {
+          resumeUlid = boot.last_ulid;
+        }
+      } else if (liveM) {
+        out.push({
+          id,
+          rows_written: liveM.flushed,
+          last_ulid: liveM.lastUlid,
+          last_updated: liveM.lastFlushAt,
+          source: "live",
+        });
+      }
+    }
+    return { resume_ulid: resumeUlid, workers: out };
   });
 
   app.post("/load/start", async (_req, reply) => {
@@ -124,8 +202,23 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
     try {
       rows = parseRowsBody(req.headers["content-type"], req.body);
     } catch (err) {
+      // Wave 7.0.5.A — surface body-parse failures instead of silently
+      // returning 400. The counter is reported via /load/status; the log
+      // line carries the content-type so operators can distinguish a
+      // misconfigured producer from a transient request-corruption bug.
+      bodyDrainErrors++;
+      const msg = (err as Error).message;
+      opts.logEvent?.(
+        "warn",
+        {
+          evt: "bulk-load-body-parse-error",
+          content_type: req.headers["content-type"] ?? null,
+          err: msg,
+        },
+        "bulk-loader /load/rows body parse failed",
+      );
       reply.code(400);
-      return { accepted: 0, reason: `malformed body: ${(err as Error).message}` };
+      return { accepted: 0, reason: `malformed body: ${msg}` };
     }
     if (rows.length === 0) {
       reply.code(202);

@@ -60,6 +60,10 @@ export interface WorkerMetrics {
   deadLettered: number;
   lastFlushLatencyMs: number | null;
   lastFlushAt: number | null;
+  // Wave 7.0.5.A — high-water mark of the most recent successfully flushed
+  // row id (ULID). Lex-monotonic; persisted by the checkpointer so resumed
+  // generators can skip rows whose `_id <= lastUlid`.
+  lastUlid: string | null;
 }
 
 export interface WorkerOptions {
@@ -224,6 +228,7 @@ export function createWorker(opts: WorkerOptions): WorkerHandle {
     deadLettered: 0,
     lastFlushLatencyMs: null,
     lastFlushAt: null,
+    lastUlid: null,
   };
 
   let stopped = false;
@@ -345,6 +350,12 @@ export function createWorker(opts: WorkerOptions): WorkerHandle {
       }
       if (!err) {
         metrics.flushed++;
+        // Wave 7.0.5.A — advance the resume watermark. ULIDs are
+        // lex-sortable; only move forward so a late retry of an older row
+        // never rewinds the high-water mark.
+        if (metrics.lastUlid === null || entry.row.id > metrics.lastUlid) {
+          metrics.lastUlid = entry.row.id;
+        }
         onSettle?.(1);
         continue;
       }

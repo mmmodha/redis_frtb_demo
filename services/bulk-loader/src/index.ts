@@ -16,6 +16,12 @@ import { createRedisClient, resolveRedisTarget } from "@frtb/redis-client";
 import { createServer } from "./server.ts";
 import { createWorkerPool, type PoolClient } from "./pool.ts";
 import { createDispatcher, type WorkerClient } from "./dispatcher.ts";
+import {
+  createCheckpointer,
+  DEFAULT_CHECKPOINT_INTERVAL_MS,
+  type CheckpointClient,
+  type CheckpointRecord,
+} from "./checkpoint.ts";
 
 const HOST = process.env.BULK_LOADER_HOST ?? process.env.HOST ?? "0.0.0.0";
 const PORT = Number(
@@ -25,6 +31,9 @@ const POOL_SIZE = Number(process.env.BULK_LOADER_POOL_SIZE ?? 32);
 const BATCH_SIZE = Number(process.env.BULK_LOADER_BATCH_SIZE ?? 1000);
 const IDLE_FLUSH_MS = Number(process.env.BULK_LOADER_IDLE_FLUSH_MS ?? 50);
 const HIGH_WATER_ENV = process.env.BULK_LOADER_HIGH_WATER;
+const CHECKPOINT_INTERVAL_MS = Number(
+  process.env.BULK_LOADER_CHECKPOINT_INTERVAL_MS ?? DEFAULT_CHECKPOINT_INTERVAL_MS,
+);
 const API_BASE = process.env.API_BASE ?? `http://localhost:${process.env.API_PORT ?? 8080}`;
 
 function log(level: "info" | "warn" | "error", msg: string, extra: object = {}): void {
@@ -83,7 +92,46 @@ async function main(): Promise<void> {
     },
   });
 
-  const app = await createServer({ pool, dispatcher, logger: false });
+  // Wave 7.0.5.A — checkpointer. Borrows pool worker[0]'s connection for
+  // HSET/HGETALL: any pool client suffices because the Enterprise proxy
+  // routes by key, not by connection. Bootstrap reads the persisted
+  // watermark before the HTTP listener accepts traffic so a freshly-started
+  // generator sees the resume row on its first /load/checkpoints fetch.
+  const firstPoolClient = pool.workers[0]?.client as unknown as CheckpointClient | undefined;
+  let checkpointer: ReturnType<typeof createCheckpointer> | null = null;
+  let bootstrap: Map<number, CheckpointRecord> = new Map();
+  if (firstPoolClient) {
+    checkpointer = createCheckpointer({
+      client: firstPoolClient,
+      source: {
+        workers: () =>
+          dispatcher.workers.map((w) => {
+            const m = w.metrics();
+            return { id: m.id, flushed: m.flushed, lastUlid: m.lastUlid };
+          }),
+      },
+      intervalMs: CHECKPOINT_INTERVAL_MS,
+      logger: { warn: (obj, m) => log("warn", m, obj) },
+    });
+    try {
+      bootstrap = await checkpointer.loadAll(POOL_SIZE);
+      log("info", "bulk-loader checkpoints loaded", {
+        count: bootstrap.size,
+        interval_ms: CHECKPOINT_INTERVAL_MS,
+      });
+    } catch (err) {
+      log("warn", "bulk-loader checkpoint bootstrap failed", { err: String(err) });
+    }
+    checkpointer.start();
+  }
+
+  const app = await createServer({
+    pool,
+    dispatcher,
+    logger: false,
+    bootstrapCheckpoints: bootstrap,
+    logEvent: (level, obj, m) => log(level, m, obj),
+  });
   await app.listen({ host: HOST, port: PORT });
   log("info", "bulk-loader listening", {
     port: PORT,
@@ -91,10 +139,12 @@ async function main(): Promise<void> {
     batch_size: BATCH_SIZE,
     idle_flush_ms: IDLE_FLUSH_MS,
     high_water: dispatcher.status().highWater,
+    checkpoint_interval_ms: CHECKPOINT_INTERVAL_MS,
   });
 
   if (process.env.SMOKE === "1") {
     await app.close();
+    if (checkpointer) await checkpointer.stop();
     await dispatcher.stop();
     await pool.stop();
     process.exit(0);
@@ -103,6 +153,7 @@ async function main(): Promise<void> {
   for (const sig of ["SIGINT", "SIGTERM"] as const) {
     process.on(sig, async () => {
       try { await app.close(); } catch { /* ignore */ }
+      try { if (checkpointer) await checkpointer.stop(); } catch { /* ignore */ }
       try { await dispatcher.stop(); } catch { /* ignore */ }
       try { await pool.stop(); } catch { /* ignore */ }
       process.exit(0);

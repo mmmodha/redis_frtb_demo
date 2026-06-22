@@ -39,6 +39,15 @@ export interface HttpProducerOptions {
   /** Jitter override (tests). Defaults to `Math.random()`. Must return a
    *  value in [0, 1). */
   random?: () => number;
+  /** Wave 7.0.5.A — hard cap on retry attempts per batch (429/5xx/network).
+   *  Defaults to 50 (HTTP_PRODUCER_MAX_RETRIES). When exceeded, the batch is
+   *  abandoned, `hardErrors` increments, a warn log fires, and the producer
+   *  surfaces the failure via the standard `firstError` path so callers
+   *  awaiting `flush()` / `close()` see the abort. */
+  maxRetries?: number;
+  /** Wave 7.0.5.A — opt out of /load/checkpoints fetch on first add() (tests
+   *  + back-compat for callers that don't speak the resume contract). */
+  resumeFromCheckpoints?: boolean;
   /** Optional structured logger (matches pino's child-logger shape). */
   logger?: {
     warn?: (obj: object, msg: string) => void;
@@ -57,6 +66,14 @@ export interface HttpProducer {
   readonly throttle429: number;
   /** Current concurrent in-flight POST count. */
   readonly inFlight: number;
+  /** Wave 7.0.5.A — count of rows short-circuited by the resume watermark
+   *  fetched from /load/checkpoints. */
+  readonly rowsSkipped: number;
+  /** Wave 7.0.5.A — count of batches abandoned after exceeding maxRetries. */
+  readonly hardErrors: number;
+  /** Wave 7.0.5.A — resume watermark loaded from /load/checkpoints, or null
+   *  when no checkpoint was found (fresh run). */
+  readonly resumeUlid: string | null;
 }
 
 const DEFAULT_BATCH_SIZE = 500;
@@ -64,6 +81,7 @@ const DEFAULT_MAX_IN_FLIGHT = 64;
 const MAX_BACKOFF_MS = 1000;
 const BASE_BACKOFF_MS = 50;
 const SLOW_SHARD_WARN_AFTER = 5;
+const DEFAULT_MAX_RETRIES = 50;
 
 // Generator emits rows with two synthetic prefixed fields (`_id`, `_hash_tag`)
 // — the bulk-loader's Row contract expects `id`, no `_hash_tag`. Strip both
@@ -78,9 +96,13 @@ export function createHttpProducer(opts: HttpProducerOptions): HttpProducer {
   if (!opts.url || typeof opts.url !== "string") {
     throw new Error("createHttpProducer: url is required");
   }
-  const endpoint = opts.url.replace(/\/+$/, "") + "/load/rows";
+  const baseUrl = opts.url.replace(/\/+$/, "");
+  const endpoint = baseUrl + "/load/rows";
+  const checkpointsEndpoint = baseUrl + "/load/checkpoints";
   const batchSize = Math.max(1, opts.batchSize ?? DEFAULT_BATCH_SIZE);
   const maxInFlight = Math.max(1, opts.maxInFlight ?? DEFAULT_MAX_IN_FLIGHT);
+  const maxRetries = Math.max(1, opts.maxRetries ?? DEFAULT_MAX_RETRIES);
+  const resumeEnabled = opts.resumeFromCheckpoints !== false;
   const fetchImpl = opts.fetchImpl ?? (globalThis.fetch as typeof fetch);
   if (!fetchImpl) {
     throw new Error("createHttpProducer: global fetch unavailable; pass fetchImpl");
@@ -90,12 +112,62 @@ export function createHttpProducer(opts: HttpProducerOptions): HttpProducer {
   const log = opts.logger;
 
   const buffer: SensitivityRow[] = [];
-  const stats = { rowsSent: 0, batchCount: 0, throttle429: 0, inFlight: 0 };
+  const stats = {
+    rowsSent: 0,
+    batchCount: 0,
+    throttle429: 0,
+    inFlight: 0,
+    rowsSkipped: 0,
+    hardErrors: 0,
+  };
   const byClass: Record<string, number> = {};
   const inFlightSet = new Set<Promise<void>>();
   const waiters: Array<() => void> = [];
   let firstError: unknown = null;
   let closed = false;
+  // Wave 7.0.5.A — lazy resume-watermark fetch. The first add() call awaits
+  // /load/checkpoints once; every subsequent add() reuses the cached promise
+  // so concurrent producers see a single network round-trip.
+  let resumeUlid: string | null = null;
+  let resumePromise: Promise<void> | null = null;
+
+  async function loadResumeWatermark(): Promise<void> {
+    if (!resumeEnabled) return;
+    try {
+      const res = await fetchImpl(checkpointsEndpoint, { method: "GET" });
+      if (!res.ok) {
+        // Not fatal — a fresh bulk-loader without the endpoint or a 404
+        // means there's no checkpoint to honour. Run from row zero.
+        await res.text().catch(() => undefined);
+        return;
+      }
+      const body = (await res.json().catch(() => null)) as
+        | { resume_ulid?: string | null }
+        | null;
+      const r = body?.resume_ulid;
+      if (typeof r === "string" && r.length > 0) {
+        resumeUlid = r;
+        log?.info?.(
+          { evt: "bulk-load-resume", resume_ulid: r, url: checkpointsEndpoint },
+          "bulk-loader resume watermark loaded",
+        );
+      }
+    } catch (err) {
+      // Network-level failure on the bootstrap fetch is non-fatal — the
+      // run starts from row zero (worst case: a few duplicate HSETs, which
+      // are idempotent for sens:<ulid>).
+      log?.warn?.(
+        { evt: "bulk-load-resume-failed", err: String(err), url: checkpointsEndpoint },
+        "bulk-loader resume watermark fetch failed; starting from row zero",
+      );
+    }
+  }
+
+  function ensureResumeLoaded(): Promise<void> {
+    if (!resumeEnabled) return Promise.resolve();
+    if (!resumePromise) resumePromise = loadResumeWatermark();
+    return resumePromise;
+  }
 
   // Slot accounting (Wave 7.0.1.C). `inFlight` is incremented *synchronously*
   // either on `acquireSlot()` (when a slot is free) or by `releaseOneWaiter()`
@@ -132,6 +204,9 @@ export function createHttpProducer(opts: HttpProducerOptions): HttpProducer {
     const payload = JSON.stringify(batch.map(toBulkRow));
     let attempt = 0;
     let consec429 = 0;
+    // Wave 7.0.5.A — `attempt` counts retries (not the initial try). The
+    // hard cap fires when `attempt >= maxRetries`, giving callers a bounded
+    // worst-case wait instead of the previous unbounded loop.
     while (true) {
       let res: Response;
       try {
@@ -141,6 +216,23 @@ export function createHttpProducer(opts: HttpProducerOptions): HttpProducer {
           body: payload,
         });
       } catch (err) {
+        if (attempt >= maxRetries) {
+          stats.hardErrors++;
+          log?.warn?.(
+            {
+              evt: "bulk-load-hard-error",
+              url: endpoint,
+              attempt,
+              max_retries: maxRetries,
+              batch_size: batch.length,
+              err: String(err),
+            },
+            "bulk-loader POST exceeded max retries (network); abandoning batch",
+          );
+          throw new Error(
+            `bulk-loader POST ${endpoint} exceeded ${maxRetries} retries: ${String(err)}`,
+          );
+        }
         // Network-level failure — treat like a transient 5xx and back off.
         await sleep(backoffMs(attempt));
         attempt++;
@@ -172,12 +264,46 @@ export function createHttpProducer(opts: HttpProducerOptions): HttpProducer {
             `bulk-loader returned 429 ${consec429}× consecutive — slow shard suspected`,
           );
         }
+        if (attempt >= maxRetries) {
+          stats.hardErrors++;
+          log?.warn?.(
+            {
+              evt: "bulk-load-hard-error",
+              url: endpoint,
+              attempt,
+              max_retries: maxRetries,
+              batch_size: batch.length,
+              status: 429,
+            },
+            "bulk-loader POST exceeded max retries (429); abandoning batch",
+          );
+          throw new Error(
+            `bulk-loader POST ${endpoint} exceeded ${maxRetries} retries (429)`,
+          );
+        }
         await sleep(backoffMs(attempt));
         attempt++;
         continue;
       }
       if (res.status >= 500 && res.status < 600) {
         await res.text().catch(() => undefined);
+        if (attempt >= maxRetries) {
+          stats.hardErrors++;
+          log?.warn?.(
+            {
+              evt: "bulk-load-hard-error",
+              url: endpoint,
+              attempt,
+              max_retries: maxRetries,
+              batch_size: batch.length,
+              status: res.status,
+            },
+            "bulk-loader POST exceeded max retries (5xx); abandoning batch",
+          );
+          throw new Error(
+            `bulk-loader POST ${endpoint} exceeded ${maxRetries} retries (${res.status})`,
+          );
+        }
         await sleep(backoffMs(attempt));
         attempt++;
         if (attempt > SLOW_SHARD_WARN_AFTER) {
@@ -230,6 +356,17 @@ export function createHttpProducer(opts: HttpProducerOptions): HttpProducer {
     async add(row: SensitivityRow): Promise<void> {
       if (closed) throw new Error("http-producer: add after close");
       if (firstError) throw firstError;
+      // Wave 7.0.5.A — fetch the resume watermark on the first add(). The
+      // call is memoised so concurrent producers share the round-trip.
+      await ensureResumeLoaded();
+      if (firstError) throw firstError;
+      // ULIDs are lex-sortable so `<=` against the watermark is the resume
+      // contract: any row already persisted by the previous run is skipped
+      // without buffering or counting toward batchCount/byClass.
+      if (resumeUlid !== null && row._id <= resumeUlid) {
+        stats.rowsSkipped += 1;
+        return;
+      }
       buffer.push(row);
       byClass[row.risk_class] = (byClass[row.risk_class] ?? 0) + 1;
       if (buffer.length >= batchSize) {
@@ -266,5 +403,8 @@ export function createHttpProducer(opts: HttpProducerOptions): HttpProducer {
     get byClass() { return byClass; },
     get throttle429() { return stats.throttle429; },
     get inFlight() { return stats.inFlight; },
+    get rowsSkipped() { return stats.rowsSkipped; },
+    get hardErrors() { return stats.hardErrors; },
+    get resumeUlid() { return resumeUlid; },
   };
 }
