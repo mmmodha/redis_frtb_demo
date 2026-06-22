@@ -66,7 +66,9 @@ describe("IngestPanel", () => {
   it("renders the Ingest heading and Streams + JSON EnterpriseCallout banners", () => {
     fetchMock.mockResolvedValue({ ok: true, json: async () => keysResponse(0) });
     renderPanel();
-    expect(screen.getByRole("heading", { name: /^Ingest$/i, level: 1 })).toBeInTheDocument();
+    // Wave 7.0.6 — heading renamed to "Ingest — live tail" to distinguish
+    // the live-tail stream consumer from the bulk-loader baseline path.
+    expect(screen.getByRole("heading", { name: /Ingest — live tail/i, level: 1 })).toBeInTheDocument();
     const callouts = screen.getAllByTestId("enterprise-callout");
     const signals = callouts.map((c) => c.getAttribute("data-signal"));
     expect(signals).toContain("Streams");
@@ -176,7 +178,9 @@ describe("IngestPanel", () => {
       return { ok: true, json: async () => ({}) };
     });
     renderPanel();
-    const startBtn = await waitFor(() => screen.getByRole("button", { name: /start ingest/i }));
+    // Wave 7.0.6 — "Start ingest" renamed to "Start live tail" alongside the
+    // header rename to make the live-tail vs bulk-loader distinction explicit.
+    const startBtn = await waitFor(() => screen.getByRole("button", { name: /start live tail/i }));
     fireEvent.click(startBtn);
     await waitFor(() => {
       const posted = fetchMock.mock.calls.find(
