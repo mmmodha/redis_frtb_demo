@@ -64,8 +64,12 @@ export function resolveStorageFormat(value: string | undefined): StorageFormat {
 // Wave 6.39.G — structured-warn sink for the tick() catch block. Optional so
 // unit tests that drive processBatch directly can omit it; the consumer
 // service plumbs the per-shard pino logger through cli.ts.
+// Wave 7.0.6.12 — added optional `error` channel for the per-command MULTI
+// failure diagnostics in processBatchAtomic. Optional so existing call sites
+// that only wire `warn` still type-check; the cli plumbs both.
 export interface ConsumerLogger {
   warn: (meta: Record<string, unknown>, msg: string) => void;
+  error?: (meta: Record<string, unknown>, msg: string) => void;
 }
 
 export interface ConsumerOptions {
@@ -1008,6 +1012,146 @@ async function emitSuggestersAfterCommit(client: RedisLike, doc: Record<string, 
   try { await p.exec(); } catch { /* best-effort */ }
 }
 
+// Wave 7.0.6.12 — per-command MULTI/pipeline diagnostics.
+//
+// Today's EXECABORT path swallows the underlying command failure: the outer
+// catch only sees the umbrella "EXECABORT Transaction discarded because of
+// previous errors" string with no pointer to WHICH queued command erred. This
+// recorder wraps the multi()/pipeline() return so every `.call(cmd, ...)` and
+// `.xack(...)` adds an entry to a parallel array; after `.exec()` resolves,
+// `findFirstCommandError` walks the ioredis `[err, val][]` result array and
+// pairs the first failing index back to its recorded command shape.
+//
+// The contract intentionally does NOT change semantics — it only adds logging.
+// On the happy path the wrapper is a one-method delegate with O(1) overhead
+// per call (a push onto a small array); on the failure path it converts an
+// otherwise-opaque EXECABORT into a single structured `{ phase, command,
+// key, args, err }` log line per failed tick.
+interface RecordedCommand {
+  cmd: string;
+  key: string;
+  args: unknown[];
+}
+interface RecorderPipe {
+  call: (cmd: string, ...args: unknown[]) => RecorderPipe;
+  xack: (...args: unknown[]) => RecorderPipe;
+  exec: () => Promise<unknown>;
+  recorded: RecordedCommand[];
+}
+type MultiOrPipelineLike = {
+  call: (cmd: string, ...args: unknown[]) => unknown;
+  xack?: (...args: unknown[]) => unknown;
+  exec: () => Promise<unknown>;
+};
+function makeRecorder(inner: MultiOrPipelineLike): RecorderPipe {
+  const recorded: RecordedCommand[] = [];
+  const record = (cmd: string, args: unknown[]): void => {
+    const key = args.length > 0 && typeof args[0] === "string" ? args[0] : "";
+    recorded.push({ cmd, key, args: args.slice(1) });
+  };
+  const proxy: RecorderPipe = {
+    recorded,
+    call(cmd: string, ...args: unknown[]) {
+      record(cmd, args);
+      inner.call(cmd, ...args);
+      return proxy;
+    },
+    xack(...args: unknown[]) {
+      record("XACK", args);
+      if (typeof inner.xack === "function") {
+        inner.xack(...args);
+      } else {
+        inner.call("XACK", ...args);
+      }
+      return proxy;
+    },
+    exec: () => inner.exec(),
+  };
+  return proxy;
+}
+// Trim a single arg to the structured-log surface. Long buffers / objects can
+// pin the log line into MBs; the cap keeps a representative slice.
+function trimArg(a: unknown): unknown {
+  if (typeof a === "string") return a.length > 64 ? `${a.slice(0, 64)}…(+${a.length - 64})` : a;
+  if (typeof a === "number" || typeof a === "boolean" || a == null) return a;
+  try {
+    const s = JSON.stringify(a);
+    return s.length > 64 ? `${s.slice(0, 64)}…` : s;
+  } catch { return "<unstringifiable>"; }
+}
+// Walk an ioredis MULTI/pipeline result array and return the first entry
+// whose `err` slot is non-null. Returns `null` if the result is not an array
+// (e.g. WATCH discarded the transaction → exec returned null) or if every
+// command succeeded. ioredis result tuples are `[Error | null, unknown]`.
+function findFirstCommandError(
+  res: unknown,
+): { index: number; err: string } | null {
+  if (!Array.isArray(res)) return null;
+  for (let i = 0; i < res.length; i++) {
+    const item = res[i] as [unknown, unknown] | undefined;
+    if (Array.isArray(item) && item[0] != null) {
+      const e = item[0];
+      const msg = e instanceof Error ? e.message : String(e);
+      return { index: i, err: msg };
+    }
+  }
+  return null;
+}
+// One-shot structured log for a phase failure (per the spec: "one per failed
+// tick is enough — don't spam"). Caller passes the phase tag, the recorder
+// that fed the failed exec, and either the `[err, val][]` array (for per-
+// command errors) or the thrown exception (for EXECABORT-style umbrella
+// failures where we can't pin the offending index).
+function logPhaseFailure(
+  logger: ConsumerLogger | undefined,
+  phase: "phase1" | "phase2" | "tail",
+  recorder: RecorderPipe,
+  res: unknown,
+  thrown: unknown,
+  context: Record<string, unknown>,
+): void {
+  if (!logger) return;
+  const emit = logger.error ?? logger.warn;
+  const firstErr = findFirstCommandError(res);
+  let meta: Record<string, unknown>;
+  if (firstErr) {
+    const rec = recorder.recorded[firstErr.index];
+    meta = {
+      phase,
+      command: rec?.cmd ?? "<unknown>",
+      key: rec?.key ?? "",
+      args: rec?.args.map(trimArg) ?? [],
+      err: firstErr.err,
+      ...context,
+    };
+  } else {
+    const msg = thrown instanceof Error ? thrown.message : (thrown != null ? String(thrown) : "transaction discarded");
+    // ioredis attaches `previousErrors: Error[]` to an EXECABORT reply so the
+    // queue-time per-command rejections survive past the umbrella throw. Pin
+    // the first previousError to the first recorded command (ioredis preserves
+    // queue order) when available, then fall back to the umbrella message.
+    const prev = thrown && typeof thrown === "object" && "previousErrors" in (thrown as Record<string, unknown>)
+      ? (thrown as { previousErrors?: unknown[] }).previousErrors
+      : undefined;
+    const previousErrors = Array.isArray(prev)
+      ? prev.map((e) => e instanceof Error ? e.message : String(e))
+      : undefined;
+    const first = recorder.recorded[0];
+    meta = {
+      phase,
+      command: first?.cmd ?? "<umbrella>",
+      key: first?.key ?? "",
+      args: first?.args.map(trimArg) ?? [],
+      err: previousErrors && previousErrors.length > 0 ? previousErrors[0] : msg,
+      queued: recorder.recorded.slice(0, 8).map((r) => `${r.cmd} ${r.key}`),
+      queuedCount: recorder.recorded.length,
+      ...(previousErrors ? { previousErrors } : {}),
+      ...context,
+    };
+  }
+  emit(meta, "ingest multi/pipeline command failed");
+}
+
 // Wave 6.39.G — Route D. The pre-6.39.G single-MULTI block spanned 5–6 hash
 // slots (`sens:<ulid>`, `{sens:<ulid>}:tenors`, the rollup keys, the seen
 // sens-type key, the stream key) and EXECABORTed with CROSSSLOT on Redis
@@ -1085,14 +1229,36 @@ export async function processBatchAtomic(
         await (client as Redis).watch(key);
         const oldHash = (await (client as Redis).hgetall(key)) as Record<string, string>;
         const txn1 = (client as Redis).multi();
+        // Wave 7.0.6.12 — wrap the multi with a recorder so a per-command
+        // failure (or umbrella EXECABORT) can be logged with the offending
+        // command + key + args instead of just the opaque outer reply.
+        const rec1 = makeRecorder(txn1 as unknown as MultiOrPipelineLike);
         writeDocForStorage(
-          txn1 as unknown as PipelineLike,
+          rec1,
           key,
           doc,
           opts.storageFormat ?? DEFAULT_STORAGE_FORMAT,
         );
-        const res1 = await txn1.exec();
+        let res1: unknown;
+        try {
+          res1 = await txn1.exec();
+        } catch (err) {
+          logPhaseFailure(opts.logger, "phase1", rec1, null, err, {
+            stream: opts.stream, group: opts.group, entryId, key,
+          });
+          throw err;
+        }
         if (res1 !== null) {
+          // Per-command runtime failures (e.g. WRONGTYPE) surface inside the
+          // exec result array even when the umbrella reply is success. Log
+          // the first such tuple, then keep the existing semantics (the row
+          // still proceeds; the tail's idempotent replay path covers retries).
+          const firstErr = findFirstCommandError(res1);
+          if (firstErr) {
+            logPhaseFailure(opts.logger, "phase1", rec1, res1, null, {
+              stream: opts.stream, group: opts.group, entryId, key,
+            });
+          }
           // Snapshot the pre-write HASH for Phase 2's delta computation.
           for (const k of Object.keys(oldHash)) oldHashForPhase2[k] = oldHash[k]!;
           phase1Committed = true;
@@ -1124,27 +1290,47 @@ export async function processBatchAtomic(
           await (client as Redis).watch(markerKey);
           const exists = (await (client as Redis).exists(markerKey)) as number;
           const txn2 = (client as Redis).multi();
+          // Wave 7.0.6.12 — recorder wrapper so EXECABORT / per-command
+          // errors emerge with the actual failing HINCRBYFLOAT/SADD/SET line
+          // instead of an opaque "Transaction discarded" rollup.
+          const rec2 = makeRecorder(txn2 as unknown as MultiOrPipelineLike);
           if (exists === 0) {
             const oldC = parseOldContribution(oldHashForPhase2, riskClass, sensType);
-            emitRollupDelta(txn2 as unknown as PipelineLike, oldC, doc);
+            emitRollupDelta(rec2, oldC, doc);
             // Wave 7.0.6.6 — keys are tag-free; the historical co-location
             // argument no longer holds. The other two seen-set SADDs
             // (`seen:risk_class`, `seen:bucket:<rc>`) still run on the
             // Phase 3 tail pipeline. emitSeenSadds is left intact for the
             // non-atomic processBatch path (writes all three on a single
             // pipeline, which standalone Redis accepts unconditionally).
-            txn2.call("SADD", seenSensTypeKey(riskClass, bucket), sensType);
-            txn2.call("SET", markerKey, "1", "EX", String(markerTtl));
+            rec2.call("SADD", seenSensTypeKey(riskClass, bucket), sensType);
+            rec2.call("SET", markerKey, "1", "EX", String(markerTtl));
           } else {
             // Replay short-circuit. Issue a single no-op on the same slot so
             // the WATCH is consumed and EXEC returns a non-null array (the
             // contract `res2 !== null === committed` keeps the retry loop
             // simple). EXISTS on the already-watched marker key is a cheap
             // slot-local no-op write-free probe.
-            txn2.call("EXISTS", markerKey);
+            rec2.call("EXISTS", markerKey);
           }
-          const res2 = await txn2.exec();
+          let res2: unknown;
+          try {
+            res2 = await txn2.exec();
+          } catch (err) {
+            logPhaseFailure(opts.logger, "phase2", rec2, null, err, {
+              stream: opts.stream, group: opts.group, entryId, key,
+              riskClass, bucket, sensType,
+            });
+            throw err;
+          }
           if (res2 !== null) {
+            const firstErr = findFirstCommandError(res2);
+            if (firstErr) {
+              logPhaseFailure(opts.logger, "phase2", rec2, res2, null, {
+                stream: opts.stream, group: opts.group, entryId, key,
+                riskClass, bucket, sensType,
+              });
+            }
             phase2Committed = true;
             break;
           }
@@ -1172,18 +1358,34 @@ export async function processBatchAtomic(
       // a no-op on already-acked entries. SUGADD is best-effort and lives in
       // its own try/catch below for back-compat.
       const tail = client.pipeline();
+      // Wave 7.0.6.12 — recorder for the tail pipeline. Tail isn't a MULTI so
+      // there's no umbrella EXECABORT, but per-command errors (e.g. CROSSSLOT
+      // when seen-set keys live on a different slot than the XACK target)
+      // still surface inside the [err, val][] array. Logging here is the only
+      // place the Wave 7 root cause becomes visible.
+      const recTail = makeRecorder(tail as unknown as MultiOrPipelineLike);
       // Wave 7.0.6 — seen-set SADDs are gated off in live-tail mode; only
       // the XACK survives so the consumer-group PEL drains.
-      if (!liveTail && riskClass) tail.call("SADD", SEEN_RISK_CLASS_KEY, riskClass);
-      if (!liveTail && riskClass && bucket) tail.call("SADD", seenBucketKey(riskClass), bucket);
-      tail.xack(opts.stream, opts.group, entryId);
+      if (!liveTail && riskClass) recTail.call("SADD", SEEN_RISK_CLASS_KEY, riskClass);
+      if (!liveTail && riskClass && bucket) recTail.call("SADD", seenBucketKey(riskClass), bucket);
+      recTail.xack(opts.stream, opts.group, entryId);
+      let resTail: unknown;
       try {
-        await tail.exec();
+        resTail = await tail.exec();
       } catch (err) {
         // Tail failure → entry replays via PEL. Surface via the logger so
         // the H1 hygiene fix in tick() doesn't swallow it (we're below
         // tick()'s try/catch here so re-throw to bubble it up).
+        logPhaseFailure(opts.logger, "tail", recTail, null, err, {
+          stream: opts.stream, group: opts.group, entryId, key,
+        });
         throw err;
+      }
+      const tailFirstErr = findFirstCommandError(resTail);
+      if (tailFirstErr) {
+        logPhaseFailure(opts.logger, "tail", recTail, resTail, null, {
+          stream: opts.stream, group: opts.group, entryId, key,
+        });
       }
       processed++;
       // Wave 7.0.6 — suggester writes (sug:*) are out of scope for the

@@ -3,6 +3,20 @@
 Operational scripts for the FRTB demo. Service-level commands live in
 `./run-local.sh`; the entries below are diagnostic helpers and one-shots.
 
+## run-local.sh stack defaults
+
+`run-local.sh start` exports a small set of env defaults via `apply_defaults`
+that layer on top of `.env.local`. Anything you set in `.env.local` wins.
+
+- **`LIVE_TAIL_MODE=true`** (Wave 7.0.6.12) — ingest skips Phase 2 (rollup
+  HINCRBYFLOATs, sens-type SADD, processed-marker SET) and the Phase 3
+  seen-set SADDs. Only the Phase 1 sens-slot MULTI (parent HSET + side-table
+  HSET) and the tail XACK + best-effort SUGADD survive. The bulk loader's
+  tag-free finalisation step owns rollup/seen keys post-load. Required
+  locally because the legacy multi-phase path EXECABORTs on the local
+  single-node Redis. Set `LIVE_TAIL_MODE=false` in `.env.local` to exercise
+  the legacy path.
+
 ## shard-balance-report.mjs (Wave 6.19)
 
 Read-only health check answering "are the shards balanced at this scale?".

@@ -1305,6 +1305,72 @@ describe("processBatch live-tail mode [Wave 7.0.6]", () => {
   });
 });
 
+// Wave 7.0.6.12 — surface per-command MULTI errors via the consumer logger.
+// Poisoning the rollup key with the wrong Redis type forces HINCRBYFLOAT to
+// fail at EXEC time; processBatchAtomic must log a structured `error` entry
+// pinned to the offending command (phase=phase2, command=HINCRBYFLOAT,
+// key=rollup:…) so operators stop staring at opaque EXECABORT rollups.
+describe("processBatchAtomic per-command MULTI errors [Wave 7.0.6.12]", () => {
+  integration("phase2 HINCRBYFLOAT against wrong-type key → logger.error pinned to the command", async () => {
+    await ensureGroup(redis, "sensitivities:in", "ingest");
+    const { processBatchAtomic } = await import("../src/consumer.ts");
+    // Pre-poison the rollup HASH slot with a STRING so the HINCRBYFLOAT
+    // queued by emitRollupDelta hits WRONGTYPE inside the MULTI. Phase 1
+    // (sens:* HSET) is untouched and commits normally; only Phase 2 fails.
+    const poisonedKey = rollupKey("EQUITY", "1", "Delta");
+    await redis.set(poisonedKey, "not-a-hash");
+    const id = ulid();
+    await redis.xadd(
+      "sensitivities:in", "*",
+      "risk_class", "EQUITY", "bucket", "1",
+      "_hash_tag", "EQUITY:1",
+      "_id", id,
+      "payload", JSON.stringify({
+        sensitivity_type: "Delta",
+        risk_value: { spot: 1.5 },
+        book: "EQ_NYC", trade_id: "TE1", risk_factor: "AAPL",
+      }),
+    );
+    const errors: Array<{ meta: Record<string, unknown>; msg: string }> = [];
+    const warns: Array<{ meta: Record<string, unknown>; msg: string }> = [];
+    const logger = {
+      warn: (meta: Record<string, unknown>, msg: string) => warns.push({ meta, msg }),
+      error: (meta: Record<string, unknown>, msg: string) => errors.push({ meta, msg }),
+    };
+    // Phase 2 surfaces either an EXECABORT throw or an array tuple with a
+    // WRONGTYPE error depending on ioredis' queue-time vs runtime split.
+    // Either path must end up in the captured `error` channel, so the
+    // outer try/catch is here only to absorb the rethrow (the entry stays
+    // in the PEL, the test only cares about the log line).
+    try {
+      await processBatchAtomic(redis, {
+        stream: "sensitivities:in",
+        group: "ingest",
+        consumerName: "phase2-multi-err",
+        batchSize: 10,
+        schema: SCHEMA,
+        storageFormat: "hash-sidetable",
+        liveTailMode: false,
+        logger,
+      });
+    } catch { /* swallowed; assertion is on the logger */ }
+    const phase2Errors = errors.filter((e) =>
+      e.meta && (e.meta as { phase?: string }).phase === "phase2",
+    );
+    expect(phase2Errors.length).toBeGreaterThan(0);
+    const first = phase2Errors[0]!.meta as Record<string, unknown>;
+    // The recorder pins the offending HINCRBYFLOAT command + key + the
+    // server-reported WRONGTYPE message; previousErrors is optionally
+    // present when ioredis surfaces EXECABORT (depends on the queue-time
+    // vs runtime split for HINCRBYFLOAT on the installed Redis version).
+    const err = String(first.err ?? "");
+    expect(err.toLowerCase()).toContain("wrongtype");
+    const cmd = String(first.command ?? "");
+    const key = String(first.key ?? "");
+    expect([cmd, key].some((s) => s.toUpperCase().includes("HINCRBYFLOAT") || s.startsWith("rollup:"))).toBe(true);
+  });
+});
+
 // Wave 6.38.A — STORAGE_FORMAT writer dispatch + 4-variant ingest. The pure-
 // helper suite asserts that `writeDocForStorage` emits the right pipelined
 // commands per variant against the recording stub. The integration suite

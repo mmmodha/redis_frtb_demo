@@ -448,8 +448,18 @@ apply_defaults() {
     CONN_STORE_KEY="dev-only-change-in-prod"
   fi
   : "${SCHEMA_FILE:=${REPO_ROOT}/config/schema/frtb-default.yaml}"
+  # Wave 7.0.6.12 — local dev runs ingest in live-tail mode by default. The
+  # legacy Phase 2 paths (rollup HINCRBYFLOATs, sens-type SADD, processed-
+  # marker SET) and the Phase 3 seen-set SADDs are gated off; the bulk
+  # loader's tag-free finalisation step owns those keys post-load. Without
+  # this, every UI ingest tick fails with `EXECABORT Transaction discarded`
+  # on the local single-node Redis (CROSSSLOT / WRONGTYPE-style failures
+  # leak through the multi). Set LIVE_TAIL_MODE=false in .env.local to
+  # exercise the legacy path locally.
+  : "${LIVE_TAIL_MODE:=true}"
   export NODE_ENV LOG_LEVEL API_URL ALLOWED_ORIGINS INTERNAL_API_TOKEN
   export SOURCE_BASE CONN_STORE_KEY SCHEMA_FILE
+  export LIVE_TAIL_MODE
 }
 
 
