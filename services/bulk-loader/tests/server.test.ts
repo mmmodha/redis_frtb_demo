@@ -331,6 +331,92 @@ describe("POST /load/rows — Wave 7.0.1.C", () => {
   });
 });
 
+describe("GET /load/status — Wave 7.0.6.22 backpressure surface", () => {
+  async function buildSlow(highWater: number, callDelayMs: number): Promise<{
+    app: FastifyInstance; pool: WorkerPool; dispatcher: DispatcherHandle; clients: FakeWriteClient[];
+  }> {
+    const writeClients = [new FakeWriteClient(), new FakeWriteClient()];
+    writeClients[0]!.callDelayMs = callDelayMs;
+    writeClients[1]!.callDelayMs = callDelayMs;
+    const fakePool: FakeClient[] = [];
+    const localPool = createWorkerPool({
+      size: 2,
+      redisFactory: () => { const c = new FakeClient(); fakePool.push(c); return c; },
+      heartbeatMs: 60_000,
+      logger: { info: () => {} },
+    });
+    fakePool[0]!.becomeReady();
+    fakePool[1]!.becomeReady();
+    const dispatcher = createDispatcher({
+      workerClients: writeClients, batchSize: 1, idleFlushMs: 0, highWater,
+    });
+    const localApp = await createServer({ pool: localPool, dispatcher });
+    await localApp.ready();
+    return { app: localApp, pool: localPool, dispatcher, clients: writeClients };
+  }
+  function makeRow(id: string): Row {
+    return { id, risk_class: "GIRR", bucket: "USD", sensitivity_type: "Delta", risk_value: { "3M": 0.1 } };
+  }
+
+  it("reports throttled=false, headroom_pct=1, recent_429_count=0 when idle", async () => {
+    const { app: a, pool: p, dispatcher: d } = await buildSlow(64, 0);
+    try {
+      const res = await a.inject({ method: "GET", url: "/load/status" });
+      const body = res.json() as {
+        throttled: boolean; headroom_pct: number | null; recent_429_count: number;
+      };
+      expect(body.throttled).toBe(false);
+      expect(body.headroom_pct).toBe(1);
+      expect(body.recent_429_count).toBe(0);
+    } finally {
+      await a.close(); await d.stop(); await p.stop();
+    }
+  });
+
+  it("surfaces throttled=true and recent_429_count>0 after a 429 burst", async () => {
+    // highWater=2 + 200ms write delay so a 3-row burst trips backpressure.
+    const { app: a, pool: p, dispatcher: d } = await buildSlow(2, 200);
+    try {
+      const fill = await a.inject({
+        method: "POST", url: "/load/rows",
+        headers: { "content-type": "application/json" },
+        payload: JSON.stringify([makeRow("a"), makeRow("b")]),
+      });
+      expect(fill.statusCode).toBe(202);
+      const overflow = await a.inject({
+        method: "POST", url: "/load/rows",
+        headers: { "content-type": "application/json" },
+        payload: JSON.stringify([makeRow("c")]),
+      });
+      expect(overflow.statusCode).toBe(429);
+      const res = await a.inject({ method: "GET", url: "/load/status" });
+      const body = res.json() as {
+        throttled: boolean; headroom_pct: number | null; recent_429_count: number;
+        dispatcher: { in_flight: number; high_water: number };
+      };
+      expect(body.recent_429_count).toBeGreaterThan(0);
+      // headroom_pct < 0.2 OR recent_429_count > 0 ⇒ throttled.
+      expect(body.throttled).toBe(true);
+      expect(body.headroom_pct).not.toBeNull();
+      expect(body.headroom_pct).toBeLessThan(1);
+      await d.drain();
+    } finally {
+      await a.close(); await d.stop(); await p.stop();
+    }
+  });
+
+  it("returns headroom_pct=null when no dispatcher is wired", async () => {
+    // Pool-only server (no dispatcher) — headroom is undefined, throttled=false.
+    const res = await app.inject({ method: "GET", url: "/load/status" });
+    const body = res.json() as {
+      throttled: boolean; headroom_pct: number | null; recent_429_count: number;
+    };
+    expect(body.headroom_pct).toBeNull();
+    expect(body.throttled).toBe(false);
+    expect(body.recent_429_count).toBe(0);
+  });
+});
+
 describe("GET /load/checkpoints — Wave 7.0.5.A", () => {
   async function buildWithDispatcher(): Promise<{
     app: FastifyInstance; pool: WorkerPool; dispatcher: DispatcherHandle; clients: FakeWriteClient[];

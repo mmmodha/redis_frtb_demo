@@ -80,6 +80,29 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
   // traffic that the old code path discarded into a 400 with no signal.
   let bodyDrainErrors = 0;
 
+  // Wave 7.0.6.22 — rolling 10s window of 429 emit timestamps. Drives the
+  // `recent_429_count` / `throttled` fields on /load/status so the UI's
+  // rate-gauge can light up the "throttled" indicator during sustained
+  // backpressure and dim it once the window clears.
+  //
+  // Plain array (not a ring buffer) is fine here: cardinality is bounded
+  // by the highest sustainable 429/sec on this process — at typical
+  // 100rps it's <1k entries, trimmed lazily on each /load/status read.
+  const recent429: number[] = [];
+  const RECENT_429_WINDOW_MS = 10_000;
+  function record429Now(): void {
+    recent429.push(Date.now());
+  }
+  function trimRecent429(now: number): void {
+    const cutoff = now - RECENT_429_WINDOW_MS;
+    // Indices are append-only-ascending; binary-search would help if this
+    // ever became hot. At <1k entries a linear shift from the front is
+    // perfectly fine and avoids the extra allocation a slice() would do.
+    let drop = 0;
+    while (drop < recent429.length && recent429[drop]! < cutoff) drop++;
+    if (drop > 0) recent429.splice(0, drop);
+  }
+
   app.get("/healthz", async (_req, reply) => {
     const s = state.pool.status();
     const healthy = state.pool.isHealthy();
@@ -149,12 +172,32 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
         seen_sadds_failed: m ? saddsFailed : null,
       };
     });
+    // Wave 7.0.6.22 — backpressure surface for the UI rate-gauge.
+    //   headroom_pct      ∈ [0,1] free capacity left in the dispatcher
+    //                     queue. 0 ⇒ next request will 429. Null when no
+    //                     dispatcher is wired (matches the legacy contract).
+    //   recent_429_count  count of 429 responses emitted in the last 10s.
+    //   throttled         derived: recent_429_count > 0 OR headroom_pct < 0.2.
+    //                     The headroom-only branch lets the panel light up
+    //                     proactively (within ~50ms of a sustained burst)
+    //                     before the first 429 ships, instead of after.
+    const nowMs = Date.now();
+    trimRecent429(nowMs);
+    const recent429Count = recent429.length;
+    let headroomPct: number | null = null;
+    if (d && d.highWater > 0) {
+      headroomPct = Math.max(0, Math.min(1, 1 - d.inFlight / d.highWater));
+    }
+    const throttled = recent429Count > 0 || (headroomPct !== null && headroomPct < 0.2);
     return {
       pool_size: s.poolSize,
       connected: s.connected,
       dispatcher: d
         ? { in_flight: d.inFlight, high_water: d.highWater }
         : null,
+      throttled,
+      headroom_pct: headroomPct,
+      recent_429_count: recent429Count,
       body_drain_errors: bodyDrainErrors,
       // Wave 7.0.6.17 — target identity + swap observability. UI banner
       // reads bound_target + api_active_target to render divergence; ops
@@ -318,6 +361,10 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
     // generator awaits would silently stall inside enqueue().
     const status = d.status();
     if (status.inFlight + rows.length > status.highWater) {
+      // Wave 7.0.6.22 — stamp the rolling-window observation BEFORE
+      // emitting the response so a /load/status read on the SAME tick
+      // sees the count tick up. Drives the UI's throttled indicator.
+      record429Now();
       reply.code(429);
       reply.header("retry-after", "1");
       return {

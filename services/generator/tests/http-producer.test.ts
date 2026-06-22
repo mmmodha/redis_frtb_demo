@@ -142,15 +142,19 @@ describe("createHttpProducer — 429 backoff + slow-shard warn", () => {
     expect(p.rowsSent).toBe(1);
     expect(p.throttle429).toBe(2);
     expect(sleeps.length).toBe(2);
+    // Wave 7.0.6.22 — BASE_BACKOFF_MS bumped 50→100 so the first jittered
+    // sleep is in [0, 101] (random=0.5 ⇒ 50) and the second in [0, 201].
     expect(sleeps[0]).toBeGreaterThan(0);
-    expect(sleeps[0]).toBeLessThanOrEqual(51);
+    expect(sleeps[0]).toBeLessThanOrEqual(101);
     expect(sleeps[1]).toBeGreaterThan(0);
-    expect(sleeps[1]).toBeLessThanOrEqual(101);
+    expect(sleeps[1]).toBeLessThanOrEqual(201);
   });
 
-  it("caps backoff at MAX_BACKOFF_MS (1000ms) across many retries", async () => {
+  it("caps backoff at MAX_BACKOFF_MS (5000ms) across many retries", async () => {
+    // Wave 7.0.6.22 — cap is 5s, base is 100ms; cap hit at attempt 6
+    // (100 * 2^6 = 6400 > 5000). Use 8 retries so we see the cap pin.
     const replies = [
-      ...new Array(10).fill({ status: 429 }),
+      ...new Array(8).fill({ status: 429 }),
       { status: 202 },
     ];
     const { impl } = fakeFetch(replies);
@@ -164,8 +168,8 @@ describe("createHttpProducer — 429 backoff + slow-shard warn", () => {
     });
     await p.add(row("a"));
     await p.close();
-    for (const s of sleeps) expect(s).toBeLessThanOrEqual(1001);
-    expect(sleeps.some((s) => s === 1001)).toBe(true);
+    for (const s of sleeps) expect(s).toBeLessThanOrEqual(5001);
+    expect(sleeps.some((s) => s === 5001)).toBe(true);
   });
 
   it("emits a slow-shard warn log after 5 consecutive 429s", async () => {
@@ -428,51 +432,26 @@ describe("createHttpProducer — Wave 7.0.5.A resume from /load/checkpoints", ()
   });
 });
 
-describe("createHttpProducer — Wave 7.0.5.A HTTP_PRODUCER_MAX_RETRIES cap", () => {
-  it("abandons a batch after maxRetries consecutive 429s; increments hardErrors", async () => {
-    const replies = new Array(50).fill({ status: 429 });
-    const { impl } = fakeFetch(replies);
-    const warns: Array<{ obj: object; msg: string }> = [];
+describe("createHttpProducer — Wave 7.0.6.22 infinite retry + throttled signal", () => {
+  it("retries 429 indefinitely (no maxRetries cap) and never hard-errors", async () => {
+    // 200 consecutive 429s — well past the pre-7.0.6.22 give-up at 50.
+    // The producer MUST keep retrying and eventually succeed on the 201st.
+    const replies = [...new Array(200).fill({ status: 429 }), { status: 202 }];
+    const { impl, calls } = fakeFetch(replies);
     const p = createHttpProducer({
-      url: "http://bulk:8086", batchSize: 1, maxRetries: 3, fetchImpl: impl,
-      sleep: async () => {}, random: () => 0,
-      logger: { warn: (obj, msg) => warns.push({ obj, msg }) },
-    });
-    await p.add(row("a"));
-    await expect(p.close()).rejects.toThrow(/exceeded 3 retries/);
-    expect(p.hardErrors).toBe(1);
-    const hard = warns.find((w) => (w.obj as { evt?: string }).evt === "bulk-load-hard-error");
-    expect(hard).toBeDefined();
-  });
-
-  it("abandons a batch after maxRetries 5xx responses", async () => {
-    const replies = new Array(50).fill({ status: 503 });
-    const { impl } = fakeFetch(replies);
-    const p = createHttpProducer({
-      url: "http://bulk:8086", batchSize: 1, maxRetries: 2, fetchImpl: impl,
+      url: "http://bulk:8086", batchSize: 1, fetchImpl: impl,
       sleep: async () => {}, random: () => 0,
     });
     await p.add(row("a"));
-    await expect(p.close()).rejects.toThrow(/exceeded 2 retries/);
-    expect(p.hardErrors).toBe(1);
+    await p.close();
+    expect(p.rowsSent).toBe(1);
+    expect(p.hardErrors).toBe(0);
+    expect(p.throttle429).toBe(200);
+    expect(calls.length).toBe(201);
   });
 
-  it("abandons a batch after maxRetries network-level failures", async () => {
-    const replies = new Array(50).fill({ status: 0, throwErr: new Error("ECONNRESET") });
-    const { impl } = fakeFetch(replies);
-    const p = createHttpProducer({
-      url: "http://bulk:8086", batchSize: 1, maxRetries: 4, fetchImpl: impl,
-      sleep: async () => {}, random: () => 0,
-    });
-    await p.add(row("a"));
-    await expect(p.close()).rejects.toThrow(/exceeded 4 retries/);
-    expect(p.hardErrors).toBe(1);
-  });
-
-  it("default maxRetries is 50 (HTTP_PRODUCER_MAX_RETRIES contract)", async () => {
-    // Verify the default is actually 50 by succeeding at attempt 51 (= 50
-    // retries after the initial attempt) — anything lower would abandon.
-    const replies = [...new Array(50).fill({ status: 429 }), { status: 202 }];
+  it("retries 5xx indefinitely (no give-up) and never hard-errors", async () => {
+    const replies = [...new Array(100).fill({ status: 503 }), { status: 202 }];
     const { impl } = fakeFetch(replies);
     const p = createHttpProducer({
       url: "http://bulk:8086", batchSize: 1, fetchImpl: impl,
@@ -482,6 +461,97 @@ describe("createHttpProducer — Wave 7.0.5.A HTTP_PRODUCER_MAX_RETRIES cap", ()
     await p.close();
     expect(p.rowsSent).toBe(1);
     expect(p.hardErrors).toBe(0);
+  });
+
+  it("retries network-level failures indefinitely (no give-up)", async () => {
+    const replies = [
+      ...new Array(80).fill({ status: 0, throwErr: new Error("ECONNRESET") }),
+      { status: 202 },
+    ];
+    const { impl } = fakeFetch(replies);
+    const p = createHttpProducer({
+      url: "http://bulk:8086", batchSize: 1, fetchImpl: impl,
+      sleep: async () => {}, random: () => 0,
+    });
+    await p.add(row("a"));
+    await p.close();
+    expect(p.rowsSent).toBe(1);
+    expect(p.hardErrors).toBe(0);
+  });
+
+  it("ignores opts.maxRetries (back-compat field is accepted but no-op)", async () => {
+    // Pass maxRetries=3 and serve 10 429s — pre-7.0.6.22 this would have
+    // thrown after 3. Now it must keep retrying and succeed on the 11th.
+    const replies = [...new Array(10).fill({ status: 429 }), { status: 202 }];
+    const { impl } = fakeFetch(replies);
+    const p = createHttpProducer({
+      url: "http://bulk:8086", batchSize: 1, maxRetries: 3, fetchImpl: impl,
+      sleep: async () => {}, random: () => 0,
+    });
+    await p.add(row("a"));
+    await p.close();
+    expect(p.rowsSent).toBe(1);
+    expect(p.hardErrors).toBe(0);
+  });
+
+  it("fires onThrottleChange(true) on first 429 and (false) on next 2xx", async () => {
+    const replies = [{ status: 429 }, { status: 429 }, { status: 202 }];
+    const { impl } = fakeFetch(replies);
+    const edges: boolean[] = [];
+    const p = createHttpProducer({
+      url: "http://bulk:8086", batchSize: 1, fetchImpl: impl,
+      sleep: async () => {}, random: () => 0,
+      onThrottleChange: (t) => edges.push(t),
+    });
+    expect(p.throttled).toBe(false);
+    await p.add(row("a"));
+    await p.close();
+    expect(edges).toEqual([true, false]);
+    expect(p.throttled).toBe(false);
+  });
+
+  it("exposes throttled, retriesTotal, and throttledAtMs", async () => {
+    const replies = [{ status: 429 }, { status: 503 }, { status: 202 }];
+    const { impl } = fakeFetch(replies);
+    let clock = 1_700_000_000_000;
+    const p = createHttpProducer({
+      url: "http://bulk:8086", batchSize: 1, fetchImpl: impl,
+      sleep: async () => {}, random: () => 0,
+      now: () => { clock += 1; return clock; },
+    });
+    await p.add(row("a"));
+    await p.close();
+    expect(p.rowsSent).toBe(1);
+    // retriesTotal counts retry attempts (429 + 5xx + network).
+    expect(p.retriesTotal).toBe(2);
+    expect(p.throttle429).toBe(1);
+    // throttledAtMs is stamped on each 429; must be set.
+    expect(p.throttledAtMs).not.toBeNull();
+    expect(p.throttledAtMs).toBeGreaterThan(0);
+    expect(p.throttled).toBe(false);
+  });
+
+  it("wakes the retry loop within one tick when signal is aborted", async () => {
+    // Endless 429s + a real (slow) sleep so the test would hang without
+    // the signal-aware sleep. abort() within ~5ms must short-circuit it
+    // and surface the abort via close().
+    const replies = new Array(10_000).fill({ status: 429 });
+    const { impl } = fakeFetch(replies);
+    const ac = new AbortController();
+    const p = createHttpProducer({
+      url: "http://bulk:8086", batchSize: 1, fetchImpl: impl,
+      // Real setTimeout sleep so the abortable race is meaningfully tested.
+      random: () => 1.0,
+      signal: ac.signal,
+    });
+    const start = Date.now();
+    setTimeout(() => ac.abort(), 50);
+    await p.add(row("a"));
+    await expect(p.close()).rejects.toThrow(/aborted/);
+    // Must terminate well before any reasonable retry budget; the schedule
+    // (with random=1, attempt=2) would sleep 401ms on its own — total wall
+    // clock should easily be < 2000ms once abort fires.
+    expect(Date.now() - start).toBeLessThan(2000);
   });
 });
 

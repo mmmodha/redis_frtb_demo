@@ -84,6 +84,22 @@ interface BulkRunRecord {
   // poll Atomics.load(cancelView, 0)); `cancelled` flag for inline.
   cancelView?: Int32Array;
   cancelled?: boolean;
+  // Wave 7.0.6.22 — bulk-load backpressure surface for the UI rate-gauge.
+  //   throttled       true while at least one in-flight batch on any worker
+  //                   is in the 429 retry loop.
+  //   retries_total   monotonic count of retry attempts (429 + 5xx + network)
+  //                   summed across all workers for this run.
+  //   throttled_at_ms wall-clock ms of the most recent 429 across any worker,
+  //                   or null when no 429 has been observed this run.
+  // Per-worker maps are kept on the record so progress messages can update
+  // a slot without losing the other workers' contributions; the wire shape
+  // (the GET /ingest/bulk/runs/:id response) reports only the aggregates.
+  throttled?: boolean;
+  retries_total?: number;
+  throttled_at_ms?: number | null;
+  perWorkerThrottled?: boolean[];
+  perWorkerRetries?: number[];
+  perWorkerThrottledAt?: Array<number | null>;
 }
 
 const DEFAULT_BATCH_SIZE = 500;
@@ -132,6 +148,29 @@ function computeCoverageFloor(rowsTotal: number, workers: number): number {
   if (rowsTotal < 100) return 0;
   const globalFloor = Math.max(1, Math.floor(rowsTotal / 100));
   return Math.max(1, Math.ceil(globalFloor / Math.max(1, workers)));
+}
+
+// Wave 7.0.6.20 — compute the per-class row count a single worker will draw
+// when iterating `for (i = offset; i < rowsTotal; i += stride)` with the
+// `classes[i % classes.length]` round-robin. Threaded to the row-generator
+// as `plannedRowsByClass` so the reallocation-based coverage floor can size
+// per-(rc, sens_type) quotas that sum EXACTLY to the worker's row count
+// (preserves the requested total instead of the 6.19 path's potential
+// inflation when the floor exceeded the natural per-combo share).
+function planRowsByClass(
+  rowsTotal: number,
+  classes: readonly string[],
+  offset: number,
+  stride: number,
+): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const c of classes) counts[c] = 0;
+  const C = classes.length;
+  if (C === 0 || stride <= 0 || rowsTotal <= 0) return counts;
+  for (let i = offset; i < rowsTotal; i += stride) {
+    counts[classes[i % C]!] = (counts[classes[i % C]!] ?? 0) + 1;
+  }
+  return counts;
 }
 
 // Wave 7.0.6.15 — resolve the schema path the API was booted with. Tests
@@ -302,11 +341,18 @@ export function registerIngestRoutes(
         return { error: "run not found" };
       }
       const rps = r.ms > 0 ? Math.round((r.rows_sent * 1000) / r.ms) : 0;
-      // Strip non-serialisable fields (Int32Array view over SAB) before
-      // shipping over the wire. Spread preserves every other key so the UI
-      // and existing tests see no shape change.
-      const { cancelView: _cv, ...wireFields } = r;
-      void _cv;
+      // Strip non-serialisable fields (Int32Array view over SAB) and the
+      // per-worker bookkeeping maps (only the run-wide aggregates are part
+      // of the wire shape). Spread preserves every other key so the UI and
+      // existing tests see no shape change.
+      const {
+        cancelView: _cv,
+        perWorkerThrottled: _pwt,
+        perWorkerRetries: _pwr,
+        perWorkerThrottledAt: _pwa,
+        ...wireFields
+      } = r;
+      void _cv; void _pwt; void _pwr; void _pwa;
       return { ...wireFields, rows_per_sec: rps };
     },
   );
@@ -374,13 +420,25 @@ function runInline(args: InlineRunArgs): void {
   const { schema, body, rowsTotal, batchSize, concurrency, classes, sensitivityTypes,
     bulkBase, fetchImpl, log, record, run_id } = args;
   const coverageFloor = computeCoverageFloor(rowsTotal, 1);
+  // Wave 7.0.6.20 — pre-plan per-class row counts (offset=0, stride=1 for
+  // the inline single-thread loop below) so the reallocation-based coverage
+  // floor sizes its quota table to EXACTLY this worker's row count.
+  const plannedRowsByClass = coverageFloor > 0
+    ? planRowsByClass(rowsTotal, classes, 0, 1)
+    : undefined;
   const generator = createRowGenerator(schema, {
     seed: body.seed,
     sensitivityTypes,
     ...(body.trade_pool_size !== undefined ? { tradePoolSize: body.trade_pool_size } : {}),
     ...(body.factor_pool_size !== undefined ? { factorPoolSize: body.factor_pool_size } : {}),
     ...(coverageFloor > 0 ? { coverageFloor } : {}),
+    ...(plannedRowsByClass ? { plannedRowsByClass } : {}),
   });
+  // Wave 7.0.6.22 — cancel propagation into the HTTP producer's retry loop.
+  // Without this an inline run with workers=1 that hits sustained 429s
+  // never observes record.cancelled (the row-boundary poll runs only
+  // BETWEEN rows, never inside producer.add()'s infinite-retry inner loop).
+  const httpAbort = new AbortController();
   const producer = createHttpProducer({
     url: bulkBase,
     batchSize,
@@ -388,6 +446,8 @@ function runInline(args: InlineRunArgs): void {
     fetchImpl,
     resumeFromCheckpoints: false,
     logger: log as unknown as never,
+    signal: httpAbort.signal,
+    onThrottleChange: (next) => { record.throttled = next; },
   });
 
   const t0 = process.hrtime.bigint();
@@ -400,25 +460,38 @@ function runInline(args: InlineRunArgs): void {
         if ((i & 0x3FF) === 0) {
           record.rows_sent = producer.rowsSent;
           record.rows_skipped = producer.rowsSkipped;
+          record.retries_total = producer.retriesTotal;
+          record.throttled_at_ms = producer.throttledAtMs;
           record.ms = Number(process.hrtime.bigint() - t0) / 1e6;
-          if (record.cancelled) break;
+          if (record.cancelled) {
+            if (!httpAbort.signal.aborted) httpAbort.abort();
+            break;
+          }
         }
       }
       await producer.close();
       record.rows_sent = producer.rowsSent;
       record.rows_skipped = producer.rowsSkipped;
+      record.retries_total = producer.retriesTotal;
+      record.throttled_at_ms = producer.throttledAtMs;
+      record.throttled = producer.throttled;
       record.ms = Number(process.hrtime.bigint() - t0) / 1e6;
       record.status = record.cancelled ? "cancelled" : "done";
     } catch (err) {
       record.rows_sent = producer.rowsSent;
       record.rows_skipped = producer.rowsSkipped;
+      record.retries_total = producer.retriesTotal;
+      record.throttled_at_ms = producer.throttledAtMs;
+      record.throttled = producer.throttled;
       record.ms = Number(process.hrtime.bigint() - t0) / 1e6;
-      record.status = "error";
-      record.error = err instanceof Error ? err.message : String(err);
-      log.warn(
-        { evt: "ingest-bulk-start", run_id, err: record.error },
-        "bulk ingest producer aborted",
-      );
+      record.status = record.cancelled ? "cancelled" : "error";
+      if (!record.cancelled) {
+        record.error = err instanceof Error ? err.message : String(err);
+        log.warn(
+          { evt: "ingest-bulk-start", run_id, err: record.error },
+          "bulk ingest producer aborted",
+        );
+      }
     } finally {
       setTimeout(() => activeRuns.delete(run_id), RUN_GRACE_MS).unref?.();
     }
@@ -453,6 +526,34 @@ function runWithWorkers(args: WorkerRunArgs): void {
   const cancelView = new Int32Array(cancelBuffer);
   record.cancelView = cancelView;
   const perWorkerRows = new Int32Array(workers);
+  // Wave 7.0.6.22 — per-worker backpressure trackers. Aggregated into
+  // record.{throttled,retries_total,throttled_at_ms} on every progress
+  // frame so the UI's /ingest/bulk/runs/:id poll always sees an up-to-
+  // date snapshot. `throttled` is an OR (any worker throttled ⇒ run
+  // throttled); `retries_total` is a SUM; `throttled_at_ms` is the MAX.
+  const perWorkerThrottled = new Array<boolean>(workers).fill(false);
+  const perWorkerRetries = new Array<number>(workers).fill(0);
+  const perWorkerThrottledAt = new Array<number | null>(workers).fill(null);
+  record.perWorkerThrottled = perWorkerThrottled;
+  record.perWorkerRetries = perWorkerRetries;
+  record.perWorkerThrottledAt = perWorkerThrottledAt;
+  record.throttled = false;
+  record.retries_total = 0;
+  record.throttled_at_ms = null;
+  function recomputeBackpressure(): void {
+    let anyThrottled = false;
+    let retriesSum = 0;
+    let lastAt: number | null = null;
+    for (let i = 0; i < workers; i++) {
+      if (perWorkerThrottled[i]) anyThrottled = true;
+      retriesSum += perWorkerRetries[i] ?? 0;
+      const at = perWorkerThrottledAt[i] ?? null;
+      if (at !== null && (lastAt === null || at > lastAt)) lastAt = at;
+    }
+    record.throttled = anyThrottled;
+    record.retries_total = retriesSum;
+    record.throttled_at_ms = lastAt;
+  }
 
   // Per-worker HTTP in-flight budget — divide the run's total concurrency
   // across workers (min 1) so the aggregate matches a workers=1 run.
@@ -469,6 +570,14 @@ function runWithWorkers(args: WorkerRunArgs): void {
   let totalRowsSent = 0;
 
   for (let w = 0; w < workers; w++) {
+    // Wave 7.0.6.20 — per-worker planned row count per class. Each worker's
+    // stride slice (`for i in [w, w+S, w+2S, ...) < N`) emits a deterministic
+    // number of rows per class via `classes[i % C]` — computing it up-front
+    // here lets the row-generator's reallocation path size its quotas to
+    // EXACTLY this worker's row count (sum across workers == rowsTotal).
+    const plannedRowsByClass = perWorkerCoverageFloor > 0
+      ? planRowsByClass(rowsTotal, classes, w, workers)
+      : undefined;
     const init: WorkerInitData = {
       schemaPath,
       // HTTP producer ignores these but the type requires them.
@@ -487,6 +596,7 @@ function runWithWorkers(args: WorkerRunArgs): void {
       ...(body.trade_pool_size !== undefined ? { tradePoolSize: body.trade_pool_size } : {}),
       ...(body.factor_pool_size !== undefined ? { factorPoolSize: body.factor_pool_size } : {}),
       ...(perWorkerCoverageFloor > 0 ? { coverageFloor: perWorkerCoverageFloor } : {}),
+      ...(plannedRowsByClass ? { plannedRowsByClass } : {}),
       cancelBuffer,
       progressBatchSize: 1000,
       bulkLoadTarget: bulkBase,
@@ -501,9 +611,18 @@ function runWithWorkers(args: WorkerRunArgs): void {
           for (let i = 0; i < workers; i++) s += perWorkerRows[i]!;
           if (s > record.rows_sent) record.rows_sent = s;
           record.ms = Number(process.hrtime.bigint() - t0) / 1e6;
+          if (msg.throttled !== undefined) perWorkerThrottled[msg.workerIdx] = msg.throttled;
+          if (typeof msg.retriesTotal === "number") perWorkerRetries[msg.workerIdx] = msg.retriesTotal;
+          if (msg.throttledAtMs !== undefined) perWorkerThrottledAt[msg.workerIdx] = msg.throttledAtMs;
+          recomputeBackpressure();
         } else if (msg.type === "done") {
           perWorkerRows[msg.workerIdx] = msg.rowsSent;
           totalRowsSent += msg.rowsSent;
+          // Worker exited cleanly ⇒ no in-flight batches, no throttle.
+          perWorkerThrottled[msg.workerIdx] = false;
+          if (typeof msg.retriesTotal === "number") perWorkerRetries[msg.workerIdx] = msg.retriesTotal;
+          if (msg.throttledAtMs !== undefined) perWorkerThrottledAt[msg.workerIdx] = msg.throttledAtMs;
+          recomputeBackpressure();
         } else if (msg.type === "error") {
           if (!firstError) firstError = new Error(`worker ${msg.workerIdx}: ${msg.message}`);
           Atomics.store(cancelView, 0, 1);

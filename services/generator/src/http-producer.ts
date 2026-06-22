@@ -8,18 +8,31 @@
 // owns slim HSET serialisation + per-shard backpressure; the generator's
 // only job is to keep enough rows in flight to saturate it.
 //
-// Backpressure (folded from Wave 7.0.5.B):
+// Backpressure (Wave 7.0.6.22 — infinite retry, no give-up):
 //   • Total concurrent in-flight POSTs are capped at `maxInFlight`
 //     (GENERATOR_INFLIGHT, default 64). `add()` awaits when saturated.
-//   • HTTP 429 from /load/rows triggers exponential-with-jitter backoff
-//     of `min(50 × 2^attempt, 1000)` ms before retry. After 5 consecutive
-//     429s on the same batch the producer emits a slow-shard warning log
-//     line (does NOT crash) and keeps retrying.
-//   • HTTP 5xx (transient) follows the same retry path. Non-2xx, non-429,
-//     non-5xx responses (e.g. 400 malformed) throw immediately.
+//   • HTTP 429 / 5xx / network failures trigger adaptive backoff with
+//     full jitter (`min(100 × 2^attempt, 5000)` ms) and the batch is
+//     retried INDEFINITELY — no max-attempts cap. Row loss on
+//     backpressure (the pre-7.0.6.22 give-up after 50 retries) is gone.
+//   • On the first 429 in a batch the producer flips a worker-local
+//     `throttled` flag and fires `onThrottleChange(true)`; on the next
+//     2xx the flag clears and `onThrottleChange(false)` fires. Callers
+//     surface this to the UI's rate-gauge to explain why throughput is
+//     pinned.
+//   • Cancellation is via `signal?: AbortSignal`. When aborted, in-flight
+//     fetches receive the signal, pending backoff sleeps wake early, and
+//     the producer's `firstError` is set so subsequent add/flush/close
+//     surface the abort. The Stop button MUST set this signal — without
+//     it a worker stuck in the infinite-retry loop will never observe a
+//     coordinator-level cancel flag (which is only polled at row
+//     boundaries inside runGenerationInline, never between retries).
 //
-// Per-process metrics surface (DoD: rows emitted, 429-throttle events,
-// current in-flight count) — `rowsSent`, `throttle429`, `inFlight`.
+// Per-process metrics surface — `rowsSent`, `throttle429`, `inFlight`,
+// `throttled`, `retriesTotal`, `throttledAtMs` (see HttpProducer).
+//
+// Non-retryable 4xx (e.g. 400 malformed) still throws immediately so
+// operator misconfigurations fail loud.
 
 import type { SensitivityRow } from "./row-generator.ts";
 
@@ -39,15 +52,27 @@ export interface HttpProducerOptions {
   /** Jitter override (tests). Defaults to `Math.random()`. Must return a
    *  value in [0, 1). */
   random?: () => number;
-  /** Wave 7.0.5.A — hard cap on retry attempts per batch (429/5xx/network).
-   *  Defaults to 50 (HTTP_PRODUCER_MAX_RETRIES). When exceeded, the batch is
-   *  abandoned, `hardErrors` increments, a warn log fires, and the producer
-   *  surfaces the failure via the standard `firstError` path so callers
-   *  awaiting `flush()` / `close()` see the abort. */
+  /** Wave 7.0.5.A — accepted for back-compat; IGNORED as of 7.0.6.22. The
+   *  producer no longer caps retries (data-loss on backpressure is
+   *  unacceptable). Leaving the field in the type so older callers compile
+   *  without churn. */
   maxRetries?: number;
   /** Wave 7.0.5.A — opt out of /load/checkpoints fetch on first add() (tests
    *  + back-compat for callers that don't speak the resume contract). */
   resumeFromCheckpoints?: boolean;
+  /** Wave 7.0.6.22 — cancellation surface. When aborted, in-flight fetches
+   *  receive the signal, queued backoff sleeps wake early, and `firstError`
+   *  is populated so subsequent add/flush/close reject with the abort. */
+  signal?: AbortSignal;
+  /** Wave 7.0.6.22 — fires once per throttled-state edge. `true` on the
+   *  first 429 in a batch (when the local `throttled` flag flips on),
+   *  `false` on the first 2xx after that (when it clears). The worker_thread
+   *  uses this to forward throttled state to the panel via postMessage.
+   *  Idempotent — no edge ⇒ no call. */
+  onThrottleChange?: (throttled: boolean) => void;
+  /** Wave 7.0.6.22 — wall-clock time source (test seam). Defaults to
+   *  Date.now. Used only to stamp `throttledAtMs` when a 429 arrives. */
+  now?: () => number;
   /** Optional structured logger (matches pino's child-logger shape). */
   logger?: {
     warn?: (obj: object, msg: string) => void;
@@ -69,19 +94,34 @@ export interface HttpProducer {
   /** Wave 7.0.5.A — count of rows short-circuited by the resume watermark
    *  fetched from /load/checkpoints. */
   readonly rowsSkipped: number;
-  /** Wave 7.0.5.A — count of batches abandoned after exceeding maxRetries. */
+  /** Wave 7.0.5.A — count of batches abandoned after exceeding maxRetries.
+   *  Wave 7.0.6.22 — always 0 (the give-up cap was removed). Kept for
+   *  back-compat with existing /ingest/bulk/runs status consumers. */
   readonly hardErrors: number;
   /** Wave 7.0.5.A — resume watermark loaded from /load/checkpoints, or null
    *  when no checkpoint was found (fresh run). */
   readonly resumeUlid: string | null;
+  /** Wave 7.0.6.22 — true while at least one in-flight batch is in the
+   *  retry loop after observing a 429. Cleared on the next 2xx. Drives the
+   *  rate-gauge "throttled" indicator surfaced to the UI panel. */
+  readonly throttled: boolean;
+  /** Wave 7.0.6.22 — monotonic count of retry attempts (429 + 5xx + network)
+   *  across all batches. Distinct from `throttle429` which counts only 429s. */
+  readonly retriesTotal: number;
+  /** Wave 7.0.6.22 — wall-clock ms of the last 429 observed, or null when
+   *  no 429 has been seen this process. */
+  readonly throttledAtMs: number | null;
 }
 
 const DEFAULT_BATCH_SIZE = 500;
 const DEFAULT_MAX_IN_FLIGHT = 64;
-const MAX_BACKOFF_MS = 1000;
-const BASE_BACKOFF_MS = 50;
+// Wave 7.0.6.22 — adaptive backoff schedule. 100ms initial, doubled per
+// retry, capped at 5s. Full jitter ([0, exp]) prevents the synchronized-
+// retry stampede a pure exponential schedule would create across N
+// parallel workers all unblocked by the same dispatcher settle.
+const MAX_BACKOFF_MS = 5000;
+const BASE_BACKOFF_MS = 100;
 const SLOW_SHARD_WARN_AFTER = 5;
-const DEFAULT_MAX_RETRIES = 50;
 
 // Generator emits rows with two synthetic prefixed fields (`_id`, `_hash_tag`)
 // — the bulk-loader's Row contract expects `id`, no `_hash_tag`. Strip both
@@ -101,7 +141,9 @@ export function createHttpProducer(opts: HttpProducerOptions): HttpProducer {
   const checkpointsEndpoint = baseUrl + "/load/checkpoints";
   const batchSize = Math.max(1, opts.batchSize ?? DEFAULT_BATCH_SIZE);
   const maxInFlight = Math.max(1, opts.maxInFlight ?? DEFAULT_MAX_IN_FLIGHT);
-  const maxRetries = Math.max(1, opts.maxRetries ?? DEFAULT_MAX_RETRIES);
+  // Wave 7.0.6.22 — opts.maxRetries is accepted for back-compat but ignored;
+  // see the doc-comment on HttpProducerOptions.maxRetries for rationale.
+  void opts.maxRetries;
   const resumeEnabled = opts.resumeFromCheckpoints !== false;
   const fetchImpl = opts.fetchImpl ?? (globalThis.fetch as typeof fetch);
   if (!fetchImpl) {
@@ -109,6 +151,9 @@ export function createHttpProducer(opts: HttpProducerOptions): HttpProducer {
   }
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const random = opts.random ?? Math.random;
+  const now = opts.now ?? Date.now;
+  const signal = opts.signal;
+  const onThrottleChange = opts.onThrottleChange;
   const log = opts.logger;
 
   const buffer: SensitivityRow[] = [];
@@ -119,7 +164,19 @@ export function createHttpProducer(opts: HttpProducerOptions): HttpProducer {
     inFlight: 0,
     rowsSkipped: 0,
     hardErrors: 0,
+    retriesTotal: 0,
+    throttledAtMs: null as number | null,
   };
+  // Per-batch throttled flags live in `throttledBatches`; the public
+  // `throttled` getter is `throttledBatches > 0`. Tracking a count (not a
+  // single bool) is the only correct shape for the multi-in-flight case —
+  // one batch clearing on 2xx must not flip the worker-wide flag off while
+  // another batch is still in the 429 retry loop.
+  let throttledBatches = 0;
+  function emitThrottle(next: boolean): void {
+    if (!onThrottleChange) return;
+    onThrottleChange(next);
+  }
   const byClass: Record<string, number> = {};
   const inFlightSet = new Set<Promise<void>>();
   const waiters: Array<() => void> = [];
@@ -200,125 +257,139 @@ export function createHttpProducer(opts: HttpProducerOptions): HttpProducer {
     return Math.floor(random() * (exp + 1));
   }
 
+  // Wave 7.0.6.22 — abort-aware sleep. Races the timer against the signal
+  // so a Stop click wakes the loop within one tick instead of waiting out
+  // the current 5s cap. The signal listener is added/removed per call so a
+  // long-lived signal does not accumulate listeners across N retries.
+  async function abortableSleep(ms: number): Promise<void> {
+    if (signal?.aborted) return;
+    if (!signal) {
+      await sleep(ms);
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      let done = false;
+      const onAbort = (): void => {
+        if (done) return;
+        done = true;
+        signal.removeEventListener("abort", onAbort);
+        resolve();
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      void sleep(ms).then(() => {
+        if (done) return;
+        done = true;
+        signal.removeEventListener("abort", onAbort);
+        resolve();
+      });
+    });
+  }
+
+  function abortError(): Error {
+    return new Error("http-producer: aborted");
+  }
+
   async function postBatch(batch: SensitivityRow[]): Promise<void> {
     const payload = JSON.stringify(batch.map(toBulkRow));
     let attempt = 0;
     let consec429 = 0;
-    // Wave 7.0.5.A — `attempt` counts retries (not the initial try). The
-    // hard cap fires when `attempt >= maxRetries`, giving callers a bounded
-    // worst-case wait instead of the previous unbounded loop.
-    while (true) {
-      let res: Response;
-      try {
-        res = await fetchImpl(endpoint, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: payload,
-        });
-      } catch (err) {
-        if (attempt >= maxRetries) {
-          stats.hardErrors++;
-          log?.warn?.(
-            {
-              evt: "bulk-load-hard-error",
-              url: endpoint,
-              attempt,
-              max_retries: maxRetries,
-              batch_size: batch.length,
-              err: String(err),
-            },
-            "bulk-loader POST exceeded max retries (network); abandoning batch",
-          );
-          throw new Error(
-            `bulk-loader POST ${endpoint} exceeded ${maxRetries} retries: ${String(err)}`,
-          );
-        }
-        // Network-level failure — treat like a transient 5xx and back off.
-        await sleep(backoffMs(attempt));
-        attempt++;
-        if (attempt > SLOW_SHARD_WARN_AFTER) {
-          log?.warn?.(
-            { evt: "bulk-load-network-retry", url: endpoint, attempt, err: String(err) },
-            "bulk-loader POST network failure; backing off",
-          );
-        }
-        continue;
+    // Local throttled latch — flipped on the first 429 in this batch, cleared
+    // on the next 2xx. Updates `throttledBatches` (worker-wide counter) so
+    // multi-batch in-flight cases aggregate correctly.
+    let batchThrottled = false;
+    function setBatchThrottled(next: boolean): void {
+      if (next === batchThrottled) return;
+      batchThrottled = next;
+      if (next) {
+        throttledBatches += 1;
+        if (throttledBatches === 1) emitThrottle(true);
+      } else {
+        throttledBatches -= 1;
+        if (throttledBatches === 0) emitThrottle(false);
       }
-      if (res.status === 202) {
-        // Bodies are small JSON acks; consume and discard so the connection
-        // can be reused. Failure to drain doesn't poison the run.
-        await res.text().catch(() => undefined);
-        stats.rowsSent += batch.length;
-        return;
+    }
+    // Wave 7.0.6.22 — infinite retry on 429/5xx/network. No max-attempts
+    // cap: row loss on backpressure is unacceptable. Abort is the only
+    // exit besides 2xx / non-retryable 4xx.
+    try {
+      while (true) {
+        if (signal?.aborted) throw abortError();
+        let res: Response;
+        try {
+          res = await fetchImpl(endpoint, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: payload,
+            ...(signal ? { signal } : {}),
+          });
+        } catch (err) {
+          if (signal?.aborted) throw abortError();
+          // Network-level failure — treat like a transient 5xx and back off.
+          stats.retriesTotal += 1;
+          await abortableSleep(backoffMs(attempt));
+          if (signal?.aborted) throw abortError();
+          attempt++;
+          if (attempt > SLOW_SHARD_WARN_AFTER) {
+            log?.warn?.(
+              { evt: "bulk-load-network-retry", url: endpoint, attempt, err: String(err) },
+              "bulk-loader POST network failure; backing off",
+            );
+          }
+          continue;
+        }
+        if (res.status === 202) {
+          // Bodies are small JSON acks; consume and discard so the connection
+          // can be reused. Failure to drain doesn't poison the run.
+          await res.text().catch(() => undefined);
+          stats.rowsSent += batch.length;
+          setBatchThrottled(false);
+          return;
+        }
+        if (res.status === 429) {
+          stats.throttle429++;
+          stats.retriesTotal += 1;
+          consec429++;
+          stats.throttledAtMs = now();
+          setBatchThrottled(true);
+          await res.text().catch(() => undefined);
+          if (consec429 === SLOW_SHARD_WARN_AFTER) {
+            // Single warn per slow-shard episode. Subsequent 429s within the
+            // same retry loop do not re-log — operators care that throughput
+            // is pinned, not about every individual retry.
+            log?.warn?.(
+              { evt: "bulk-load-slow-shard", url: endpoint, consec429, batch_size: batch.length },
+              `bulk-loader returned 429 ${consec429}× consecutive — slow shard suspected`,
+            );
+          }
+          await abortableSleep(backoffMs(attempt));
+          if (signal?.aborted) throw abortError();
+          attempt++;
+          continue;
+        }
+        if (res.status >= 500 && res.status < 600) {
+          await res.text().catch(() => undefined);
+          stats.retriesTotal += 1;
+          await abortableSleep(backoffMs(attempt));
+          if (signal?.aborted) throw abortError();
+          attempt++;
+          if (attempt > SLOW_SHARD_WARN_AFTER) {
+            log?.warn?.(
+              { evt: "bulk-load-5xx-retry", url: endpoint, status: res.status, attempt },
+              "bulk-loader returned 5xx; backing off",
+            );
+          }
+          continue;
+        }
+        // 4xx other than 429 (e.g. 400 malformed) — these are operator-
+        // fixable misconfigurations. Surface the body so the generator log
+        // explains why ingest stopped.
+        const body = await res.text().catch(() => "");
+        throw new Error(`bulk-loader ${res.status} ${endpoint}: ${body.slice(0, 256)}`);
       }
-      if (res.status === 429) {
-        stats.throttle429++;
-        consec429++;
-        await res.text().catch(() => undefined);
-        if (consec429 === SLOW_SHARD_WARN_AFTER) {
-          // Single warn per slow-shard episode. Subsequent 429s within the
-          // same retry loop do not re-log — operators care that throughput
-          // is pinned, not about every individual retry.
-          log?.warn?.(
-            { evt: "bulk-load-slow-shard", url: endpoint, consec429, batch_size: batch.length },
-            `bulk-loader returned 429 ${consec429}× consecutive — slow shard suspected`,
-          );
-        }
-        if (attempt >= maxRetries) {
-          stats.hardErrors++;
-          log?.warn?.(
-            {
-              evt: "bulk-load-hard-error",
-              url: endpoint,
-              attempt,
-              max_retries: maxRetries,
-              batch_size: batch.length,
-              status: 429,
-            },
-            "bulk-loader POST exceeded max retries (429); abandoning batch",
-          );
-          throw new Error(
-            `bulk-loader POST ${endpoint} exceeded ${maxRetries} retries (429)`,
-          );
-        }
-        await sleep(backoffMs(attempt));
-        attempt++;
-        continue;
-      }
-      if (res.status >= 500 && res.status < 600) {
-        await res.text().catch(() => undefined);
-        if (attempt >= maxRetries) {
-          stats.hardErrors++;
-          log?.warn?.(
-            {
-              evt: "bulk-load-hard-error",
-              url: endpoint,
-              attempt,
-              max_retries: maxRetries,
-              batch_size: batch.length,
-              status: res.status,
-            },
-            "bulk-loader POST exceeded max retries (5xx); abandoning batch",
-          );
-          throw new Error(
-            `bulk-loader POST ${endpoint} exceeded ${maxRetries} retries (${res.status})`,
-          );
-        }
-        await sleep(backoffMs(attempt));
-        attempt++;
-        if (attempt > SLOW_SHARD_WARN_AFTER) {
-          log?.warn?.(
-            { evt: "bulk-load-5xx-retry", url: endpoint, status: res.status, attempt },
-            "bulk-loader returned 5xx; backing off",
-          );
-        }
-        continue;
-      }
-      // 4xx other than 429 (e.g. 400 malformed, 503 not-accepting) — these
-      // are operator-fixable misconfigurations. Surface the body so the
-      // generator log explains why ingest stopped.
-      const body = await res.text().catch(() => "");
-      throw new Error(`bulk-loader ${res.status} ${endpoint}: ${body.slice(0, 256)}`);
+    } finally {
+      // Ensure the batch's throttle latch is always cleared on exit (success,
+      // 4xx throw, or abort) so the worker-wide counter never leaks.
+      setBatchThrottled(false);
     }
   }
 
@@ -406,5 +477,8 @@ export function createHttpProducer(opts: HttpProducerOptions): HttpProducer {
     get rowsSkipped() { return stats.rowsSkipped; },
     get hardErrors() { return stats.hardErrors; },
     get resumeUlid() { return resumeUlid; },
+    get throttled() { return throttledBatches > 0; },
+    get retriesTotal() { return stats.retriesTotal; },
+    get throttledAtMs() { return stats.throttledAtMs; },
   };
 }

@@ -64,6 +64,13 @@ export interface WorkerInitData {
    *  divides the global floor (max(1, floor(rowsTotal/100))) by totalWorkers
    *  before spawn so the aggregate guarantee holds. Undefined / 0 disables. */
   coverageFloor?: number;
+  /** Wave 7.0.6.20 — per-worker planned row count per risk_class, computed by
+   *  the coordinator from (totalRows, classes, workerIdx, totalWorkers) and
+   *  threaded through here so the row-generator can pre-compute reallocation
+   *  quotas that preserve the requested total exactly (instead of the 6.19
+   *  bias-on-pick path which could let the floor inflate row counts when the
+   *  effective floor exceeded the natural per-combo share). */
+  plannedRowsByClass?: Readonly<Record<string, number>>;
   /** Optional Curvature/Delta/Vega mix is folded into sensitivityTypes by the
    * coordinator before spawn. */
   /** Int32Array view of [0] = cancel flag (0 = run, 1 = cancel). */
@@ -93,13 +100,29 @@ export interface WorkerInitData {
 }
 
 export type WorkerMessage =
-  | { type: "progress"; workerIdx: number; rowsSent: number }
+  | {
+      type: "progress";
+      workerIdx: number;
+      rowsSent: number;
+      // Wave 7.0.6.22 — bulk-load backpressure surface. `throttled` is true
+      // while at least one of this worker's in-flight batches is in the 429
+      // retry loop; `retriesTotal` is monotonic (429 + 5xx + network); both
+      // are 0 / false when the producer isn't an HTTP producer.
+      throttled?: boolean;
+      retriesTotal?: number;
+      throttledAtMs?: number | null;
+    }
   | {
       type: "done";
       workerIdx: number;
       rowsSent: number;
       byClass: Record<string, number>;
       cancelled: boolean;
+      // Wave 7.0.6.22 — terminal snapshot of the backpressure counters so
+      // the coordinator's final aggregate is exact (last progress frame
+      // may have been a few rows behind the true final state).
+      retriesTotal?: number;
+      throttledAtMs?: number | null;
     }
   | { type: "error"; workerIdx: number; message: string };
 
@@ -124,6 +147,7 @@ async function main(): Promise<void> {
     factorPoolSize: data.factorPoolSize,
     distribution: data.distribution,
     coverageFloor: data.coverageFloor,
+    plannedRowsByClass: data.plannedRowsByClass,
   });
   // Wave 7.0.1.C — HTTP producer needs no Redis connection; skip the
   // createClient call entirely so per-worker connection budget is zero.
@@ -137,6 +161,36 @@ async function main(): Promise<void> {
   // the stream entirely (router + flow-control gate are stream-only).
   // Wave 7.0.1.C — `bulkLoadTarget` takes precedence over both stream and
   // direct (CLI rejects bulk + direct combo before spawn).
+  // Wave 7.0.6.22 — abort propagation. The cancel SAB is polled at row
+  // boundaries inside runGenerationInline, but the HTTP producer's retry
+  // loop blocks BETWEEN rows (acquireSlot + abortableSleep) so the row-
+  // boundary poll alone never reaches it. We mirror the SAB into an
+  // AbortController via a low-frequency interval — when cancel flips,
+  // controller.abort() wakes the producer's in-flight fetches AND
+  // unblocks any backoff sleeps within one tick.
+  const httpAbort = new AbortController();
+  let cancelPollHandle: NodeJS.Timeout | undefined;
+  if (data.bulkLoadTarget) {
+    cancelPollHandle = setInterval(() => {
+      if (Atomics.load(cancel, 0) !== 0 && !httpAbort.signal.aborted) {
+        httpAbort.abort();
+        if (cancelPollHandle) clearInterval(cancelPollHandle);
+        cancelPollHandle = undefined;
+      }
+    }, 50);
+    cancelPollHandle.unref?.();
+  }
+
+  // Wave 7.0.6.22 — local backpressure mirror surfaced via progress frames.
+  // The HTTP producer fires `onThrottleChange` on each edge (false → true on
+  // the first 429 in any in-flight batch; true → false when all batches
+  // settle). The runGenerationInline progress callback emits a frame on a
+  // row-count cadence, so we always include the latest flag value when it
+  // ticks. A throttle edge between row-cadence ticks is not emitted on its
+  // own — that's fine, the next tick (≤ progressEvery rows later, typically
+  // well under 1s of wall-clock) carries the corrected state.
+  let producerThrottled = false;
+
   let producer: StreamProducer;
   if (data.bulkLoadTarget) {
     producer = createHttpProducer({
@@ -144,6 +198,8 @@ async function main(): Promise<void> {
       batchSize: data.batchSize,
       maxInFlight: data.httpInFlight,
       logger: log,
+      signal: httpAbort.signal,
+      onThrottleChange: (next) => { producerThrottled = next; },
     }) as unknown as StreamProducer;
   } else if (data.mode === "direct") {
     client = createClient(data.redisUrl);
@@ -171,6 +227,17 @@ async function main(): Promise<void> {
   const progressEvery = data.progressBatchSize ?? 1000;
   const port = parentPort;
 
+  // Wave 7.0.6.22 — surface the producer's backpressure counters on each
+  // progress frame. Reads happen on the row-cadence (~1000 rows / typically
+  // <1s) which is plenty for the panel's rate-gauge polling cadence.
+  function producerStats(): { retriesTotal: number; throttledAtMs: number | null } {
+    const p = producer as unknown as { retriesTotal?: number; throttledAtMs?: number | null };
+    return {
+      retriesTotal: typeof p.retriesTotal === "number" ? p.retriesTotal : 0,
+      throttledAtMs: typeof p.throttledAtMs === "number" ? p.throttledAtMs : null,
+    };
+  }
+
   try {
     const result = await runGenerationInline({
       totalRows: data.totalRows,
@@ -181,8 +248,17 @@ async function main(): Promise<void> {
       producer,
       isCancelled: () => Atomics.load(cancel, 0) !== 0,
       rate: data.rate,
-      onProgress: (rowsSent) =>
-        port.postMessage({ type: "progress", workerIdx: data.workerIdx, rowsSent } satisfies WorkerMessage),
+      onProgress: (rowsSent) => {
+        const s = producerStats();
+        port.postMessage({
+          type: "progress",
+          workerIdx: data.workerIdx,
+          rowsSent,
+          throttled: producerThrottled,
+          retriesTotal: s.retriesTotal,
+          throttledAtMs: s.throttledAtMs,
+        } satisfies WorkerMessage);
+      },
       progressEvery,
     });
     // Wave 7.0.1.C — HTTP producer's flush() (called by runGenerationInline)
@@ -190,12 +266,15 @@ async function main(): Promise<void> {
     // surfaces background POST errors. close() is a no-op for the stream /
     // direct paths when buffers are already empty.
     if (data.bulkLoadTarget) await producer.close();
+    const s = producerStats();
     port.postMessage({
       type: "done",
       workerIdx: data.workerIdx,
       rowsSent: result.rowsSent,
       byClass: result.byClass,
       cancelled: result.cancelled,
+      retriesTotal: s.retriesTotal,
+      throttledAtMs: s.throttledAtMs,
     } satisfies WorkerMessage);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -205,6 +284,7 @@ async function main(): Promise<void> {
       message,
     } satisfies WorkerMessage);
   } finally {
+    if (cancelPollHandle) clearInterval(cancelPollHandle);
     if (client) {
       try { await client.quit(); } catch { /* connection already torn down */ }
     }
