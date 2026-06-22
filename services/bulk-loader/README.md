@@ -53,3 +53,59 @@ client to the bulk-loader (`httpInFlight` defaults to `concurrency / workers`),
 so the aggregate POST rate is unchanged but row generation is no longer
 single-threaded. The bulk-loader sees the same `/load/rows` body shape; only
 the producer-side parallelism changes.
+
+
+## Discovery sets (Wave 7.0.6.13a)
+
+Each HSET is co-pipelined with three SADDs that populate the discovery
+layer calc reads via `SMEMBERS`:
+
+* `seen:risk_class` — every risk class that has at least one row.
+* `seen:bucket:<rc>` — buckets observed within `<rc>`.
+* `seen:sens_type:<rc>:<bkt>` — sens types observed within `(rc, bkt)`.
+
+Key shapes mirror `services/ingest/src/consumer.ts:emitSeenSadds`; both
+ingest paths (stream consumer, bulk loader) write the same tag-free
+shapes defined in `shared/calc/src/rollup-keys.ts`. Without these sets
+`/calc/sbm` discovers no buckets to dispatch over and returns
+`data_status:"empty"` even when `sens:*` keys are present.
+
+Per-worker counters `seen_sadds_emitted` / `seen_sadds_failed` (and
+their top-level sums on `GET /load/status`) confirm the writer populated
+the discovery layer. After a healthy ingest, `seen_sadds_emitted` is
+`3 × rows-flushed` and `seen_sadds_failed` is `0`.
+
+### Migration
+
+Any target that received bulk-loader-written rows BEFORE Wave 7.0.6.13a
+has rows in `sens:*` but missing entries in the `seen:*` sets, so calc
+discovery on that target will return empty. There is no in-place backfill
+route by design (operator policy: a FLUSHDB on the affected target is the
+only supported recovery — repair-by-scan is intentionally out of scope to
+avoid production accidents). Operator steps:
+
+1. Confirm the target is the one to repair (`/admin/active-target` on the api).
+2. `redis-cli -h <host> -p <port> FLUSHDB` (or the equivalent for the
+   Cloud target).
+3. Re-ingest. The first row written populates `seen:risk_class`; calc
+   discovery is restored as soon as the first batch flushes.
+
+## Verification SOP
+
+All bulk-loader regression checks MUST run against a FLUSHDB'd clean
+target. Stale `seen:*` sets from prior runs will mask discovery-layer
+holes — the legacy stream consumer is the canonical writer of those sets,
+so a target previously hit by the stream path keeps the discovery layer
+populated even if the bulk writer is broken. Operators / CI smokes:
+
+* Before any bulk-loader → calc smoke, run `redis-cli FLUSHDB` against
+  the bound target and confirm `DBSIZE == 0`.
+* After a fresh bulk ingest, verify `GET /load/status` reports
+  `seen_sadds_emitted > 0` and `seen_sadds_failed == 0`.
+* Probe `SMEMBERS seen:bucket:GIRR` / `SMEMBERS seen:sens_type:GIRR:<bkt>`
+  before running the calc smoke — empty results mean the writer
+  regressed.
+
+This guidance applies to local operator scripts only; the bulk-loader
+does NOT enforce a FLUSHDB at runtime on `/load/start` (production
+accident-class risk).

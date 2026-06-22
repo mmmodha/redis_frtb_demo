@@ -119,10 +119,16 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
       for (const m of d.workers) dispatcherMetricsById.set(m.id, m);
     }
     let oomTotal = 0;
+    let seenSaddsEmittedTotal = 0;
+    let seenSaddsFailedTotal = 0;
     const workers = s.workers.map((w) => {
       const m = dispatcherMetricsById.get(w.id);
       const oom = m?.oomRejected ?? 0;
+      const saddsEmitted = m?.seenSaddsEmitted ?? 0;
+      const saddsFailed = m?.seenSaddsFailed ?? 0;
       oomTotal += oom;
+      seenSaddsEmittedTotal += saddsEmitted;
+      seenSaddsFailedTotal += saddsFailed;
       return {
         ...w,
         last_flush_at: m?.lastFlushAt ?? w.last_flush_at,
@@ -136,6 +142,11 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
         // dispatcher is wired so the existing null-for-all-metrics contract
         // holds; integer (possibly zero) when wired.
         oom_rejected: m ? oom : null,
+        // Wave 7.0.6.13a — per-worker seen-set SADD counters. Null when no
+        // dispatcher is wired so the existing null-for-all-metrics contract
+        // holds; integer (possibly zero) when wired.
+        seen_sadds_emitted: m ? saddsEmitted : null,
+        seen_sadds_failed: m ? saddsFailed : null,
       };
     });
     return {
@@ -158,6 +169,13 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
       target_watcher: state.targetWatcher,
       accepting: state.accepting,
       oom_rejected_total: oomTotal,
+      // Wave 7.0.6.13a — top-level sums of the per-worker seen-set SADD
+      // counters. Operators / smoke harnesses read these to confirm the
+      // bulk writer populated the discovery layer (`seen:risk_class` /
+      // `seen:bucket:<rc>` / `seen:sens_type:<rc>:<bkt>`) calc dispatches
+      // over via SMEMBERS.
+      seen_sadds_emitted: seenSaddsEmittedTotal,
+      seen_sadds_failed: seenSaddsFailedTotal,
       workers,
     };
   });

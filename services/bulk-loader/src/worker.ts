@@ -6,6 +6,14 @@
 // Enterprise proxy's `all-master-shards` policy fans the pooled connections
 // across master nodes.
 //
+// Wave 7.0.6.13a — every HSET is co-pipelined with three SADDs that
+// populate the discovery-layer sets (`seen:risk_class`, `seen:bucket:<rc>`,
+// `seen:sens_type:<rc>:<bkt>`) calc reads via SMEMBERS. Key shapes are
+// imported from `@frtb/calc-shared/rollup-keys` (no string-literal
+// duplication). The SADDs share the pipeline with the HSET so a failure
+// puts the row on the existing retry → dead-letter ladder; both HSET and
+// SADD are idempotent so re-executing on retry is safe.
+//
 // Flush triggers: (a) buffer hits batchSize, (b) idle-flush timer fires after
 // no push for idleFlushMs, (c) drain() is called explicitly. Errors from
 // `pipeline.exec()` are reported per-row in the [err, reply] tuples: permanent
@@ -13,6 +21,12 @@
 // else (connection drop / timeout / BUSY / MASTERDOWN) is requeued with a
 // bounded retry count before dead-lettering. Dead-lettered rows append to a
 // capped Redis Stream `bulk-loader:dead` for forensic review.
+
+import {
+  SEEN_RISK_CLASS_KEY,
+  seenBucketKey,
+  seenSensTypeKey,
+} from "@frtb/calc-shared/rollup-keys";
 
 // Structural mirror of `SensitivityRiskValue` in shared/schema/src/types.ts.
 // Kept inline (rather than importing @frtb/schema) so the bulk-loader stays a
@@ -69,6 +83,15 @@ export interface WorkerMetrics {
   // can tell a memory-cap symptom apart from generic write failures without
   // grepping logs. NEVER mutated independently of `errors`.
   oomRejected: number;
+  // Wave 7.0.6.13a — counts of seen-set SADD replies emitted alongside
+  // HSETs. `seenSaddsEmitted` increments per successful SADD reply (so a
+  // row contributing 3 unique discovery tuples bumps it by 3 even though
+  // Redis Set semantics may dedupe server-side). `seenSaddsFailed`
+  // increments per SADD reply carrying an error tuple; a row whose SADDs
+  // all fail still rolls back through the existing retry ladder via the
+  // shared err-per-row aggregation.
+  seenSaddsEmitted: number;
+  seenSaddsFailed: number;
 }
 
 export interface WorkerOptions {
@@ -301,6 +324,8 @@ export function createWorker(opts: WorkerOptions): WorkerHandle {
     lastFlushAt: null,
     lastUlid: null,
     oomRejected: 0,
+    seenSaddsEmitted: 0,
+    seenSaddsFailed: 0,
   };
 
   let stopped = false;
@@ -407,17 +432,36 @@ export function createWorker(opts: WorkerOptions): WorkerHandle {
     if (batch.length === 0) return;
     const start = now();
     const pipeline = opts.client.pipeline();
-    const indexed: Array<{ entry: BufferedRow; piped: boolean }> = [];
+    const indexed: Array<{ entry: BufferedRow; piped: boolean; saddCount: number }> = [];
     for (const entry of batch) {
       const fields = rowToHashFields(entry.row, tenorsByClass);
       if (fields.length === 0) {
         // Row had no writable fields — treat as a permanent malformed row
         // and dead-letter it directly without occupying a pipeline slot.
-        indexed.push({ entry, piped: false });
+        // Wave 7.0.6.13a — short-circuited here so seen-set SADDs are NEVER
+        // emitted for malformed rows; the discovery layer cannot be
+        // partially populated by a row that fails the HSET argv check.
+        indexed.push({ entry, piped: false, saddCount: 0 });
         continue;
       }
       pipeline.call("HSET", `sens:${entry.row.id}`, ...fields);
-      indexed.push({ entry, piped: true });
+      // Wave 7.0.6.13a — mirror `emitSeenSadds` (services/ingest/src/
+      // consumer.ts) so the bulk path populates the same discovery sets
+      // calc reads via SMEMBERS. Co-pipelined with the HSET; reply tuples
+      // are walked per-row below so a SADD failure aggregates into the
+      // same retry/dead-letter ladder as the HSET. Guard mirrors the
+      // legacy guard verbatim (string-typed rc/bkt/sens, non-empty).
+      const rc = typeof entry.row.risk_class === "string" ? entry.row.risk_class : "";
+      const bkt = typeof entry.row.bucket === "string" ? entry.row.bucket : "";
+      const sens = typeof entry.row.sensitivity_type === "string" ? entry.row.sensitivity_type : "";
+      let saddCount = 0;
+      if (rc && bkt && sens) {
+        pipeline.call("SADD", SEEN_RISK_CLASS_KEY, rc);
+        pipeline.call("SADD", seenBucketKey(rc), bkt);
+        pipeline.call("SADD", seenSensTypeKey(rc, bkt), sens);
+        saddCount = 3;
+      }
+      indexed.push({ entry, piped: true, saddCount });
     }
 
     const malformed = indexed.filter((x) => !x.piped);
@@ -441,18 +485,36 @@ export function createWorker(opts: WorkerOptions): WorkerHandle {
     }
 
     let replyIdx = 0;
-    for (const { entry, piped } of indexed) {
+    for (const { entry, piped, saddCount } of indexed) {
       if (!piped) continue; // already dead-lettered above
-      let err: Error | null = null;
+      // Wave 7.0.6.13a — collect HSET and per-SADD outcomes for the row.
+      // `err` is the row-level failure used by the existing retry/OOM
+      // ladder; HSET err wins, otherwise the first SADD err. Per-SADD
+      // success/failure feeds the seen_sadds_* counters even when the
+      // row itself succeeds.
+      let hsetErr: Error | null = null;
+      const saddErrs: Error[] = [];
+      let saddOks = 0;
       if (pipelineErr) {
-        err = pipelineErr;
+        hsetErr = pipelineErr;
+        for (let s = 0; s < saddCount; s++) saddErrs.push(pipelineErr);
       } else if (replies) {
-        const tuple = replies[replyIdx];
+        const hsetTuple = replies[replyIdx];
         replyIdx++;
-        if (tuple && tuple[0]) err = tuple[0];
+        if (hsetTuple && hsetTuple[0]) hsetErr = hsetTuple[0];
+        for (let s = 0; s < saddCount; s++) {
+          const t = replies[replyIdx];
+          replyIdx++;
+          if (t && t[0]) saddErrs.push(t[0]);
+          else saddOks++;
+        }
       } else {
-        err = new Error("pipeline aborted (null replies)");
+        hsetErr = new Error("pipeline aborted (null replies)");
+        for (let s = 0; s < saddCount; s++) saddErrs.push(hsetErr);
       }
+      metrics.seenSaddsEmitted += saddOks;
+      metrics.seenSaddsFailed += saddErrs.length;
+      const err: Error | null = hsetErr ?? saddErrs[0] ?? null;
       if (!err) {
         metrics.flushed++;
         // Wave 7.0.5.A — advance the resume watermark. ULIDs are
