@@ -1,26 +1,48 @@
-// Wave 7.0.1.A / 7.0.1.B — bulk-loader HTTP control surface.
+// Wave 7.0.1.A / 7.0.1.B / 7.0.1.C — bulk-loader HTTP control surface.
 //
 //   GET  /healthz        → 200 iff pool isHealthy() (≥75% workers connected).
 //   GET  /load/status    → pool size, connected count, per-worker pool state
 //                          + dispatcher in-flight / per-worker write metrics
 //                          (queued, flushed, errors, retries, dead-lettered,
 //                          last_flush_latency_ms) when a dispatcher is wired.
-//   POST /load/start     → stub. Wave 7.0.1.C wires the generator producer
-//                          into the dispatcher; this route stays a stub
-//                          until then.
+//   POST /load/start     → toggles accepting=true (idempotent). Returns 202
+//                          with the current accepting state.
+//   POST /load/stop      → toggles accepting=false; subsequent /load/rows
+//                          requests are rejected with 503. Returns 202.
+//   POST /load/rows      → 7.0.1.C row sink. Accepts NDJSON
+//                          (`application/x-ndjson`) or JSON-array
+//                          (`application/json`) bodies, enqueues each row
+//                          into the 7.0.1.B dispatcher. 202 on accept,
+//                          429 when in-flight ≥ highWater (producer-side
+//                          backpressure), 503 when not accepting, 400 on
+//                          malformed body, 5xx on dispatcher failure.
 
 import Fastify, { type FastifyInstance } from "fastify";
 import type { WorkerPool } from "./pool.ts";
-import type { DispatcherHandle } from "./dispatcher.ts";
+import type { DispatcherHandle, Row } from "./dispatcher.ts";
 
 export interface CreateServerOpts {
   pool: WorkerPool;
   dispatcher?: DispatcherHandle;
   logger?: boolean;
+  // Wave 7.0.1.C — initial accepting state. Defaults to true so a freshly
+  // booted bulk-loader is ready to ingest without an explicit /load/start.
+  // /load/start and /load/stop flip this at runtime.
+  accepting?: boolean;
 }
 
 export async function createServer(opts: CreateServerOpts): Promise<FastifyInstance> {
   const app = Fastify({ logger: opts.logger ?? false });
+  // Wave 7.0.1.C — NDJSON content-type parser. We keep the raw string and
+  // split on newlines below so single-line JSON-arrays sent with the wrong
+  // content-type still parse, and so a trailing newline is tolerated.
+  app.addContentTypeParser(
+    "application/x-ndjson",
+    { parseAs: "string" },
+    (_req, body, done) => done(null, body),
+  );
+
+  let accepting = opts.accepting !== false;
 
   app.get("/healthz", async (_req, reply) => {
     const s = opts.pool.status();
@@ -68,15 +90,110 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
   });
 
   app.post("/load/start", async (_req, reply) => {
-    // Wave 7.0.1.B — dispatcher exists but rows arrive via 7.0.1.C's
-    // generator wiring (out-of-scope for this wave). Returning 503 keeps
-    // the route discoverable without pretending we accepted a job.
-    reply.code(503);
-    return {
-      accepted: false,
-      reason: "bulk writer: row producer wiring lands in Wave 7.0.1.C",
-    };
+    // Wave 7.0.1.C — real lifecycle endpoint. Idempotently flips accepting
+    // to true so producers can verify the bulk-loader is ready to ingest
+    // before sending /load/rows traffic. The dispatcher is constructed at
+    // boot; this endpoint does not (re)create it.
+    accepting = true;
+    reply.code(202);
+    return { accepted: true, accepting };
+  });
+
+  app.post("/load/stop", async (_req, reply) => {
+    // Wave 7.0.1.C — drain side of the lifecycle. Flips accepting to false
+    // so subsequent /load/rows requests get 503. Already-queued rows
+    // continue to flush through the dispatcher's worker buffers.
+    accepting = false;
+    reply.code(202);
+    return { accepted: true, accepting };
+  });
+
+  app.post("/load/rows", async (req, reply) => {
+    // Wave 7.0.1.C — row ingest entry point. The dispatcher is required;
+    // an unwired server (no 7.0.1.B dispatcher) cannot accept rows.
+    const d = opts.dispatcher;
+    if (!d) {
+      reply.code(503);
+      return { accepted: 0, reason: "no dispatcher wired" };
+    }
+    if (!accepting) {
+      reply.code(503);
+      return { accepted: 0, reason: "bulk-loader not accepting (call /load/start)" };
+    }
+    let rows: Row[];
+    try {
+      rows = parseRowsBody(req.headers["content-type"], req.body);
+    } catch (err) {
+      reply.code(400);
+      return { accepted: 0, reason: `malformed body: ${(err as Error).message}` };
+    }
+    if (rows.length === 0) {
+      reply.code(202);
+      return { accepted: 0 };
+    }
+    // Producer-side backpressure signal: if the current snapshot is already
+    // at or above the dispatcher's high-water mark, return 429 so the
+    // generator's HTTP producer pauses with exponential-jitter backoff
+    // (folded 7.0.5.B). This is the load-bearing knob — without it,
+    // generator awaits would silently stall inside enqueue().
+    const status = d.status();
+    if (status.inFlight + rows.length > status.highWater) {
+      reply.code(429);
+      reply.header("retry-after", "1");
+      return {
+        accepted: 0,
+        reason: "high-water exceeded",
+        in_flight: status.inFlight,
+        high_water: status.highWater,
+      };
+    }
+    try {
+      // Under highWater (checked above), enqueue resolves synchronously
+      // — no await would block. We still await Promise.all so any
+      // unexpected back-edge (concurrent producer racing past the snapshot)
+      // surfaces here rather than as an unhandled-rejection.
+      await Promise.all(rows.map((r) => d.enqueue(r)));
+    } catch (err) {
+      reply.code(500);
+      return { accepted: 0, reason: `enqueue failed: ${(err as Error).message}` };
+    }
+    reply.code(202);
+    return { accepted: rows.length };
   });
 
   return app;
+}
+
+// Wave 7.0.1.C — body parser shared by /load/rows. Accepts NDJSON (one
+// JSON object per line, blank lines tolerated) or a JSON array. Strict on
+// content-type so a misconfigured client (e.g. sending NDJSON as
+// application/json) fails fast with a 400 rather than silently dropping
+// the trailing rows after JSON.parse hits the first newline.
+export function parseRowsBody(contentType: string | undefined, body: unknown): Row[] {
+  const ct = (contentType ?? "").toLowerCase();
+  if (ct.startsWith("application/x-ndjson")) {
+    if (typeof body !== "string") {
+      throw new Error("ndjson body must be a string");
+    }
+    const out: Row[] = [];
+    for (const line of body.split("\n")) {
+      const trimmed = line.trim();
+      if (trimmed.length === 0) continue;
+      const parsed = JSON.parse(trimmed);
+      if (parsed == null || typeof parsed !== "object") {
+        throw new Error("ndjson line is not a JSON object");
+      }
+      out.push(parsed as Row);
+    }
+    return out;
+  }
+  if (ct.startsWith("application/json")) {
+    if (!Array.isArray(body)) {
+      throw new Error("application/json body must be an array of rows");
+    }
+    return body as Row[];
+  }
+  throw new Error(
+    `unsupported content-type: ${ct || "(missing)"} — expected application/x-ndjson or application/json`,
+  );
 }

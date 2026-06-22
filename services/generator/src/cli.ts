@@ -20,8 +20,14 @@ import {
   resolveStorageFormatEnv,
   resolveGeneratorMode,
   resolveDistribution,
+  resolveBulkLoadTarget,
+  resolvePositiveIntEnv,
   type GeneratorMode,
 } from "./direct-writer-bind.js";
+// Wave 7.0.1.C — bulk-loader HTTP producer (`BULK_LOAD_TARGET=1` swaps it
+// in). Imported eagerly so the dynamic-import latency doesn't show up on
+// the hot path; the constructor is still gated on the env flag below.
+import { createHttpProducer } from "./http-producer.js";
 import { probeCluster, fallbackShape, BYTES_PER_ROW, type ClusterShape } from "./probe.js";
 import {
   pickProfile,
@@ -250,9 +256,20 @@ async function main(): Promise<void> {
   const storageFormat: StorageFormat = mode === "direct"
     ? await resolveStorageFormatEnv(process.env.STORAGE_FORMAT)
     : "hash-sidetable";
+  // Wave 7.0.1.C — bulk-loader HTTP target. When BULK_LOAD_TARGET resolves
+  // to an enabled URL, the generator swaps the XADD producer for the HTTP
+  // producer (POST /load/rows). Default off keeps the pre-wave XADD path
+  // bit-identical. Mutually exclusive with GENERATOR_MODE=direct (direct
+  // writes to Redis from the generator process; the HTTP path delegates to
+  // the bulk-loader service) — we error fast rather than silently picking.
+  const bulkLoadTarget = resolveBulkLoadTarget(process.env.BULK_LOAD_TARGET);
+  if (bulkLoadTarget && mode === "direct") {
+    throw new Error("BULK_LOAD_TARGET is mutually exclusive with GENERATOR_MODE=direct");
+  }
+  const httpInFlight = resolvePositiveIntEnv(process.env.GENERATOR_INFLIGHT, 64);
 
   log.info(
-    { totalRows, classes, schemaPath, stream: opts.stream, workers: requestedWorkers, profile: profileName, mode, distribution, storageFormat },
+    { totalRows, classes, schemaPath, stream: opts.stream, workers: requestedWorkers, profile: profileName, mode, distribution, storageFormat, bulkLoadTarget: bulkLoadTarget ? redacted(bulkLoadTarget) : null },
     "generator starting",
   );
   const start = Date.now();
@@ -264,15 +281,27 @@ async function main(): Promise<void> {
     // pre-wave inline loop shape. Wave 5.92A — only thread a router when
     // streamShards !== 1; the N=1 / per-bucket=false branch leaves producer
     // construction byte-for-byte identical to pre-5.92 (no router arg).
-    const client = createClient(redisUrl);
     const generator = createRowGenerator(schema, { seed: baseSeed, sensitivityTypes, distribution });
     let producer: StreamProducer;
-    if (mode === "direct") {
+    let client: Redis | Cluster | undefined;
+    if (bulkLoadTarget) {
+      // Wave 7.0.1.C — HTTP producer does not need a Redis client (rows go
+      // to the bulk-loader over HTTP). We skip createClient entirely so the
+      // generator's connection budget stays unaffected.
+      producer = createHttpProducer({
+        url: bulkLoadTarget,
+        batchSize,
+        maxInFlight: httpInFlight,
+        logger: log,
+      }) as unknown as StreamProducer;
+    } else if (mode === "direct") {
+      client = createClient(redisUrl);
       const hooks = await loadDirectWriterHooks();
       producer = createDirectWriter(client, {
         schema, storageFormat, batchSize, hooks,
       }) as unknown as StreamProducer;
     } else {
+      client = createClient(redisUrl);
       const router = streamShards === 1 ? undefined : createStreamRouter(opts.stream, streamShards);
       const flowControl = createStreamFlowControl(client, {}, log);
       producer = createStreamProducer(client, {
@@ -286,8 +315,14 @@ async function main(): Promise<void> {
         totalRows, classes, offset: 0, stride: 1,
         generator, producer, rate,
       });
+      // Wave 7.0.1.C — HTTP producer needs an explicit close() to drain
+      // in-flight POSTs (flush() inside runGenerationInline already empties
+      // the row buffer, but close() also releases waiters + surfaces any
+      // background error). Legacy XADD/direct paths are bit-identical to
+      // pre-7.0.1.C (no close() call) so the workers.test.ts canary holds.
+      if (bulkLoadTarget) await producer.close();
     } finally {
-      await closeClient(client);
+      if (client) await closeClient(client);
     }
     logDone(producer.rowsSent, producer.byClass, start);
     return;
@@ -296,7 +331,13 @@ async function main(): Promise<void> {
   // Multi-worker path. Coordinator owns: connection-budget cap, worker spawn,
   // SharedArrayBuffer cancel propagation, postMessage progress aggregation,
   // and aggregate logging.
-  const cappedWorkers = await capWorkersForCluster(redisUrl, requestedWorkers, pipelineWindow);
+  // Wave 7.0.1.C — when BULK_LOAD_TARGET is set every worker uses the HTTP
+  // producer, so the maxclients-derived cap (which models Redis connections
+  // per worker) does not apply: each worker holds zero Redis connections.
+  // Still respect GENERATOR_WORKERS / --workers as the operator's request.
+  const cappedWorkers = bulkLoadTarget
+    ? requestedWorkers
+    : await capWorkersForCluster(redisUrl, requestedWorkers, pipelineWindow);
   if (cappedWorkers < requestedWorkers) {
     log.warn(
       { requested: requestedWorkers, capped: cappedWorkers, pipelineWindow, headroom: MAXCLIENTS_HEADROOM },
@@ -309,8 +350,11 @@ async function main(): Promise<void> {
     baseSeed, totalRows, classes, totalWorkers: cappedWorkers, rate, start,
     streamShards, streamMaxLen, sensitivityTypes,
     mode, distribution, storageFormat,
+    bulkLoadTarget, httpInFlight,
   });
 }
+
+
 
 // Wave 5.92C — resolve approximate MAXLEN cap: explicit --stream-maxlen >
 // STREAM_MAXLEN env > DEFAULT_STREAM_MAXLEN. `0` or negative disables the
@@ -363,6 +407,12 @@ interface RunWithWorkersOpts {
   mode: GeneratorMode;
   distribution: "uniform" | "realistic" | "pareto" | undefined;
   storageFormat: StorageFormat;
+  // Wave 7.0.1.C — bulk-loader HTTP target + per-worker in-flight cap.
+  // When `bulkLoadTarget` is undefined every worker falls back to the
+  // pre-7.0.1.C XADD/direct path (bit-identical to the workers.test.ts
+  // canary). When set, every worker swaps in the HTTP producer.
+  bulkLoadTarget: string | undefined;
+  httpInFlight: number;
 }
 
 async function runWithWorkers(opts: RunWithWorkersOpts): Promise<void> {
@@ -416,6 +466,8 @@ async function runWithWorkers(opts: RunWithWorkersOpts): Promise<void> {
       mode: opts.mode,
       distribution: opts.distribution,
       storageFormat: opts.storageFormat,
+      bulkLoadTarget: opts.bulkLoadTarget,
+      httpInFlight: opts.httpInFlight,
     };
     const worker = new Worker(workerEntry, {
       workerData: init,

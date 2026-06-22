@@ -75,3 +75,32 @@ export function resolveDistribution(value: string | undefined): DistributionEnv 
   if (value === "uniform" || value === "realistic" || value === "pareto") return value;
   throw new Error(`DISTRIBUTION: unknown value "${value}" (expected: uniform, realistic, pareto)`);
 }
+
+// Wave 7.0.1.C — BULK_LOAD_TARGET env parser. Returns the resolved
+// bulk-loader base URL, or undefined for the legacy XADD/direct path.
+// Accepted forms:
+//   • unset / empty / 0 / false / off → undefined (legacy path)
+//   • 1 / true / on                   → http://localhost:8086 (default URL)
+//   • http(s)://…                     → used verbatim
+// Anything else throws so a typo can't silently fall back to XADD when the
+// operator intended HTTP ingest (mirrors the GENERATOR_MODE policy).
+export function resolveBulkLoadTarget(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  const v = value.trim();
+  if (v === "" || v === "0" || v.toLowerCase() === "false" || v.toLowerCase() === "off") return undefined;
+  if (v === "1" || v.toLowerCase() === "true" || v.toLowerCase() === "on") return "http://localhost:8086";
+  if (!/^https?:\/\//i.test(v)) {
+    throw new Error(`BULK_LOAD_TARGET must be 1/0/true/false or an http(s):// URL (got: ${v})`);
+  }
+  return v;
+}
+
+// Wave 7.0.1.C — generic positive-int env parser with a fallback. Used by
+// GENERATOR_INFLIGHT (and similar 7.0.1.C dials). Garbage / non-positive
+// values fall back rather than crashing so a stray env doesn't fail boot.
+export function resolvePositiveIntEnv(value: string | undefined, fallback: number): number {
+  if (value === undefined || value === "") return fallback;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.floor(n);
+}

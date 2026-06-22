@@ -90,12 +90,25 @@ describe("GET /load/status", () => {
 });
 
 describe("POST /load/start", () => {
-  it("returns 503 stub until row producer wiring lands in 7.0.1.C", async () => {
+  it("toggles accepting=true (idempotent) and returns 202", async () => {
     const res = await app.inject({ method: "POST", url: "/load/start" });
-    expect(res.statusCode).toBe(503);
-    const body = res.json() as { accepted: boolean; reason: string };
-    expect(body.accepted).toBe(false);
-    expect(body.reason).toMatch(/7\.0\.1\.C/);
+    expect(res.statusCode).toBe(202);
+    const body = res.json() as { accepted: boolean; accepting: boolean };
+    expect(body.accepted).toBe(true);
+    expect(body.accepting).toBe(true);
+    // Idempotent — second call still succeeds.
+    const res2 = await app.inject({ method: "POST", url: "/load/start" });
+    expect(res2.statusCode).toBe(202);
+  });
+});
+
+describe("POST /load/stop", () => {
+  it("toggles accepting=false and returns 202", async () => {
+    const res = await app.inject({ method: "POST", url: "/load/stop" });
+    expect(res.statusCode).toBe(202);
+    const body = res.json() as { accepted: boolean; accepting: boolean };
+    expect(body.accepted).toBe(true);
+    expect(body.accepting).toBe(false);
   });
 });
 
@@ -158,5 +171,156 @@ describe("GET /load/status — with dispatcher wired", () => {
     buildPool(4);
     app = await createServer({ pool });
     await app.ready();
+  });
+});
+
+
+describe("POST /load/rows — Wave 7.0.1.C", () => {
+  async function buildWithDispatcher(opts: { highWater?: number; callDelayMs?: number; accepting?: boolean } = {}): Promise<{
+    app: FastifyInstance;
+    pool: WorkerPool;
+    dispatcher: DispatcherHandle;
+    clients: FakeWriteClient[];
+  }> {
+    const writeClients = [new FakeWriteClient(), new FakeWriteClient()];
+    if (opts.callDelayMs) {
+      writeClients[0]!.callDelayMs = opts.callDelayMs;
+      writeClients[1]!.callDelayMs = opts.callDelayMs;
+    }
+    const fakePool: FakeClient[] = [];
+    const localPool = createWorkerPool({
+      size: 2,
+      redisFactory: () => { const c = new FakeClient(); fakePool.push(c); return c; },
+      heartbeatMs: 60_000,
+      logger: { info: () => {} },
+    });
+    fakePool[0]!.becomeReady();
+    fakePool[1]!.becomeReady();
+    const dispatcher = createDispatcher({
+      workerClients: writeClients,
+      batchSize: 1,
+      idleFlushMs: 0,
+      highWater: opts.highWater ?? 64,
+    });
+    const localApp = await createServer({ pool: localPool, dispatcher, accepting: opts.accepting });
+    await localApp.ready();
+    return { app: localApp, pool: localPool, dispatcher, clients: writeClients };
+  }
+  function makeRow(id: string): Row {
+    return { id, risk_class: "GIRR", bucket: "USD", sensitivity_type: "Delta", risk_value: { "3M": 0.1 } };
+  }
+
+  it("accepts a JSON-array body and enqueues every row (202)", async () => {
+    const { app: a, pool: p, dispatcher: d } = await buildWithDispatcher();
+    try {
+      const res = await a.inject({
+        method: "POST", url: "/load/rows",
+        headers: { "content-type": "application/json" },
+        payload: JSON.stringify([makeRow("a"), makeRow("b"), makeRow("c")]),
+      });
+      expect(res.statusCode).toBe(202);
+      const body = res.json() as { accepted: number };
+      expect(body.accepted).toBe(3);
+      await d.drain();
+    } finally {
+      await a.close(); await d.stop(); await p.stop();
+    }
+  });
+
+  it("accepts an NDJSON body and enqueues every line (202)", async () => {
+    const { app: a, pool: p, dispatcher: d, clients } = await buildWithDispatcher();
+    try {
+      const payload = [makeRow("x"), makeRow("y")].map((r) => JSON.stringify(r)).join("\n") + "\n";
+      const res = await a.inject({
+        method: "POST", url: "/load/rows",
+        headers: { "content-type": "application/x-ndjson" },
+        payload,
+      });
+      expect(res.statusCode).toBe(202);
+      expect((res.json() as { accepted: number }).accepted).toBe(2);
+      await d.drain();
+      const allHsets = clients.flatMap((c) => c.hsets.map((h) => h.key)).sort();
+      expect(allHsets).toEqual(["sens:x", "sens:y"]);
+    } finally {
+      await a.close(); await d.stop(); await p.stop();
+    }
+  });
+
+  it("returns 429 when inFlight + rows would exceed highWater (producer-side backpressure)", async () => {
+    // 200ms call delay keeps both flushes pending so inFlight stays pegged.
+    const { app: a, pool: p, dispatcher: d } = await buildWithDispatcher({ highWater: 2, callDelayMs: 200 });
+    try {
+      // Saturate inFlight with two rows; both flushes are still pending
+      // because of the 200 ms delay.
+      const fill = await a.inject({
+        method: "POST", url: "/load/rows",
+        headers: { "content-type": "application/json" },
+        payload: JSON.stringify([makeRow("a"), makeRow("b")]),
+      });
+      expect(fill.statusCode).toBe(202);
+      expect(d.status().inFlight).toBe(2);
+      // Next single-row request would push inFlight to 3 > highWater=2.
+      const overflow = await a.inject({
+        method: "POST", url: "/load/rows",
+        headers: { "content-type": "application/json" },
+        payload: JSON.stringify([makeRow("c")]),
+      });
+      expect(overflow.statusCode).toBe(429);
+      const body = overflow.json() as { accepted: number; reason: string; in_flight: number; high_water: number };
+      expect(body.accepted).toBe(0);
+      expect(body.reason).toMatch(/high-water/);
+      expect(body.high_water).toBe(2);
+      expect(overflow.headers["retry-after"]).toBe("1");
+      await d.drain();
+    } finally {
+      await a.close(); await d.stop(); await p.stop();
+    }
+  });
+
+  it("returns 503 when not accepting; /load/start re-enables", async () => {
+    const { app: a, pool: p, dispatcher: d } = await buildWithDispatcher({ accepting: false });
+    try {
+      const blocked = await a.inject({
+        method: "POST", url: "/load/rows",
+        headers: { "content-type": "application/json" },
+        payload: JSON.stringify([makeRow("a")]),
+      });
+      expect(blocked.statusCode).toBe(503);
+      await a.inject({ method: "POST", url: "/load/start" });
+      const ok = await a.inject({
+        method: "POST", url: "/load/rows",
+        headers: { "content-type": "application/json" },
+        payload: JSON.stringify([makeRow("a")]),
+      });
+      expect(ok.statusCode).toBe(202);
+      await d.drain();
+    } finally {
+      await a.close(); await d.stop(); await p.stop();
+    }
+  });
+
+  it("returns 400 on malformed body (wrong content-type)", async () => {
+    const { app: a, pool: p, dispatcher: d } = await buildWithDispatcher();
+    try {
+      const res = await a.inject({
+        method: "POST", url: "/load/rows",
+        headers: { "content-type": "text/plain" },
+        payload: "not json",
+      });
+      expect(res.statusCode).toBe(400);
+    } finally {
+      await a.close(); await d.stop(); await p.stop();
+    }
+  });
+
+  it("returns 503 when no dispatcher is wired", async () => {
+    // Pool-only server (no dispatcher) — represents a partially-booted
+    // bulk-loader.
+    const res = await app.inject({
+      method: "POST", url: "/load/rows",
+      headers: { "content-type": "application/json" },
+      payload: JSON.stringify([{ id: "x", risk_class: "GIRR", bucket: "USD", sensitivity_type: "Delta", risk_value: 1 }]),
+    });
+    expect(res.statusCode).toBe(503);
   });
 });

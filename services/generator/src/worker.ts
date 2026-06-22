@@ -33,6 +33,8 @@ import { createStreamFlowControl } from "./flow-control.ts";
 // writer reuses services/ingest/src/consumer.ts at runtime.
 import { createDirectWriter, type StorageFormat } from "./direct-writer.ts";
 import { loadDirectWriterHooks, resolveStorageFormatEnv } from "./direct-writer-bind.ts";
+// Wave 7.0.1.C — bulk-loader HTTP producer wired in via `bulkLoadTarget`.
+import { createHttpProducer } from "./http-producer.ts";
 
 export interface WorkerInitData {
   schemaPath: string;
@@ -77,6 +79,13 @@ export interface WorkerInitData {
   /** Wave 6.39.A — STORAGE_FORMAT override for direct-write. Ignored in
    *  stream mode (ingest resolves its own STORAGE_FORMAT). */
   storageFormat?: StorageFormat;
+  /** Wave 7.0.1.C — bulk-loader HTTP target URL. When set, swaps in the
+   *  HTTP producer (POST /load/rows) instead of XADD/direct. Mutually
+   *  exclusive with `mode === "direct"` (validated at the CLI). */
+  bulkLoadTarget?: string;
+  /** Wave 7.0.1.C — per-worker max concurrent in-flight POSTs to
+   *  /load/rows. Defaults to 64 if undefined (matches CLI fallback). */
+  httpInFlight?: number;
 }
 
 export type WorkerMessage =
@@ -111,7 +120,9 @@ async function main(): Promise<void> {
     factorPoolSize: data.factorPoolSize,
     distribution: data.distribution,
   });
-  const client = createClient(data.redisUrl);
+  // Wave 7.0.1.C — HTTP producer needs no Redis connection; skip the
+  // createClient call entirely so per-worker connection budget is zero.
+  let client: Redis | Cluster | undefined;
   // Wave 5.92C — per-worker pino logger (worker_threads can't share the
   // parent's pino instance).
   const log = pino({ level: process.env.LOG_LEVEL ?? "info" }).child({ worker: data.workerIdx });
@@ -119,8 +130,18 @@ async function main(): Promise<void> {
   // pre-6.39.A producer path bit-identical; `direct` swaps in the direct-
   // write writer (HSET + pre-aggregated HINCRBYFLOAT + SADD) and bypasses
   // the stream entirely (router + flow-control gate are stream-only).
+  // Wave 7.0.1.C — `bulkLoadTarget` takes precedence over both stream and
+  // direct (CLI rejects bulk + direct combo before spawn).
   let producer: StreamProducer;
-  if (data.mode === "direct") {
+  if (data.bulkLoadTarget) {
+    producer = createHttpProducer({
+      url: data.bulkLoadTarget,
+      batchSize: data.batchSize,
+      maxInFlight: data.httpInFlight,
+      logger: log,
+    }) as unknown as StreamProducer;
+  } else if (data.mode === "direct") {
+    client = createClient(data.redisUrl);
     const hooks = await loadDirectWriterHooks();
     producer = createDirectWriter(client, {
       schema,
@@ -129,6 +150,7 @@ async function main(): Promise<void> {
       hooks,
     }) as unknown as StreamProducer;
   } else {
+    client = createClient(data.redisUrl);
     const router = createStreamRouter(data.stream, data.streamShards);
     const flowControl = createStreamFlowControl(client, {}, log);
     producer = createStreamProducer(client, {
@@ -158,6 +180,11 @@ async function main(): Promise<void> {
         port.postMessage({ type: "progress", workerIdx: data.workerIdx, rowsSent } satisfies WorkerMessage),
       progressEvery,
     });
+    // Wave 7.0.1.C — HTTP producer's flush() (called by runGenerationInline)
+    // empties the row buffer, but only close() releases queued waiters and
+    // surfaces background POST errors. close() is a no-op for the stream /
+    // direct paths when buffers are already empty.
+    if (data.bulkLoadTarget) await producer.close();
     port.postMessage({
       type: "done",
       workerIdx: data.workerIdx,
@@ -173,7 +200,9 @@ async function main(): Promise<void> {
       message,
     } satisfies WorkerMessage);
   } finally {
-    try { await client.quit(); } catch { /* connection already torn down */ }
+    if (client) {
+      try { await client.quit(); } catch { /* connection already torn down */ }
+    }
   }
 }
 
