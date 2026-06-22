@@ -215,3 +215,29 @@ export async function getSensIndexName(
   }
   return name;
 }
+
+// Wave 7.0.2.B — slim variant resolver for the lazy-math calc path. Shares
+// the same `bootstrap:schema-hash:{target_label}` key as the fat index so
+// the writer / reader hash7 can never skew. Adopted-legacy targets (the
+// `legacy:` sentinel prefix) fall back to the unversioned slim base name —
+// the slim FT.CREATE is idempotent and the bootstrap path ensures the
+// versioned slim index alongside the legacy fat one.
+export async function getSlimSensIndexName(
+  client: RedisLike,
+  target_label: string,
+): Promise<string> {
+  let name = BASE_SLIM_INDEX_NAME;
+  try {
+    const reply = await client.call("GET", schemaHashKey(target_label));
+    if (typeof reply === "string") {
+      if (reply.startsWith(LEGACY_HASH_PREFIX)) {
+        name = BASE_SLIM_INDEX_NAME;
+      } else if (reply.length >= HASH_PREFIX_LEN) {
+        name = versionedSlimIndexName(reply);
+      }
+    }
+  } catch {
+    // Same fall-back rationale as getSensIndexName above.
+  }
+  return name;
+}

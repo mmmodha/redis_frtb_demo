@@ -265,6 +265,31 @@ function readSlimEnabled(): boolean {
   return raw === "1" || raw.toLowerCase() === "true";
 }
 
+// Wave 7.0.2.B — lazy-math calc path reads from the slim index. Refuse to
+// boot when the operator has enabled lazy-math without also enabling the slim
+// index, otherwise every /calc/sbm request silently falls back to the fat
+// index (FT.AGGREGATE against `ws_*` fields) and reports a misleading 'lazy'
+// success. The check fires before any side effects so a misconfigured target
+// surfaces as a single fatal log line instead of in-flight wrong-result
+// responses.
+function readLazyMathEnabled(): boolean {
+  const raw = (process.env.CALC_LAZY_MATH ?? "").trim();
+  return raw === "1" || raw.toLowerCase() === "true";
+}
+
+export class LazyMathRequiresSlimIndexError extends Error {
+  constructor() {
+    super(
+      "CALC_LAZY_MATH=1 requires ENABLE_SLIM_SENS_INDEX=1: the slim index " +
+      "(idx:sens:slim:v{hash7}) is the only index that carries the raw `s_*` " +
+      "fields the lazy-math fast path APPLYs the weight literals against. " +
+      "Either unset CALC_LAZY_MATH (fall back to the pre-computed fat path) " +
+      "or set ENABLE_SLIM_SENS_INDEX=1 so the slim index gets bootstrapped.",
+    );
+    this.name = "LazyMathRequiresSlimIndexError";
+  }
+}
+
 async function runSlimIndexEnsure(
   nodes: RedisLike[],
   schema: Schema,
@@ -358,6 +383,19 @@ export async function bootstrapFrtb(
   log: (entry: Record<string, unknown>) => void = (e) => console.log(JSON.stringify(e)),
   opts: BootstrapOpts = {},
 ): Promise<BootstrapResult> {
+  // Wave 7.0.2.B — pre-flight: refuse boot when CALC_LAZY_MATH=1 is set but
+  // the slim index is not enabled. Logged before throwing so the operator
+  // sees the misconfiguration in the standard `bootstrap:` log stream.
+  if (readLazyMathEnabled() && !readSlimEnabled()) {
+    log({
+      service: "api",
+      bootstrap: "lazy-math-preflight",
+      action: "refuse-start",
+      level: "fatal",
+      reason: "CALC_LAZY_MATH=1 without ENABLE_SLIM_SENS_INDEX=1",
+    });
+    throw new LazyMathRequiresSlimIndexError();
+  }
   const nodes = resolveMasterNodes(client);
   const newHash = computeSchemaHash(schema);
   const newIndexName = versionedIndexName(newHash);

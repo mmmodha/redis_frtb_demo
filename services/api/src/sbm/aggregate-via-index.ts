@@ -84,7 +84,19 @@ export interface AggregateBucketsOpts {
   // getSensIndexName. Wave 6.30.B2 — required so a caller can no longer
   // silently fall back to the literal `idx:sens` on a cluster where only
   // the versioned name exists (the 412 "idx:sens not found" reproducer).
+  // Wave 7.0.2.B — when `lazyMath` is true, the caller is responsible for
+  // resolving the slim variant (`idx:sens:slim:v{hash7}` via
+  // `getSlimSensIndexName`) and passing it here. The helper does not flip
+  // the index name based on `lazyMath` — explicit so the route's
+  // resolved_command echo and the live FT.AGGREGATE stay in lock-step.
   indexName: string;
+  // Wave 7.0.2.B — lazy-math fast path. When true: read raw `s_*` fields
+  // from the slim index, fold weight literals into the APPLY clauses, and
+  // post-multiply per-bucket sums by the bucket weight in the TS reducer
+  // for `by_bucket` Delta shapes. Vega/Curvature ALWAYS use weight 1.0
+  // (see `resolveLazyMathWeights`). Default false preserves the
+  // pre-7.0.2.B fat-index path byte-for-byte.
+  lazyMath?: boolean;
 }
 
 // Wave 5.41 — same explicit per-call timeout the legacy discovery FT.AGGREGATE
@@ -124,13 +136,33 @@ interface LegFields {
 }
 
 function resolveLegFields(schema: Schema, riskClass: string, leg: FastLeg): LegFields {
+  return resolveLegFieldsForPrefix(schema, riskClass, leg, "ws");
+}
+
+// Wave 7.0.2.B — slim-index variant. Returns the same `LegFields` shape but
+// with `s_*` aliases (raw per-class per-tenor sensitivities from the
+// idx:sens:slim schema) instead of `ws_*` (pre-weighted from the fat
+// idx:sens schema). Consumed by `aggregateBucketsViaIndex` when the
+// lazyMath flag is set; the APPLY clause folds the weight literal in
+// before reducer aggregation. Per-tenor / scalar split mirrors the fat
+// resolver and the slim schema's `buildSlimSchemaFields` iteration.
+function resolveSlimLegFields(schema: Schema, riskClass: string, leg: FastLeg): LegFields {
+  return resolveLegFieldsForPrefix(schema, riskClass, leg, "s");
+}
+
+function resolveLegFieldsForPrefix(
+  schema: Schema,
+  riskClass: string,
+  leg: FastLeg,
+  prefix: "ws" | "s",
+): LegFields {
   const upper = riskClass.toUpperCase();
   const cls = schema.risk_classes[upper];
   const lower = upper.toLowerCase();
   const isPerTenor = PER_TENOR_CLASSES.has(upper) && cls?.tenor?.nodes?.length;
   const tenors = isPerTenor ? cls!.tenor!.nodes : [""];
   const fieldsFor = (root: string): string[] =>
-    tenors.map((t) => (t ? `ws_${lower}_${root}_${t}` : `ws_${lower}_${root}`));
+    tenors.map((t) => (t ? `${prefix}_${lower}_${root}_${t}` : `${prefix}_${lower}_${root}`));
   if (leg === "delta") return { delta: fieldsFor("delta"), sensitivityType: "Delta" };
   if (leg === "vega") return { vega: fieldsFor("vega"), sensitivityType: "Vega" };
   return {
@@ -138,6 +170,78 @@ function resolveLegFields(schema: Schema, riskClass: string, leg: FastLeg): LegF
     cvrDown: fieldsFor("cvr_down"),
     sensitivityType: "Curvature",
   };
+}
+
+// Wave 7.0.2.B — lazy-math weight resolution. Mirrors
+// `services/ingest/src/consumer.ts:legWeight` EXACTLY:
+//   Vega / Curvature → always 1.0 regardless of schema-table presence.
+//   Delta            → schema's `<class>_delta_weights`:
+//                        constant  → single weight applied to every field.
+//                        by_tenor  → per-tenor weights, aligned with the
+//                                    per-tenor field list (perTenor classes
+//                                    only — falls back to 0 otherwise).
+//                        by_bucket → bucket-dependent; cannot be injected
+//                                    into APPLY (no @bucket access there),
+//                                    so the per-bucket sums are multiplied
+//                                    by the bucket weight in the TS reducer.
+// CRITICAL: `config/schema/frtb-default.yaml` has NO `equity_vega_weights`,
+// `fx_vega_weights`, `commodity_vega_weights`, or any `*_curvature_weights`
+// table. A naive schema lookup would either trip a `schema_missing_weights`
+// 503 or silently substitute 0 and zero those legs. The Vega/Curvature
+// short-circuit BEFORE the schema lookup is the only safe path.
+export type WeightSpec =
+  | { kind: "constant"; value: number }
+  | { kind: "by_tenor"; values: number[] }
+  | { kind: "by_bucket"; map: Record<string, number> };
+
+export function resolveLazyMathWeights(
+  schema: Schema,
+  riskClass: string,
+  leg: FastLeg,
+  perTenor: boolean,
+): WeightSpec {
+  if (leg === "vega" || leg === "curvature") {
+    return { kind: "constant", value: 1.0 };
+  }
+  const upper = riskClass.toUpperCase();
+  const cls = schema.risk_classes[upper];
+  const ref = cls?.risk_weights_ref;
+  const table = ref ? schema.risk_weights[ref] : undefined;
+  if (!table) return { kind: "constant", value: 0 };
+  if ("constant" in table) return { kind: "constant", value: table.constant };
+  if ("by_tenor" in table) {
+    const nodes = cls?.tenor?.nodes;
+    if (perTenor && nodes && nodes.length > 0) {
+      const values = nodes.map((t) => table.by_tenor[t] ?? 0);
+      return { kind: "by_tenor", values };
+    }
+    return { kind: "constant", value: 0 };
+  }
+  if ("by_bucket" in table) return { kind: "by_bucket", map: table.by_bucket };
+  return { kind: "constant", value: 0 };
+}
+
+// Wave 7.0.2.B — per-field multiplier array for the lazy-math APPLY builders.
+// Curvature legs ignore the cvrUp/cvrDown distinction here because the rule
+// short-circuits to 1.0; for Delta perTenor classes the i-th entry aligns
+// with the i-th per-tenor field (resolveSlimLegFields and resolveLazyMathWeights
+// both iterate `cls.tenor.nodes` in declaration order).
+function applyMultipliers(roots: string[], weights: WeightSpec | null): number[] {
+  if (!weights) return roots.map(() => 1.0);
+  if (weights.kind === "constant") return roots.map(() => weights.value);
+  if (weights.kind === "by_tenor") return roots.map((_, i) => weights.values[i] ?? 0);
+  // by_bucket: APPLY-side gets the raw value (multiplier 1); the per-bucket
+  // weight is applied to the GROUPBY sums in the TS reducer.
+  return roots.map(() => 1.0);
+}
+
+// Wave 7.0.2.B — render a numeric weight as an APPLY literal. Standard
+// JS `toString` produces clean decimals for every weight in
+// frtb-default.yaml (e.g. 0.017, 0.55) and falls back to scientific
+// notation for extreme magnitudes — both are accepted by the
+// RediSearch SEARCH_EXPR parser.
+function formatWeightLiteral(w: number): string {
+  return String(w);
 }
 
 // Resolve the intra-bucket correlation ρ the closed-form K_b uses for this
@@ -255,7 +359,13 @@ export function buildFastPathQuery(
   return parts.join(" ");
 }
 
-export { FT_AGGREGATE_TIMEOUT_MS, resolveLegFields, resolveRho, resolveQueryNodes };
+export {
+  FT_AGGREGATE_TIMEOUT_MS,
+  resolveLegFields,
+  resolveRho,
+  resolveQueryNodes,
+  resolveSlimLegFields,
+};
 
 // Wave 5.96A — render an FT.AGGREGATE argv as a copy-pasteable command string
 // for the per-bucket drilldown's "Redis command" block. Tokens containing
@@ -336,6 +446,15 @@ export function buildFastPathAggregateArgs(
   perTenor: boolean,
   indexName: string,
   searchVer: number,
+  // Wave 7.0.2.B — optional per-leg weight spec used by the lazy-math fast
+  // path. When provided, the `_safe` alias resolves to the WEIGHTED value
+  // (raw `s_*` field × weight literal) instead of the bare null-coerced
+  // field. `by_bucket` shapes leave the APPLY as raw and rely on the TS
+  // reducer to multiply the GROUPBY sums by the per-bucket weight, because
+  // APPLY has no @bucket access. Unset weights (default) preserve the
+  // pre-7.0.2.B behaviour byte-for-byte — existing fat-path callers stay
+  // unaffected.
+  weights?: { delta?: WeightSpec; vega?: WeightSpec; curvature?: WeightSpec } | null,
 ): unknown[] {
   void perTenor;
   const args: unknown[] = [indexName, query];
@@ -343,27 +462,31 @@ export function buildFastPathAggregateArgs(
   const loadSeen = new Set<string>();
   const applyClauses: Array<[string, string]> = [];
   const sumReducers: Array<[string, string]> = [];
-  const safeRef = (f: string): string => {
+  const safeRef = (f: string, multiplier: number): string => {
     const alias = `${f}_safe`;
     if (!loadSeen.has(f)) {
       loadSeen.add(f);
       loadFields.push(f);
     }
-    applyClauses.push([nullCoerceApplyExpr(f, searchVer), alias]);
+    const base = nullCoerceApplyExpr(f, searchVer);
+    const expr = multiplier === 1.0 ? base : `(${base}*${formatWeightLiteral(multiplier)})`;
+    applyClauses.push([expr, alias]);
     return alias;
   };
-  const addNumericLeg = (roots: string[], prefix: string): void => {
-    for (const f of roots) {
-      const safe = safeRef(f);
+  const addNumericLeg = (roots: string[], prefix: string, mults: number[]): void => {
+    for (let i = 0; i < roots.length; i++) {
+      const f = roots[i]!;
+      const safe = safeRef(f, mults[i] ?? 1.0);
       const sqAlias = `${prefix}_${f}_sq`;
       applyClauses.push([`(@${safe}*@${safe})`, sqAlias]);
       sumReducers.push([safe, `sum_${prefix}_${f}`]);
       sumReducers.push([sqAlias, `sum_${prefix}_${f}_sq`]);
     }
   };
-  const addCurvatureLeg = (roots: string[], prefix: string): void => {
-    for (const f of roots) {
-      const safe = safeRef(f);
+  const addCurvatureLeg = (roots: string[], prefix: string, mults: number[]): void => {
+    for (let i = 0; i < roots.length; i++) {
+      const f = roots[i]!;
+      const safe = safeRef(f, mults[i] ?? 1.0);
       const negAlias = `${prefix}_${f}_neg`;
       const sqAlias = `${prefix}_${f}_sq`;
       const negSqAlias = `${prefix}_${f}_negsq`;
@@ -376,10 +499,13 @@ export function buildFastPathAggregateArgs(
       sumReducers.push([negSqAlias, `sum_${prefix}_${f}_negsq`]);
     }
   };
-  if (fields.delta) addNumericLeg(fields.delta, "d");
-  if (fields.vega) addNumericLeg(fields.vega, "v");
-  if (fields.cvrUp) addCurvatureLeg(fields.cvrUp, "u");
-  if (fields.cvrDown) addCurvatureLeg(fields.cvrDown, "n");
+  const deltaW = weights?.delta ?? null;
+  const vegaW = weights?.vega ?? null;
+  const curvW = weights?.curvature ?? null;
+  if (fields.delta) addNumericLeg(fields.delta, "d", applyMultipliers(fields.delta, deltaW));
+  if (fields.vega) addNumericLeg(fields.vega, "v", applyMultipliers(fields.vega, vegaW));
+  if (fields.cvrUp) addCurvatureLeg(fields.cvrUp, "u", applyMultipliers(fields.cvrUp, curvW));
+  if (fields.cvrDown) addCurvatureLeg(fields.cvrDown, "n", applyMultipliers(fields.cvrDown, curvW));
   if (loadFields.length > 0) {
     args.push("LOAD", String(loadFields.length));
     for (const f of loadFields) args.push(`@${f}`);
@@ -407,6 +533,9 @@ export function buildComponentsAggregateArgs(
   fields: LegFields,
   indexName: string,
   searchVer: number,
+  // Wave 7.0.2.B — see `buildFastPathAggregateArgs` for the weight-injection
+  // contract; same semantics here for the per-(bucket, risk_factor) reducer.
+  weights?: { delta?: WeightSpec; vega?: WeightSpec; curvature?: WeightSpec } | null,
 ): unknown[] {
   const args: unknown[] = [indexName, query];
   // Wave 6.39.H / Wave 6.41.E.fix5 — version-aware null-coercion: see the
@@ -417,28 +546,34 @@ export function buildComponentsAggregateArgs(
   const loadSeen = new Set<string>();
   const applyClauses: Array<[string, string]> = [];
   const sumReducers: Array<[string, string]> = [];
-  const safeRef = (f: string): string => {
+  const safeRef = (f: string, multiplier: number): string => {
     const alias = `${f}_safe`;
     if (!loadSeen.has(f)) {
       loadSeen.add(f);
       loadFields.push(f);
     }
-    applyClauses.push([nullCoerceApplyExpr(f, searchVer), alias]);
+    const base = nullCoerceApplyExpr(f, searchVer);
+    const expr = multiplier === 1.0 ? base : `(${base}*${formatWeightLiteral(multiplier)})`;
+    applyClauses.push([expr, alias]);
     return alias;
   };
-  const addLeg = (roots: string[], prefix: string): void => {
-    for (const f of roots) {
-      const safe = safeRef(f);
+  const addLeg = (roots: string[], prefix: string, mults: number[]): void => {
+    for (let i = 0; i < roots.length; i++) {
+      const f = roots[i]!;
+      const safe = safeRef(f, mults[i] ?? 1.0);
       const sqAlias = `${prefix}_${f}_sq`;
       applyClauses.push([`(@${safe}*@${safe})`, sqAlias]);
       sumReducers.push([safe, `sum_${prefix}_${f}`]);
       sumReducers.push([sqAlias, `sum_${prefix}_${f}_sq`]);
     }
   };
-  if (fields.delta) addLeg(fields.delta, "d");
-  if (fields.vega) addLeg(fields.vega, "v");
-  if (fields.cvrUp) addLeg(fields.cvrUp, "u");
-  if (fields.cvrDown) addLeg(fields.cvrDown, "n");
+  const deltaW = weights?.delta ?? null;
+  const vegaW = weights?.vega ?? null;
+  const curvW = weights?.curvature ?? null;
+  if (fields.delta) addLeg(fields.delta, "d", applyMultipliers(fields.delta, deltaW));
+  if (fields.vega) addLeg(fields.vega, "v", applyMultipliers(fields.vega, vegaW));
+  if (fields.cvrUp) addLeg(fields.cvrUp, "u", applyMultipliers(fields.cvrUp, curvW));
+  if (fields.cvrDown) addLeg(fields.cvrDown, "n", applyMultipliers(fields.cvrDown, curvW));
   if (loadFields.length > 0) {
     args.push("LOAD", String(loadFields.length));
     for (const f of loadFields) args.push(`@${f}`);
@@ -1115,7 +1250,12 @@ export async function aggregateBucketsViaIndex(opts: AggregateBucketsOpts): Prom
   }
   const start = process.hrtime.bigint();
   const riskClass = opts.riskClass.toUpperCase();
-  const fields = resolveLegFields(opts.schema, riskClass, opts.leg);
+  const lazyMath = opts.lazyMath === true;
+  // Wave 7.0.2.B — slim variant uses `s_*` aliases; fat variant keeps `ws_*`.
+  // The two share LegFields shape so the rest of the pipeline is agnostic.
+  const fields = lazyMath
+    ? resolveSlimLegFields(opts.schema, riskClass, opts.leg)
+    : resolveLegFields(opts.schema, riskClass, opts.leg);
   const rho = resolveRho(opts.schema, riskClass, opts.leg);
   const perTenor = PER_TENOR_CLASSES.has(riskClass) && (opts.schema.risk_classes[riskClass]?.tenor?.nodes?.length ?? 0) > 0;
   const query = buildFastPathQuery(riskClass, fields.sensitivityType, opts.filters);
@@ -1130,14 +1270,29 @@ export async function aggregateBucketsViaIndex(opts: AggregateBucketsOpts): Prom
   // connection; a target swap rebuilds the pool client and naturally misses
   // the cache.
   const searchVer = await getSearchModuleMajorVersion(opts.redis);
-  const argv = buildFastPathAggregateArgs(query, fields, perTenor, indexName, searchVer);
+  // Wave 7.0.2.B — resolve per-leg weights once. For non-lazy callers the
+  // builders get `null` weights and emit the byte-identical pre-7.0.2.B
+  // APPLY argv. For lazy callers the Vega/Curvature short-circuit to 1.0
+  // happens inside `resolveLazyMathWeights` (the only safe place — see the
+  // CRITICAL note in that helper's docblock).
+  const weightSpec: WeightSpec | null = lazyMath
+    ? resolveLazyMathWeights(opts.schema, riskClass, opts.leg, perTenor)
+    : null;
+  const builderWeights = lazyMath
+    ? {
+        delta: opts.leg === "delta" ? weightSpec! : undefined,
+        vega: opts.leg === "vega" ? weightSpec! : undefined,
+        curvature: opts.leg === "curvature" ? weightSpec! : undefined,
+      }
+    : null;
+  const argv = buildFastPathAggregateArgs(query, fields, perTenor, indexName, searchVer, builderWeights);
   const nodes = resolveQueryNodes(opts.redis);
   const merged = new Map<string, Record<string, string>>();
   // Wave 5.96A.1 — scalar (non-perTenor) classes need a second FT.AGGREGATE
   // grouped by (@bucket, @risk_factor) to recover per-RF components; perTenor
   // (GIRR) already exposes per-tenor sums via the main aggregate.
   const needsPerRf = opts.components !== undefined && !perTenor;
-  const perRfArgv = needsPerRf ? buildComponentsAggregateArgs(query, fields, indexName, searchVer) : null;
+  const perRfArgv = needsPerRf ? buildComponentsAggregateArgs(query, fields, indexName, searchVer, builderWeights) : null;
   const perRfMerged = new Map<string, Map<string, Record<string, string>>>();
   for (const node of nodes) {
     const reply = await node.call("FT.AGGREGATE", ...argv);
@@ -1173,6 +1328,17 @@ export async function aggregateBucketsViaIndex(opts: AggregateBucketsOpts): Prom
       }
     }
   }
+  // Wave 7.0.2.B — by_bucket Delta weighting cannot be folded into APPLY
+  // (APPLY runs before GROUPBY and has no @bucket binding for a per-row
+  // weight lookup). Multiply the GROUPBY sums (and per-RF sums) by the
+  // per-bucket weight here, in TS, before bucketResultFromRow consumes them.
+  // For sum_d_<f> the multiplier is w; for sum_d_<f>_sq it is w² because the
+  // underlying per-row Σ(s²) becomes Σ(w·s)² = w²·Σ(s²) for a per-bucket
+  // (row-invariant) weight. Vega/Curvature short-circuit to constant 1.0 in
+  // resolveLazyMathWeights, so this block is a no-op for those legs.
+  if (lazyMath && weightSpec && weightSpec.kind === "by_bucket" && opts.leg === "delta" && fields.delta) {
+    applyByBucketDeltaWeights(merged, perRfMerged, fields.delta, weightSpec.map);
+  }
   const out: BucketResult[] = [];
   for (const row of merged.values()) {
     const b = row.bucket ?? "";
@@ -1180,5 +1346,43 @@ export async function aggregateBucketsViaIndex(opts: AggregateBucketsOpts): Prom
     out.push(bucketResultFromRow(row, fields, opts.leg, rho, perTenor, start, perRfRow, opts.components));
   }
   return out;
+}
+
+// Wave 7.0.2.B — in-place post-multiplication of FT.AGGREGATE delta sums by
+// the per-bucket weight. Pure / synchronous; called only when lazyMath is on
+// and the resolved WeightSpec is `by_bucket`. The Number coercion mirrors
+// `safeNum` so a missing / "nan" entry (sparse rows on Enterprise builds)
+// stays at 0 rather than poisoning the bucket with NaN.
+function applyByBucketDeltaWeights(
+  merged: Map<string, Record<string, string>>,
+  perRfMerged: Map<string, Map<string, Record<string, string>>>,
+  deltaFields: ReadonlyArray<string>,
+  weightMap: Record<string, number>,
+): void {
+  const scaleRow = (row: Record<string, string>, w: number): void => {
+    const wSq = w * w;
+    for (const f of deltaFields) {
+      const sumKey = `sum_d_${f}`;
+      const sqKey = `sum_d_${f}_sq`;
+      if (row[sumKey] != null) {
+        const n = Number(row[sumKey]);
+        row[sumKey] = String(Number.isFinite(n) ? n * w : 0);
+      }
+      if (row[sqKey] != null) {
+        const n = Number(row[sqKey]);
+        row[sqKey] = String(Number.isFinite(n) ? n * wSq : 0);
+      }
+    }
+  };
+  for (const [bucket, row] of merged) {
+    const w = weightMap[bucket] ?? 0;
+    if (w === 1.0) continue;
+    scaleRow(row, w);
+  }
+  for (const [bucket, bm] of perRfMerged) {
+    const w = weightMap[bucket] ?? 0;
+    if (w === 1.0) continue;
+    for (const m of bm.values()) scaleRow(m, w);
+  }
 }
 

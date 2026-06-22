@@ -5,7 +5,7 @@ import { regionFromDesk } from "@frtb/calc-shared/region";
 import type { RedisLike } from "../redis-like.ts";
 import { getActiveTarget } from "../active-target.ts";
 import { getBootstrapStatus } from "../bootstrap-status.ts";
-import { getSensIndexName } from "../lib/sens-index.ts";
+import { getSensIndexName, getSlimSensIndexName } from "../lib/sens-index.ts";
 import { translateRedisError } from "../redis-errors.ts";
 import { recordKbCacheSkipFiltered } from "../sbm/kb-cache.ts";
 import {
@@ -25,10 +25,13 @@ import {
   formatRedisCommand,
   FtAggregateFallbackDisabledError,
   LUA_PATH_ENGINE,
+  resolveLazyMathWeights,
   resolveLegFields,
   resolveRho,
+  resolveSlimLegFields,
   ROLLUP_PATH_ENGINE,
   tryRollupReadout,
+  type WeightSpec,
 } from "../sbm/aggregate-via-index.ts";
 // Wave 6.41.E.fix5 — needed to render `resolved_command` with the same APPLY
 // null-coercion shape the live cluster's RediSearch will actually accept.
@@ -294,6 +297,18 @@ function fcallFallbackEnabled(): boolean {
   return process.env.CALC_FCALL_FALLBACK === "1";
 }
 
+// Wave 7.0.2.B — lazy-math fast path gate. When set, calc reads from the
+// slim index (raw `s_*` fields) and folds the weight literal into the
+// FT.AGGREGATE APPLY clauses instead of consuming the pre-weighted `ws_*`
+// fields the fat ingest pre-computes. Default off for safety; the
+// `bootstrap-preflight` refuses to start when CALC_LAZY_MATH=1 is set
+// without ENABLE_SLIM_SENS_INDEX=1 (see bootstrap.ts), so by the time a
+// request lands here the slim index is guaranteed to exist on every master.
+function lazyMathEnabled(): boolean {
+  const raw = (process.env.CALC_LAZY_MATH ?? "").trim();
+  return raw === "1" || raw.toLowerCase() === "true";
+}
+
 const ALLOWED_LEG = new Set(["delta", "vega", "curvature"]);
 type Leg = "delta" | "vega" | "curvature";
 
@@ -473,7 +488,13 @@ async function computeSbmCharge(
   // Wave 6.18i — resolve the live versioned `idx:sens:v{hash7}` once per
   // request and reuse for discovery FT.AGGREGATE, the FT.INFO probe, the
   // fast-path aggregate fan-out, and the resolved-command echo. Cached 30s.
-  const indexName = await getSensIndexName(redis, target_label);
+  // Wave 7.0.2.B — when CALC_LAZY_MATH=1, target the slim variant
+  // (`idx:sens:slim:v{hash7}`) instead. Both share the same schema-hash
+  // key so the hash7 suffix is identical by construction.
+  const lazyMath = lazyMathEnabled();
+  const indexName = lazyMath
+    ? await getSlimSensIndexName(redis, target_label)
+    : await getSensIndexName(redis, target_label);
   const t0 = process.hrtime.bigint();
 
   // Wave 5.83C-2 — short-TTL response cache lookup.
@@ -624,6 +645,24 @@ async function computeSbmCharge(
     }
     useFastPath = true;
   }
+  // Wave 7.0.2.B — Lua FCALL × lazy-math guard (verifier §5.1). The Lua
+  // kernels read `doc.risk_value` from the per-row JSON; the slim writer
+  // (Wave 7.0.1.B) maintains only the flat `s_*` HASH fields and does NOT
+  // populate that JSON. Dispatching FCALL under lazy-math would silently
+  // return wrong-result-success — refuse with an explicit 503 instead.
+  if (!useFastPath && lazyMath) {
+    return {
+      ok: false,
+      statusCode: 503,
+      body: {
+        error: "fcall-incompatible-with-lazy-math",
+        hint:
+          "Lua FCALL kernels read JSON doc.risk_value which the slim ingest path does not write. " +
+          "Either unset CALC_LAZY_MATH=1 (fall back to the pre-computed ws_* fat-index fast path) " +
+          "or unset CALC_FCALL_FALLBACK=1 / force_path=lua so the lazy-math fast path is dispatched.",
+      },
+    };
+  }
   const fanoutStart = process.hrtime.bigint();
   const dispatchedKeys = buckets.map((b) => `sens:{${risk_class}:${b}}:_route`);
   let results: BucketResultWithEngine[];
@@ -643,16 +682,40 @@ async function computeSbmCharge(
       const hasExclude = EXCLUDE_KEYS.some((k) => excludeCsv[k] !== "");
       const hasInclude = INCLUDE_KEYS.some((k) => includeCsv[k] !== "");
       const hasFilter = hasExclude || hasInclude;
-      const tryRollup = process.env.CALC_ROLLUP_PATH !== "0" && !hasFilter;
+      // Wave 7.0.2.B — disable the per-bucket rollup fast-fast path under
+      // lazy-math. The rollup hashes (Wave 6.14a) store pre-weighted `sum_ws`
+      // / `sum_ws_sq` written by the fat ingest path; the slim writer does
+      // not maintain them, so HGETALL would either miss or return stale
+      // values. Falling back to FT.AGGREGATE against the slim index is the
+      // only safe path while CALC_LAZY_MATH=1.
+      const tryRollup = process.env.CALC_ROLLUP_PATH !== "0" && !hasFilter && !lazyMath;
       // Wave 6.41.A — observable bypass counter. Bumped once per (rc, bucket)
       // we'd otherwise have served from the K_b cache so /metrics proves
       // the cache-skip-on-filter behavior without poking redis.
       if (hasFilter && buckets.length > 0) {
         recordKbCacheSkipFiltered(buckets.length);
       }
-      const legFields = resolveLegFields(schema!, risk_class, leg);
       const perTenor = (schema!.risk_classes[risk_class]?.tenor?.nodes?.length ?? 0) > 0
         && risk_class === "GIRR";
+      // Wave 7.0.2.B — under lazy-math the resolved_command echo must mirror
+      // the slim aliases and APPLY weight literals the live FT.AGGREGATE will
+      // execute; otherwise the UI drilldown shows a command operators can
+      // paste that would either 404 (`ws_*` not in slim index) or compute
+      // unweighted values. Same weight resolution rules as the aggregate
+      // helper — Vega/Curvature short-circuit to 1.0 inside the helper.
+      const legFields = lazyMath
+        ? resolveSlimLegFields(schema!, risk_class, leg)
+        : resolveLegFields(schema!, risk_class, leg);
+      const lazyWeightSpec: WeightSpec | null = lazyMath
+        ? resolveLazyMathWeights(schema!, risk_class, leg, perTenor)
+        : null;
+      const lazyBuilderWeights = lazyMath
+        ? {
+            delta: leg === "delta" ? lazyWeightSpec! : undefined,
+            vega: leg === "vega" ? lazyWeightSpec! : undefined,
+            curvature: leg === "curvature" ? lazyWeightSpec! : undefined,
+          }
+        : null;
 
       // Wave 6.41.A — resolve region include / exclude to concrete desk
       // lists via a one-shot FT.AGGREGATE GROUPBY @desk. region is purely
@@ -731,7 +794,14 @@ async function computeSbmCharge(
           exclude: excludeFilter,
           include: includeFilter,
         });
-        const perBucketArgv = buildFastPathAggregateArgs(perBucketQuery, legFields, perTenor, indexName, searchVer);
+        const perBucketArgv = buildFastPathAggregateArgs(
+          perBucketQuery,
+          legFields,
+          perTenor,
+          indexName,
+          searchVer,
+          lazyBuilderWeights,
+        );
         return formatRedisCommand("FT.AGGREGATE", perBucketArgv);
       };
       let rollup: BucketResult[] | null = null;
@@ -771,6 +841,7 @@ async function computeSbmCharge(
           },
           components: { crossTopN: 10 },
           indexName,
+          lazyMath,
         });
         const byBucket = new Map(fast.map((r) => [r.bucket, r]));
         results = buckets.map((b) => {
@@ -1669,7 +1740,12 @@ export function registerCalcRoute(
       const target_label = getActiveTarget().label;
       // Wave 6.18i — same versioned-index resolution as /calc/sbm so the
       // bucket-cross-detail endpoint targets the live `idx:sens:v{hash7}`.
-      const indexName = await getSensIndexName(redis, target_label);
+      // Wave 7.0.2.B — lazy-math reads the slim variant; same hash7 suffix
+      // as the fat index by construction.
+      const lazyMath = lazyMathEnabled();
+      const indexName = lazyMath
+        ? await getSlimSensIndexName(redis, target_label)
+        : await getSensIndexName(redis, target_label);
       try {
         const results = await aggregateBucketsViaIndex({
           redis,
@@ -1688,6 +1764,7 @@ export function registerCalcRoute(
           },
           components: { crossTopN: null },
           indexName,
+          lazyMath,
         });
         const hit = results.find((r) => r.bucket === bucket);
         if (!hit) {
