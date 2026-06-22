@@ -61,6 +61,27 @@ export interface RowGeneratorOptions {
    * multi-worker callers divide by stride so the aggregate ≥ the global floor.
    */
   coverageFloor?: number;
+  /**
+   * Wave 7.0.6.20 — pre-planned per-class row counts for the reallocation-
+   * based coverage floor. When provided alongside `coverageFloor > 0` and
+   * `sensitivityTypes.length > 1`, the generator pre-computes a per-(rc,
+   * sens_type) quota table that:
+   *   1. starts from a uniform split (rows/N per sens_type, with the integer
+   *      remainder distributed to the lowest-index combos);
+   *   2. raises any below-`coverageFloor` combo up to the floor by STEALING
+   *      from the largest combo (effective floor capped at floor(rows/N) so
+   *      the table is always realisable);
+   *   3. sums to exactly the planned per-class row count — preserving the
+   *      requested total instead of inflating it the way the 6.19 bias-on-
+   *      pick path could when the floor exceeded the natural share.
+   * Each `generate(rc)` call then picks the sens_type with the largest
+   * remaining quota and decrements it. The pick still consumes exactly one
+   * `rng()` tick per row (ignored when a quota table exists) so the rng-
+   * isolation canary holds for any seed. Callers that don't pass this fall
+   * back to the legacy 6.19 bias-on-pick path (floor guarantee, no row-count
+   * preservation contract).
+   */
+  plannedRowsByClass?: Readonly<Record<string, number>>;
 }
 
 export type DistributionMode = NonNullable<RowGeneratorOptions["distribution"]>;
@@ -143,6 +164,20 @@ export function createRowGenerator(
   // index pick (preserves the rng-isolation canary).
   const coverageFloor = Math.max(0, Math.floor(opts.coverageFloor ?? 0));
   const sensCountsByClass: Map<string, number[]> = new Map();
+  // Wave 7.0.6.20 — pre-computed per-class quota tables for the reallocation
+  // path. Built once from `plannedRowsByClass`; classes absent from the map
+  // (or with non-positive counts) fall back to the 6.19 bias-on-pick path
+  // so callers that haven't migrated still get the floor guarantee.
+  let quotasByClass: Map<string, number[]> | undefined;
+  if (coverageFloor > 0 && sensTypes.length > 1 && opts.plannedRowsByClass) {
+    quotasByClass = new Map();
+    for (const cls of Object.keys(opts.plannedRowsByClass)) {
+      const planned = Math.floor(opts.plannedRowsByClass[cls] ?? 0);
+      if (planned > 0) {
+        quotasByClass.set(cls, computeCoverageQuotas(planned, sensTypes.length, coverageFloor));
+      }
+    }
+  }
   const dimsByName = new Map<string, Dimension>();
   for (const d of schema.dimensions) dimsByName.set(d.name, d);
   const binding = schema.frtb_binding;
@@ -274,21 +309,48 @@ export function createRowGenerator(
       // sens-type for this class until each combo has ≥ coverageFloor draws,
       // then fall through to the uniform pick. Always consume exactly one
       // rng() tick so the rng-isolation canary holds in the no-floor default.
+      // Wave 7.0.6.20 — reallocation path: when `plannedRowsByClass` was
+      // supplied, consult the pre-computed quota table and pick the sens_type
+      // with the largest remaining quota (deterministic; the per-row rng()
+      // tick is still consumed but discarded — preserves the rng-isolation
+      // invariant for downstream bucket/risk_value draws). This guarantees
+      // the per-class row total is EXACTLY the planned count instead of the
+      // bias-on-pick path's "force first N per combo" approach that could
+      // skew toward Delta-heavy starts.
       const sensR = rng();
       let sensType: string;
       if (coverageFloor > 0 && sensTypes.length > 1) {
-        let counts = sensCountsByClass.get(riskClass);
-        if (!counts) {
-          counts = new Array<number>(sensTypes.length).fill(0);
-          sensCountsByClass.set(riskClass, counts);
+        const quotas = quotasByClass?.get(riskClass);
+        if (quotas) {
+          let idx = 0;
+          let best = quotas[0]!;
+          for (let s = 1; s < sensTypes.length; s++) {
+            if (quotas[s]! > best) { idx = s; best = quotas[s]!; }
+          }
+          // If every quota is exhausted (caller emitted more rows than
+          // planned), fall through to the uniform pick so the row still
+          // gets a valid sens_type. Tests assert callers stay within the
+          // planned count; this branch is purely defensive.
+          if (best <= 0) {
+            sensType = sensTypes[(sensR * sensTypes.length) | 0]!;
+          } else {
+            sensType = sensTypes[idx]!;
+            quotas[idx] = quotas[idx]! - 1;
+          }
+        } else {
+          let counts = sensCountsByClass.get(riskClass);
+          if (!counts) {
+            counts = new Array<number>(sensTypes.length).fill(0);
+            sensCountsByClass.set(riskClass, counts);
+          }
+          let idx = -1;
+          for (let s = 0; s < sensTypes.length; s++) {
+            if (counts[s]! < coverageFloor) { idx = s; break; }
+          }
+          if (idx < 0) idx = (sensR * sensTypes.length) | 0;
+          sensType = sensTypes[idx]!;
+          counts[idx] = counts[idx]! + 1;
         }
-        let idx = -1;
-        for (let s = 0; s < sensTypes.length; s++) {
-          if (counts[s]! < coverageFloor) { idx = s; break; }
-        }
-        if (idx < 0) idx = (sensR * sensTypes.length) | 0;
-        sensType = sensTypes[idx]!;
-        counts[idx] = counts[idx]! + 1;
       } else {
         sensType = sensTypes[(sensR * sensTypes.length) | 0]!;
       }
@@ -414,4 +476,55 @@ export function createRowGenerator(
       return row;
     },
   };
+}
+
+/**
+ * Wave 7.0.6.20 — build a per-sens_type quota vector whose elements sum
+ * EXACTLY to `plannedRows` and whose minimum is `min(floor, plannedRows/n)`.
+ *
+ * The vector starts as a uniform split (`floor(plannedRows / n)` with the
+ * remainder distributed to the lowest-index combos so the first sens_type
+ * never has fewer rows than the last — important for the Delta-first
+ * verifier gate). Below-floor combos are then raised to the floor by
+ * stealing from the largest combo. The effective floor is capped at
+ * `floor(plannedRows / n)` so the table is always realisable when the
+ * caller asked for fewer rows than `n × floor` (small smoke runs).
+ *
+ * Exported so the api's `runWithWorkers` and tests can independently verify
+ * `sum(quotas) === plannedRows` and `min(quotas) >= min(floor, ⌊rows/n⌋)`.
+ */
+export function computeCoverageQuotas(plannedRows: number, n: number, floor: number): number[] {
+  const quotas = new Array<number>(n);
+  if (n <= 0) return quotas;
+  if (plannedRows <= 0) { for (let i = 0; i < n; i++) quotas[i] = 0; return quotas; }
+  const base = Math.floor(plannedRows / n);
+  const remainder = plannedRows - base * n;
+  for (let i = 0; i < n; i++) quotas[i] = base + (i < remainder ? 1 : 0);
+  const effFloor = Math.min(Math.max(0, Math.floor(floor)), Math.floor(plannedRows / n));
+  if (effFloor <= 0) return quotas;
+  // Bounded iteration: each pass either resolves one below-floor combo or
+  // exits (no steal source available). n iterations is sufficient because
+  // the uniform-base case has at most one below-floor combo after the
+  // remainder distribution.
+  for (let iter = 0; iter < n + 1; iter++) {
+    let needIdx = -1;
+    for (let i = 0; i < n; i++) {
+      if (quotas[i]! < effFloor) { needIdx = i; break; }
+    }
+    if (needIdx < 0) break;
+    let stealIdx = -1;
+    let stealMax = effFloor;
+    for (let i = 0; i < n; i++) {
+      if (i === needIdx) continue;
+      if (quotas[i]! > stealMax) { stealIdx = i; stealMax = quotas[i]!; }
+    }
+    if (stealIdx < 0) break;
+    const deficit = effFloor - quotas[needIdx]!;
+    const available = quotas[stealIdx]! - effFloor;
+    const transfer = Math.min(deficit, available);
+    if (transfer <= 0) break;
+    quotas[needIdx] = quotas[needIdx]! + transfer;
+    quotas[stealIdx] = quotas[stealIdx]! - transfer;
+  }
+  return quotas;
 }

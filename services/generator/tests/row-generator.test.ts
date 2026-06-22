@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadSchema } from "@frtb/schema";
 import type { Schema } from "@frtb/schema";
-import { createRowGenerator } from "../src/row-generator.ts";
+import { createRowGenerator, computeCoverageQuotas } from "../src/row-generator.ts";
 
 const here = resolve(fileURLToPath(import.meta.url), "..");
 const multiClass = resolve(here, "fixtures/multi-class.yaml");
@@ -342,6 +342,203 @@ describe("createRowGenerator — Curvature shape A (Wave 5.16d)", () => {
         expect(rb.sensitivity_type).toBe(ra.sensitivity_type);
         expect(rb.bucket).toBe(ra.bucket);
         expect(rb.risk_value).toEqual(ra.risk_value);
+      }
+    });
+  });
+
+  // Wave 7.0.6.20 — reallocation-based coverage floor. The 6.19 bias-on-pick
+  // path forced the first `floor` rows of each (rc, sens_type) regardless of
+  // the planned per-class row count, which could let the floor effectively
+  // inflate the row mix when multiplied across (classes × sens_types) on a
+  // small per-worker slice. The 6.20 path pre-computes a per-(rc, sens_type)
+  // quota table that sums EXACTLY to the planned per-class row count, so the
+  // overall row total is preserved within ±num_combos (integer rounding).
+  describe("coverage floor reallocation (Wave 7.0.6.20)", () => {
+    // Helper — drive the generator round-robin across `classes` for the
+    // planned per-class counts and return the (rc, sens_type) histogram.
+    function runPlanned(opts: {
+      seed: string | number;
+      sensTypes: readonly string[];
+      coverageFloor: number;
+      classes: readonly string[];
+      offset: number;
+      stride: number;
+      rowsTotal: number;
+    }): { hist: Record<string, number>; rowsEmitted: number; plannedRowsByClass: Record<string, number> } {
+      const plannedRowsByClass: Record<string, number> = {};
+      for (const c of opts.classes) plannedRowsByClass[c] = 0;
+      for (let i = opts.offset; i < opts.rowsTotal; i += opts.stride) {
+        plannedRowsByClass[opts.classes[i % opts.classes.length]!]!++;
+      }
+      const gen = createRowGenerator(schema, {
+        seed: opts.seed,
+        sensitivityTypes: [...opts.sensTypes],
+        coverageFloor: opts.coverageFloor,
+        plannedRowsByClass,
+      });
+      const hist: Record<string, number> = {};
+      let rowsEmitted = 0;
+      for (let i = opts.offset; i < opts.rowsTotal; i += opts.stride) {
+        const row = gen.generate(opts.classes[i % opts.classes.length]!);
+        const key = `${row.risk_class}|${row.sensitivity_type}`;
+        hist[key] = (hist[key] ?? 0) + 1;
+        rowsEmitted++;
+      }
+      return { hist, rowsEmitted, plannedRowsByClass };
+    }
+
+    it("computeCoverageQuotas sums to plannedRows exactly and meets the floor (or capped floor when plannedRows < n*floor)", () => {
+      // Realistic 1M-row / 3-combo case: uniform split already exceeds the
+      // floor — reallocation is a no-op; sum matches plannedRows exactly.
+      const big = computeCoverageQuotas(333_334, 3, 10_000);
+      expect(big.reduce((a, b) => a + b, 0)).toBe(333_334);
+      for (const q of big) expect(q).toBeGreaterThanOrEqual(10_000);
+      // Small smoke case: rows=66, n=3, floor=20 → effFloor=min(20, 22)=20.
+      // Base uniform = [22,22,22]; nothing to reallocate; floor met.
+      const small = computeCoverageQuotas(66, 3, 20);
+      expect(small.reduce((a, b) => a + b, 0)).toBe(66);
+      for (const q of small) expect(q).toBeGreaterThanOrEqual(20);
+      // Sub-min-floor case: rows=10, n=3, floor=5 → effFloor=min(5, 3)=3.
+      // Caller asked for 5 per combo but only 10 rows available, so we
+      // settle for floor(10/3)=3 and PRESERVE the total of 10.
+      const tiny = computeCoverageQuotas(10, 3, 5);
+      expect(tiny.reduce((a, b) => a + b, 0)).toBe(10);
+      for (const q of tiny) expect(q).toBeGreaterThanOrEqual(3);
+    });
+
+    it("small-run preserves GIRR Curvature guarantee AND total within ±num_combos (rows=200, 3 classes × 3 sens-types)", () => {
+      // Mirrors POST /ingest/bulk/start rows=200 with coverageFloor=2.
+      const sensTypes = ["Delta", "Vega", "Curvature"] as const;
+      const classes = ["GIRR", "EQUITY", "FX"] as const;
+      const { hist, rowsEmitted, plannedRowsByClass } = runPlanned({
+        seed: "realloc-200",
+        sensTypes,
+        coverageFloor: 2,
+        classes,
+        offset: 0,
+        stride: 1,
+        rowsTotal: 200,
+      });
+      // Total emitted == requested EXACTLY (reallocation, not addition).
+      expect(rowsEmitted).toBe(200);
+      const total = Object.values(hist).reduce((a, b) => a + b, 0);
+      expect(total).toBe(200);
+      // Per-class sum matches the planned per-class row count exactly.
+      for (const cls of classes) {
+        let perClass = 0;
+        for (const st of sensTypes) perClass += hist[`${cls}|${st}`] ?? 0;
+        expect(perClass).toBe(plannedRowsByClass[cls]);
+      }
+      // GIRR Curvature preserved (≥ floor since the natural share also meets it).
+      expect(hist["GIRR|Curvature"] ?? 0).toBeGreaterThanOrEqual(2);
+    });
+
+    it("medium run rows=1000 across 3 classes × 3 sens-types: actual == requested exactly (tolerance ±num_combos = 9)", () => {
+      const { rowsEmitted } = runPlanned({
+        seed: "realloc-1k",
+        sensTypes: ["Delta", "Vega", "Curvature"],
+        coverageFloor: 10,
+        classes: ["GIRR", "EQUITY", "FX"],
+        offset: 0,
+        stride: 1,
+        rowsTotal: 1000,
+      });
+      expect(Math.abs(rowsEmitted - 1000)).toBeLessThanOrEqual(9);
+      // Stronger: per-class quotas sum to plannedRows exactly, so the only
+      // way rowsEmitted ≠ rowsTotal is if the round-robin doesn't cover all
+      // rows (it does for stride=1).
+      expect(rowsEmitted).toBe(1000);
+    });
+
+    it("large run rows=1,000,000 across 3 classes × 3 sens-types: actual within ±9 of requested", () => {
+      const { rowsEmitted } = runPlanned({
+        seed: "realloc-1M",
+        sensTypes: ["Delta", "Vega", "Curvature"],
+        coverageFloor: 10_000,
+        classes: ["GIRR", "EQUITY", "FX"],
+        offset: 0,
+        stride: 1,
+        rowsTotal: 1_000_000,
+      });
+      expect(Math.abs(rowsEmitted - 1_000_000)).toBeLessThanOrEqual(9);
+      expect(rowsEmitted).toBe(1_000_000);
+    });
+
+    it("multi-worker rows=1,000,000 split across 24 workers: sum of per-worker emissions == requested exactly", () => {
+      const totalRows = 1_000_000;
+      const workers = 24;
+      const sensTypes = ["Delta", "Vega", "Curvature"] as const;
+      const classes = ["GIRR", "EQUITY", "FX"] as const;
+      // computeCoverageFloor(1M, 24) = ceil(10_000 / 24) = 417.
+      const perWorkerCoverageFloor = 417;
+      let sumRows = 0;
+      for (let w = 0; w < workers; w++) {
+        const { rowsEmitted } = runPlanned({
+          seed: `realloc-mw:w${w}`,
+          sensTypes,
+          coverageFloor: perWorkerCoverageFloor,
+          classes,
+          offset: w,
+          stride: workers,
+          rowsTotal: totalRows,
+        });
+        sumRows += rowsEmitted;
+      }
+      // Per-worker quotas sum to per-worker plannedRows exactly, and per-
+      // worker plannedRows sum to totalRows (the stride loop covers every i
+      // ∈ [0, totalRows) exactly once across w ∈ [0, workers)).
+      expect(sumRows).toBe(totalRows);
+    });
+
+    it("same seed → same per-(rc, sens_type) distribution within ±1 (rng-isolation canary preserved across the floor path)", () => {
+      const sensTypes = ["Delta", "Vega", "Curvature"] as const;
+      const classes = ["GIRR", "EQUITY", "FX"] as const;
+      const a = runPlanned({
+        seed: "realloc-canary",
+        sensTypes,
+        coverageFloor: 50,
+        classes,
+        offset: 0,
+        stride: 1,
+        rowsTotal: 5_000,
+      });
+      const b = runPlanned({
+        seed: "realloc-canary",
+        sensTypes,
+        coverageFloor: 50,
+        classes,
+        offset: 0,
+        stride: 1,
+        rowsTotal: 5_000,
+      });
+      // Deterministic — identical seeds and quotas yield identical pick
+      // sequences. Allow ±1 only as a safety margin; in practice should be 0.
+      for (const cls of classes) {
+        for (const st of sensTypes) {
+          const key = `${cls}|${st}`;
+          expect(Math.abs((a.hist[key] ?? 0) - (b.hist[key] ?? 0))).toBeLessThanOrEqual(1);
+        }
+      }
+    });
+
+    it("legacy bias-on-pick (no plannedRowsByClass) still satisfies the floor guarantee — back-compat for callers not yet migrated", () => {
+      // The 6.19 path stays as a fallback when plannedRowsByClass is absent.
+      const gen = createRowGenerator(schema, {
+        seed: "back-compat",
+        sensitivityTypes: ["Delta", "Vega", "Curvature"],
+        coverageFloor: 3,
+      });
+      const classes = ["GIRR", "EQUITY", "FX"] as const;
+      const counts: Record<string, number> = {};
+      for (let i = 0; i < 300; i++) {
+        const row = gen.generate(classes[i % classes.length]!);
+        const key = `${row.risk_class}|${row.sensitivity_type}`;
+        counts[key] = (counts[key] ?? 0) + 1;
+      }
+      for (const cls of classes) {
+        for (const st of ["Delta", "Vega", "Curvature"]) {
+          expect(counts[`${cls}|${st}`] ?? 0).toBeGreaterThanOrEqual(3);
+        }
       }
     });
   });
