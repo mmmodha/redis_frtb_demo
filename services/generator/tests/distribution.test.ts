@@ -101,6 +101,40 @@ describe("createRowGenerator — distribution=pareto + default (Wave 6.39.A)", (
     expect(Math.abs((hist.GBP ?? 0) / N - 0.1)).toBeLessThanOrEqual(0.02);
   });
 
+  // Wave 7.0.6.19 — coverage floor must not skew large-run distributions.
+  // At N=200k rows the global floor is max(1, floor(N/100)) = 2000 per combo
+  // (3 classes × 3 sens-types = 9 combos → 18k forced rows, 9% of total).
+  // The remaining 91% are drawn uniformly from sensTypes, so the per-combo
+  // share converges on 1/9 within ±5% (uniform target / well inside the
+  // task spec tolerance). N=200k is chosen to keep the test CI-fast while
+  // still being statistically meaningful for ±5%.
+  it("coverage floor at rows=200000 keeps (risk_class, sensitivity_type) within ±5% of uniform target (3 classes × 3 sens-types)", () => {
+    const N = 200_000;
+    const classes = ["GIRR", "EQUITY", "FX"] as const;
+    const sensTypes = ["Delta", "Vega", "Curvature"] as const;
+    const coverageFloor = Math.max(1, Math.floor(N / 100));
+    const gen = createRowGenerator(baseSchema, {
+      seed: "dist-large",
+      sensitivityTypes: [...sensTypes],
+      coverageFloor,
+    });
+    const hist: Record<string, number> = {};
+    for (let i = 0; i < N; i++) {
+      const row = gen.generate(classes[i % classes.length]!);
+      const key = `${row.risk_class}|${row.sensitivity_type}`;
+      hist[key] = (hist[key] ?? 0) + 1;
+    }
+    const target = 1 / (classes.length * sensTypes.length);
+    for (const cls of classes) {
+      for (const st of sensTypes) {
+        const share = (hist[`${cls}|${st}`] ?? 0) / N;
+        // Every combo present (floor guarantee) and within ±5% of uniform.
+        expect(share).toBeGreaterThan(0);
+        expect(Math.abs(share - target)).toBeLessThan(0.05);
+      }
+    }
+  });
+
   it("default (undefined) preserves legacy behaviour bit-for-bit — pareto-equivalent", () => {
     // Same seed → same rng sequence → same row tuples. Default path was the
     // schema-aware draw; setting `distribution: "pareto"` must replay the

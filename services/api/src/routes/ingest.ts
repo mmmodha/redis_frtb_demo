@@ -99,7 +99,11 @@ const MAX_WORKERS = 32;
 // defined in schema". Defaulting to GIRR + EQUITY covers the two SBM smokes
 // the operator runs after a fresh ingest (GIRR Delta, EQUITY Delta).
 const DEFAULT_CLASSES = ["GIRR", "EQUITY", "FX"] as const;
-const DEFAULT_SENSITIVITY_TYPES = ["Delta", "Vega"] as const;
+// Wave 7.0.6.19 — include Curvature in the bulk-ingest default so the
+// verifier's 5-combo calc smoke (GIRR Δ/Vega/Curv, EQUITY Δ, FX Δ) has all
+// the rows it needs after a stock POST /ingest/bulk/start (the /generator/
+// start route already defaulted to ["Delta","Vega","Curvature"]).
+const DEFAULT_SENSITIVITY_TYPES = ["Delta", "Vega", "Curvature"] as const;
 // Bulk-loader-only retention; the UI polls /ingest/bulk/runs/:id while a run
 // is in flight and a few seconds after completion, then drops the handle.
 const RUN_GRACE_MS = 60_000;
@@ -115,6 +119,19 @@ function pickInt(...vals: Array<number | undefined>): number | undefined {
 
 function clamp(n: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, n));
+}
+
+// Wave 7.0.6.19 — sensitivity_type coverage floor. Each (risk_class,
+// sensitivity_type) combo gets at least `globalFloor` emissions across the
+// whole run so small smokes (rows=50k) reliably cover all 5 verifier combos
+// (GIRR Δ/Vega/Curv, EQUITY Δ, FX Δ). Disabled for rows < 100 (the natural
+// uniform draw already covers all combos at that scale, and the floor would
+// dominate a sub-100-row run). Multi-worker callers divide by stride so the
+// per-worker forced rows sum to ≥ globalFloor across the cluster.
+function computeCoverageFloor(rowsTotal: number, workers: number): number {
+  if (rowsTotal < 100) return 0;
+  const globalFloor = Math.max(1, Math.floor(rowsTotal / 100));
+  return Math.max(1, Math.ceil(globalFloor / Math.max(1, workers)));
 }
 
 // Wave 7.0.6.15 — resolve the schema path the API was booted with. Tests
@@ -356,11 +373,13 @@ interface InlineRunArgs {
 function runInline(args: InlineRunArgs): void {
   const { schema, body, rowsTotal, batchSize, concurrency, classes, sensitivityTypes,
     bulkBase, fetchImpl, log, record, run_id } = args;
+  const coverageFloor = computeCoverageFloor(rowsTotal, 1);
   const generator = createRowGenerator(schema, {
     seed: body.seed,
     sensitivityTypes,
     ...(body.trade_pool_size !== undefined ? { tradePoolSize: body.trade_pool_size } : {}),
     ...(body.factor_pool_size !== undefined ? { factorPoolSize: body.factor_pool_size } : {}),
+    ...(coverageFloor > 0 ? { coverageFloor } : {}),
   });
   const producer = createHttpProducer({
     url: bulkBase,
@@ -439,6 +458,10 @@ function runWithWorkers(args: WorkerRunArgs): void {
   // across workers (min 1) so the aggregate matches a workers=1 run.
   const perWorkerInFlight = Math.max(1, Math.floor(concurrency / workers));
   const baseSeed = body.seed !== undefined ? String(body.seed) : "default";
+  // Wave 7.0.6.19 — per-worker coverage floor. The aggregate across stride
+  // workers is ≥ the global floor because each worker forces ≥
+  // ceil(globalFloor / workers) emissions per combo (helper rounds up).
+  const perWorkerCoverageFloor = computeCoverageFloor(rowsTotal, workers);
 
   const t0 = process.hrtime.bigint();
   const workerPromises: Promise<void>[] = [];
@@ -463,6 +486,7 @@ function runWithWorkers(args: WorkerRunArgs): void {
       sensitivityTypes,
       ...(body.trade_pool_size !== undefined ? { tradePoolSize: body.trade_pool_size } : {}),
       ...(body.factor_pool_size !== undefined ? { factorPoolSize: body.factor_pool_size } : {}),
+      ...(perWorkerCoverageFloor > 0 ? { coverageFloor: perWorkerCoverageFloor } : {}),
       cancelBuffer,
       progressBatchSize: 1000,
       bulkLoadTarget: bulkBase,

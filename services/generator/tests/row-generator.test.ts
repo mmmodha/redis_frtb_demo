@@ -272,6 +272,80 @@ describe("createRowGenerator — Curvature shape A (Wave 5.16d)", () => {
     expect(row.sensitivity_type).toBe("Curvature");
   });
 
+  // Wave 7.0.6.19 — sensitivity_type coverage floor. Guarantees every
+  // (risk_class, sensitivity_type) combo gets at least `coverageFloor`
+  // emissions per class before reverting to uniform-random. Closes the
+  // verifier-Step-6 gap where a 50k bulk run could emit ZERO GIRR Curvature
+  // rows because the uniform pick missed it. Default (undefined / 0)
+  // preserves the legacy single-rng()-tick pick (rng-isolation canary holds).
+  describe("coverage floor (Wave 7.0.6.19)", () => {
+    it("rows=200 across 3 classes round-robin contains ≥1 GIRR Curvature row when floor=2", () => {
+      // Mirrors POST /ingest/bulk/start computeCoverageFloor(200, 1) = 2.
+      const gen = createRowGenerator(schema, {
+        seed: "rows-200",
+        sensitivityTypes: ["Delta", "Vega", "Curvature"],
+        coverageFloor: 2,
+      });
+      const classes = ["GIRR", "EQUITY", "FX"] as const;
+      let girrCurvature = 0;
+      for (let i = 0; i < 200; i++) {
+        const row = gen.generate(classes[i % classes.length]!);
+        if (row.risk_class === "GIRR" && row.sensitivity_type === "Curvature") girrCurvature++;
+      }
+      // Floor=2 means GIRR sees Curvature at least twice; ingest verifier
+      // only needs ≥1 to gate Step 6 as charge>0.
+      expect(girrCurvature).toBeGreaterThanOrEqual(2);
+    });
+
+    it("every (risk_class, sensitivity_type) combo meets the floor across 3 classes", () => {
+      const gen = createRowGenerator(schema, {
+        seed: "floor-all",
+        sensitivityTypes: ["Delta", "Vega", "Curvature"],
+        coverageFloor: 3,
+      });
+      const classes = ["GIRR", "EQUITY", "FX"] as const;
+      const counts: Record<string, number> = {};
+      for (let i = 0; i < 300; i++) {
+        const row = gen.generate(classes[i % classes.length]!);
+        const key = `${row.risk_class}|${row.sensitivity_type}`;
+        counts[key] = (counts[key] ?? 0) + 1;
+      }
+      for (const cls of classes) {
+        for (const st of ["Delta", "Vega", "Curvature"]) {
+          expect(counts[`${cls}|${st}`] ?? 0).toBeGreaterThanOrEqual(3);
+        }
+      }
+    });
+
+    it("floor consumes one rng() tick per row — risk_value sequence matches a no-floor run with the same seed for the first floor*sensTypes rows when forced indices align with the uniform pick", () => {
+      // Sanity: floor changes sens_type pick but does NOT shift the
+      // downstream rng() ticks (bucket / risk_value / weights). For a
+      // single-class run with floor and N rows, the bucket sequence equals
+      // the no-floor run because both consume one tick before the sens_type
+      // pick and one after.
+      const a = createRowGenerator(schema, { seed: "tick", sensitivityTypes: ["Delta"], coverageFloor: 5 });
+      const b = createRowGenerator(schema, { seed: "tick", sensitivityTypes: ["Delta"] });
+      for (let i = 0; i < 50; i++) {
+        const ra = a.generate("GIRR");
+        const rb = b.generate("GIRR");
+        expect(ra.bucket).toBe(rb.bucket);
+        expect(ra.risk_value).toEqual(rb.risk_value);
+      }
+    });
+
+    it("coverageFloor undefined / 0 preserves legacy uniform pick (rng-isolation canary holds)", () => {
+      const a = createRowGenerator(schema, { seed: "legacy", sensitivityTypes: ["Delta", "Vega", "Curvature"] });
+      const b = createRowGenerator(schema, { seed: "legacy", sensitivityTypes: ["Delta", "Vega", "Curvature"], coverageFloor: 0 });
+      for (let i = 0; i < 60; i++) {
+        const ra = a.generate("GIRR");
+        const rb = b.generate("GIRR");
+        expect(rb.sensitivity_type).toBe(ra.sensitivity_type);
+        expect(rb.bucket).toBe(ra.bucket);
+        expect(rb.risk_value).toEqual(ra.risk_value);
+      }
+    });
+  });
+
   it("default sensitivityTypes (Delta/Vega) never emits Curvature — preserves pre-5.16d behaviour", () => {
     const gen = createRowGenerator(schema, { seed: 5 });
     for (let i = 0; i < 200; i++) {

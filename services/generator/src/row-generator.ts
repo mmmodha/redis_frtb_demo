@@ -46,6 +46,21 @@ export interface RowGeneratorOptions {
    * rng-isolation canary (existing) continues to hold.
    */
   distribution?: "uniform" | "realistic" | "pareto";
+  /**
+   * Wave 7.0.6.19 — sensitivity_type coverage floor. When set to N > 0 and
+   * `sensitivityTypes.length > 1`, the first N draws of each sensitivity_type
+   * for a given risk_class are FORCED in declared order (Delta, Vega,
+   * Curvature, …) before the loop reverts to the uniform-random pick. This
+   * guarantees every `(risk_class, sensitivity_type)` combo gets ≥ N rows so
+   * small smoke runs (rows=50k) reliably contain GIRR Curvature etc. — the
+   * verifier's 5-combo calc smoke gate is meaningful.
+   *
+   * The floor consumes one rng() tick per row (same as the uniform path) so
+   * the rng-isolation canary holds for the no-floor default (undefined / 0).
+   * Callers compute N = max(1, floor(rowsTotal / 100)) when rowsTotal >= 100;
+   * multi-worker callers divide by stride so the aggregate ≥ the global floor.
+   */
+  coverageFloor?: number;
 }
 
 export type DistributionMode = NonNullable<RowGeneratorOptions["distribution"]>;
@@ -121,6 +136,13 @@ export function createRowGenerator(
   const sensTypes = opts.sensitivityTypes && opts.sensitivityTypes.length > 0
     ? opts.sensitivityTypes
     : DEFAULT_SENSITIVITY_TYPES;
+  // Wave 7.0.6.19 — per-(risk_class, sensitivity_type) emission counters
+  // backing the coverage-floor guarantee. Lazily initialised per class on
+  // first draw; only consulted when `coverageFloor > 0 && sensTypes.length
+  // > 1` so the no-floor default path stays a single bounds-check + bitwise
+  // index pick (preserves the rng-isolation canary).
+  const coverageFloor = Math.max(0, Math.floor(opts.coverageFloor ?? 0));
+  const sensCountsByClass: Map<string, number[]> = new Map();
   const dimsByName = new Map<string, Dimension>();
   for (const d of schema.dimensions) dimsByName.set(d.name, d);
   const binding = schema.frtb_binding;
@@ -248,7 +270,28 @@ export function createRowGenerator(
       // Pre-pick the sensitivity_type for this row so the rv_array/rv_scalar
       // handlers can branch on it (the sens_type op may come AFTER risk_value
       // in the dimension list — we cannot rely on op execution order).
-      const sensType = sensTypes[(rng() * sensTypes.length) | 0]!;
+      // Wave 7.0.6.19 — coverage floor: when active, FORCE the lowest-count
+      // sens-type for this class until each combo has ≥ coverageFloor draws,
+      // then fall through to the uniform pick. Always consume exactly one
+      // rng() tick so the rng-isolation canary holds in the no-floor default.
+      const sensR = rng();
+      let sensType: string;
+      if (coverageFloor > 0 && sensTypes.length > 1) {
+        let counts = sensCountsByClass.get(riskClass);
+        if (!counts) {
+          counts = new Array<number>(sensTypes.length).fill(0);
+          sensCountsByClass.set(riskClass, counts);
+        }
+        let idx = -1;
+        for (let s = 0; s < sensTypes.length; s++) {
+          if (counts[s]! < coverageFloor) { idx = s; break; }
+        }
+        if (idx < 0) idx = (sensR * sensTypes.length) | 0;
+        sensType = sensTypes[idx]!;
+        counts[idx] = counts[idx]! + 1;
+      } else {
+        sensType = sensTypes[(sensR * sensTypes.length) | 0]!;
+      }
       const row: SensitivityRow = {
         risk_class: riskClass,
         bucket,

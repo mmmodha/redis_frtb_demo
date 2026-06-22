@@ -60,6 +60,10 @@ export interface WorkerInitData {
   sensitivityTypes?: string[];
   tradePoolSize?: number;
   factorPoolSize?: number;
+  /** Wave 7.0.6.19 — per-worker sensitivity_type coverage floor. Coordinator
+   *  divides the global floor (max(1, floor(rowsTotal/100))) by totalWorkers
+   *  before spawn so the aggregate guarantee holds. Undefined / 0 disables. */
+  coverageFloor?: number;
   /** Optional Curvature/Delta/Vega mix is folded into sensitivityTypes by the
    * coordinator before spawn. */
   /** Int32Array view of [0] = cancel flag (0 = run, 1 = cancel). */
@@ -119,6 +123,7 @@ async function main(): Promise<void> {
     tradePoolSize: data.tradePoolSize,
     factorPoolSize: data.factorPoolSize,
     distribution: data.distribution,
+    coverageFloor: data.coverageFloor,
   });
   // Wave 7.0.1.C — HTTP producer needs no Redis connection; skip the
   // createClient call entirely so per-worker connection budget is zero.
