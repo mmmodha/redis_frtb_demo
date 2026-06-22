@@ -328,3 +328,65 @@ describe("GET /admin/index-count (Wave 6.44.D)", () => {
     expect(search!.args[0]).toBe(body.index_name);
   });
 });
+
+// Wave 7.0.6.15 — GET /admin/host-info surfaces the host's CPU count + the
+// recommended worker cap (cores-2, min 1) so the UI can pre-fill the worker
+// slider safely. Pool size mirrors $BULK_LOADER_POOL_SIZE (default 32);
+// shards reflects the active target's CLUSTER INFO (null on standalone).
+describe("GET /admin/host-info", () => {
+  let app: Awaited<ReturnType<typeof createServer>>;
+  afterEach(async () => {
+    if (app) await app.close();
+    resetActiveTarget();
+    delete process.env.BULK_LOADER_POOL_SIZE;
+  });
+
+  it("returns the host-aware worker cap + pool size + null shards on standalone", async () => {
+    const fr = fakeRedis();
+    // Standalone CLUSTER INFO → cluster_enabled:0; parser returns
+    // { enabled: false, size: 0 } so the route emits shards: null.
+    fr.setResponse("CLUSTER", "cluster_enabled:0\r\n");
+    app = await createServer({
+      redis: fr,
+      activeTarget: { host: "127.0.0.1", port: 6379, tls: false, db: 0, label: "redis-primary" },
+    });
+    const res = await app.inject({ method: "GET", url: "/admin/host-info" });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(typeof body.cores).toBe("number");
+    expect(body.cores).toBeGreaterThanOrEqual(1);
+    expect(body.recommended_max_workers).toBe(Math.max(1, body.cores - 2));
+    expect(body.max_workers_hard_cap).toBe(32);
+    expect(body.bulk_loader_pool_size).toBe(32);
+    expect(body.shards).toBeNull();
+    expect(body.target_label).toBe("redis-primary");
+  });
+
+  it("honours $BULK_LOADER_POOL_SIZE override", async () => {
+    process.env.BULK_LOADER_POOL_SIZE = "64";
+    const fr = fakeRedis();
+    fr.setResponse("CLUSTER", "cluster_enabled:0\r\n");
+    app = await createServer({
+      redis: fr,
+      activeTarget: { host: "127.0.0.1", port: 6379, tls: false, db: 0, label: "redis-primary" },
+    });
+    const res = await app.inject({ method: "GET", url: "/admin/host-info" });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().bulk_loader_pool_size).toBe(64);
+  });
+
+  it("returns target_label=null and tolerates absent active target", async () => {
+    const fr = fakeRedis();
+    app = await createServer({
+      redis: fr,
+      activeTarget: { host: "127.0.0.1", port: 6379, tls: false, db: 0, label: "" },
+    });
+    const res = await app.inject({ method: "GET", url: "/admin/host-info" });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.target_label).toBeNull();
+    expect(body.shards).toBeNull();
+    // No CLUSTER call when there's no active target.
+    expect(fr.calls.find((c) => c.command === "CLUSTER")).toBeUndefined();
+  });
+});

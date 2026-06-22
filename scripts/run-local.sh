@@ -461,9 +461,16 @@ apply_defaults() {
   : "${LIVE_TAIL_MODE:=true}"
   : "${CALC_LAZY_MATH:=1}"
   : "${ENABLE_SLIM_SENS_INDEX:=1}"
+  # Wave 7.0.6.15 — bulk-loader pooled-socket count. The dispatcher fans
+  # HSET pipelines across `BULK_LOADER_POOL_SIZE` sockets; on a multi-shard
+  # cluster this should be >= shard_count so each master has at least one
+  # dedicated connection. 32 is a safe default for single-node + small
+  # clusters; surface via `host-info` so the UI can flag undersized pools.
+  : "${BULK_LOADER_POOL_SIZE:=32}"
   export NODE_ENV LOG_LEVEL API_URL ALLOWED_ORIGINS INTERNAL_API_TOKEN
   export SOURCE_BASE CONN_STORE_KEY SCHEMA_FILE
   export LIVE_TAIL_MODE CALC_LAZY_MATH ENABLE_SLIM_SENS_INDEX
+  export BULK_LOADER_POOL_SIZE
 }
 
 

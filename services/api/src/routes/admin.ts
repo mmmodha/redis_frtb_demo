@@ -11,10 +11,12 @@
 // Calculate call lands on a primed cluster. Bootstrap failures don't fail the
 // flush — they're surfaced as `bootstrap.ok: false` so the UI can warn.
 
+import { availableParallelism } from "node:os";
 import type { FastifyInstance } from "fastify";
 import type { Schema } from "@frtb/schema";
 import type { RedisLike } from "../redis-like.ts";
 import { getActiveTarget, type RuntimeCategory } from "../active-target.ts";
+import { parseClusterInfo } from "@frtb/generator";
 import {
   getBootstrapStatus,
   markBootstrapStatusRunning,
@@ -437,5 +439,41 @@ export function registerAdminRoutes(
 
     const ms = Math.round(Number(process.hrtime.bigint() - t0) / 1e6);
     return { ok: bootstrap.ok, ms, bootstrap };
+  });
+
+  // Wave 7.0.6.15 — GET /admin/host-info. Surfaces host CPU count + the
+  // recommended worker cap (cores-2, min 1) so the IngestPanel's worker
+  // slider can be pre-filled with a safe default on big hosts. Also returns
+  // the bulk-loader pool size (env-driven knob) and the active Redis target's
+  // master-shard count when it's a cluster. Shards is `null` on standalone
+  // or when no active target is set so the UI can render "N/A".
+  app.get("/admin/host-info", { config: { category: "light" } }, async (req) => {
+    const cores = Math.max(1, availableParallelism());
+    const recommended_max_workers = Math.max(1, cores - 2);
+    const poolEnv = Number(process.env.BULK_LOADER_POOL_SIZE);
+    const bulk_loader_pool_size = Number.isFinite(poolEnv) && poolEnv > 0 ? poolEnv : 32;
+
+    let target_label = "";
+    try { target_label = getActiveTarget().label; } catch { /* no active target */ }
+    let shards: number | null = null;
+    if (target_label) {
+      try {
+        const redis = await getRedis(req.poolCategory);
+        const text = await (redis.call("CLUSTER", "INFO") as Promise<string>);
+        const ci = parseClusterInfo(typeof text === "string" ? text : "");
+        if (ci.enabled && ci.size > 0) shards = ci.size;
+      } catch {
+        // Standalone reports "cluster_enabled:0" (or errors on very old
+        // builds) — both map to "no shards reported".
+      }
+    }
+    return {
+      cores,
+      recommended_max_workers,
+      max_workers_hard_cap: 32,
+      bulk_loader_pool_size,
+      shards,
+      target_label: target_label || null,
+    };
   });
 }

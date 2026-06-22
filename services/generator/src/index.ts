@@ -83,3 +83,15 @@ export {
   type ResolvedDials,
   type RefuseOrGoResult,
 } from "./profile.ts";
+
+// Wave 7.0.6.15 — re-export the worker init/message protocol + resolved
+// path to the worker-entry.mjs shim so in-process consumers (api →
+// /ingest/bulk/start with workers>1) can spawn the same worker_threads the
+// CLI uses without duplicating the bootstrap shim. The shim lives next to
+// this index in `services/generator/src/`, so the URL resolves correctly
+// from both dev (tsx) and a built dist (file copied alongside).
+export type { WorkerInitData, WorkerMessage } from "./worker.ts";
+import { fileURLToPath } from "node:url";
+export const workerEntryUrl: string = fileURLToPath(
+  new URL("./worker-entry.mjs", import.meta.url),
+);

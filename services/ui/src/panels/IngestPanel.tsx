@@ -28,9 +28,12 @@ import {
   setIngestShards,
   startBulkIngest,
   startIngest,
+  getHostInfo,
+  cancelBulkIngest,
   type BulkIngestRunStatus,
   type BulkLoadStatus,
   type GeneratorConfig,
+  type HostInfo,
   type PreflightResponse,
   type Source,
 } from "../lib/ingest";
@@ -413,6 +416,13 @@ export function IngestPanel() {
   const [bulkRun, setBulkRun] = useState<BulkIngestRunStatus | null>(null);
   const [bulkLoad, setBulkLoad] = useState<BulkLoadStatus | null>(null);
   const [bulkRunId, setBulkRunId] = useState<string | null>(null);
+  // Wave 7.0.6.15 — worker_threads fan-out for the bulk-loader run. Defaults
+  // to 1 (single-worker bit-equivalent path) until /admin/host-info reports
+  // the recommended cap, at which point we bump the slider to that value.
+  // `hostInfo` is fetched once on mount; failures fall back to a 1-worker
+  // run + the existing legacy single-worker code path.
+  const [workers, setWorkers] = useState<number>(1);
+  const [hostInfo, setHostInfo] = useState<HostInfo | null>(null);
   // Wave 6.12b — ingest fan-out card state. `ingestShards` mirrors the most
   // recent GET /ingest/shards; `producerDial` is the resolved
   // dials.stream_shards from the active run (when one exists). Both are
@@ -464,6 +474,19 @@ export function IngestPanel() {
   useEffect(() => {
     void preflightHandle.runPreflight();
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Wave 7.0.6.15 — fetch host info once on mount. The hint line surfaces
+  // `cores · pool · shards` and the max attribute on the workers input is
+  // clamped to `recommended_max_workers`. The slider stays at its default
+  // value of 1 (single-worker bit-equivalent path) until the operator
+  // explicitly bumps it; we never auto-scale workers on the user's behalf.
+  useEffect(() => {
+    let cancelled = false;
+    getHostInfo()
+      .then((info) => { if (!cancelled) setHostInfo(info); })
+      .catch(() => { /* tolerate missing /admin/host-info */ });
+    return () => { cancelled = true; };
   }, []);
 
   useEffect(() => {
@@ -681,7 +704,10 @@ export function IngestPanel() {
       // when the operator explicitly selects it.
       if (ingestMode === "bulk-loader") {
         setPresetStep(`Starting ${p.label} bulk-loader run…`);
-        const start = await startBulkIngest({ rows: p.rows });
+        // Wave 7.0.6.15 — thread the workers slider through. workers=1
+        // (default) lands on the inline bit-equivalent path; >1 spawns
+        // worker_threads in the api process.
+        const start = await startBulkIngest({ rows: p.rows, workers });
         setBulkRunId(start.run_id);
         setBulkRun({
           run_id: start.run_id,
@@ -691,6 +717,7 @@ export function IngestPanel() {
           rows_skipped: 0,
           batch_size: start.batch_size,
           concurrency: start.concurrency,
+          workers: start.workers,
           ms: 0,
           started_at_iso: start.started_at_iso,
           bulk_loader_base: start.bulk_loader_base,
@@ -752,10 +779,13 @@ export function IngestPanel() {
   }, [bulkRunId]);
 
   function onCancelBulkRun(): void {
-    // Bulk runs are server-driven; the operator's "stop" today is the
-    // observe-and-wait path. Clear the tracked id so the polling effect
-    // tears down; the producer either finishes naturally or surfaces an
-    // error on its next /ingest/bulk/runs poll.
+    // Wave 7.0.6.15 — fire-and-forget POST /ingest/bulk/cancel so the api
+    // can flip the SharedArrayBuffer cancel flag (workers>1) or the inline
+    // `cancelled` boolean (workers=1). Tolerate failures: the local
+    // polling tear-down below is what the operator sees most reliably.
+    if (bulkRunId) {
+      void cancelBulkIngest(bulkRunId).catch(() => { /* tolerated */ });
+    }
     setBulkRunId(null);
   }
 
@@ -885,6 +915,9 @@ export function IngestPanel() {
         bulkRun={bulkRun}
         bulkLoad={bulkLoad}
         onCancelBulkRun={onCancelBulkRun}
+        workers={workers}
+        onWorkersChange={setWorkers}
+        hostInfo={hostInfo}
       />
 
       <button
@@ -1089,8 +1122,23 @@ function RunPresetCard(props: {
   bulkRun: BulkIngestRunStatus | null;
   bulkLoad: BulkLoadStatus | null;
   onCancelBulkRun: () => void;
+  // Wave 7.0.6.15 — worker_threads fan-out controls. `workers` is the
+  // current slider value; `hostInfo` is the cached /admin/host-info response
+  // used to cap the slider at recommended_max_workers and to render the
+  // "Host: N cores · pool P · shards S" hint line.
+  workers: number;
+  onWorkersChange: (n: number) => void;
+  hostInfo: HostInfo | null;
 }) {
-  const { presetKey, onSelect, onStart, startDisabled, inflight, runStatus, step, error, trackedRun, onCancelRun, ingestMode, onModeChange, bulkRun, bulkLoad, onCancelBulkRun } = props;
+  const { presetKey, onSelect, onStart, startDisabled, inflight, runStatus, step, error, trackedRun, onCancelRun, ingestMode, onModeChange, bulkRun, bulkLoad, onCancelBulkRun, workers, onWorkersChange, hostInfo } = props;
+  // Wave 7.0.6.15 — cap the slider at the host's recommended_max_workers
+  // when /admin/host-info is available; failsafe to 8 when the call errored
+  // (hostInfo === null) so the operator can still bump above 1.
+  const workersMax = hostInfo ? Math.max(1, hostInfo.recommended_max_workers) : 8;
+  const workersDisabled = startDisabled || ingestMode !== "bulk-loader";
+  const hostHint = hostInfo
+    ? `Host: ${hostInfo.cores} cores · pool ${hostInfo.bulk_loader_pool_size ?? "?"} · shards ${hostInfo.shards ?? "?"}`
+    : "Host: ? cores · pool ? · shards ?";
   const showProgress = trackedRun !== null
     && (trackedRun.status === "running" || trackedRun.status === "cancelling");
   const showBulkProgress = bulkRun !== null;
@@ -1152,6 +1200,33 @@ function RunPresetCard(props: {
             <option value="bulk-loader">Bulk-loader (fast)</option>
             <option value="stream">Stream (legacy)</option>
           </select>
+        </label>
+        {/* Wave 7.0.6.15 — worker_threads fan-out slider. Only meaningful in
+            bulk-loader mode; disabled in stream mode (which stays
+            single-consumer). Min=1 (bit-equivalent), Max clamped to the
+            host's recommended_max_workers (or 8 failsafe). */}
+        <label className="ingest-presets__workers" data-testid="ingest-workers-label">
+          <span className="ingest-presets__workers-label">Workers:</span>
+          <input
+            type="number"
+            min={1}
+            max={workersMax}
+            step={1}
+            value={workers}
+            disabled={workersDisabled}
+            onChange={(e) => {
+              const n = Number(e.target.value);
+              if (!Number.isFinite(n)) return;
+              const clamped = Math.max(1, Math.min(workersMax, Math.floor(n)));
+              onWorkersChange(clamped);
+            }}
+            data-testid="ingest-workers-input"
+            aria-label="Workers"
+            style={{ width: "5em" }}
+          />
+          <span className="ingest-presets__workers-hint" data-testid="ingest-workers-hint">
+            {hostHint}
+          </span>
         </label>
         <button
           type="button"

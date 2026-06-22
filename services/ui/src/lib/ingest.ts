@@ -124,6 +124,10 @@ export interface BulkIngestConfig {
   seed?: string | number;
   trade_pool_size?: number;
   factor_pool_size?: number;
+  // Wave 7.0.6.15 — worker_threads fan-out. 1 (default) preserves the
+  // single-worker bit-equivalence canary; >1 spawns N workers, each
+  // owning 1/N of the row picker via stride partitioning.
+  workers?: number;
 }
 
 export interface BulkIngestStartResponse {
@@ -132,23 +136,53 @@ export interface BulkIngestStartResponse {
   rows_total: number;
   batch_size: number;
   concurrency: number;
+  workers?: number;
   bulk_loader_base: string;
   started_at_iso: string;
 }
 
 export interface BulkIngestRunStatus {
   run_id: string;
-  status: "running" | "done" | "error";
+  status: "running" | "done" | "error" | "cancelled";
   rows_total: number;
   rows_sent: number;
   rows_skipped: number;
   batch_size: number;
   concurrency: number;
+  workers?: number;
   ms: number;
   started_at_iso: string;
   bulk_loader_base: string;
   rows_per_sec: number;
   error?: string;
+}
+
+// Wave 7.0.6.15 — GET /admin/host-info. Surfaces the host CPU count + the
+// recommended worker cap so the IngestPanel slider can default safely.
+export interface HostInfo {
+  cores: number;
+  recommended_max_workers: number;
+  max_workers_hard_cap: number;
+  bulk_loader_pool_size: number;
+  shards: number | null;
+  target_label: string | null;
+}
+
+export async function getHostInfo(): Promise<HostInfo> {
+  const res = await fetch(`${apiBase()}/admin/host-info`);
+  if (!res.ok) throw new Error(`api /admin/host-info ${res.status}`);
+  return (await res.json()) as HostInfo;
+}
+
+export async function cancelBulkIngest(runId: string): Promise<void> {
+  const res = await fetch(`${apiBase()}/ingest/bulk/cancel`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ run_id: runId }),
+  });
+  if (!res.ok && res.status !== 409) {
+    throw new Error(`api /ingest/bulk/cancel ${res.status}`);
+  }
 }
 
 // Per-worker entry surfaced by the bulk-loader's /load/status. The UI reads
