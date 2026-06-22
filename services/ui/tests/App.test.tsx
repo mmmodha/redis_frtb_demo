@@ -42,6 +42,13 @@ describe("<App /> routes", () => {
     expect(screen.getByRole("heading", { name: /observability/i, level: 1 })).toBeInTheDocument();
   });
 
+  it("renders the Per-shard panel at /observability/shards", () => {
+    renderAt("/observability/shards");
+    expect(
+      screen.getByRole("heading", { name: /per-shard observability/i, level: 1 }),
+    ).toBeInTheDocument();
+  });
+
   it("redirects the root path / to /observability", () => {
     renderAt("/");
     const nav = screen.getByRole("navigation", { name: /primary/i });

@@ -123,3 +123,26 @@ export interface RecentCalcRunsResponse { items: RecentCalcRun[] }
 export function getRecentCalcRuns(limit = 5): Promise<RecentCalcRunsResponse> {
   return getJson<RecentCalcRunsResponse>(`/calc/recent?limit=${limit}`);
 }
+
+// Wave 7.0.4.B — per-shard observability row as returned by GET
+// /observability/per-shard. Shape mirrors services/api/src/routes/observability
+// .ts `PerShardRow` (Wave 7.0.4.A). `degraded:true` is set on the single
+// aggregated fallback row the api emits when no fresh rladmin snapshot is
+// available — the UI panel surfaces this state distinctly from real shards.
+export interface PerShardRow {
+  shard_id: string;
+  role: string;
+  memory_used: number;
+  key_count: number | null;
+  write_ops_per_sec: number | null;
+  index_lag: number | null;
+  last_observed_at: string | null;
+  snapshot_age_seconds: number | null;
+  degraded?: true;
+}
+
+export type PerShardResponse = PerShardRow[];
+
+export function getObservabilityPerShard(): Promise<PerShardResponse> {
+  return getJson<PerShardResponse>(`/observability/per-shard`);
+}

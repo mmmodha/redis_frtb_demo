@@ -10,6 +10,7 @@ import { Ingest } from "./routes/Ingest";
 import { Pivot } from "./routes/Pivot";
 import { Calc } from "./routes/Calc";
 import { Observability } from "./routes/Observability";
+import { Shards } from "./routes/Shards";
 import { Loadgen } from "./routes/Loadgen";
 import { Explorer } from "./routes/Explorer";
 import { Admin } from "./routes/Admin";
@@ -29,6 +30,7 @@ export function App() {
                 <Route path="/pivot" element={<Pivot />} />
                 <Route path="/calc" element={<Calc />} />
                 <Route path="/observability" element={<Observability />} />
+                <Route path="/observability/shards" element={<Shards />} />
                 <Route path="/loadgen" element={<Loadgen />} />
                 <Route path="/explorer" element={<Explorer />} />
                 <Route path="/admin" element={<Admin />} />

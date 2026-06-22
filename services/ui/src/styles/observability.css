@@ -180,3 +180,65 @@
   font-family: var(--font-mono);
   color: var(--redis-text-primary);
 }
+
+
+/* Wave 7.0.4.B — per-shard live panel (route /observability/shards). */
+.per-shard-panel { display: grid; gap: var(--grid); }
+.per-shard-panel__loading,
+.per-shard-panel__error,
+.per-shard-panel__empty { color: var(--redis-text-secondary); font-size: 0.875rem; padding: var(--grid); }
+.per-shard-panel__error { color: var(--redis-hyper); }
+.per-shard-panel__controls {
+  display: flex; align-items: center; gap: calc(var(--grid) * 0.75);
+  font-size: 0.8125rem;
+}
+.per-shard-panel__deviation-label { color: var(--redis-text-secondary); }
+.per-shard-panel__degraded {
+  font-size: 0.75rem;
+  color: var(--redis-text-secondary);
+  background: rgba(220, 56, 47, 0.08);
+  border: 1px solid rgba(220, 56, 47, 0.35);
+  border-radius: var(--radius);
+  padding: 2px 8px;
+}
+.per-shard-panel__table {
+  width: 100%; border-collapse: collapse;
+}
+.per-shard-panel__table th,
+.per-shard-panel__table td {
+  padding: 6px 8px; text-align: left;
+  border-bottom: 1px solid var(--redis-border-secondary);
+  font-size: 0.8125rem; vertical-align: middle;
+}
+.per-shard-panel__table th {
+  font-weight: 600; color: var(--redis-text-secondary);
+  text-transform: uppercase; font-size: 0.6875rem; letter-spacing: 0.04em;
+}
+.per-shard-panel__sort-button {
+  background: none; border: 0; padding: 0; color: inherit;
+  font: inherit; cursor: pointer;
+}
+.per-shard-panel__sort-button[data-sort-active="1"] { color: var(--redis-text-primary); }
+.per-shard-panel__row--deviation {
+  background: rgba(220, 56, 47, 0.10);
+  outline: 1px solid rgba(220, 56, 47, 0.45);
+}
+.per-shard-panel__shard-id { font-family: var(--font-mono); color: var(--redis-text-primary); }
+.per-shard-panel__pill {
+  margin-left: 6px; font-size: 0.625rem; padding: 1px 6px;
+  border-radius: var(--radius); color: var(--redis-text-secondary);
+  background: var(--redis-bg-tertiary);
+}
+.per-shard-panel__numeric { font-family: var(--font-mono); color: var(--redis-text-primary); }
+.per-shard-panel__memory { display: flex; align-items: center; gap: 8px; min-width: 180px; }
+.per-shard-panel__memory-bar-track {
+  flex: 1; height: 8px; background: var(--redis-bg-tertiary);
+  border-radius: var(--radius); overflow: hidden;
+}
+.per-shard-panel__memory-bar-fill {
+  height: 100%;
+  background: var(--redis-hyper);
+  transition: width 200ms linear;
+}
+.per-shard-panel__memory-label { font-family: var(--font-mono); font-size: 0.75rem; color: var(--redis-text-primary); white-space: nowrap; }
+.per-shard-panel__sparkline-empty { color: var(--redis-text-secondary); }
