@@ -999,6 +999,13 @@ function parseHgetall(reply: unknown): Record<string, string> | null {
   return null;
 }
 
+// Wave 7.0.6.6 — `tryRollupReadout` is the legacy rollup fast-path reader.
+// Under `CALC_LAZY_MATH=1` (Wave 7 default) the calc route bypasses this
+// function entirely (lazy math reads `sens:{rc:bkt}:*` and computes K_b on
+// the fly), so this code path is unreachable in production. It still calls
+// `rollupKey()` from @frtb/calc-shared/rollup-keys, which Wave 7.0.6.6
+// switched to tag-free shapes — the function therefore matches the new
+// bulk-writer shape automatically. No behavioural change intended.
 export async function tryRollupReadout(
   redis: RedisLike,
   schema: Schema,

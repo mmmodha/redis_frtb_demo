@@ -51,7 +51,8 @@ function resolveMasterNodes(client: RedisLike): RedisLike[] {
 // field shape of emitRollupHincrs() in consumer.ts exactly — scalar legs
 // write sum_ws/sum_ws_sq/count; Curvature legs sign-split into sum_ws_up*
 // + sum_ws_down*; perTenor classes (GIRR Delta/Vega/Curvature) add a
-// per-tenor sub-rollup at rollup:{rc:bkt}:<sens>:tenor:<t>.
+// per-tenor sub-rollup at rollup:<rc>:<bkt>:<sens>:tenor:<t>
+// (Wave 7.0.6.6 — tag-free).
 export function accumulateRollup(
   doc: Record<string, unknown>,
   scalar: Map<string, ScalarAcc>,

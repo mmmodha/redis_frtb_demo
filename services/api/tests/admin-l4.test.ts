@@ -38,7 +38,7 @@ describe("GET /admin/drift-status", () => {
     fr.setResponse("SRANDMEMBER", (args: unknown[]) => {
       const key = String(args[0]);
       if (key === "seen:risk_class") return "EQUITY";
-      if (key === "seen:bucket:{EQUITY}") return "1";
+      if (key === "seen:bucket:EQUITY") return "1";
       return null;
     });
     fr.setResponse("HGETALL", () => ["sum_ws", "10", "count", "1"]);

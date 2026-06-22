@@ -388,12 +388,11 @@ describe("Route D — two-phase MULTI + idempotency marker [Wave 6.39.G]", () =>
       stream: "sensitivities:in", group: "ingest", consumerName: "routed-1",
       batchSize: 10, schema: SCHEMA,
     });
-    // Marker is keyed by `{<rc>:<bkt>}:<entryId>` so a slot-local SCAN over
-    // the rollup slot finds it without a cluster fan-out.
-    const exists = await redis.exists(`processed:{EQUITY:1}:${entryId}`);
+    // Wave 7.0.6.6 — marker is tag-free `processed:<rc>:<bkt>:<entryId>`.
+    const exists = await redis.exists(`processed:EQUITY:1:${entryId}`);
     expect(exists).toBe(1);
     // TTL must be set (positive) so the marker eventually decays.
-    const ttl = await redis.ttl(`processed:{EQUITY:1}:${entryId}`);
+    const ttl = await redis.ttl(`processed:EQUITY:1:${entryId}`);
     expect(ttl).toBeGreaterThan(0);
   });
 
@@ -473,7 +472,18 @@ describe("Route D — two-phase MULTI + idempotency marker [Wave 6.39.G]", () =>
 // than one Redis Cluster slot. The pre-6.39.G single-MULTI write would have
 // failed this test (its MULTI block spanned 5–6 slots); Route D's two-phase
 // split keeps each MULTI slot-local so the test passes.
-describe("CROSSSLOT guard — slot-local Phase 1/2 MULTIs [Wave 6.39.G]", () => {
+//
+// Wave 7.0.6.6 — rollup / seen / processed keys are now TAG-FREE, so Phase 2
+// of the legacy writer inevitably spans multiple cluster slots (rollup keys,
+// seen:sens_type, processed marker all hash to different slots). The Phase 2
+// CROSSSLOT regression is an acknowledged trade-off documented in
+// shared/calc/src/rollup-keys.ts and the task brief: live-tail mode (7.0.6,
+// default in Wave 7) bypasses this path, the bulk path doesn't use MULTI,
+// and backfill is idempotent. The assertion is therefore scoped to PHASE 1
+// only (sens-slot MULTI, still tag-rooted on `{sens:<ulid>}`). The Phase 2
+// CROSSSLOT exposure for legacy cluster ingest is flagged in the wave's
+// completion report.
+describe("CROSSSLOT guard — slot-local Phase 1 MULTI [Wave 6.39.G / 7.0.6.6]", () => {
   // Cheap slot oracle: Redis Cluster CRC16 over the hash-tag span. Returns
   // a synthetic "slot" — exact algorithm doesn't matter, only that two
   // keys with the same hash-tag content produce the same value.
@@ -570,15 +580,26 @@ describe("CROSSSLOT guard — slot-local Phase 1/2 MULTIs [Wave 6.39.G]", () => 
     expect(n).toBe(1);
     void currentPhase;
 
-    // Every MULTI's queued slot set must contain at most ONE slot. The
-    // pre-6.39.G single-MULTI would have produced { slot(sens:…), slot(GIRR:USD-IRS) }
-    // → size 2 → CROSSSLOT on cluster. Route D keeps each MULTI single-slot.
+    // The Phase 1 MULTI's queued slot set must contain at most ONE slot.
+    // Phase 1 still uses the `{sens:<ulid>}` hash-tag to co-locate the
+    // parent and side-table HSETs on a single shard, so the pre-6.39.G
+    // CROSSSLOT regression on the sens-side is still blocked by this test.
+    //
+    // Wave 7.0.6.6 — Phase 2 (rollup + seen:sens_type + processed marker)
+    // is now multi-slot by construction: tag-free keys hash to whichever
+    // slot the unbraced key crc16s to. The legacy MULTI here will CROSSSLOT
+    // on a real cluster; live-tail mode (Wave 7 default) bypasses it, and
+    // the bulk-loader / finaliser path doesn't use MULTI at all.
     const multiPhases = queued.filter((q) => q.phase === "multi");
     expect(multiPhases.length).toBeGreaterThanOrEqual(2); // Phase 1 + Phase 2
-    for (const p of multiPhases) {
+    const phase1Multis = multiPhases.filter((p) =>
+      [...p.slots].every((s) => !s.includes("processed:") && !s.includes("rollup:")),
+    );
+    expect(phase1Multis.length).toBeGreaterThanOrEqual(1);
+    for (const p of phase1Multis) {
       expect(
         p.slots.size,
-        `MULTI spans ${p.slots.size} slots: ${[...p.slots].join(", ")}`,
+        `Phase 1 MULTI spans ${p.slots.size} slots: ${[...p.slots].join(", ")}`,
       ).toBeLessThanOrEqual(1);
     }
   });

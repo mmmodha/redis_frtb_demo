@@ -112,7 +112,8 @@ export function fakeRedis(): FakeRedis {
       const upper = command.toUpperCase();
       responses.set(upper, response);
       // Wave 6.24 — bucket discovery in calc.ts switched from FT.AGGREGATE
-      // (GROUPBY @bucket) to SMEMBERS on `seen:bucket:{<rc>}`. The existing
+      // (GROUPBY @bucket) to SMEMBERS on `seen:bucket:<rc>` (Wave
+      // 7.0.6.6 — tag-free). The existing
       // calc / total / cache tests register their bucket fixture by
       // `setResponse("FT.AGGREGATE", ftAggregateReply([...]))`; auto-mirror
       // that fixture as an SMEMBERS responder so the tests keep passing

@@ -20,12 +20,12 @@ import {
 import { computeMaxLen } from "../src/jobs/stream-retention.ts";
 
 function primeFakeForCrons(fr: ReturnType<typeof fakeRedis>): void {
-  // Drift detector reads: SRANDMEMBER seen:risk_class, SRANDMEMBER seen:bucket:{rc},
-  // then HGETALL rollup:{rc:bkt}:Delta.
+  // Drift detector reads: SRANDMEMBER seen:risk_class, SRANDMEMBER seen:bucket:<rc>,
+  // then HGETALL rollup:<rc>:<bkt>:Delta (Wave 7.0.6.6 — tag-free).
   fr.setResponse("SRANDMEMBER", (args: unknown[]) => {
     const key = String(args[0]);
     if (key === "seen:risk_class") return "EQUITY";
-    if (key === "seen:bucket:{EQUITY}") return "1";
+    if (key === "seen:bucket:EQUITY") return "1";
     return null;
   });
   fr.setResponse("HGETALL", () => ["sum_ws", "1", "sum_ws_sq", "1", "count", "1"]);

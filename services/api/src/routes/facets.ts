@@ -25,7 +25,7 @@ import { getSensIndexName } from "../lib/sens-index.ts";
 // server-side cost (~150ms × ~95 queries against 100M-row idx:sens, ~15s
 // regardless of pipeline batching — 6.27's verifier confirmed the bottleneck
 // was server-side serialization, not RTT). We now read the pre-aggregated
-// counters maintained by ingest in `rollup:{rc:bkt}:<sens>` hashes (Wave
+// counters maintained by ingest in `rollup:<rc>:<bkt>:<sens>` hashes (Wave
 // 6.14a). Each rollup hash already has a `count` field (one HINCRBY per
 // row), so the route just pipelines `HGET … count` for every (rc, bkt, sens)
 // triple from the schema and sums in JS:

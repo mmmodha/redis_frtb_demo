@@ -1,6 +1,7 @@
 // Wave 6.39.B — GET /admin/calc-coverage. Walks the materialized discovery
-// sets (`seen:risk_class` → `seen:bucket:{<rc>}` → `seen:sens_type:{<rc>:<bkt>}`,
-// maintained by Wave 6.24 ingest) and reports per-tuple rollup presence
+// sets (`seen:risk_class` → `seen:bucket:<rc>` → `seen:sens_type:<rc>:<bkt>`,
+// Wave 7.0.6.6 tag-free; maintained by Wave 6.24 ingest) and reports per-
+// tuple rollup presence
 // plus the contributing-doc count from the rollup HASH so operators can see
 // at a glance which (rc, bucket, sens_type) cells will satisfy /calc on the
 // rollup fast-fast path vs. fall back to FT.AGGREGATE (which is gated by
@@ -29,14 +30,14 @@ describe("Wave 6.39.B — GET /admin/calc-coverage", () => {
     fr.setResponse("SMEMBERS", (args: unknown[]) => {
       const key = String(args[0]);
       if (key === "seen:risk_class") return ["EQUITY"];
-      if (key === "seen:bucket:{EQUITY}") return ["B1", "B2"];
-      if (key === "seen:sens_type:{EQUITY:B1}") return ["Delta"];
-      if (key === "seen:sens_type:{EQUITY:B2}") return ["Delta"];
+      if (key === "seen:bucket:EQUITY") return ["B1", "B2"];
+      if (key === "seen:sens_type:EQUITY:B1") return ["Delta"];
+      if (key === "seen:sens_type:EQUITY:B2") return ["Delta"];
       return [];
     });
     fr.setResponse("HGETALL", (args: unknown[]) => {
       const key = String(args[0]);
-      if (key === "rollup:{EQUITY:B1}:Delta") return ["sum_ws", "1.5", "sum_ws_sq", "2.25", "count", "5"];
+      if (key === "rollup:EQUITY:B1:Delta") return ["sum_ws", "1.5", "sum_ws_sq", "2.25", "count", "5"];
       return []; // B2 — missing rollup
     });
 
@@ -82,25 +83,25 @@ describe("Wave 6.39.B — GET /admin/calc-coverage", () => {
     fr.setResponse("SMEMBERS", (args: unknown[]) => {
       const key = String(args[0]);
       if (key === "seen:risk_class") return ["GIRR"];
-      if (key === "seen:bucket:{GIRR}") return ["USD"];
-      if (key === "seen:sens_type:{GIRR:USD}") return ["Delta"];
+      if (key === "seen:bucket:GIRR") return ["USD"];
+      if (key === "seen:sens_type:GIRR:USD") return ["Delta"];
       return [];
     });
     // GIRR base rollup is empty; rely on SCAN to find per-tenor variants
     fr.setResponse("HGETALL", () => []);
     fr.setResponse("SCAN", (args: unknown[]) => {
-      // SCAN cursor 0 MATCH rollup:{GIRR:USD}:Delta:tenor:* COUNT 100
+      // SCAN cursor 0 MATCH rollup:GIRR:USD:Delta:tenor:* COUNT 100
       const match = String(args[2] ?? "");
-      if (match.startsWith("rollup:{GIRR:USD}:Delta:tenor:")) {
-        return ["0", ["rollup:{GIRR:USD}:Delta:tenor:3M", "rollup:{GIRR:USD}:Delta:tenor:6M"]];
+      if (match.startsWith("rollup:GIRR:USD:Delta:tenor:")) {
+        return ["0", ["rollup:GIRR:USD:Delta:tenor:3M", "rollup:GIRR:USD:Delta:tenor:6M"]];
       }
       return ["0", []];
     });
     // Per-tenor rollup HGET on `count` for sum
     fr.setResponse("HGET", (args: unknown[]) => {
       const key = String(args[0]);
-      if (key === "rollup:{GIRR:USD}:Delta:tenor:3M") return "2";
-      if (key === "rollup:{GIRR:USD}:Delta:tenor:6M") return "3";
+      if (key === "rollup:GIRR:USD:Delta:tenor:3M") return "2";
+      if (key === "rollup:GIRR:USD:Delta:tenor:6M") return "3";
       return null;
     });
     app = Fastify();

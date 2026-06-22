@@ -37,8 +37,8 @@ describe("tryRollupReadout — sparse per-tenor hashes (Wave 6.49.A)", () => {
     // returned null and the route fell back to a 422.
     fr.setResponse("HGETALL", (args: unknown[]) => {
       const key = String(args[0]);
-      if (key === "rollup:{GIRR:USD}:Delta:tenor:5Y") return [];
-      if (key.startsWith("rollup:{GIRR:USD}:Delta:tenor:")) {
+      if (key === "rollup:GIRR:USD:Delta:tenor:5Y") return [];
+      if (key.startsWith("rollup:GIRR:USD:Delta:tenor:")) {
         return ["sum_ws", "1.0", "sum_ws_sq", "1.0", "count", "1"];
       }
       return [];
@@ -67,7 +67,7 @@ describe("tryRollupReadout — sparse per-tenor hashes (Wave 6.49.A)", () => {
     // fix EUR is silently dropped and USD still computes.
     fr.setResponse("HGETALL", (args: unknown[]) => {
       const key = String(args[0]);
-      if (key.startsWith("rollup:{GIRR:USD}:Delta:tenor:")) {
+      if (key.startsWith("rollup:GIRR:USD:Delta:tenor:")) {
         return ["sum_ws", "2.0", "sum_ws_sq", "4.0", "count", "1"];
       }
       return [];

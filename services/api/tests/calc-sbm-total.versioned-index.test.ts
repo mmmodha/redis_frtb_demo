@@ -36,7 +36,8 @@ describe("POST /calc/sbm/total — versioned idx:sens plumbing (Wave 6.30.B2)", 
       return null;
     });
 
-    // Wave 6.24 — bucket discovery uses SMEMBERS on `seen:bucket:{<rc>}`.
+    // Wave 6.24 — bucket discovery uses SMEMBERS on `seen:bucket:<rc>`
+    // (Wave 7.0.6.6 — tag-free).
     // Set this BEFORE FT.AGGREGATE so the fake's auto-mirror shim is
     // skipped (it would otherwise route SMEMBERS through the FT.AGGREGATE
     // responder, which throws on unexpected first-args).

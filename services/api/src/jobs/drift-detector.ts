@@ -1,8 +1,9 @@
 // Wave 6.39.C — Layer 4: rollup drift detector.
 //
 // Picks one random (rc, bucket) per tick from the materialized discovery sets
-// (`seen:risk_class`, `seen:bucket:{<rc>}`) and compares the persisted
-// `rollup:{<rc>:<bkt>}:<sens>` hash's `sum_ws` against a fresh recomputation.
+// (`seen:risk_class`, `seen:bucket:<rc>` — Wave 7.0.6.6 tag-free) and
+// compares the persisted `rollup:<rc>:<bkt>:<sens>` hash's `sum_ws` against
+// a fresh recomputation.
 // Recomputation is injected so the worker stays decoupled from the schema-
 // dependent FT.AGGREGATE path (callers wire `aggregateBucketsViaIndex` here;
 // tests stub a fixture sum). Results land in a bounded ring buffer

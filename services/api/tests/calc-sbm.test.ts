@@ -77,13 +77,14 @@ describe("POST /calc/sbm — MVP endpoint", () => {
       expect(key).toMatch(/^sens:\{GIRR:[^}]+\}:_route$/);
       expect(c.args[3]).toBe("GIRR");
     }
-    // Wave 6.24 — discovery is now SMEMBERS on `seen:bucket:{<rc>}` instead
-    // of FT.AGGREGATE; the resolved-command echo (commands.discovery) still
-    // carries the equivalent FT.AGGREGATE shape under `legacy_query` for the
-    // UI drilldown, but no FT.AGGREGATE is actually dispatched for discovery.
+    // Wave 6.24 — discovery is now SMEMBERS on `seen:bucket:<rc>` (Wave
+    // 7.0.6.6 — tag-free) instead of FT.AGGREGATE; the resolved-command
+    // echo (commands.discovery) still carries the equivalent FT.AGGREGATE
+    // shape under `legacy_query` for the UI drilldown, but no FT.AGGREGATE
+    // is actually dispatched for discovery.
     const sm = fr.calls.find((c) => c.command === "SMEMBERS");
     expect(sm).toBeDefined();
-    expect(sm!.args[0]).toBe("seen:bucket:{GIRR}");
+    expect(sm!.args[0]).toBe("seen:bucket:GIRR");
   });
 
   it("Vega routes to sbm_vega_bucket and accepts case-insensitive sensitivity_type", async () => {
@@ -369,12 +370,13 @@ describe("POST /calc/sbm — MVP endpoint", () => {
 
 
   // Wave 6.24 — discovery moved off FT.AGGREGATE to a single SMEMBERS on
-  // `seen:bucket:{<rc>}`. The explicit per-call TIMEOUT that Wave 5.41
-  // protected the FT.AGGREGATE discovery with no longer applies: SMEMBERS
-  // on a small materialized set is O(N) of the set size (typically <100
-  // entries) and bounded by the runtime ioredis commandTimeout (35s, Wave
-  // 6.18f). This test now locks the SMEMBERS dispatch + key shape instead.
-  it("Wave 6.24: discovery dispatches SMEMBERS on seen:bucket:{<rc>}", async () => {
+  // `seen:bucket:<rc>` (Wave 7.0.6.6 — tag-free). The explicit per-call
+  // TIMEOUT that Wave 5.41 protected the FT.AGGREGATE discovery with no
+  // longer applies: SMEMBERS on a small materialized set is O(N) of the
+  // set size (typically <100 entries) and bounded by the runtime ioredis
+  // commandTimeout (35s, Wave 6.18f). This test now locks the SMEMBERS
+  // dispatch + key shape instead.
+  it("Wave 6.24: discovery dispatches SMEMBERS on seen:bucket:<rc>", async () => {
     const fr = fakeRedis();
     fr.setResponse("FT.AGGREGATE", ftAggregateReply(["USD-IRS"]));
     fr.setResponse("FCALL", ["K_b", "1", "S_b", "1", "count", "1", "ms", "1"]);
@@ -387,7 +389,7 @@ describe("POST /calc/sbm — MVP endpoint", () => {
     expect(res.statusCode).toBe(200);
     const sm = fr.calls.find((c) => c.command === "SMEMBERS");
     expect(sm).toBeDefined();
-    expect(sm!.args[0]).toBe("seen:bucket:{GIRR}");
+    expect(sm!.args[0]).toBe("seen:bucket:GIRR");
   });
 
   // Wave 5.41: when FT.AGGREGATE throws but FT.INFO reports a populated
@@ -458,7 +460,8 @@ describe("POST /calc/sbm — MVP endpoint", () => {
   // sees the union and FCALLs every bucket.
   it("cluster mode: SMEMBERS dispatches on the coordinator (single-slot) and the union of buckets is FCALLed", async () => {
     // Wave 6.24 — discovery is a single SMEMBERS routed to the slot that
-    // owns `seen:bucket:{<rc>}`. The route no longer per-master fan-outs:
+    // owns `seen:bucket:<rc>` (Wave 7.0.6.6 — tag-free). The route no
+    // longer per-master fan-outs:
     // ioredis Cluster.call(SMEMBERS, key) is a single command. The
     // coordinator-level fake must therefore return the union directly.
     const coord = fakeRedis();
@@ -579,14 +582,14 @@ describe("POST /calc/sbm — MVP endpoint", () => {
     expect(String(fc!.args[2])).toMatch(/^sens:\{GIRR:[^}]+\}:_route$/);
     const sm = fr.calls.find((c) => c.command === "SMEMBERS");
     expect(sm).toBeDefined();
-    expect(sm!.args[0]).toBe("seen:bucket:{GIRR}");
+    expect(sm!.args[0]).toBe("seen:bucket:GIRR");
   });
 
   it("standalone mode: bucket discovery issues a single SMEMBERS (Wave 6.24)", async () => {
     // Wave 6.24 — discovery is a single SMEMBERS regardless of cluster vs.
     // standalone topology; the per-master fan-out the old FT.AGGREGATE
-    // discovery did is gone (the seen:bucket:{<rc>} key is hash-tagged so
-    // it owns a single slot).
+    // discovery did is gone (Wave 7.0.6.6 — the seen:bucket:<rc> key is
+    // tag-free so it lives on whichever slot the unbraced key hashes to).
     const fr = fakeRedis();
     fr.setResponse("FT.AGGREGATE", ftAggregateReply(["B1"]));
     fr.setResponse("FCALL", ["K_b", "1", "S_b", "1", "count", "1", "ms", "1"]);
@@ -624,7 +627,7 @@ describe("POST /calc/sbm — MVP endpoint", () => {
     // the FT.AGGREGATE equivalent is preserved as `legacy_*` echoes so the
     // UI drilldown can still render the index query operators can copy.
     expect(body.commands.discovery.command).toBe("SMEMBERS");
-    expect(body.commands.discovery.key).toBe("seen:bucket:{GIRR}");
+    expect(body.commands.discovery.key).toBe("seen:bucket:GIRR");
     expect(body.commands.discovery.legacy_command).toBe("FT.AGGREGATE");
     expect(body.commands.discovery.legacy_index).toBe("idx:sens");
     expect(body.commands.discovery.legacy_query).toContain("@risk_class:{GIRR}");
@@ -669,11 +672,12 @@ describe("POST /calc/sbm — MVP endpoint", () => {
       // Wave 6.24 — the legacy FT.AGGREGATE discovery query is no longer
       // dispatched, but its narrowed shape is still echoed under
       // commands.discovery.legacy_query for the UI drilldown. The actual
-      // dispatched command is SMEMBERS on `seen:bucket:{<rc>}`; the
-      // subset filter is applied client-side via Set intersection.
+      // dispatched command is SMEMBERS on `seen:bucket:<rc>` (Wave
+      // 7.0.6.6 — tag-free); the subset filter is applied client-side via
+      // Set intersection.
       const sm = fr.calls.find((c) => c.command === "SMEMBERS");
       expect(sm).toBeDefined();
-      expect(sm!.args[0]).toBe("seen:bucket:{GIRR}");
+      expect(sm!.args[0]).toBe("seen:bucket:GIRR");
       const lq = String(res.json().commands.discovery.legacy_query);
       expect(lq).toContain("@risk_class:{GIRR}");
       expect(lq).toContain("@bucket:{USD|EUR|GBP}");
@@ -834,10 +838,11 @@ describe("POST /calc/sbm — MVP endpoint", () => {
       expect(res.statusCode).toBe(200);
       const body = res.json();
       // Wave 6.24 — legacy_query echoes the pre-5.31a single-predicate
-      // form; actual dispatch is SMEMBERS on seen:bucket:{GIRR}.
+      // form; actual dispatch is SMEMBERS on seen:bucket:GIRR (Wave
+      // 7.0.6.6 — tag-free).
       expect(body.commands.discovery.legacy_query).toBe("@risk_class:{GIRR}");
       expect(body.commands.discovery.command).toBe("SMEMBERS");
-      expect(body.commands.discovery.key).toBe("seen:bucket:{GIRR}");
+      expect(body.commands.discovery.key).toBe("seen:bucket:GIRR");
       // Known response keys are still all present, no surprise additions tied
       // to subset handling (note/ok stay absent on the happy path).
       expect(body).not.toHaveProperty("note");
@@ -2110,7 +2115,7 @@ describe("POST /calc/sbm — MVP endpoint", () => {
       });
       fr.setResponse("HGETALL", (args: unknown[]) => {
         const key = String(args[0]);
-        if (key === "rollup:{EQUITY:1}:Delta") {
+        if (key === "rollup:EQUITY:1:Delta") {
           return ["sum_ws", "10", "sum_ws_sq", "50", "count", "5"];
         }
         return [];
@@ -2145,7 +2150,7 @@ describe("POST /calc/sbm — MVP endpoint", () => {
       const tenorSums: Record<string, number> = { "3M": 2, "6M": 3, "1Y": 4 };
       fr.setResponse("HGETALL", (args: unknown[]) => {
         const key = String(args[0]);
-        const m = key.match(/^rollup:\{GIRR:USD\}:Delta:tenor:(.+)$/);
+        const m = key.match(/^rollup:GIRR:USD:Delta:tenor:(.+)$/);
         if (m) {
           const t = m[1]!;
           const ws = tenorSums[t];
@@ -2268,7 +2273,7 @@ describe("POST /calc/sbm — MVP endpoint", () => {
       const tenorSums: Record<string, number> = { "3M": 2, "6M": 3, "1Y": 4 };
       fr.setResponse("HGETALL", (args: unknown[]) => {
         const key = String(args[0]);
-        const m = key.match(/^rollup:\{GIRR:USD\}:Delta:tenor:(.+)$/);
+        const m = key.match(/^rollup:GIRR:USD:Delta:tenor:(.+)$/);
         if (m) {
           const t = m[1]!;
           const ws = tenorSums[t];
@@ -2317,7 +2322,7 @@ describe("POST /calc/sbm — MVP endpoint", () => {
       };
       fr.setResponse("HGETALL", (args: unknown[]) => {
         const key = String(args[0]);
-        const m = key.match(/^rollup:\{GIRR:USD\}:Curvature:tenor:(.+)$/);
+        const m = key.match(/^rollup:GIRR:USD:Curvature:tenor:(.+)$/);
         if (m) {
           const t = m[1]!;
           const pair = tenorPairs[t];
@@ -2362,7 +2367,7 @@ describe("POST /calc/sbm — MVP endpoint", () => {
       const tenorSums: Record<string, number> = { "3M": 2, "6M": 3, "1Y": 4 };
       fr.setResponse("HGETALL", (args: unknown[]) => {
         const key = String(args[0]);
-        const m = key.match(/^rollup:\{GIRR:USD\}:Delta:tenor:(.+)$/);
+        const m = key.match(/^rollup:GIRR:USD:Delta:tenor:(.+)$/);
         if (m) {
           const t = m[1]!;
           const ws = tenorSums[t];

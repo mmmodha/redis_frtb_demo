@@ -1,8 +1,9 @@
 // Wave 6.39.B — calc-side admin endpoints.
 //
 //   GET /admin/calc-coverage  — walks the Wave 6.24 discovery sets
-//     (`seen:risk_class` → `seen:bucket:{<rc>}` →
-//      `seen:sens_type:{<rc>:<bkt>}`) and reports per-tuple rollup
+//     (`seen:risk_class` → `seen:bucket:<rc>` →
+//      `seen:sens_type:<rc>:<bkt>` — Wave 7.0.6.6 tag-free) and reports
+//     per-tuple rollup
 //     presence + contributing doc count. Operators use it to see at a
 //     glance which (rc, bucket, sens_type) cells will satisfy the rollup
 //     fast-fast path (Wave 6.14b) vs. fall back to FT.AGGREGATE (which

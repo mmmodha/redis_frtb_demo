@@ -830,8 +830,10 @@ export async function bootstrapFrtb(
 
   // Step 4 (Wave 6.14c) — rollup completeness sanity check. Cross-reference
   // the set of distinct (risk_class, bucket) pairs in idx:sens against the
-  // set of `rollup:{rc:bkt}:*` hash-tags discovered by SCAN. A short rollup
-  // count means the cluster holds sens docs that landed before 6.14a was
+  // set of `rollup:<rc>:<bkt>:*` keys discovered by SCAN (Wave 7.0.6.6 —
+  // tag-free shape; the leading `rollup:<rc>:<bkt>:` prefix identifies the
+  // bucket). A short rollup count means the cluster holds sens docs that
+  // landed before 6.14a was
   // deployed; surface a single non-fatal WARN so operators know to run the
   // BACKFILL_ROLLUPS=1 tool. Index- or SCAN-level errors on individual
   // shards are tolerated by design (the index may be cold on a fresh shard)
@@ -865,13 +867,16 @@ export async function bootstrapFrtb(
       // here just biases the check toward NOT warning.
     }
   }
+  // Wave 7.0.6.6 — tag-free key shape: `rollup:<rc>:<bkt>:<sens>[:tenor:<t>]`.
+  // SCAN narrows by the literal `rollup:` prefix and the parser extracts
+  // the first two colon-delimited tokens after it as the (rc, bkt) pair.
   const rollupHashtags = new Set<string>();
   for (const node of nodes) {
     let cursor = "0";
     try {
       do {
         const reply = (await node.call(
-          "SCAN", cursor, "MATCH", "rollup:{*}:*", "COUNT", "500",
+          "SCAN", cursor, "MATCH", "rollup:*", "COUNT", "500",
         )) as unknown;
         if (
           !Array.isArray(reply) || reply.length < 2 ||
@@ -881,8 +886,8 @@ export async function bootstrapFrtb(
         }
         cursor = reply[0];
         for (const key of reply[1] as string[]) {
-          const m = /^rollup:\{([^}]+)\}:/.exec(key);
-          if (m) rollupHashtags.add(m[1]!);
+          const m = /^rollup:([^:]+):([^:]+):/.exec(key);
+          if (m) rollupHashtags.add(`${m[1]!}:${m[2]!}`);
         }
       } while (cursor !== "0");
     } catch {

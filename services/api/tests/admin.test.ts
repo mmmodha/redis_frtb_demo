@@ -125,7 +125,7 @@ describe("POST /admin/flush", () => {
   // up to TTL, requiring `?nocache=true` as a workaround.
   //
   // Wave 6.28 — /facets now reads pre-aggregated row counts from
-  // `rollup:{rc:bkt}:<sens>` hashes (the `count` field). The mock targets
+  // `rollup:<rc>:<bkt>:<sens>` hashes (Wave 7.0.6.6 — tag-free; the `count` field). The mock targets
   // HGET on those keys and a one-class fixture schema keeps the expected
   // fan-out small (1 rc × 1 bucket × 3 sens = 3 HGETs per request).
   it("invalidates the /facets cache so a subsequent GET /facets reflects post-flush state immediately", async () => {

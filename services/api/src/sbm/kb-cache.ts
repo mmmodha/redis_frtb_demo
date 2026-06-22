@@ -11,7 +11,7 @@
 //
 // Key shape: `kb:{<rc>:<bkt>}:<sens>:<scenario>:<regime>` — the literal
 // `{...}` hash-tag wraps the (rc, bucket) pair, matching the
-// `rollup:{<rc>:<bkt>}:…` and `sens:{<rc>:<bkt>}:…` shape so a single slot
+// `rollup:<rc>:<bkt>:…` (Wave 7.0.6.6 tag-free) and `sens:{<rc>:<bkt>}:…` shape so a single slot
 // owns all bucket-scoped state in cluster mode. Two HMGETs per bucket
 // (kb-key + rollup-key content_hash check) stay slot-local.
 //

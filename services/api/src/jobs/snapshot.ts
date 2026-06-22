@@ -4,10 +4,10 @@
 // `snap:rollup:<ts>:<original-key>`, EXPIRE the destination at 7 days. The
 // per-run summary lands in the `snap:index` hash (one field per run keyed
 // by ISO timestamp) so /admin/snapshots can render the history without
-// re-scanning. Redis COPY is not used because the destination's hash tag
-// (rooted on the original `{rc:bkt}`) is preserved by string concat — the
-// snapshot lives on the same slot as the live rollup, so HGETALL+HMSET on
-// the same slot is cluster-safe.
+// re-scanning. Wave 7.0.6.6 — rollup keys are tag-free so the snapshot
+// destination is also tag-free; cluster-mode slot affinity is no longer
+// guaranteed but HGETALL + HMSET on different slots is still safe (two
+// independent commands, no MULTI).
 
 import type { RedisLike } from "../redis-like.ts";
 import { incCounter } from "./metrics.ts";
@@ -72,9 +72,8 @@ export async function runSnapshot(opts: RunSnapshotOpts): Promise<SnapshotSummar
     const hash = parseHgetall(await redis.call("HGETALL", key));
     if (!hash) continue;
     // Strip the `rollup:` prefix so the snapshot lives at
-    // `snap:rollup:<ts>:{rc:bkt}:<sens>[:tenor:<t>]`. The original hash tag
-    // is preserved by concat so the snapshot lands on the same slot as the
-    // live rollup it copies from (cluster-safe).
+    // `snap:rollup:<ts>:<rc>:<bkt>:<sens>[:tenor:<t>]` (Wave 7.0.6.6 —
+    // tag-free; mirrors the live rollup shape).
     const suffix = key.startsWith(ROLLUP_PREFIX) ? key.slice(ROLLUP_PREFIX.length) : key;
     const dst = `snap:rollup:${ts}:${suffix}`;
     const fieldArgs: string[] = [];

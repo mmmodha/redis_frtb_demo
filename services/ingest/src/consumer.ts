@@ -368,7 +368,8 @@ export function enrichDoc(
 // `sum_ws_down_sq`, `count` so the calc reduce can apply the ψ-gate +
 // max(K_up, K_down) without re-reading the underlying docs. PerTenor
 // classes (GIRR Delta/Vega/Curvature) additionally maintain per-tenor
-// breakdowns at `rollup:{rc:bkt}:sens:tenor:<t>` with the same fields.
+// breakdowns at `rollup:<rc>:<bkt>:<sens>:tenor:<t>` with the same fields
+// (Wave 7.0.6.6 — tag-free).
 //
 // All HINCRBYFLOAT calls are pushed onto the same pipeline as the JSON.SET
 // + XACK so the whole apply is one round-trip per row. Idempotency follows
@@ -384,20 +385,18 @@ type PipelineLike = { call: (cmd: string, ...args: unknown[]) => unknown };
 // (rc, bkt, sens_type) tuple actually grows the set). Pipelined alongside
 // JSON.SET + emitRollupHincrs so the apply remains one round-trip per row.
 //
-// Hash-tag placement matches `shared/calc/src/rollup-keys.ts`:
-//   * `seen:risk_class`              — global key, single slot in cluster
-//                                      mode. Hot enough that calc / facets
-//                                      can hit it directly without a fan-
-//                                      out.
-//   * `seen:bucket:{<rc>}`           — slot-affinity with the per-class
-//                                      rollup hashes (`rollup:{<rc>:<bkt>}`),
-//                                      so a future `SINTERSTORE`-style
-//                                      bucket discovery routes to the same
-//                                      shard as the data it inspects.
-//   * `seen:sens_type:{<rc>:<bkt>}`  — co-located with the per-bucket
-//                                      rollup hashes / sens keys; SMEMBERS
-//                                      here drives the facets sensitivity-
-//                                      type listing without fan-out.
+// Key shapes match `shared/calc/src/rollup-keys.ts` (Wave 7.0.6.6 tag-free
+// — the legacy `{<rc>}` / `{<rc>:<bkt>}` hash tags were dropped to align
+// with the bulk writer path and the canonical finaliser scripts):
+//   * `seen:risk_class`              — global key. Hot enough that calc /
+//                                      facets can hit it directly without
+//                                      a fan-out.
+//   * `seen:bucket:<rc>`             — set of buckets observed within
+//                                      `<rc>`. SMEMBERS here drives calc
+//                                      bucket discovery.
+//   * `seen:sens_type:<rc>:<bkt>`    — set of sens types observed within
+//                                      (rc, bucket). SMEMBERS here drives
+//                                      the facets sensitivity-type listing.
 export function emitSeenSadds(pipeline: PipelineLike, doc: Record<string, unknown>): void {
   const rc = typeof doc.risk_class === "string" ? doc.risk_class : undefined;
   const bkt = typeof doc.bucket === "string" ? doc.bucket : undefined;
@@ -1010,23 +1009,21 @@ async function emitSuggestersAfterCommit(client: RedisLike, doc: Record<string, 
 }
 
 // Wave 6.39.G — Route D. The pre-6.39.G single-MULTI block spanned 5–6 hash
-// slots (`sens:<ulid>`, `{sens:<ulid>}:tenors`, `rollup:{<rc>:<bkt>}:*`,
-// `seen:sens_type:{<rc>:<bkt>}`, the stream key) and EXECABORTed with
-// CROSSSLOT on Redis Enterprise / Cluster. Route D splits each per-row write
-// into THREE slot-local phases joined by an idempotency marker:
+// slots (`sens:<ulid>`, `{sens:<ulid>}:tenors`, the rollup keys, the seen
+// sens-type key, the stream key) and EXECABORTed with CROSSSLOT on Redis
+// Enterprise / Cluster. Route D splits each per-row write into THREE
+// slot-local phases joined by an idempotency marker:
 //
 //   Phase 1 — Sens-slot MULTI on the slot of `sens:<ulid>`:
 //     WATCH sens:<ulid>; HGETALL sens:<ulid>; MULTI; HSET sens:<ulid> …;
 //     HSET {sens:<ulid>}:tenors … (when per-tenor); EXEC.
-//   Phase 2 — Rollup-slot MULTI on the slot of `{<rc>:<bkt>}`:
-//     WATCH processed:{<rc>:<bkt>}:<entryId>; EXISTS processed:…;
-//     if NOT alreadyApplied: MULTI; HINCRBYFLOAT rollup:…; SADD
-//     seen:sens_type:…; SET processed:… 1 EX <STREAM_RETENTION_SEC>; EXEC.
-//     If alreadyApplied: skip the rollup writes entirely (replay short-
-//     circuit). Both branches still issue MULTI/EXEC for shape parity so
-//     the WATCH is consumed cleanly.
+//   Phase 2 — Rollup writes (Wave 7.0.6.6 — tag-free keys break the prior
+//     single-slot guarantee; legacy callers run this phase as a plain
+//     pipeline, NOT a MULTI). Reads the `processed:<rc>:<bkt>:<entryId>`
+//     marker for replay short-circuit, then HINCRBYFLOATs the rollup keys,
+//     SADDs `seen:sens_type:<rc>:<bkt>`, and SETs the marker with TTL.
 //   Phase 3 — Tail pipeline (non-atomic, all idempotent):
-//     SADD seen:risk_class; SADD seen:bucket:{<rc>}; XACK …; SUGADD ….
+//     SADD seen:risk_class; SADD seen:bucket:<rc>; XACK …; SUGADD ….
 //
 // Failure modes (see task note table): Phase 1 fail → entry stays in PEL,
 // replay re-runs idempotently. Phase 1 OK + Phase 2 fail → replay; marker
@@ -1130,10 +1127,10 @@ export async function processBatchAtomic(
           if (exists === 0) {
             const oldC = parseOldContribution(oldHashForPhase2, riskClass, sensType);
             emitRollupDelta(txn2 as unknown as PipelineLike, oldC, doc);
-            // Only the `seen:sens_type:{<rc>:<bkt>}` SADD is slot-local to
-            // the rollup hashes; the other two (`seen:risk_class`,
-            // `seen:bucket:{<rc>}`) move to the Phase 3 tail pipeline where
-            // CROSSSLOT does not apply. emitSeenSadds is left intact for the
+            // Wave 7.0.6.6 — keys are tag-free; the historical co-location
+            // argument no longer holds. The other two seen-set SADDs
+            // (`seen:risk_class`, `seen:bucket:<rc>`) still run on the
+            // Phase 3 tail pipeline. emitSeenSadds is left intact for the
             // non-atomic processBatch path (writes all three on a single
             // pipeline, which standalone Redis accepts unconditionally).
             txn2.call("SADD", seenSensTypeKey(riskClass, bucket), sensType);

@@ -112,10 +112,10 @@ end)
     await redis.call("JSON.SET", d.key, "$", JSON.stringify(d.body));
   }
   // Wave 6.55.K — bucket discovery flipped from FT.AGGREGATE to
-  // `SMEMBERS seen:bucket:{<rc>}` in Wave 6.24 (services/ingest/src/consumer.ts
-  // :emitSeenSadds). Mirror the production SADD shape so the reducer sees the
-  // fixture's two GIRR buckets.
-  await redis.call("SADD", "seen:bucket:{GIRR}", "USD-IRS", "EUR-IRS");
+  // `SMEMBERS seen:bucket:<rc>` in Wave 6.24 (services/ingest/src/consumer.ts
+  // :emitSeenSadds). Wave 7.0.6.6 — key shape is tag-free. Mirror the
+  // production SADD shape so the reducer sees the fixture's two GIRR buckets.
+  await redis.call("SADD", "seen:bucket:GIRR", "USD-IRS", "EUR-IRS");
 }, 30_000);
 
 afterAll(async () => {

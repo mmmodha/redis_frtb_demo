@@ -18,16 +18,17 @@ describe("runSnapshot", () => {
 
   it("scans rollup:* keys, HMSETs snap:rollup:<ts>:* with 7-day TTL", async () => {
     const fr = fakeRedis();
+    // Wave 7.0.6.6 — rollup keys are tag-free; snapshot mirrors the shape.
     fr.setScan("0", [
-      "rollup:{EQUITY:1}:Delta",
-      "rollup:{GIRR:USD}:Delta:tenor:3M",
+      "rollup:EQUITY:1:Delta",
+      "rollup:GIRR:USD:Delta:tenor:3M",
     ]);
     fr.setResponse("HGETALL", (args: unknown[]) => {
       const key = String(args[0]);
-      if (key === "rollup:{EQUITY:1}:Delta") {
+      if (key === "rollup:EQUITY:1:Delta") {
         return ["sum_ws", "10", "sum_ws_sq", "100", "count", "5"];
       }
-      if (key === "rollup:{GIRR:USD}:Delta:tenor:3M") {
+      if (key === "rollup:GIRR:USD:Delta:tenor:3M") {
         return ["sum_ws", "20", "sum_ws_sq", "400", "count", "8"];
       }
       return [];
@@ -43,8 +44,8 @@ describe("runSnapshot", () => {
 
     const hmsetCalls = fr.calls.filter((c) => c.command === "HMSET");
     expect(hmsetCalls).toHaveLength(2);
-    expect(hmsetCalls[0]!.args[0]).toBe(`snap:rollup:${ts}:{EQUITY:1}:Delta`);
-    expect(hmsetCalls[1]!.args[0]).toBe(`snap:rollup:${ts}:{GIRR:USD}:Delta:tenor:3M`);
+    expect(hmsetCalls[0]!.args[0]).toBe(`snap:rollup:${ts}:EQUITY:1:Delta`);
+    expect(hmsetCalls[1]!.args[0]).toBe(`snap:rollup:${ts}:GIRR:USD:Delta:tenor:3M`);
 
     const expireCalls = fr.calls.filter((c) => c.command === "EXPIRE");
     expect(expireCalls).toHaveLength(2);

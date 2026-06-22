@@ -1081,7 +1081,7 @@ describe("backfillRollups — Wave 6.14c", () => {
 // path is exercised separately above). Uses the pipelineStub recorder so we
 // can assert the exact command shape without booting Redis.
 describe("emitSeenSadds — Wave 6.24", () => {
-  it("emits SADD seen:risk_class + seen:bucket:{<rc>} + seen:sens_type:{<rc>:<bkt>} for a complete (rc, bkt, sens) row", () => {
+  it("emits SADD seen:risk_class + seen:bucket:<rc> + seen:sens_type:<rc>:<bkt> for a complete (rc, bkt, sens) row", () => {
     const record: RecordedPipelineCall[] = [];
     const stub = pipelineStub(record);
     emitSeenSadds(
@@ -1098,18 +1098,21 @@ describe("emitSeenSadds — Wave 6.24", () => {
     });
   });
 
-  it("hash-tags co-locate seen:bucket and seen:sens_type with the matching rollup hash key", () => {
-    // The hash-tag of `rollup:{GIRR:USD-IRS}:Delta` is `GIRR:USD-IRS`, which
-    // must match the tag inside `seen:sens_type:{GIRR:USD-IRS}` so both keys
-    // land on the same Redis Cluster slot. `seen:bucket:{GIRR}` shares only
-    // the `GIRR` prefix, intentionally — it indexes ALL buckets for the
-    // risk class and lives on whichever slot owns `{GIRR}`.
+  it("Wave 7.0.6.6 — rollup and seen keys are tag-free (no `{...}` braces)", () => {
+    // The Wave 6.24 hash-tag co-location guarantee was dropped in Wave
+    // 7.0.6.6 to align with the bulk-loader / finaliser writers. This
+    // test pins the new shapes so the legacy braced form can't silently
+    // sneak back in.
     const rk = rollupKey("GIRR", "USD-IRS", "Delta");
     const sensTypeKey = seenSensTypeKey("GIRR", "USD-IRS");
-    expect(rk).toContain("{GIRR:USD-IRS}");
-    expect(sensTypeKey).toContain("{GIRR:USD-IRS}");
+    expect(rk).toBe("rollup:GIRR:USD-IRS:Delta");
+    expect(sensTypeKey).toBe("seen:sens_type:GIRR:USD-IRS");
     const bucketKey = seenBucketKey("GIRR");
-    expect(bucketKey).toContain("{GIRR}");
+    expect(bucketKey).toBe("seen:bucket:GIRR");
+    for (const k of [rk, sensTypeKey, bucketKey]) {
+      expect(k).not.toContain("{");
+      expect(k).not.toContain("}");
+    }
   });
 
   it("rows missing risk_class / bucket / sensitivity_type emit no SADDs", () => {

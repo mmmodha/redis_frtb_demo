@@ -11,7 +11,8 @@ import {
 } from "../../src/active-target.ts";
 
 // Wave 6.28 — /facets now reads pre-aggregated row counts from the rollup
-// hashes that ingest (Wave 6.14a) maintains at `rollup:{rc:bkt}:<sens>`. For
+// hashes that ingest (Wave 6.14a) maintains at `rollup:<rc>:<bkt>:<sens>`
+// (Wave 7.0.6.6 — tag-free). For
 // each (risk_class, bucket, sensitivity_type) triple permitted by the schema,
 // the route HGETs the `count` field through a non-transactional ioredis
 // pipeline and sums in JS. Tests pin a minimal hand-crafted schema so the
@@ -142,7 +143,8 @@ describe("GET /facets", () => {
     const keys = hgets.map((c) => String(c.args[0]));
     for (const c of hgets) {
       expect(c.args[1]).toBe("count");
-      expect(String(c.args[0])).toMatch(/^rollup:\{[^:]+:[^}]+\}:[A-Za-z]+$/);
+      // Wave 7.0.6.6 — tag-free shape: `rollup:<rc>:<bkt>:<sens>`.
+      expect(String(c.args[0])).toMatch(/^rollup:[^:]+:[^:]+:[A-Za-z]+$/);
     }
     expect(keys).toContain(rollupKey("GIRR", "USD", "Delta"));
     expect(keys).toContain(rollupKey("GIRR", "USD", "Vega"));

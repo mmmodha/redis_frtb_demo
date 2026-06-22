@@ -536,7 +536,8 @@ async function computeSbmCharge(
   }
 
   // Wave 6.24 — bucket discovery is now a single SMEMBERS on
-  // `seen:bucket:{<rc>}` instead of an FT.AGGREGATE-with-GROUPBY against
+  // `seen:bucket:<rc>` (Wave 7.0.6.6 — tag-free) instead of an
+  // FT.AGGREGATE-with-GROUPBY against
   // `idx:sens`. The set is maintained by ingest's apply path (see
   // services/ingest/src/consumer.ts:emitSeenSadds) and hash-tagged on
   // `<rc>` so it lives on the slot that owns the rollup hashes for this
@@ -929,7 +930,7 @@ async function computeSbmCharge(
   const commands = {
     discovery: {
       // Wave 6.24 — discovery is now SMEMBERS against the materialized
-      // `seen:bucket:{<rc>}` set (maintained by ingest). The legacy
+      // `seen:bucket:<rc>` set (Wave 7.0.6.6 — tag-free). The legacy
       // FT.AGGREGATE shape is preserved as the `legacy_query` echo so the
       // UI drilldown can still surface the equivalent index query for
       // operator copy-paste.

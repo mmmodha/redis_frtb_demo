@@ -425,8 +425,9 @@ describe("bootstrap — idempotent at the orchestration layer", () => {
 });
 
 // Wave 6.14c — Step 4 rollup completeness sanity check. When the discovery
-// FT.AGGREGATE finds (rc, bkt) buckets but the SCAN over `rollup:{*}:*` keys
-// turns up a smaller distinct hash-tag count, bootstrap emits a single
+// FT.AGGREGATE finds (rc, bkt) buckets but the SCAN over `rollup:*` keys
+// turns up a smaller distinct (rc, bkt) count (Wave 7.0.6.6 — tag-free,
+// parsed by the leading `rollup:<rc>:<bkt>:` prefix), bootstrap emits a single
 // non-fatal WARN log entry pointing operators at the backfill tool. No log
 // line is emitted on the healthy path so the existing standalone log shape
 // is unchanged when no docs / no rollups are present.
@@ -459,7 +460,10 @@ function fakeStandaloneWithRollupShortfall(
       if (cmd === "SCAN") {
         scanCalls += 1;
         if (scanCalls === 1) {
-          const keys = opts.rollupHashtags.map((ht) => `rollup:{${ht}}:Delta`);
+          // Wave 7.0.6.6 — rollup keys are tag-free `rollup:<rc>:<bkt>:<sens>`.
+          // `ht` is still the `<rc>:<bkt>` pair (kept as-is for fixture
+          // brevity); just drop the braces in the emitted shape.
+          const keys = opts.rollupHashtags.map((ht) => `rollup:${ht}:Delta`);
           return ["0", keys];
         }
         return ["0", []];

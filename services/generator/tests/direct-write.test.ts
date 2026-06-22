@@ -107,7 +107,8 @@ describe.each(FORMATS)("direct-write [%s] — Wave 6.39.A", (format) => {
     const N = 75; // forces ≥ 3 flushes at batchSize=25
     for (let i = 0; i < N; i++) await writer.add(gen.generate("FX"));
     await writer.flush();
-    const count = await client.hget("rollup:{FX:USDEUR}:Delta", "count");
+    // Wave 7.0.6.6 — rollup key is tag-free `rollup:<rc>:<bkt>:<sens>`.
+    const count = await client.hget("rollup:FX:USDEUR:Delta", "count");
     expect(Number(count)).toBe(N);
   });
 });

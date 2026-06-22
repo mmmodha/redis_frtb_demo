@@ -3,10 +3,14 @@
 // directly on the fast path. Both ingest and calc import this module so the
 // key shape and field set stay in lock-step.
 //
-// Key shape mirrors the locked `sens:{<rc>:<bkt>}:<ulid>` contract — the
-// literal `{...}` braces wrap the `<risk_class>:<bucket>` hash-tag so the
-// rollup hash co-locates with the per-bucket sens keys on the same Redis
-// Cluster slot (keeps any FCALL / pipeline that touches both slot-local).
+// Wave 7.0.6.6 — keys are emitted TAG-FREE (no `{...}` braces). The bulk
+// writer path (services/bulk-loader, Wave 7.0.3.A/B) and the canonical
+// finalisers (scripts/finalise-rollups.mjs, scripts/finalise-seen-sets.mjs)
+// produce unbraced shapes; readers and legacy writers must match. The
+// previous co-location MULTI atomicity (rollup-write + processed-marker on
+// one slot) no longer holds — live-tail mode (7.0.6) skips the rollup write
+// entirely, the bulk path doesn't use MULTI, and backfill paths are
+// idempotent, so this is safe under Wave 7.
 
 // Returns the rollup hash key for a (risk_class, bucket, sensitivity_type)
 // triple, optionally narrowed to a single tenor. Tenor-less form holds the
@@ -18,7 +22,7 @@ export function rollupKey(
   sens: string,
   tenor?: string,
 ): string {
-  const base = `rollup:{${rc}:${bkt}}:${sens}`;
+  const base = `rollup:${rc}:${bkt}:${sens}`;
   return tenor != null ? `${base}:tenor:${tenor}` : base;
 }
 
@@ -45,40 +49,33 @@ export type RollupFieldCurvature = (typeof ROLLUP_FIELDS_CURVATURE)[number];
 // "which risk_classes / buckets / sensitivity_types have data?" in a single
 // SMEMBERS round-trip instead of an FT.AGGREGATE over `idx:sens`.
 //
+// Wave 7.0.6.6 — discovery-set keys are TAG-FREE. The bulk-loader and the
+// canonical finalisers write to `seen:bucket:<rc>` and
+// `seen:sens_type:<rc>:<bkt>` (no braces); readers must match.
+//
 // Key hierarchy:
-//   * `seen:risk_class`               — set of risk classes with data. Global
-//                                       (no hash tag). Single SMEMBERS for
-//                                       the facets / discovery top level.
-//   * `seen:bucket:{<rc>}`            — set of buckets within `<rc>`. Hash-
-//                                       tagged on `<rc>` so it lives on the
-//                                       slot that owns that risk class's
-//                                       data. Replaces the per-class FT.
-//                                       AGGREGATE discovery query in calc.
-//   * `seen:sens_type:{<rc>:<bkt>}`   — set of sensitivity_types within a
-//                                       (rc, bucket) bucket. Hash-tagged to
-//                                       MATCH the `rollup:{<rc>:<bkt>}:…`
-//                                       and `sens:{<rc>:<bkt>}:…` keys so a
-//                                       single slot owns everything related
-//                                       to that bucket.
+//   * `seen:risk_class`               — set of risk classes with data. Single
+//                                       SMEMBERS for the facets / discovery
+//                                       top level.
+//   * `seen:bucket:<rc>`              — set of buckets within `<rc>`.
+//                                       Replaces the per-class FT.AGGREGATE
+//                                       discovery query in calc.
+//   * `seen:sens_type:<rc>:<bkt>`     — set of sensitivity_types within a
+//                                       (rc, bucket) bucket.
 export const SEEN_RISK_CLASS_KEY = "seen:risk_class";
 
 export function seenBucketKey(rc: string): string {
-  return `seen:bucket:{${rc}}`;
+  return `seen:bucket:${rc}`;
 }
 
 export function seenSensTypeKey(rc: string, bkt: string): string {
-  return `seen:sens_type:{${rc}:${bkt}}`;
+  return `seen:sens_type:${rc}:${bkt}`;
 }
 
 // Wave 6.39.G — per-entry idempotency marker for the rollup phase of the
-// two-phase ingest writer. The atomic delta-reconciliation MULTI used to span
-// `sens:<ulid>` and `rollup:{<rc>:<bkt>}:*` (different slots → CROSSSLOT on
-// Redis Enterprise / Cluster). Route D splits the per-row write into a sens-
-// slot MULTI (Phase 1) and a rollup-slot MULTI (Phase 2); this marker lives on
-// the rollup slot so Phase 2 can short-circuit on replay without re-applying
-// the HINCRBYFLOAT deltas. TTL is set to the stream-retention window by the
-// caller so the marker disappears once the stream entry can no longer be
-// re-delivered.
+// two-phase ingest writer. Originally hash-tagged on `<rc>:<bkt>` to keep the
+// rollup-write + marker on a single slot for MULTI atomicity. Wave 7.0.6.6
+// drops the tags (see header above for the safety argument).
 export function processedMarkerKey(rc: string, bkt: string, entryId: string): string {
-  return `processed:{${rc}:${bkt}}:${entryId}`;
+  return `processed:${rc}:${bkt}:${entryId}`;
 }
