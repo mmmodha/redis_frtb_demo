@@ -15,12 +15,16 @@
 import { createRedisClient, resolveRedisTarget } from "@frtb/redis-client";
 import { createServer } from "./server.ts";
 import { createWorkerPool, type PoolClient } from "./pool.ts";
+import { createDispatcher, type WorkerClient } from "./dispatcher.ts";
 
 const HOST = process.env.BULK_LOADER_HOST ?? process.env.HOST ?? "0.0.0.0";
 const PORT = Number(
   process.env.BULK_LOADER_PORT ?? process.env.PORT ?? process.env.HEALTH_PORT ?? 8086,
 );
 const POOL_SIZE = Number(process.env.BULK_LOADER_POOL_SIZE ?? 32);
+const BATCH_SIZE = Number(process.env.BULK_LOADER_BATCH_SIZE ?? 1000);
+const IDLE_FLUSH_MS = Number(process.env.BULK_LOADER_IDLE_FLUSH_MS ?? 50);
+const HIGH_WATER_ENV = process.env.BULK_LOADER_HIGH_WATER;
 const API_BASE = process.env.API_BASE ?? `http://localhost:${process.env.API_PORT ?? 8080}`;
 
 function log(level: "info" | "warn" | "error", msg: string, extra: object = {}): void {
@@ -64,12 +68,34 @@ async function main(): Promise<void> {
     logger: { info: (obj, m) => log("info", m, obj) },
   });
 
-  const app = await createServer({ pool, logger: false });
+  // Wave 7.0.1.B — write dispatcher. Each pool client is also a WorkerClient
+  // (ioredis Redis exposes pipeline() + call()), so we hand the same
+  // PoolClient instances to the dispatcher. Backpressure high-water defaults
+  // to 5 × batch_size × pool_size unless BULK_LOADER_HIGH_WATER is set.
+  const dispatcher = createDispatcher({
+    workerClients: pool.workers.map((w) => w.client as unknown as WorkerClient),
+    batchSize: BATCH_SIZE,
+    idleFlushMs: IDLE_FLUSH_MS,
+    highWater: HIGH_WATER_ENV ? Number(HIGH_WATER_ENV) : undefined,
+    logger: {
+      warn: (obj, m) => log("warn", m, obj),
+      info: (obj, m) => log("info", m, obj),
+    },
+  });
+
+  const app = await createServer({ pool, dispatcher, logger: false });
   await app.listen({ host: HOST, port: PORT });
-  log("info", "bulk-loader listening", { port: PORT, pool_size: POOL_SIZE });
+  log("info", "bulk-loader listening", {
+    port: PORT,
+    pool_size: POOL_SIZE,
+    batch_size: BATCH_SIZE,
+    idle_flush_ms: IDLE_FLUSH_MS,
+    high_water: dispatcher.status().highWater,
+  });
 
   if (process.env.SMOKE === "1") {
     await app.close();
+    await dispatcher.stop();
     await pool.stop();
     process.exit(0);
   }
@@ -77,6 +103,7 @@ async function main(): Promise<void> {
   for (const sig of ["SIGINT", "SIGTERM"] as const) {
     process.on(sig, async () => {
       try { await app.close(); } catch { /* ignore */ }
+      try { await dispatcher.stop(); } catch { /* ignore */ }
       try { await pool.stop(); } catch { /* ignore */ }
       process.exit(0);
     });
