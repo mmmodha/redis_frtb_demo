@@ -139,6 +139,25 @@ REDIS_URL='redis://…' node scripts/diagnose-ingest.mjs                 # pre-f
 REDIS_URL='redis://…' node scripts/diagnose-ingest.mjs --probe --yes   # 60s controlled probe
 ```
 
+## dev-up-and-diagnose.sh (Wave 7.0.6.9)
+
+One-shot operator entrypoint that stops the local stack, rebuilds the UI
+bundle, restarts every service (incl. bulk-loader on :8086), ensures the
+api's active target points at `localhost:12000`, waits for
+`/admin/index-count` to expose a live `index_name`, then runs
+`diagnose-ingest.mjs --probe --yes` and tees output to
+`logs/diagnose-ingest-<UTC>.log`.
+
+```bash
+./scripts/dev-up-and-diagnose.sh
+```
+
+Pre-requisites: `.env.local` with `REDIS_USERNAME` / `REDIS_PASSWORD`, and
+Redis Enterprise already listening on `localhost:12000` (docker compose
+up). The script never starts docker; it fails clean with a clear message
+if RE is unreachable. Thin wrapper over `run-local.sh` — does not
+reimplement service orchestration.
+
 ## Other helpers
 
 - `_check-xlen.mjs` — XLEN + XPENDING across the 16 hash-tag shard streams.
