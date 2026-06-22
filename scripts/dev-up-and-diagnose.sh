@@ -207,29 +207,89 @@ if ! ensure_active_target; then
 fi
 
 # ---------- 5. wait for /admin/index-count to return a non-null index_name ----------
+# Wave 7.0.6.11 — on initial 30s timeout, attempt a manual rebuild via the
+# canonical `POST /admin/rebuild-indexes` endpoint (see
+# services/api/src/routes/admin.ts), re-poll for another 30s, and on final
+# failure print a precise diagnostic block (bootstrap-status, active
+# connection, active target, and bootstrap-related api log entries) instead
+# of the previous vague "Tail api logs:" pointer.
+API_BASE="http://localhost:8080"
+API_LOG="${REPO_ROOT}/.run/logs/api.log"
+
+# Poll /admin/index-count for up to $1 seconds. On success sets $got_index
+# and returns 0; on timeout leaves $got_index empty and returns 1.
+poll_index_name() {
+  local max_s="$1"
+  local i=0 resp="" name=""
+  got_index=""
+  while (( i < max_s )); do
+    resp="$(curl -fsS --max-time 2 "${API_BASE}/admin/index-count" 2>/dev/null || true)"
+    if [[ -n "${resp}" ]]; then
+      name="$(printf '%s' "${resp}" | node -e '
+        let d=""; process.stdin.on("data",c=>d+=c).on("end",()=>{
+          try { const j=JSON.parse(d); if (j && j.index_name) process.stdout.write(String(j.index_name)); } catch {}
+        });' 2>/dev/null || true)"
+      if [[ -n "${name}" ]]; then
+        got_index="${name}"
+        return 0
+      fi
+    fi
+    sleep 1
+    i=$(( i + 1 ))
+  done
+  return 1
+}
+
+# Dump the failure diagnostic block to stderr. No credentials are touched —
+# only operator-facing surfaces (/redis/active-target*, /connections/active,
+# already-redacted api.log lines).
+dump_index_failure_diagnostic() {
+  fail "  ─── diagnostic block ───────────────────────────────────────────────"
+  fail "  GET /redis/active-target/bootstrap-status:"
+  curl -sS --max-time 3 "${API_BASE}/redis/active-target/bootstrap-status" 2>&1 \
+    | sed 's/^/    /' >&2 || true
+  printf '\n' >&2
+  fail "  GET /connections/active:"
+  curl -sS --max-time 3 "${API_BASE}/connections/active" 2>&1 \
+    | sed 's/^/    /' >&2 || true
+  printf '\n' >&2
+  fail "  GET /redis/active-target:"
+  curl -sS --max-time 3 "${API_BASE}/redis/active-target" 2>&1 \
+    | sed 's/^/    /' >&2 || true
+  printf '\n' >&2
+  if [[ -r "${API_LOG}" ]]; then
+    fail "  Last 50 bootstrap-related api.log entries (${API_LOG}):"
+    grep -iE "bootstrap|FT\.CREATE|idx:sens|activate" "${API_LOG}" \
+      | tail -n 50 | sed 's/^/    /' >&2 || true
+    if grep -iqE "bootstrap.*(error|fail|fatal)|FT\.CREATE.*(error|fail)" "${API_LOG}"; then
+      fail "  next step → see Wave 7.0.6.10 (bootstrap bug) — api.log shows a bootstrap error"
+    fi
+  else
+    fail "  api log not readable at ${API_LOG}"
+  fi
+  fail "  ────────────────────────────────────────────────────────────────────"
+}
+
 hdr "[5/6] Waiting for /admin/index-count to expose a live index_name (≤ 30s)"
 got_index=""
-i=0
-while (( i < 30 )); do
-  resp="$(curl -fsS --max-time 2 "http://localhost:8080/admin/index-count" 2>/dev/null || true)"
-  if [[ -n "${resp}" ]]; then
-    name="$(printf '%s' "${resp}" | node -e '
-      let d=""; process.stdin.on("data",c=>d+=c).on("end",()=>{
-        try { const j=JSON.parse(d); if (j && j.index_name) process.stdout.write(String(j.index_name)); } catch {}
-      });' 2>/dev/null || true)"
-    if [[ -n "${name}" ]]; then
-      got_index="${name}"
-      ok "  index_name=${name}"
-      break
-    fi
+if poll_index_name 30; then
+  ok "  index_name=${got_index}"
+else
+  warn "  [5/6] index never appeared in 30s — attempting manual rebuild"
+  rebuild_http="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 \
+    -X POST "${API_BASE}/admin/rebuild-indexes" 2>/dev/null || echo "000")"
+  if [[ "${rebuild_http}" =~ ^2[0-9][0-9]$ ]]; then
+    info "  POST /admin/rebuild-indexes → ${rebuild_http}; re-polling for 30s"
+  else
+    warn "  POST /admin/rebuild-indexes → ${rebuild_http} (re-polling anyway)"
   fi
-  sleep 1
-  i=$(( i + 1 ))
-done
-if [[ -z "${got_index}" ]]; then
-  fail "  /admin/index-count never returned a non-null index_name within 30s."
-  fail "  Tail api logs: ./scripts/run-local.sh logs api"
-  exit 1
+  if poll_index_name 30; then
+    ok "  index_name=${got_index} (recovered after manual rebuild)"
+  else
+    fail "  /admin/index-count never returned a non-null index_name after manual rebuild."
+    dump_index_failure_diagnostic
+    exit 1
+  fi
 fi
 
 # ---------- 6. run diagnose-ingest ----------
