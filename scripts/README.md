@@ -53,6 +53,30 @@ Run BEFORE the first calc against a target that ingested data prior to
 Wave 6.24 — otherwise calc's SMEMBERS-based discovery will return an
 empty bucket set and the route reports `no-data-or-index`.
 
+## finalise-rollups.mjs (Wave 7.0.3.A)
+
+Post-load rollup finalisation — materialises the per-bucket rollup hashes
+from bulk-loaded `sens:*` docs via FT.AGGREGATE against `idx:sens:slim`,
+one query per `(risk_class, sensitivity_type)`. Writes tag-free
+`rollup:<rc>:<bkt>:<sens>[:tenor:<t>]` keys (NO `{...}` hash tag) so the
+rollup family spreads across every shard instead of pinning each bucket
+onto one slot.
+
+```bash
+REDIS_URL='rediss://…' \
+  node --env-file=.env.local scripts/finalise-rollups.mjs
+```
+
+Field shape mirrors the legacy incremental path
+(`services/ingest/src/backfill-rollups.ts`) minus `sum_ws_up_sq` /
+`sum_ws_down_sq` (verifier §3.2: never read by calc) and minus
+`processed:*` markers (bulk path has no stream replay). Idempotent: HSET
+overwrites the same fields on every re-run.
+
+Outputs one JSON line on stdout (`rollups_written` / `empty_groups` /
+`errors` / `elapsed_ms`) and per-`(rc, sens)` progress on stderr.
+Run-time budget: < 5 min on 10M docs / 2-shard cluster.
+
 ## Other helpers
 
 - `_check-xlen.mjs` — XLEN + XPENDING across the 16 hash-tag shard streams.
