@@ -33,6 +33,7 @@ import {
   type Checkpointer,
 } from "./checkpoint.ts";
 import { createActiveTargetWatcher, type ActiveTargetWatcher } from "./active-target-watcher.ts";
+import { fetchActiveTargetIdentity } from "./active-target-identity.ts";
 import {
   createBulkLoaderState,
   swapTarget,
@@ -243,12 +244,16 @@ async function main(): Promise<void> {
   // Boot triple — built against the URL we just resolved.
   const initial = await buildRuntime(resolved.url);
 
-  // Wave 7.0.6.17 — try to fetch the api's labelled identity so the state
-  // holder's bound_target.label is populated correctly. Best-effort; on
-  // failure we fall back to a synthetic label derived from the resolver
-  // source so /load/status still has something printable.
+  // Wave 7.0.6.17 / 7.0.6.17a — fetch the api's labelled identity via the
+  // unauthenticated /admin/active-target-identity endpoint so the state
+  // holder's bound_target.label is populated correctly EVEN when
+  // INTERNAL_API_TOKEN is unset (the pre-7.0.6.17a path short-circuited
+  // here and fell back to a synthetic label, which combined with the
+  // gated stale-poll let token-unset deploys silently write to the wrong
+  // DB). Best-effort; on failure we fall back to a synthetic label derived
+  // from the resolver source so /load/status still has something printable.
   const token = process.env.INTERNAL_API_TOKEN;
-  const apiInitial = await fetchActiveTargetBest(API_BASE, token);
+  const apiInitial = await fetchActiveTargetIdentity(API_BASE);
   const boundLabel = apiInitial?.label
     ?? (resolved.source === "active-target" ? "active-target" : resolved.source === "explicit" ? "explicit-url" : "env-redis");
   const state: BulkLoaderState = createBulkLoaderState({
@@ -260,6 +265,17 @@ async function main(): Promise<void> {
     boundVersion: apiInitial?.version ?? null,
     targetWatcher: token ? "enabled" : "disabled",
   });
+  // Wave 7.0.6.17a — seed apiActiveTarget at boot so the very first
+  // /load/status reflects any pre-existing divergence (e.g. operator
+  // switched the api between bulk-loader's resolveRedisTarget and this
+  // listen()) without waiting one full TARGET_STALE_CHECK_INTERVAL_MS.
+  if (apiInitial) {
+    updateApiActiveTarget(
+      state,
+      { host: apiInitial.host, port: apiInitial.port, label: apiInitial.label },
+      apiInitial.version,
+    );
+  }
 
   // Wave 7.0.6.17 — active-target watcher. When INTERNAL_API_TOKEN is set,
   // poll /internal/redis/active-target/full every 5s and invoke
@@ -305,13 +321,18 @@ async function main(): Promise<void> {
     log("warn", "INTERNAL_API_TOKEN not set; active-target watcher disabled", {});
   }
 
-  // Wave 7.0.6.17 — periodic stale-target safety-net. Even when the
-  // watcher is enabled, a swap failure leaves last_swap_error set; this
-  // poll keeps updating api_active_target so the UI banner reflects the
-  // current divergence and /load/rows fails loud. When the watcher is
-  // disabled this is the ONLY signal that flips target_stale=true.
+  // Wave 7.0.6.17 / 7.0.6.17a — periodic stale-target safety-net. Even
+  // when the watcher is enabled, a swap failure leaves last_swap_error
+  // set; this poll keeps updating api_active_target so the UI banner
+  // reflects the current divergence and /load/rows fails loud. When the
+  // watcher is disabled this is the ONLY signal that flips
+  // target_stale=true — so it MUST run unconditionally (the pre-7.0.6.17a
+  // implementation called the token-gated full endpoint, which short-
+  // circuited on missing token and silently let writes land on the wrong
+  // DB). The new identity endpoint is unauthenticated by design and emits
+  // only non-secret fields.
   const staleTimer: NodeJS.Timeout = setInterval(async () => {
-    const t = await fetchActiveTargetBest(API_BASE, token);
+    const t = await fetchActiveTargetIdentity(API_BASE);
     if (!t) return;
     updateApiActiveTarget(
       state,

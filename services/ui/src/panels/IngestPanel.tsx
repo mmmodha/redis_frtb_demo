@@ -366,7 +366,16 @@ function BulkLoaderTargetBanner(props: {
   const watcherEnabled = hostInfo!.bulk_loader_target_watcher === "enabled";
   const apiLabel = ingestTargetLabel!;
   let message: string;
-  if (stale) {
+  if (stale && !watcherEnabled) {
+    // Wave 7.0.6.17a — token-unset deploys now flip stale via the
+    // unauthenticated /admin/active-target-identity poll. Spell out that
+    // the bulk-loader will NOT auto-recover so the operator restarts
+    // after pointing the bulk-loader at the new target.
+    message =
+      `Bulk loader is bound to ${bound.label} but the api is now serving ${apiLabel}. ` +
+      "Watcher is disabled (INTERNAL_API_TOKEN unset); the bulk-loader will not " +
+      "auto-recover. Restart it after pointing at the new target.";
+  } else if (stale) {
     message =
       `Bulk loader is bound to ${bound.label} but the api active-target is ${apiLabel}. ` +
       "Writes are being rejected (503) to prevent landing rows in the wrong DB. " +

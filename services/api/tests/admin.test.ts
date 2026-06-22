@@ -464,3 +464,73 @@ describe("GET /admin/host-info", () => {
     }
   });
 });
+
+// Wave 7.0.6.17a — GET /admin/active-target-identity exposes the
+// non-secret identity (host, port, label, version) of the active Redis
+// target so the bulk-loader's stale-target poll runs unconditionally
+// (no INTERNAL_API_TOKEN required). MUST NOT leak url / password /
+// username / tls / db — those stay on the token-gated
+// /internal/redis/active-target/full surface.
+describe("GET /admin/active-target-identity (Wave 7.0.6.17a)", () => {
+  let app: Awaited<ReturnType<typeof createServer>>;
+  afterEach(async () => {
+    if (app) await app.close();
+    resetActiveTarget();
+  });
+
+  it("returns host, port, label, version and never leaks creds", async () => {
+    const fr = fakeRedis();
+    app = await createServer({
+      redis: fr,
+      activeTarget: { host: "10.0.0.7", port: 12345, tls: false, db: 0, label: "redis-primary" },
+    });
+    const res = await app.inject({ method: "GET", url: "/admin/active-target-identity" });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as Record<string, unknown>;
+    expect(body.host).toBe("10.0.0.7");
+    expect(body.port).toBe(12345);
+    expect(body.label).toBe("redis-primary");
+    expect(typeof body.version).toBe("number");
+    // Identity-only contract — credential / connection fields MUST NOT
+    // appear on this surface. Mirrors the token-gated full endpoint's
+    // separation so a public CORS-allowed caller cannot pivot from
+    // identity to creds.
+    expect(body.url).toBeUndefined();
+    expect(body.password).toBeUndefined();
+    expect(body.username).toBeUndefined();
+    expect(body.tls).toBeUndefined();
+    expect(body.db).toBeUndefined();
+    expect(body.clusterMode).toBeUndefined();
+  });
+
+  it("returns 503 with { error: \"no active target\" } when label is empty", async () => {
+    const fr = fakeRedis();
+    app = await createServer({
+      redis: fr,
+      activeTarget: { host: "127.0.0.1", port: 6379, tls: false, db: 0, label: "" },
+    });
+    const res = await app.inject({ method: "GET", url: "/admin/active-target-identity" });
+    expect(res.statusCode).toBe(503);
+    expect(res.json()).toEqual({ error: "no active target" });
+  });
+
+  it("requires no Authorization header (public endpoint)", async () => {
+    // No INTERNAL_API_TOKEN env set; bulk-loader's stale poll relies on
+    // this contract so a token-unset deploy still surfaces divergence.
+    const prev = process.env.INTERNAL_API_TOKEN;
+    delete process.env.INTERNAL_API_TOKEN;
+    try {
+      const fr = fakeRedis();
+      app = await createServer({
+        redis: fr,
+        activeTarget: { host: "127.0.0.1", port: 6379, tls: false, db: 0, label: "localcluster" },
+      });
+      const res = await app.inject({ method: "GET", url: "/admin/active-target-identity" });
+      expect(res.statusCode).toBe(200);
+      const body = res.json() as { label: string };
+      expect(body.label).toBe("localcluster");
+    } finally {
+      if (prev !== undefined) process.env.INTERNAL_API_TOKEN = prev;
+    }
+  });
+});

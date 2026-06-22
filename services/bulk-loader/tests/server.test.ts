@@ -5,11 +5,16 @@
 //   • /load/status reports pool_size, connected, per-worker heartbeat fields.
 //   • /load/start is wired but stubbed (503 until 7.0.1.B).
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createServer } from "../src/server.ts";
 import { createWorkerPool, type WorkerPool } from "../src/pool.ts";
 import { createDispatcher, type DispatcherHandle, type Row } from "../src/dispatcher.ts";
-import { createBulkLoaderState, type BulkLoaderState } from "../src/swap-target.ts";
+import {
+  createBulkLoaderState,
+  updateApiActiveTarget,
+  type BulkLoaderState,
+} from "../src/swap-target.ts";
+import { fetchActiveTargetIdentity } from "../src/active-target-identity.ts";
 import { FakeClient } from "./helpers/fake-client.ts";
 import { FakeWriteClient } from "./helpers/fake-write-client.ts";
 import type { FastifyInstance } from "fastify";
@@ -628,6 +633,161 @@ describe("Wave 7.0.6.17 — target_stale fail-loud + new /load/status fields", (
       expect(body.workers[0]?.errors).toBe(1);
     } finally {
       await localApp.close(); await dispatcher.stop(); await localPool.stop();
+    }
+  });
+});
+
+// Wave 7.0.6.17a — regression coverage for the token-unset deploy. The
+// 7.0.6.17 implementation gated the stale-poll behind the token-gated
+// /internal/redis/active-target/full endpoint, so a bulk-loader without
+// INTERNAL_API_TOKEN silently kept writing to a divergent target. The
+// fix introduces an unauthenticated /admin/active-target-identity
+// endpoint on the api and rewires the bulk-loader's stale poll to it.
+// These tests exercise the new helper end-to-end and assert that the
+// bulk-loader's stale state + /healthz + /load/rows all fail-loud as
+// soon as the polled identity diverges from bound_target.
+describe("Wave 7.0.6.17a — public identity endpoint flips target_stale (token unset)", () => {
+  async function buildLocal(): Promise<{
+    app: FastifyInstance; pool: WorkerPool; dispatcher: DispatcherHandle; state: BulkLoaderState;
+  }> {
+    const writeClients = [new FakeWriteClient(), new FakeWriteClient()];
+    const fakePool: FakeClient[] = [];
+    const localPool = createWorkerPool({
+      size: 2,
+      redisFactory: () => { const c = new FakeClient(); fakePool.push(c); return c; },
+      heartbeatMs: 60_000, logger: { info: () => { } },
+    });
+    fakePool[0]!.becomeReady();
+    fakePool[1]!.becomeReady();
+    const dispatcher = createDispatcher({
+      workerClients: writeClients, batchSize: 1, idleFlushMs: 0, highWater: 64,
+    });
+    const state = createBulkLoaderState({
+      pool: localPool, dispatcher, checkpointer: null,
+      bootstrapCheckpoints: new Map(),
+      boundTarget: { host: "127.0.0.1", port: 12000, label: "localcluster" },
+      boundVersion: 1,
+      // Token-unset deploy → watcher disabled. This is the failure mode
+      // that 7.0.6.17 left unguarded.
+      targetWatcher: "disabled",
+    });
+    const localApp = await createServer({ state });
+    await localApp.ready();
+    return { app: localApp, pool: localPool, dispatcher, state };
+  }
+  function makeRow(id: string): Row {
+    return { id, risk_class: "GIRR", bucket: "USD", sensitivity_type: "Delta", risk_value: { "3M": 0.1 } };
+  }
+
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  it("fetchActiveTargetIdentity hits /admin/active-target-identity with no Authorization header", async () => {
+    const fetchSpy = vi.fn(async (input: RequestInfo, init?: RequestInit) => {
+      // The helper must NOT attach a bearer token — public endpoint by
+      // design (creds-bearing /internal/redis/active-target/full stays
+      // token-gated and untouched).
+      expect((init?.headers as Record<string, string> | undefined)?.Authorization).toBeUndefined();
+      expect(String(input)).toBe("http://api.local/admin/active-target-identity");
+      return new Response(JSON.stringify({
+        host: "10.0.0.7", port: 12345, label: "redis-cloud-prod", version: 17,
+      }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+    const out = await fetchActiveTargetIdentity("http://api.local");
+    expect(out).toEqual({ host: "10.0.0.7", port: 12345, label: "redis-cloud-prod", version: 17 });
+  });
+
+  it("returns null on non-2xx, malformed body, or fetch failure", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("nope", { status: 503 })));
+    expect(await fetchActiveTargetIdentity("http://api.local")).toBeNull();
+    vi.unstubAllGlobals();
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ host: "x" }), { status: 200 })));
+    expect(await fetchActiveTargetIdentity("http://api.local")).toBeNull();
+    vi.unstubAllGlobals();
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("ECONNREFUSED"); }));
+    expect(await fetchActiveTargetIdentity("http://api.local")).toBeNull();
+  });
+
+  it("identity poll flips target_stale=true, /load/rows + /healthz return 503, /load/status reports target_watcher=disabled", async () => {
+    const { app: a, pool: p, dispatcher: d, state } = await buildLocal();
+    try {
+      // No token in the env, divergent identity from the api → the poll
+      // must observe the divergence and call updateApiActiveTarget. We
+      // stub fetch (no auth header expected) and drive the poll manually
+      // so the test is deterministic instead of waiting on setInterval.
+      delete process.env.INTERNAL_API_TOKEN;
+      vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+        host: "10.0.0.7", port: 12345, label: "redis-cloud-prod", version: 99,
+      }), { status: 200 })));
+
+      const id = await fetchActiveTargetIdentity("http://api.local");
+      expect(id).not.toBeNull();
+      updateApiActiveTarget(state, { host: id!.host, port: id!.port, label: id!.label }, id!.version);
+
+      expect(state.targetStale).toBe(true);
+      expect(state.targetStaleReason).toMatch(/stale target/);
+      expect(state.targetStaleReason).toMatch(/localcluster/);
+      expect(state.targetStaleReason).toMatch(/redis-cloud-prod/);
+
+      const rows = await a.inject({
+        method: "POST", url: "/load/rows",
+        headers: { "content-type": "application/json" },
+        payload: JSON.stringify([makeRow("u1")]),
+      });
+      expect(rows.statusCode).toBe(503);
+      const rowsBody = rows.json() as { accepted: number; reason: string };
+      expect(rowsBody.accepted).toBe(0);
+      expect(rowsBody.reason).toMatch(/stale target/);
+
+      const health = await a.inject({ method: "GET", url: "/healthz" });
+      expect(health.statusCode).toBe(503);
+      const healthBody = health.json() as { status: string; target_stale: boolean };
+      expect(healthBody.status).toBe("degraded");
+      expect(healthBody.target_stale).toBe(true);
+
+      const status = await a.inject({ method: "GET", url: "/load/status" });
+      const statusBody = status.json() as {
+        target_stale: boolean; target_watcher: string;
+        bound_target: { label: string }; api_active_target: { label: string } | null;
+      };
+      expect(statusBody.target_stale).toBe(true);
+      expect(statusBody.target_watcher).toBe("disabled");
+      expect(statusBody.bound_target.label).toBe("localcluster");
+      expect(statusBody.api_active_target?.label).toBe("redis-cloud-prod");
+    } finally {
+      await a.close(); await d.stop(); await p.stop();
+    }
+  });
+
+  it("identity poll keeps target_stale=false and /load/rows accepts when identity matches bound_target", async () => {
+    const { app: a, pool: p, dispatcher: d, state } = await buildLocal();
+    try {
+      delete process.env.INTERNAL_API_TOKEN;
+      // Identity converges on the bound target — same host/port/label.
+      // updateApiActiveTarget must NOT flip stale; /load/rows must accept.
+      vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+        host: "127.0.0.1", port: 12000, label: "localcluster", version: 2,
+      }), { status: 200 })));
+
+      const id = await fetchActiveTargetIdentity("http://api.local");
+      expect(id).not.toBeNull();
+      updateApiActiveTarget(state, { host: id!.host, port: id!.port, label: id!.label }, id!.version);
+
+      expect(state.targetStale).toBe(false);
+      expect(state.targetStaleReason).toBeNull();
+
+      const rows = await a.inject({
+        method: "POST", url: "/load/rows",
+        headers: { "content-type": "application/json" },
+        payload: JSON.stringify([makeRow("u1")]),
+      });
+      expect(rows.statusCode).toBe(202);
+      expect((rows.json() as { accepted: number }).accepted).toBe(1);
+
+      const health = await a.inject({ method: "GET", url: "/healthz" });
+      expect(health.statusCode).toBe(200);
+    } finally {
+      await a.close(); await d.stop(); await p.stop();
     }
   });
 });

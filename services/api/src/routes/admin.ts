@@ -15,7 +15,7 @@ import { availableParallelism } from "node:os";
 import type { FastifyInstance } from "fastify";
 import type { Schema } from "@frtb/schema";
 import type { RedisLike } from "../redis-like.ts";
-import { getActiveTarget, type RuntimeCategory } from "../active-target.ts";
+import { getActiveTarget, getActiveTargetVersion, type RuntimeCategory } from "../active-target.ts";
 import { parseClusterInfo } from "@frtb/generator";
 import {
   getBootstrapStatus,
@@ -491,6 +491,32 @@ export function registerAdminRoutes(
       bulk_loader_bound_target: blStatus?.bound_target ?? null,
       bulk_loader_target_stale: blStatus?.target_stale ?? null,
       bulk_loader_target_watcher: blStatus?.target_watcher ?? null,
+    };
+  });
+
+  // Wave 7.0.6.17a — GET /admin/active-target-identity. Public (no auth)
+  // identity-only view of the active Redis target so the bulk-loader's
+  // stale-target safety-net poll runs unconditionally — even when
+  // INTERNAL_API_TOKEN is unset and the token-gated
+  // /internal/redis/active-target/full path is unavailable. Symmetrical
+  // to /admin/host-info (also unauthenticated): emits only non-secret
+  // identity fields. NEVER returns url / password / username / tls / db.
+  // 503 when no active target is resolved (boot edge-case / empty label).
+  app.get("/admin/active-target-identity", { config: { category: "light" } }, async (_req, reply) => {
+    let target;
+    try { target = getActiveTarget(); } catch {
+      reply.code(503);
+      return { error: "no active target" };
+    }
+    if (!target.label) {
+      reply.code(503);
+      return { error: "no active target" };
+    }
+    return {
+      host: target.host,
+      port: target.port,
+      label: target.label,
+      version: getActiveTargetVersion(),
     };
   });
 }
