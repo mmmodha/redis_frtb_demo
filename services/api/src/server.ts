@@ -28,6 +28,7 @@ import { registerObservabilityRoutes } from "./routes/observability.ts";
 import { registerSourcesProxyRoutes } from "./routes/sources-proxy.ts";
 import { registerLoadgenProxyRoutes } from "./routes/loadgen-proxy.ts";
 import { registerIngestShardsRoutes } from "./routes/ingest-shards.ts";
+import { registerIngestRoutes } from "./routes/ingest.ts";
 import { registerGeneratorRoutes } from "./routes/generator.ts";
 import { registerAdminRoutes } from "./routes/admin.ts";
 import { registerInternalTargetRoutes } from "./routes/internal-target.ts";
@@ -155,6 +156,13 @@ export interface CreateServerOpts {
   // production wiring the gate exists to protect. Tests that want to
   // exercise the probe gate explicitly pass a fake here.
   readinessProbe?: () => Promise<{ ok: boolean; err?: string }>;
+  // Wave 7.0.6.13 — bulk-loader base URL for POST /ingest/bulk/start. Falls
+  // back to BULK_LOADER_URL / BULK_LOADER_PORT inside the handler.
+  bulkLoaderBase?: string;
+  // Wave 7.0.6.13 — fetch override for the bulk-loader producer. Tests inject
+  // a stub so they can drive /ingest/bulk/start without standing up a real
+  // bulk-loader.
+  ingestFetchImpl?: typeof fetch;
 }
 
 // Wave 5.16g — parse the ALLOWED_ORIGINS env-var pattern used by the demo
@@ -342,6 +350,14 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
     cancelDrainMs: opts.generatorCancelDrainMs,
   });
   registerAdminRoutes(app, getRedis, { schema: opts.schema });
+
+  // Wave 7.0.6.13 — bulk-loader fast-path ingest route. Drives the
+  // bulk-loader (POST :8086/load/rows) from the UI's "Start ingest" button so
+  // the demo bypasses the latency-bound stream consumer.
+  registerIngestRoutes(app, opts.schema, {
+    bulkLoaderBase: opts.bulkLoaderBase,
+    fetchImpl: opts.ingestFetchImpl,
+  });
 
   // Wave 5.16t — auto-bootstrap on every active-target change. The hook is
   // registered before the connections store so the very first profile-switch

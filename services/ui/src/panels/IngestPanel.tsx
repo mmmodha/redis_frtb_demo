@@ -15,6 +15,8 @@ import {
 import {
   stopAllRuns,
   flushDb,
+  getBulkIngestRun,
+  getBulkLoadStatus,
   getGeneratorRunStatus,
   getIndexCount,
   getIngestShards,
@@ -24,7 +26,10 @@ import {
   rebuildIndexes,
   resetIngestShards,
   setIngestShards,
+  startBulkIngest,
   startIngest,
+  type BulkIngestRunStatus,
+  type BulkLoadStatus,
   type GeneratorConfig,
   type PreflightResponse,
   type Source,
@@ -397,6 +402,17 @@ export function IngestPanel() {
   const [presetError, setPresetError] = useState<string | null>(null);
   const [presetInflight, setPresetInflight] = useState<boolean>(false);
   const [advancedOpen, setAdvancedOpen] = useState<boolean>(false);
+  // Wave 7.0.6.13 — ingest mode toggle. "bulk-loader" (default) drives
+  // POST /ingest/bulk/start → bulk-loader fast path; "stream" preserves the
+  // legacy /generator/start XADD path for replay tests.
+  const [ingestMode, setIngestMode] = useState<"bulk-loader" | "stream">("bulk-loader");
+  // Wave 7.0.6.13 — bulk-run state. `bulkRun` is the most recent
+  // /ingest/bulk/runs/:id response; `bulkLoad` is the most recent
+  // /ingest/bulk/load-status snapshot. Both refresh on the 1s telemetry tick
+  // while a bulk run is active.
+  const [bulkRun, setBulkRun] = useState<BulkIngestRunStatus | null>(null);
+  const [bulkLoad, setBulkLoad] = useState<BulkLoadStatus | null>(null);
+  const [bulkRunId, setBulkRunId] = useState<string | null>(null);
   // Wave 6.12b — ingest fan-out card state. `ingestShards` mirrors the most
   // recent GET /ingest/shards; `producerDial` is the resolved
   // dials.stream_shards from the active run (when one exists). Both are
@@ -658,6 +674,31 @@ export function IngestPanel() {
         return;
       }
       if (rebuilt) setPresetStep("Indexes repaired.");
+      // Wave 7.0.6.13 — bulk-loader mode bypasses /ingest/shards (the
+      // consumer is not in the write path) and posts straight to
+      // /ingest/bulk/start. Stream mode keeps the existing fan-out align +
+      // startRun handoff so the legacy /generator/start path still works
+      // when the operator explicitly selects it.
+      if (ingestMode === "bulk-loader") {
+        setPresetStep(`Starting ${p.label} bulk-loader run…`);
+        const start = await startBulkIngest({ rows: p.rows });
+        setBulkRunId(start.run_id);
+        setBulkRun({
+          run_id: start.run_id,
+          status: "running",
+          rows_total: start.rows_total,
+          rows_sent: 0,
+          rows_skipped: 0,
+          batch_size: start.batch_size,
+          concurrency: start.concurrency,
+          ms: 0,
+          started_at_iso: start.started_at_iso,
+          bulk_loader_base: start.bulk_loader_base,
+          rows_per_sec: 0,
+        });
+        setPresetStep(null);
+        return;
+      }
       setPresetStep(`Aligning consumer to ${p.shards} shard${p.shards === 1 ? "" : "s"}…`);
       const snap = await setIngestShards(p.shards);
       setIngestShardsState(snap.totalShards);
@@ -675,12 +716,58 @@ export function IngestPanel() {
     }
   }
 
+  // Wave 7.0.6.13 — poll /ingest/bulk/runs/:id + /ingest/bulk/load-status
+  // every 1s while a bulk run is active (and for ~3s after it terminates so
+  // the operator sees the final flushed counter). The polls stop when the
+  // run reaches a terminal status AND the bulk-loader dispatcher has drained
+  // its in-flight queue.
+  useEffect(() => {
+    if (!bulkRunId) return;
+    let cancelled = false;
+    let terminalSince: number | null = null;
+    const tick = async (): Promise<void> => {
+      try {
+        const [r, s] = await Promise.all([
+          getBulkIngestRun(bulkRunId),
+          getBulkLoadStatus().catch(() => null),
+        ]);
+        if (cancelled) return;
+        if (r) setBulkRun(r);
+        if (s) setBulkLoad(s);
+        const terminal = r && (r.status === "done" || r.status === "error");
+        const drained = !s?.dispatcher || s.dispatcher.in_flight === 0;
+        if (terminal && drained) {
+          if (terminalSince === null) terminalSince = Date.now();
+          if (Date.now() - terminalSince >= 3_000) return;
+        } else {
+          terminalSince = null;
+        }
+        if (!cancelled) timer = window.setTimeout(() => { void tick(); }, POLL_MS);
+      } catch {
+        if (!cancelled) timer = window.setTimeout(() => { void tick(); }, POLL_MS);
+      }
+    };
+    let timer: number = window.setTimeout(() => { void tick(); }, 0);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [bulkRunId]);
+
+  function onCancelBulkRun(): void {
+    // Bulk runs are server-driven; the operator's "stop" today is the
+    // observe-and-wait path. Clear the tracked id so the polling effect
+    // tears down; the producer either finishes naturally or surfaces an
+    // error on its next /ingest/bulk/runs poll.
+    setBulkRunId(null);
+  }
+
   // Wave 6.17 — Start stays disabled while any step is in flight: the
   // orchestrator's own pre-startRun window, plus the entire tracked-run
   // lifetime ("running" + "cancelling"). Once the run hits a terminal
   // status the button re-enables for the next preset selection.
+  // Wave 7.0.6.13 — bulk-loader runs also gate Start until the tracked bulk
+  // run reaches a terminal status (so back-to-back clicks don't stack).
   const presetRunInflight = trackedRun?.status === "running" || trackedRun?.status === "cancelling";
-  const presetStartDisabled = presetInflight || presetRunInflight;
+  const bulkRunInflight = bulkRun?.status === "running";
+  const presetStartDisabled = presetInflight || presetRunInflight || bulkRunInflight;
 
   // Wave 6.12b — Apply handler for the ingest fan-out card. POST returns
   // the new snapshot synchronously, so the displayed value updates straight
@@ -793,6 +880,11 @@ export function IngestPanel() {
         error={presetError}
         trackedRun={trackedRun}
         onCancelRun={cancelRun}
+        ingestMode={ingestMode}
+        onModeChange={setIngestMode}
+        bulkRun={bulkRun}
+        bulkLoad={bulkLoad}
+        onCancelBulkRun={onCancelBulkRun}
       />
 
       <button
@@ -989,10 +1081,19 @@ function RunPresetCard(props: {
   // the bar that already renders inside the Advanced disclosure.
   trackedRun: GeneratorRunState | null;
   onCancelRun: () => void;
+  // Wave 7.0.6.13 — ingest mode selector + bulk-loader run status. Default
+  // mode is "bulk-loader" (POST /ingest/bulk/start). "stream" preserves the
+  // legacy /generator/start XADD path for replay tests.
+  ingestMode: "bulk-loader" | "stream";
+  onModeChange: (m: "bulk-loader" | "stream") => void;
+  bulkRun: BulkIngestRunStatus | null;
+  bulkLoad: BulkLoadStatus | null;
+  onCancelBulkRun: () => void;
 }) {
-  const { presetKey, onSelect, onStart, startDisabled, inflight, runStatus, step, error, trackedRun, onCancelRun } = props;
+  const { presetKey, onSelect, onStart, startDisabled, inflight, runStatus, step, error, trackedRun, onCancelRun, ingestMode, onModeChange, bulkRun, bulkLoad, onCancelBulkRun } = props;
   const showProgress = trackedRun !== null
     && (trackedRun.status === "running" || trackedRun.status === "cancelling");
+  const showBulkProgress = bulkRun !== null;
   const selected = RUN_PRESETS[presetKey];
   // Button label tracks the high-level state: idle / pre-run automation /
   // run in flight / cancelling / done. Idle text names the staged preset so
@@ -1003,7 +1104,9 @@ function RunPresetCard(props: {
       ? "Generating…"
       : runStatus === "cancelling"
         ? "Cancelling…"
-        : `Start ${selected.label}`;
+        : bulkRun?.status === "running"
+          ? "Loading…"
+          : `Start ${selected.label}`;
   return (
     <PanelCard title="Run preset">
       <div
@@ -1038,6 +1141,18 @@ function RunPresetCard(props: {
         })}
       </div>
       <div className="ingest-presets__actions">
+        <label className="ingest-presets__mode" data-testid="ingest-mode-label">
+          <span className="ingest-presets__mode-label">Mode:</span>
+          <select
+            value={ingestMode}
+            disabled={startDisabled}
+            onChange={(e) => onModeChange(e.target.value as "bulk-loader" | "stream")}
+            data-testid="ingest-mode-select"
+          >
+            <option value="bulk-loader">Bulk-loader (fast)</option>
+            <option value="stream">Stream (legacy)</option>
+          </select>
+        </label>
         <button
           type="button"
           className="btn btn--primary"
@@ -1070,8 +1185,50 @@ function RunPresetCard(props: {
       {showProgress ? (
         <GeneratorProgress run={trackedRun!} onCancel={onCancelRun} />
       ) : null}
+      {showBulkProgress ? (
+        <BulkIngestProgress run={bulkRun!} load={bulkLoad} onCancel={onCancelBulkRun} />
+      ) : null}
       <IndexingProgress />
     </PanelCard>
+  );
+}
+
+// Wave 7.0.6.13 — bulk-loader run progress strip. Mirrors the look of
+// GeneratorProgress but reads from /ingest/bulk/runs/:id (producer-side
+// rows_sent + rps) and /load/status (dispatcher flushed / in_flight). The
+// "queued" tile is the bulk-loader worker queue total — distinct from the
+// producer's in-flight POST window and useful for spotting backpressure.
+function BulkIngestProgress(props: {
+  run: BulkIngestRunStatus;
+  load: BulkLoadStatus | null;
+  onCancel: () => void;
+}) {
+  const { run, load } = props;
+  const total = run.rows_total;
+  const sent = run.rows_sent;
+  const pct = total > 0 ? Math.min(100, (sent / total) * 100) : 0;
+  const flushed = (load?.workers ?? []).reduce((acc, w) => acc + (w.flushed ?? 0), 0);
+  const queued = (load?.workers ?? []).reduce((acc, w) => acc + (w.queued ?? 0), 0);
+  const inFlight = load?.dispatcher?.in_flight ?? 0;
+  const elapsedSec = run.ms / 1000;
+  const indexRps = run.rows_per_sec || (elapsedSec > 0 ? Math.round(sent / elapsedSec) : 0);
+  return (
+    <div className="bulk-progress" data-testid="bulk-progress">
+      <div className="bulk-progress__bar" role="progressbar" aria-valuenow={Math.round(pct)} aria-valuemin={0} aria-valuemax={100}>
+        <div className="bulk-progress__fill" style={{ width: `${pct}%` }} />
+      </div>
+      <div className="bulk-progress__metrics">
+        <span data-testid="bulk-progress-sent"><strong>{fmtInt(sent)}</strong> / {fmtInt(total)} sent</span>
+        <span data-testid="bulk-progress-flushed"><strong>{fmtInt(flushed)}</strong> flushed</span>
+        <span data-testid="bulk-progress-queued"><strong>{fmtInt(queued)}</strong> queued</span>
+        <span data-testid="bulk-progress-inflight"><strong>{fmtInt(inFlight)}</strong> in flight</span>
+        <span data-testid="bulk-progress-rps"><strong>{fmtInt(indexRps)}</strong> rows/s</span>
+        <span data-testid="bulk-progress-status">status: {run.status}</span>
+      </div>
+      {run.error ? (
+        <div className="bulk-progress__error" role="alert" data-testid="bulk-progress-error">{run.error}</div>
+      ) : null}
+    </div>
   );
 }
 

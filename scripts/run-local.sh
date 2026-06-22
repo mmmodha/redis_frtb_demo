@@ -448,18 +448,22 @@ apply_defaults() {
     CONN_STORE_KEY="dev-only-change-in-prod"
   fi
   : "${SCHEMA_FILE:=${REPO_ROOT}/config/schema/frtb-default.yaml}"
-  # Wave 7.0.6.12 — local dev runs ingest in live-tail mode by default. The
-  # legacy Phase 2 paths (rollup HINCRBYFLOATs, sens-type SADD, processed-
-  # marker SET) and the Phase 3 seen-set SADDs are gated off; the bulk
-  # loader's tag-free finalisation step owns those keys post-load. Without
-  # this, every UI ingest tick fails with `EXECABORT Transaction discarded`
-  # on the local single-node Redis (CROSSSLOT / WRONGTYPE-style failures
-  # leak through the multi). Set LIVE_TAIL_MODE=false in .env.local to
-  # exercise the legacy path locally.
+  # Wave 7 trio — the bulk-loader fast path (UI "Start ingest" in 7.0.6.13)
+  # writes SLIM rows (raw NUMERIC s_<class>_<leg>[_<tenor>]), so calc must
+  # weight on read (CALC_LAZY_MATH=1) and bootstrap must materialise the
+  # parallel slim index alongside the fat one (ENABLE_SLIM_SENS_INDEX=1).
+  # Bootstrap refuses CALC_LAZY_MATH=1 without ENABLE_SLIM_SENS_INDEX=1
+  # (LazyMathRequiresSlimIndexError, services/api/src/bootstrap.ts) — these
+  # three defaults must move together. LIVE_TAIL_MODE=true keeps the
+  # stream-consumer in sens-only mode (legacy Phase 2/3 paths gated off so
+  # the multi/exec doesn't EXECABORT on a single-node Redis). All three
+  # respect .env.local overrides via `:=`.
   : "${LIVE_TAIL_MODE:=true}"
+  : "${CALC_LAZY_MATH:=1}"
+  : "${ENABLE_SLIM_SENS_INDEX:=1}"
   export NODE_ENV LOG_LEVEL API_URL ALLOWED_ORIGINS INTERNAL_API_TOKEN
   export SOURCE_BASE CONN_STORE_KEY SCHEMA_FILE
-  export LIVE_TAIL_MODE
+  export LIVE_TAIL_MODE CALC_LAZY_MATH ENABLE_SLIM_SENS_INDEX
 }
 
 

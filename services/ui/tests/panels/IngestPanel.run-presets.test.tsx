@@ -133,6 +133,14 @@ function findCall(fetchMock: ReturnType<typeof vi.fn>, urlMatcher: RegExp, metho
   );
 }
 
+// Wave 7.0.6.13 — these legacy-stream tests target the /generator/start/stream
+// XADD path. The IngestPanel default mode flipped to "bulk-loader" in 7.0.6.13,
+// so each test that asserts the stream-path orchestrator must first flip the
+// Mode dropdown to "stream" before clicking Start.
+function selectStreamMode() {
+  fireEvent.change(screen.getByTestId("ingest-mode-select"), { target: { value: "stream" } });
+}
+
 describe("IngestPanel — Wave 6.17 presets-only run", () => {
   beforeEach(() => { /* no fake timers — orchestrator is fully promise-driven */ });
   afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
@@ -198,6 +206,7 @@ describe("IngestPanel — Wave 6.17 presets-only run", () => {
     const fetchMock = mockFetch();
     renderPanel();
     await screen.findByTestId("ingest-preset-start-btn");
+    selectStreamMode();
     fireEvent.click(screen.getByTestId("ingest-preset-start-btn"));
     await waitFor(() => {
       expect(findCall(fetchMock, /\/generator\/start\/stream$/, "POST")).toBeDefined();
@@ -224,6 +233,7 @@ describe("IngestPanel — Wave 6.17 presets-only run", () => {
     const fetchMock = mockFetch();
     renderPanel();
     await screen.findByTestId("ingest-preset-start-btn");
+    selectStreamMode();
     fireEvent.click(screen.getByTestId("ingest-preset-large"));
     fireEvent.click(screen.getByTestId("ingest-preset-start-btn"));
     await waitFor(() => {
@@ -242,6 +252,7 @@ describe("IngestPanel — Wave 6.17 presets-only run", () => {
     const fetchMock = mockFetch();
     renderPanel();
     await screen.findByTestId("ingest-preset-start-btn");
+    selectStreamMode();
     fireEvent.click(screen.getByTestId("ingest-preset-overnight"));
     fireEvent.click(screen.getByTestId("ingest-preset-start-btn"));
     await waitFor(() => {
@@ -257,6 +268,7 @@ describe("IngestPanel — Wave 6.17 presets-only run", () => {
     const fetchMock = mockFetch({ initialState: "fail", rebuildHeals: true });
     renderPanel();
     await screen.findByTestId("ingest-preset-start-btn");
+    selectStreamMode();
     fireEvent.click(screen.getByTestId("ingest-preset-start-btn"));
     await waitFor(() => {
       expect(findCall(fetchMock, /\/admin\/rebuild-indexes$/, "POST")).toBeDefined();
@@ -285,6 +297,7 @@ describe("IngestPanel — Wave 6.17 presets-only run", () => {
     renderPanel();
     const start = await screen.findByTestId("ingest-preset-start-btn") as HTMLButtonElement;
     expect(start.disabled).toBe(false);
+    selectStreamMode();
     fireEvent.click(start);
     // Immediately after click, the button is disabled.
     expect(start.disabled).toBe(true);
@@ -314,6 +327,7 @@ describe("IngestPanel — Wave 6.17 presets-only run", () => {
     const fetchMock = mockFetch({ shardsPostStatus: 409, shardsPostError: "rebuild already in progress" });
     renderPanel();
     await screen.findByTestId("ingest-preset-start-btn");
+    selectStreamMode();
     fireEvent.click(screen.getByTestId("ingest-preset-start-btn"));
     const err = await screen.findByTestId("ingest-preset-error");
     expect(err.textContent).toMatch(/409/);
@@ -404,7 +418,9 @@ describe("IngestPanel — Wave 6.17 presets-only run", () => {
       terminalFrame: { run_id: "01HXRUN", rows_done: 5, rows_total: 100, elapsed_ms: 10, rows_per_sec: 100 },
     });
     renderPanel();
-    fireEvent.click(await screen.findByTestId("ingest-preset-start-btn"));
+    await screen.findByTestId("ingest-preset-start-btn");
+    selectStreamMode();
+    fireEvent.click(screen.getByTestId("ingest-preset-start-btn"));
     const bar = await screen.findByTestId("generator-progress");
     expect(bar).toBeInTheDocument();
     // The Advanced disclosure must remain collapsed — the bar is on the

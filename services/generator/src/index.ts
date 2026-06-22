@@ -18,6 +18,16 @@ export {
   type StreamProducerFlowControl,
 } from "./producer.ts";
 
+// Wave 7.0.6.13 — bulk-loader HTTP producer. Re-exported so the api's
+// /ingest/bulk/start route can drive the bulk-loader fast path without
+// duplicating batching/backpressure logic the CLI already owns.
+export {
+  createHttpProducer,
+  toBulkRow,
+  type HttpProducer,
+  type HttpProducerOptions,
+} from "./http-producer.ts";
+
 // Wave 6.39.A — direct-write backend. Bypasses the Redis Stream and writes
 // HSET + pre-aggregated HINCRBYFLOAT + SADD directly. Same `add/flush/close`
 // surface as StreamProducer so the shared row-loop drives either backend.

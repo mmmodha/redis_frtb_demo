@@ -111,6 +111,98 @@ export async function startIngest(sourceId: string): Promise<IngestRunResponse> 
   return (await res.json()) as IngestRunResponse;
 }
 
+// Wave 7.0.6.13 — bulk-loader fast-path client. Drives POST /ingest/bulk/start
+// on the api, which generates rows and forwards batches to the bulk-loader's
+// /load/rows endpoint. Default batch_size=500 / concurrency=32 mirror the
+// values that produced 70k rows/s in the diagnose-ingest probe.
+export interface BulkIngestConfig {
+  rows: number;
+  batch_size?: number;
+  concurrency?: number;
+  classes?: string[];
+  sensitivity_types?: string[];
+  seed?: string | number;
+  trade_pool_size?: number;
+  factor_pool_size?: number;
+}
+
+export interface BulkIngestStartResponse {
+  ok: boolean;
+  run_id: string;
+  rows_total: number;
+  batch_size: number;
+  concurrency: number;
+  bulk_loader_base: string;
+  started_at_iso: string;
+}
+
+export interface BulkIngestRunStatus {
+  run_id: string;
+  status: "running" | "done" | "error";
+  rows_total: number;
+  rows_sent: number;
+  rows_skipped: number;
+  batch_size: number;
+  concurrency: number;
+  ms: number;
+  started_at_iso: string;
+  bulk_loader_base: string;
+  rows_per_sec: number;
+  error?: string;
+}
+
+// Per-worker entry surfaced by the bulk-loader's /load/status. The UI reads
+// flushed / queued / errors aggregates for the headline counters; the rest
+// is forwarded verbatim so a future card can show per-shard breakdowns.
+export interface BulkLoadStatusWorker {
+  id: number;
+  queued: number | null;
+  flushed: number | null;
+  errors: number | null;
+  retries: number | null;
+  dead_lettered: number | null;
+  last_flush_latency_ms: number | null;
+  [k: string]: unknown;
+}
+
+export interface BulkLoadStatus {
+  pool_size: number;
+  connected: number;
+  dispatcher: { in_flight: number; high_water: number } | null;
+  body_drain_errors: number;
+  workers: BulkLoadStatusWorker[];
+}
+
+export async function startBulkIngest(config: BulkIngestConfig): Promise<BulkIngestStartResponse> {
+  const res = await fetch(`${apiBase()}/ingest/bulk/start`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(config),
+  });
+  if (!res.ok) {
+    let detail = `${res.status}`;
+    try {
+      const err = (await res.json()) as { error?: string };
+      if (err?.error) detail = `${res.status}: ${err.error}`;
+    } catch { /* not json */ }
+    throw new Error(`api /ingest/bulk/start ${detail}`);
+  }
+  return (await res.json()) as BulkIngestStartResponse;
+}
+
+export async function getBulkIngestRun(runId: string): Promise<BulkIngestRunStatus | null> {
+  const res = await fetch(`${apiBase()}/ingest/bulk/runs/${encodeURIComponent(runId)}`);
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`api /ingest/bulk/runs/${runId} ${res.status}`);
+  return (await res.json()) as BulkIngestRunStatus;
+}
+
+export async function getBulkLoadStatus(): Promise<BulkLoadStatus> {
+  const res = await fetch(`${apiBase()}/ingest/bulk/load-status`);
+  if (!res.ok) throw new Error(`api /ingest/bulk/load-status ${res.status}`);
+  return (await res.json()) as BulkLoadStatus;
+}
+
 export async function startGenerator(config?: GeneratorConfig): Promise<GeneratorStartResponse> {
   const body = config ? JSON.stringify(config) : "{}";
   const res = await fetch(`${apiBase()}/generator/start`, {
