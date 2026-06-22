@@ -351,6 +351,12 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
   // entries from the previous target don't leak into /admin/drift-status
   // after a profile switch (the rc:bucket keys refer to data that doesn't
   // exist on the new target).
+  // Wave 7.0.6.10 — pass `force: true` so re-activating the SAME profile
+  // (idempotent UI click, or a restart that auto-activates the persisted
+  // target) deterministically re-verifies the index instead of short-
+  // circuiting on a stale `phase=ready` snapshot. The runner's own
+  // schema-hash + FT.INFO probe keeps the no-op case cheap (`bootstrap-skip`
+  // log, single FT.INFO per master), but a wiped index now self-heals.
   onActiveTargetChange((target) => {
     clearDriftResults();
     const client = getActiveRedisClient();
@@ -359,6 +365,7 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
       // ioredis Redis|Cluster satisfies the bootstrap RedisLike surface.
       client as unknown as Parameters<typeof scheduleBootstrap>[1],
       opts.schema,
+      { force: true },
     );
   });
 
@@ -380,10 +387,15 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
         await (client as unknown as { call: (cmd: string, ...args: unknown[]) => Promise<unknown> })
           .call("DEL", schemaHashKey(target.label));
       } catch { /* DEL failure must not block self-heal scheduling */ }
+      // Wave 7.0.6.10 — force the schedule so the post-FLUSHDB self-heal
+      // can't be short-circuited by a residual `phase=ready` snapshot tied
+      // to the same target_label (triggerBootstrapSelfHeal flips ready→idle
+      // but a concurrent re-fire could land on a freshly-marked ready).
       scheduleBootstrap(
         target,
         client as unknown as Parameters<typeof scheduleBootstrap>[1],
         opts.schema,
+        { force: true },
       );
     })();
   });

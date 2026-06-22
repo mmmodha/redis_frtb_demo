@@ -181,13 +181,27 @@ export function triggerBootstrapSelfHeal(): void {
 // so rapid switch-clicks coalesce, idempotent on same-target ready, and
 // generation-gated so an in-flight earlier attempt's late resolution can't
 // overwrite a newer attempt's phase.
+//
+// Wave 7.0.6.10 — `opts.force` bypasses the same-target ready short-circuit.
+// The runner (bootstrapFrtb) still uses its own cheap FT.INFO probe to skip
+// when the schema-hash matches and the index is present on every master, so
+// re-activation against an already-healthy target is cheap (`bootstrap-skip`
+// log, ~ms per master). When the in-memory phase says `ready` but the
+// underlying index was wiped (cluster restart, manual DROPINDEX, snapshot
+// restore) `force` lets the listener path re-create the index instead of
+// silently no-op-ing on the stale snapshot.
+export interface ScheduleBootstrapOpts {
+  force?: boolean;
+}
+
 export function scheduleBootstrap(
   target: ActiveTarget,
   client: BootstrapRedis | null,
   schema: Schema | undefined,
+  opts: ScheduleBootstrapOpts = {},
 ): void {
   if (!client || !schema) return;
-  if (status.phase === "ready" && status.target_label === target.label) return;
+  if (!opts.force && status.phase === "ready" && status.target_label === target.label) return;
 
   if (debounceTimer) clearTimeout(debounceTimer);
   // Wave 5.16y — synchronously bump generation and flip to "running" so a
@@ -230,10 +244,15 @@ export function scheduleBootstrap(
         // withBootTimeout's catch, runnerSettled is already true.
         if (!runnerSettled) {
           const timeoutErr = new Error(`scheduled-bootstrap-timeout: exceeded ${ms}ms`);
-          console.log(JSON.stringify({
+          // Wave 7.0.6.10 — surface scheduled-bootstrap failures at level=error
+          // so `grep -i bootstrap .run/logs/api.log` shows the failure instead
+          // of just the structured log line. Operators chasing a missing FT
+          // index after activation rely on this surface.
+          console.error(JSON.stringify({
             service: "api",
             bootstrap: "frtb",
             action: "scheduled-bootstrap-timeout",
+            level: "error",
             target_label: target.label,
             ms,
           }));
@@ -246,6 +265,14 @@ export function scheduleBootstrap(
         // failures so the UI / operators can distinguish "rebuild this
         // node" from "the whole target is unreachable".
         if (err instanceof BootstrapPartialError) {
+          console.error(JSON.stringify({
+            service: "api",
+            bootstrap: "frtb",
+            action: "scheduled-bootstrap-partial",
+            level: "error",
+            target_label: target.label,
+            failures: err.failures,
+          }));
           markBootstrapStatusPartial(target.label, err.failures);
           // Wave 6.18k — also flip /readyz to match phase tracker
           // (mirrors index.ts:209-214: boot path calls markBootstrapFailed
@@ -254,6 +281,14 @@ export function scheduleBootstrap(
           markBootstrapFailed(err);
           return;
         }
+        console.error(JSON.stringify({
+          service: "api",
+          bootstrap: "frtb",
+          action: "scheduled-bootstrap-failed",
+          level: "error",
+          target_label: target.label,
+          err: String(err instanceof Error ? err.message : err),
+        }));
         markBootstrapStatusFailed(target.label, err);
         // Wave 6.18k — also flip /readyz to match phase tracker
         markBootstrapFailed(err);

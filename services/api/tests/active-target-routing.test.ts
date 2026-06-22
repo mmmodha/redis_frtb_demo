@@ -287,4 +287,40 @@ describe("Wave 5.16t — api routes follow active-target per-request", () => {
 
     expect(getBootstrapStatus().phase).toBe("ready");
   });
+
+  // Wave 7.0.6.10 — re-activating the SAME profile (idempotent UI click, or
+  // post-restart auto-activate of the persisted target) must still drive a
+  // runner invocation instead of short-circuiting on the residual
+  // `phase=ready` snapshot. Without this the cluster can sit on an empty
+  // FT._LIST after activation: boot bootstrap marked ready, the user re-
+  // activates, scheduleBootstrap no-ops, and the index stays missing if it
+  // was wiped out-of-band (cluster restart, manual DROPINDEX, snapshot).
+  // The fix wires `force: true` into the onActiveTargetChange listener;
+  // the runner's own FT.INFO+schema-hash skip keeps the no-op case cheap.
+  it("re-activating the same target re-fires bootstrap (force-on-activate)", async () => {
+    setDebounceMsForTests(5);
+    let runnerCalls = 0;
+    setBootstrapRunnerForTests(() => {
+      runnerCalls += 1;
+      return Promise.resolve();
+    });
+
+    const fakeSchema = { risk_classes: [] } as unknown as Parameters<typeof createServer>[0]["schema"];
+    app = await createServer({ redis: fakeRedis(), schema: fakeSchema });
+
+    setActiveTarget(TARGET_A);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(runnerCalls).toBe(1);
+    expect(getBootstrapStatus().phase).toBe("ready");
+    expect(getBootstrapStatus().target_label).toBe("target-A");
+
+    // Re-activate the SAME target — listener must drive a second runner call
+    // (force=true bypasses the ready/same-label short-circuit).
+    setActiveTarget(TARGET_A);
+    expect(getBootstrapStatus().phase).toBe("running");
+    expect(getBootstrapStatus().target_label).toBe("target-A");
+    await new Promise((r) => setTimeout(r, 30));
+    expect(runnerCalls).toBe(2);
+    expect(getBootstrapStatus().phase).toBe("ready");
+  });
 });
