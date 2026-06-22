@@ -18,7 +18,7 @@
 // that previously blocked every restart on a large index.
 
 import type { Cluster, Redis } from "ioredis";
-import { buildCreateArgs } from "@frtb/rqe";
+import { buildCreateArgs, buildSlimCreateArgs } from "@frtb/rqe";
 import type { Schema } from "@frtb/schema";
 import { computeSchemaHash } from "./lib/schema-hash.ts";
 import {
@@ -30,6 +30,7 @@ import {
   parseFtInfoAttributes,
   schemaHashKey,
   versionedIndexName,
+  versionedSlimIndexName,
 } from "./lib/sens-index.ts";
 import {
   loadFrtbLibrary,
@@ -251,6 +252,59 @@ async function probeDocCountStrict(client: RedisLike, indexName: string): Promis
     throw err;
   }
   return parseDocCount(reply);
+}
+
+// Wave 7.0.2.A — env-gated slim index ensure. Runs per-master FT.CREATE for
+// `idx:sens:slim:v<hash7>`, tolerating "already exists" so re-boots are no-ops
+// and the same boot client reaching multiple masters does not trip. Slim
+// failures are logged but NEVER added to the per-node `indexFailed` bag —
+// the fat index remains the authoritative path until Wave 7.0.2.B flips calc
+// over, so a slim FT.CREATE failure must not block boot.
+function readSlimEnabled(): boolean {
+  const raw = (process.env.ENABLE_SLIM_SENS_INDEX ?? "").trim();
+  return raw === "1" || raw.toLowerCase() === "true";
+}
+
+async function runSlimIndexEnsure(
+  nodes: RedisLike[],
+  schema: Schema,
+  slimIndexName: string,
+  log: (entry: Record<string, unknown>) => void,
+): Promise<void> {
+  const createArgs = buildSlimCreateArgs(schema);
+  // First positional from buildSlimCreateArgs is the base slim name; replace
+  // with the versioned name so the index lands under `idx:sens:slim:v{hash7}`.
+  createArgs[0] = slimIndexName;
+  let okCount = 0;
+  for (let i = 0; i < nodes.length; i++) {
+    const node = nodes[i]!;
+    try {
+      await node.call("FT.CREATE", ...createArgs);
+      okCount += 1;
+    } catch (err) {
+      const msg = String(err instanceof Error ? err.message : err).toLowerCase();
+      if (msg.includes("already exists")) {
+        okCount += 1;
+        continue;
+      }
+      log({
+        service: "api",
+        bootstrap: "idx:sens:slim",
+        action: "create-failed",
+        level: "warn",
+        node_id: `node-${i}`,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  log({
+    service: "api",
+    bootstrap: "idx:sens:slim",
+    action: "ensured",
+    index: slimIndexName,
+    nodes: nodes.length,
+    ok: okCount,
+  });
 }
 
 async function runIndexRebuild(
@@ -621,6 +675,18 @@ export async function bootstrapFrtb(
     indexFailed.push(...await runIndexRebuild(nodes, schema, BASE_INDEX_NAME, BASE_INDEX_NAME));
     log({ service: "api", bootstrap: "idx:sens", action: "created", nodes: nodes.length });
   }
+
+  // Wave 7.0.2.A — ensure the slim variant alongside the fat index when
+  // ENABLE_SLIM_SENS_INDEX is set. Runs on both warm and cold boots (placed
+  // before the skipped early-return) so a previously-cold cluster picks up
+  // the slim index on first restart with the flag enabled. Idempotent
+  // FT.CREATE per master; failures are logged and tolerated — calc still
+  // reads through the fat index until Wave 7.0.2.B flips it over.
+  if (readSlimEnabled()) {
+    const slimIndexName = versionedSlimIndexName(newHash);
+    await runSlimIndexEnsure(nodes, schema, slimIndexName, log);
+  }
+
   if (skipped) {
     // Wave 6.18i — fast path: schema unchanged + index present on every
     // master. Skip Steps 2-4 because the frtb library and suggesters are

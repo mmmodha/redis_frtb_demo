@@ -45,3 +45,17 @@ export function ensureSensIndex(
   schema?: SensIndexSchemaInput,
 ): Promise<EnsureResult>;
 export function dropSensIndex(client: RqeRedisLike): Promise<DropResult>;
+
+// Wave 7.0.2.A — slim variant exports. Same shapes as the fat helpers; the
+// slim schema drops the unused trader/_calibration TAGs and replaces the
+// pre-weighted ws_* NUMERIC SORTABLE set with the raw s_* set the lazy-math
+// fast path multiplies by weight at query time.
+export const IDX_NAME_SLIM: string;
+export const IDX_SLIM_SCHEMA_FIELDS: ReadonlyArray<SensIndexField>;
+export function buildSlimSchemaFields(schema?: SensIndexSchemaInput): SensIndexField[];
+export function buildSlimCreateArgs(schema?: SensIndexSchemaInput): string[];
+export function ensureSlimSensIndex(
+  client: RqeRedisLike,
+  schema?: SensIndexSchemaInput,
+): Promise<EnsureResult>;
+export function dropSlimSensIndex(client: RqeRedisLike): Promise<DropResult>;

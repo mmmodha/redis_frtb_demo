@@ -29,6 +29,15 @@ export function versionedIndexName(hash: string): string {
   return `${BASE_INDEX_NAME}:v${hash.slice(0, HASH_PREFIX_LEN)}`;
 }
 
+// Wave 7.0.2.A — slim RediSearch variant lives alongside the fat idx:sens
+// during the lazy-math migration. Same 7-hex schema-hash suffix as the fat
+// index so a writer/reader hash skew is impossible by construction.
+export const BASE_SLIM_INDEX_NAME = "idx:sens:slim";
+
+export function versionedSlimIndexName(hash: string): string {
+  return `${BASE_SLIM_INDEX_NAME}:v${hash.slice(0, HASH_PREFIX_LEN)}`;
+}
+
 export function schemaHashKey(target_label: string): string {
   return `bootstrap:schema-hash:${target_label}`;
 }

@@ -212,3 +212,109 @@ export async function dropSensIndex(client) {
     throw err;
   }
 }
+
+// Wave 7.0.2.A — slim RediSearch schema variant. Lives alongside the fat
+// `idx:sens` during the lazy-math migration. Two differences from the fat
+// schema:
+//   1. Drops `trader` and `_calibration` TAGs — Phase 0 audit (Wave 7.0.0.A)
+//      confirmed zero read sites in calc/api. Kept TAGs: risk_class, bucket,
+//      sensitivity_type, book, trade_id, risk_factor, desk.
+//   2. Indexes the RAW per-class/per-leg sensitivity values as `s_<class>_
+//      <leg>[_<tenor>]` NUMERIC SORTABLE fields instead of the pre-weighted
+//      `ws_*` set. The lazy-math fast path (Wave 7.0.2.B) APPLYs `@s_field *
+//      <weight>` at query time so weight changes do not require a re-write.
+// Prefix and FILTER mirror `idx:sens` because both indices read the same
+// underlying `sens:<ulid>` / `sensh:<ulid>` HASH docs — the slim writer
+// (Wave 7.0.1.B) flattens the additional `s_*` fields onto each row.
+export const IDX_NAME_SLIM = "idx:sens:slim";
+
+export const IDX_SLIM_SCHEMA_FIELDS = Object.freeze([
+  { path: "risk_class", as: "risk_class", type: "TAG" },
+  { path: "bucket", as: "bucket", type: "TAG" },
+  { path: "sensitivity_type", as: "sensitivity_type", type: "TAG" },
+  { path: "book", as: "book", type: "TAG" },
+  { path: "trade_id", as: "trade_id", type: "TAG" },
+  { path: "risk_factor", as: "risk_factor", type: "TAG" },
+  { path: "desk", as: "desk", type: "TAG" },
+]);
+
+function rawTenorHashField(classLower, leg, tenor) {
+  return `s_${classLower}_${leg}_${tenor}`;
+}
+
+// buildSlimSchemaFields — full ordered field list for slim FT.CREATE. Returns
+// the slim TAG base plus dynamic per-class per-tenor (or scalar) raw NUMERIC
+// SORTABLE fields derived from the schema. Mirrors buildSchemaFields'
+// iteration shape so the per-tenor / scalar split stays in lockstep with the
+// fat index. Pass no schema to get just the TAG base.
+export function buildSlimSchemaFields(schema) {
+  const out = IDX_SLIM_SCHEMA_FIELDS.slice();
+  const riskClasses = schema && schema.risk_classes ? schema.risk_classes : null;
+  if (!riskClasses) return out;
+  for (const className of Object.keys(riskClasses)) {
+    const cfg = riskClasses[className];
+    if (!cfg) continue;
+    const classLower = className.toLowerCase();
+    const tenorNodes = cfg.tenor && Array.isArray(cfg.tenor.nodes) ? cfg.tenor.nodes : [];
+    const isPerTenor = PER_TENOR_CLASSES.includes(className) && tenorNodes.length > 0;
+    for (const { leg } of WS_LEGS) {
+      if (isPerTenor) {
+        for (const tenor of tenorNodes) {
+          const name = rawTenorHashField(classLower, leg, tenor);
+          out.push({ path: name, as: name, type: "NUMERIC", sortable: true });
+        }
+      } else {
+        const name = `s_${classLower}_${leg}`;
+        out.push({ path: name, as: name, type: "NUMERIC", sortable: true });
+      }
+    }
+  }
+  return out;
+}
+
+export function buildSlimCreateArgs(schema) {
+  const args = [
+    IDX_NAME_SLIM,
+    "ON", "HASH",
+    "PREFIX", "2", IDX_PREFIX, IDX_SHADOW_PREFIX,
+    "FILTER", "exists(@risk_class)",
+    "SCHEMA",
+  ];
+  for (const f of buildSlimSchemaFields(schema)) {
+    args.push(f.path, "AS", f.as, f.type);
+    if (f.sortable) args.push("SORTABLE");
+  }
+  return args;
+}
+
+// ensureSlimSensIndex — idempotently create idx:sens:slim. Safe to call
+// concurrently from multiple processes; any caller that loses the race sees
+// "already exists" and returns happily.
+export async function ensureSlimSensIndex(client, schema) {
+  if (!client) throw new TypeError("ensureSlimSensIndex: redis client required");
+  const args = buildSlimCreateArgs(schema);
+  try {
+    await client.call("FT.CREATE", ...args);
+    return { created: true, name: IDX_NAME_SLIM };
+  } catch (err) {
+    if (isAlreadyExistsError(err)) {
+      return { created: false, name: IDX_NAME_SLIM };
+    }
+    throw err;
+  }
+}
+
+// dropSlimSensIndex — remove idx:sens:slim. Idempotent: dropping a missing
+// index is not an error.
+export async function dropSlimSensIndex(client) {
+  if (!client) throw new TypeError("dropSlimSensIndex: redis client required");
+  try {
+    await client.call("FT.DROPINDEX", IDX_NAME_SLIM);
+    return { dropped: true, name: IDX_NAME_SLIM };
+  } catch (err) {
+    if (isUnknownIndexError(err)) {
+      return { dropped: false, name: IDX_NAME_SLIM };
+    }
+    throw err;
+  }
+}

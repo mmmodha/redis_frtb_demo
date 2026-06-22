@@ -14,6 +14,10 @@ import {
   IDX_SCHEMA_FIELDS,
   buildCreateArgs,
   buildSchemaFields,
+  IDX_NAME_SLIM,
+  IDX_SLIM_SCHEMA_FIELDS,
+  buildSlimSchemaFields,
+  buildSlimCreateArgs,
 } from "../src/index.mjs";
 
 // Integration tests run against a real Redis with the RediSearch + RedisJSON
@@ -242,6 +246,99 @@ describe("@frtb/rqe — buildSchemaFields / buildCreateArgs (Wave 5.83A)", () =>
     }
     // 4 legs × (10 GIRR tenors + 1 Equity scalar + 1 FX scalar) = 48 dynamic
     // NUMERIC fields. Pin the count so a leg/tenor change is loud.
+    expect(numericCount).toBe(48);
+  });
+});
+
+// Wave 7.0.2.A — slim variant. Pins the slim schema shape (TAG set without
+// trader/_calibration, raw s_<class>_<leg>[_<tenor>] NUMERIC SORTABLE fields,
+// no ws_* fields) so a regression in either dimension is loud.
+describe("@frtb/rqe — slim variant (Wave 7.0.2.A)", () => {
+  const tenors = ["3M", "6M", "1Y", "2Y", "3Y", "5Y", "10Y", "15Y", "20Y", "30Y"];
+  const fakeSchema = {
+    risk_classes: {
+      GIRR: { tenor: { nodes: tenors } },
+      EQUITY: {},
+      FX: {},
+    },
+  };
+
+  it("exports the slim index name 'idx:sens:slim'", () => {
+    expect(IDX_NAME_SLIM).toBe("idx:sens:slim");
+  });
+
+  it("declares exactly 7 TAGs and drops trader/_calibration", () => {
+    const aliases = IDX_SLIM_SCHEMA_FIELDS.map((f) => f.as);
+    expect(aliases).toEqual([
+      "risk_class", "bucket", "sensitivity_type", "book", "trade_id", "risk_factor", "desk",
+    ]);
+    for (const f of IDX_SLIM_SCHEMA_FIELDS) {
+      expect(f.type).toBe("TAG");
+      // HASH layout: path == field name (no JSONPath prefix).
+      expect(f.path).toBe(f.as);
+    }
+    // The dropped TAGs MUST NOT appear on the slim base.
+    expect(aliases).not.toContain("trader");
+    expect(aliases).not.toContain("_calibration");
+  });
+
+  it("returns the slim TAG base unchanged when called with no schema", () => {
+    const fields = buildSlimSchemaFields();
+    expect(fields).toEqual([...IDX_SLIM_SCHEMA_FIELDS]);
+  });
+
+  it("emits s_girr_<leg>_<tenor> NUMERIC SORTABLE for every (leg × tenor) on GIRR", () => {
+    const fields = buildSlimSchemaFields(fakeSchema);
+    const byAlias = Object.fromEntries(fields.map((f) => [f.as, f]));
+    for (const leg of ["delta", "vega", "cvr_up", "cvr_down"]) {
+      for (const t of tenors) {
+        const alias = `s_girr_${leg}_${t}`;
+        expect(byAlias[alias], `${alias} must be declared`).toBeDefined();
+        expect(byAlias[alias].path).toBe(alias);
+        expect(byAlias[alias].type).toBe("NUMERIC");
+        expect(byAlias[alias].sortable).toBe(true);
+      }
+    }
+  });
+
+  it("emits scalar s_<class>_<leg> NUMERIC SORTABLE for Equity/FX (no tenor suffix)", () => {
+    const fields = buildSlimSchemaFields(fakeSchema);
+    const byAlias = Object.fromEntries(fields.map((f) => [f.as, f]));
+    for (const klass of ["equity", "fx"]) {
+      for (const leg of ["delta", "vega", "cvr_up", "cvr_down"]) {
+        const alias = `s_${klass}_${leg}`;
+        expect(byAlias[alias], `${alias} must be declared`).toBeDefined();
+        expect(byAlias[alias].path).toBe(alias);
+        expect(byAlias[alias].type).toBe("NUMERIC");
+        expect(byAlias[alias].sortable).toBe(true);
+        expect(byAlias[`${alias}_3M`]).toBeUndefined();
+      }
+    }
+  });
+
+  it("declares NO ws_* fields on the slim index (lazy-math multiplies at query time)", () => {
+    const fields = buildSlimSchemaFields(fakeSchema);
+    for (const f of fields) {
+      expect(f.as.startsWith("ws_"), `slim must not declare ws_* field "${f.as}"`).toBe(false);
+      expect(f.path.startsWith("ws_"), `slim must not declare ws_* path "${f.path}"`).toBe(false);
+    }
+  });
+
+  it("buildSlimCreateArgs(schema) emits the locked FT.CREATE head and SORTABLE after every NUMERIC", () => {
+    const args = buildSlimCreateArgs(fakeSchema);
+    expect(args.slice(0, 10)).toEqual([
+      IDX_NAME_SLIM, "ON", "HASH", "PREFIX", "2", IDX_PREFIX, "sensh:",
+      "FILTER", "exists(@risk_class)", "SCHEMA",
+    ]);
+    let numericCount = 0;
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] === "NUMERIC") {
+        numericCount += 1;
+        expect(args[i + 1], `NUMERIC at arg ${i} must be followed by SORTABLE`).toBe("SORTABLE");
+      }
+    }
+    // Same shape arithmetic as the fat index: 4 legs × (10 GIRR tenors + 1
+    // Equity scalar + 1 FX scalar) = 48 raw NUMERIC fields.
     expect(numericCount).toBe(48);
   });
 });
