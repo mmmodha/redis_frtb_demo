@@ -295,6 +295,146 @@ export async function readShards(
   }
 }
 
+// Wave 7.0.4.A — Per-shard observability endpoint backed by an operator-side
+// `rladmin info shards` snapshot written to the Redis key
+// `ops:per-shard-snapshot` by scripts/capture-shard-snapshot.sh. The API
+// service never SSHes into the cluster — it only reads the snapshot key.
+const PER_SHARD_SNAPSHOT_KEY = "ops:per-shard-snapshot";
+const PER_SHARD_STALENESS_MS = 30_000;
+
+export interface RladminShardRow {
+  shard_id: string;
+  role: "master" | "slave";
+  memory_used: number;
+  node_id?: string;
+}
+
+// Parse a "12.34MB" / "1.5GB" style memory token into bytes. Bare numbers
+// pass through. Unknown shapes return 0 (matches rladmin "0" / "—" cells).
+export function parseRladminMemory(s: string): number {
+  const trimmed = (s ?? "").trim();
+  const m = trimmed.match(/^([0-9]+(?:\.[0-9]+)?)\s*([KMGT]?)B?$/i);
+  if (!m) {
+    const n = Number(trimmed);
+    return Number.isFinite(n) ? n : 0;
+  }
+  const n = Number(m[1]);
+  if (!Number.isFinite(n)) return 0;
+  const unit = (m[2] ?? "").toUpperCase();
+  const mult =
+    unit === "K" ? 1024 :
+    unit === "M" ? 1024 ** 2 :
+    unit === "G" ? 1024 ** 3 :
+    unit === "T" ? 1024 ** 4 : 1;
+  return Math.round(n * mult);
+}
+
+// Parse the `rladmin info shards` table. Header-driven so column order or
+// extra columns (varies across Redis Enterprise versions) don't break the
+// parser. Only `SHARD:ID` + `ROLE` are required; missing `USED_MEMORY`
+// yields memory_used=0 rather than throwing.
+export function parseRladminShards(text: string): RladminShardRow[] {
+  const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0);
+  let headerIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] ?? "";
+    if (/\bSHARD:ID\b/i.test(line) && /\bROLE\b/i.test(line)) {
+      headerIdx = i;
+      break;
+    }
+  }
+  if (headerIdx < 0) return [];
+  const headers = (lines[headerIdx] ?? "").trim().split(/\s+/);
+  const idCol = headers.findIndex((h) => h.toUpperCase() === "SHARD:ID");
+  const roleCol = headers.findIndex((h) => h.toUpperCase() === "ROLE");
+  const memCol = headers.findIndex((h) => h.toUpperCase() === "USED_MEMORY");
+  const nodeCol = headers.findIndex((h) => h.toUpperCase() === "NODE:ID");
+  if (idCol < 0 || roleCol < 0) return [];
+  const out: RladminShardRow[] = [];
+  for (let i = headerIdx + 1; i < lines.length; i++) {
+    const parts = (lines[i] ?? "").trim().split(/\s+/);
+    if (parts.length < headers.length) continue;
+    const id = parts[idCol] ?? "";
+    if (!/^redis:\d+$/.test(id)) continue;
+    const role = parts[roleCol];
+    if (role !== "master" && role !== "slave") continue;
+    const memory_used = memCol >= 0 ? parseRladminMemory(parts[memCol] ?? "") : 0;
+    const row: RladminShardRow = { shard_id: id, role, memory_used };
+    if (nodeCol >= 0 && parts[nodeCol]) row.node_id = parts[nodeCol];
+    out.push(row);
+  }
+  return out;
+}
+
+export interface PerShardExtras {
+  key_count?: number | null;
+  write_ops_per_sec?: number | null;
+  index_lag?: number | null;
+}
+
+// Snapshot envelope written by scripts/capture-shard-snapshot.sh. Either
+// `shards_raw` (rladmin table; parsed here) or `shards` (already-extracted
+// rows) is required. `extras` carries per-shard stats that rladmin doesn't
+// expose (key_count, write_ops_per_sec, index_lag) — keyed by shard_id.
+export interface PerShardSnapshotEnvelope {
+  captured_at: string;
+  shards_raw?: string;
+  shards?: Array<{
+    shard_id: string;
+    role: string;
+    memory_used?: number;
+  } & PerShardExtras>;
+  extras?: Record<string, PerShardExtras>;
+}
+
+export interface PerShardRow {
+  shard_id: string;
+  role: string;
+  memory_used: number;
+  key_count: number | null;
+  write_ops_per_sec: number | null;
+  index_lag: number | null;
+  last_observed_at: string | null;
+  snapshot_age_seconds: number | null;
+  degraded?: true;
+}
+
+function numOrNull(v: unknown): number | null {
+  if (v === null || v === undefined) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+// Wave 7.0.4.A — degraded fallback when no fresh snapshot is available.
+// Returns a single aggregated row built from `INFO memory` + `INFO stats` +
+// `DBSIZE` so the UI still has *something* to render. `index_lag` is null
+// because the API service can't enumerate per-shard FT.INFO without the
+// snapshot script's per-port redis-cli probes.
+async function buildDegradedPerShardRow(
+  redis: RedisLike,
+  capturedAt: string | null,
+  ageSeconds: number | null,
+): Promise<PerShardRow> {
+  const [memText, statsText, dbsize] = await Promise.all([
+    redis.info("memory"),
+    redis.info("stats"),
+    redis.dbsize(),
+  ]);
+  const mem = parseInfo(memText);
+  const stats = parseInfo(statsText);
+  return {
+    shard_id: "aggregate",
+    role: "master",
+    memory_used: Number(mem.used_memory ?? 0),
+    key_count: Number.isFinite(Number(dbsize)) ? Number(dbsize) : null,
+    write_ops_per_sec: numOrNull(stats.instantaneous_ops_per_sec),
+    index_lag: null,
+    last_observed_at: capturedAt,
+    snapshot_age_seconds: ageSeconds,
+    degraded: true,
+  };
+}
+
 // Wave 5.85 — debug aid for "is the api seeing my cluster?". Returns the
 // parsed CLUSTER NODES list joined to the per-master INFO summary. Read-only,
 // no metric writes, no side effects. Standalone targets return an empty
@@ -450,6 +590,121 @@ export function registerObservabilityRoutes(
     try {
       const topology = await readTopology(redis, req.log);
       return topology;
+    } catch (err) {
+      const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
+      if (translated) {
+        reply.code(translated.status);
+        return translated.body;
+      }
+      throw err;
+    }
+  });
+
+  // Wave 7.0.4.A — per-shard observability backed by the operator-side
+  // `rladmin info shards` snapshot. Reads the snapshot envelope from the
+  // Redis key `ops:per-shard-snapshot`; falls back to a single aggregated
+  // INFO row tagged `degraded: true` when no snapshot is present or the
+  // snapshot is older than PER_SHARD_STALENESS_MS (30s). The API service
+  // never SSHes — capture-shard-snapshot.sh runs on a cluster node.
+  app.get("/observability/per-shard", { config: { category: "light" } }, async (req, reply) => {
+    const redis = await getRedis(req.poolCategory);
+    const target_label = getActiveTarget().label;
+    try {
+      const now = Date.now();
+      let envelope: PerShardSnapshotEnvelope | null = null;
+      let parseError: string | null = null;
+      try {
+        const raw = await redis.call("GET", PER_SHARD_SNAPSHOT_KEY);
+        if (typeof raw === "string" && raw.length > 0) {
+          try {
+            envelope = JSON.parse(raw) as PerShardSnapshotEnvelope;
+          } catch (err) {
+            parseError = String(err);
+            req.log.warn({
+              warn: "per-shard-snapshot-parse-failed",
+              reason: parseError,
+            });
+          }
+        }
+      } catch (err) {
+        const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
+        if (translated) {
+          reply.code(translated.status);
+          return translated.body;
+        }
+        throw err;
+      }
+
+      const capturedAtRaw = envelope?.captured_at ?? null;
+      const capturedAtMs = capturedAtRaw ? Date.parse(capturedAtRaw) : NaN;
+      const ageMs = Number.isFinite(capturedAtMs) ? now - capturedAtMs : Infinity;
+      const ageSec = Number.isFinite(ageMs) ? Math.round(ageMs / 1000) : null;
+      const fresh =
+        envelope !== null &&
+        Number.isFinite(capturedAtMs) &&
+        ageMs >= 0 &&
+        ageMs <= PER_SHARD_STALENESS_MS;
+
+      if (!fresh) {
+        return [await buildDegradedPerShardRow(redis, capturedAtRaw, ageSec)];
+      }
+
+      const env = envelope as PerShardSnapshotEnvelope;
+      const baseRows: Array<{
+        shard_id: string;
+        role: string;
+        memory_used: number;
+        extras: PerShardExtras;
+      }> = [];
+      if (Array.isArray(env.shards)) {
+        for (const s of env.shards) {
+          if (!s || typeof s.shard_id !== "string") continue;
+          if (s.role !== "master") continue;
+          baseRows.push({
+            shard_id: s.shard_id,
+            role: s.role,
+            memory_used: Number(s.memory_used ?? 0),
+            extras: {
+              key_count: numOrNull(s.key_count),
+              write_ops_per_sec: numOrNull(s.write_ops_per_sec),
+              index_lag: numOrNull(s.index_lag),
+            },
+          });
+        }
+      } else if (typeof env.shards_raw === "string") {
+        const parsed = parseRladminShards(env.shards_raw);
+        for (const p of parsed) {
+          if (p.role !== "master") continue;
+          baseRows.push({
+            shard_id: p.shard_id,
+            role: p.role,
+            memory_used: p.memory_used,
+            extras: {},
+          });
+        }
+      }
+
+      const extras = env.extras ?? {};
+      const rows: PerShardRow[] = baseRows.map((r) => {
+        const ex = extras[r.shard_id] ?? {};
+        return {
+          shard_id: r.shard_id,
+          role: r.role,
+          memory_used: r.memory_used,
+          key_count: numOrNull(r.extras.key_count ?? ex.key_count),
+          write_ops_per_sec: numOrNull(r.extras.write_ops_per_sec ?? ex.write_ops_per_sec),
+          index_lag: numOrNull(r.extras.index_lag ?? ex.index_lag),
+          last_observed_at: capturedAtRaw,
+          snapshot_age_seconds: ageSec,
+        };
+      });
+
+      // No master rows extracted from a fresh envelope → fall back to the
+      // degraded shape so the caller always gets a renderable response.
+      if (rows.length === 0) {
+        return [await buildDegradedPerShardRow(redis, capturedAtRaw, ageSec)];
+      }
+      return rows;
     } catch (err) {
       const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
       if (translated) {

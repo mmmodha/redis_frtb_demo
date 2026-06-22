@@ -12,7 +12,11 @@
 
 import { describe, it, expect, afterEach } from "vitest";
 import { createServer } from "../src/server.ts";
-import type { Shard } from "../src/routes/observability.ts";
+import type { PerShardRow, Shard } from "../src/routes/observability.ts";
+import {
+  parseRladminMemory,
+  parseRladminShards,
+} from "../src/routes/observability.ts";
 import { fakeRedis } from "./helpers/fake-redis.ts";
 
 const CLUSTER_NODES_THREE_PRIMARIES = [
@@ -438,5 +442,244 @@ describe("GET /observability/topology (Wave 5.85)", () => {
     expect(body.clusterClient).toBe(false);
     expect(body.nodes).toEqual([]);
     expect(body.perNode).toEqual({});
+  });
+});
+
+// Wave 7.0.4.A — `rladmin info shards` parser. Representative output captured
+// from Redis Enterprise 7.x; column order varies across versions so the
+// parser is header-driven (matches "SHARD:ID" + "ROLE" positions, ignores
+// extra columns). Slaves are emitted so the endpoint layer can pick masters.
+const RLADMIN_INFO_SHARDS_TWO_MASTERS = [
+  "SHARD:ID    NODE:ID  ROLE     NAME    SLOTS                 USED_MEMORY  BACKUP_PROGRESS  RAM_FRAG  WATCHDOG_STATUS",
+  "redis:1     node:1   master   db:1    0-8191                123.45MB     idle             1.20      OK",
+  "redis:2     node:2   master   db:1    8192-16383            234.56MB     idle             1.18      OK",
+  "redis:3     node:3   slave    db:1    0-8191                122.10MB     idle             1.22      OK",
+  "redis:4     node:1   slave    db:1    8192-16383            233.20MB     idle             1.19      OK",
+].join("\n");
+
+describe("parseRladminMemory", () => {
+  it("converts MB/GB/KB tokens to bytes (rounded)", () => {
+    expect(parseRladminMemory("1KB")).toBe(1024);
+    expect(parseRladminMemory("1MB")).toBe(1024 * 1024);
+    expect(parseRladminMemory("1.5GB")).toBe(Math.round(1.5 * 1024 ** 3));
+    expect(parseRladminMemory("123.45MB")).toBe(Math.round(123.45 * 1024 ** 2));
+  });
+
+  it("falls back to 0 on unknown shapes and parses bare numbers", () => {
+    expect(parseRladminMemory("12345")).toBe(12345);
+    expect(parseRladminMemory("—")).toBe(0);
+    expect(parseRladminMemory("")).toBe(0);
+  });
+});
+
+describe("parseRladminShards", () => {
+  it("extracts shard_id/role/memory_used per row, masters and slaves alike", () => {
+    const rows = parseRladminShards(RLADMIN_INFO_SHARDS_TWO_MASTERS);
+    expect(rows).toHaveLength(4);
+    expect(rows[0]).toEqual({
+      shard_id: "redis:1",
+      role: "master",
+      memory_used: Math.round(123.45 * 1024 ** 2),
+      node_id: "node:1",
+    });
+    expect(rows[1].shard_id).toBe("redis:2");
+    expect(rows[1].role).toBe("master");
+    expect(rows[1].memory_used).toBe(Math.round(234.56 * 1024 ** 2));
+    expect(rows[2].role).toBe("slave");
+    expect(rows[3].role).toBe("slave");
+  });
+
+  it("returns [] when the SHARD:ID header is absent", () => {
+    expect(parseRladminShards("CLUSTER NODES:\nnode:1 master ...\n")).toEqual([]);
+    expect(parseRladminShards("")).toEqual([]);
+  });
+
+  it("ignores non-shard data rows that don't match `redis:<n>`", () => {
+    const text = [
+      "SHARD:ID  NODE:ID  ROLE   NAME  SLOTS         USED_MEMORY",
+      "redis:1   node:1   master db:1  0-8191        100MB",
+      "junk      node:2   master db:1  8192-16383    100MB",
+      "",
+      "(some trailing prose)",
+    ].join("\n");
+    const rows = parseRladminShards(text);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].shard_id).toBe("redis:1");
+  });
+});
+
+// Wave 7.0.4.A — snapshot envelope is JSON SET at `ops:per-shard-snapshot`
+// by scripts/capture-shard-snapshot.sh on a cluster node. The endpoint
+// reads via redis.call("GET", key); fakeRedis records that as command="GET".
+function snapshotEnvelope(opts: {
+  ageSeconds: number;
+  shards_raw?: string;
+  shards?: unknown[];
+  extras?: Record<string, unknown>;
+}): string {
+  const captured_at = new Date(Date.now() - opts.ageSeconds * 1000).toISOString();
+  const env: Record<string, unknown> = { captured_at };
+  if (opts.shards_raw !== undefined) env.shards_raw = opts.shards_raw;
+  if (opts.shards !== undefined) env.shards = opts.shards;
+  if (opts.extras !== undefined) env.extras = opts.extras;
+  return JSON.stringify(env);
+}
+
+// fakeRedis throws when no responder is registered for a command. The
+// per-shard handler calls GET unconditionally; tests register that responder
+// here (either returning the snapshot JSON or null for "no snapshot").
+function setSnapshot(fr: ReturnType<typeof fakeRedis>, value: string | null): void {
+  fr.setResponse("GET", value);
+}
+
+describe("GET /observability/per-shard (Wave 7.0.4.A)", () => {
+  let app: Awaited<ReturnType<typeof createServer>>;
+  afterEach(async () => {
+    if (app) await app.close();
+  });
+
+  it("returns one row per master from a fresh snapshot (shards_raw + extras path)", async () => {
+    const fr = fakeRedis();
+    setSnapshot(fr, snapshotEnvelope({
+      ageSeconds: 5,
+      shards_raw: RLADMIN_INFO_SHARDS_TWO_MASTERS,
+      extras: {
+        "redis:1": { key_count: 1000, write_ops_per_sec: 250.5, index_lag: 0 },
+        "redis:2": { key_count: 2000, write_ops_per_sec: 175.25, index_lag: 12 },
+      },
+    }));
+    app = await createServer({ redis: fr });
+
+    const res = await app.inject({ method: "GET", url: "/observability/per-shard" });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as PerShardRow[];
+    expect(Array.isArray(body)).toBe(true);
+    expect(body).toHaveLength(2);
+
+    const byId = Object.fromEntries(body.map((r) => [r.shard_id, r]));
+    expect(byId["redis:1"].role).toBe("master");
+    expect(byId["redis:1"].memory_used).toBe(Math.round(123.45 * 1024 ** 2));
+    expect(byId["redis:1"].key_count).toBe(1000);
+    expect(byId["redis:1"].write_ops_per_sec).toBe(250.5);
+    expect(byId["redis:1"].index_lag).toBe(0);
+    expect(byId["redis:1"].last_observed_at).toBeTruthy();
+    expect(byId["redis:1"].snapshot_age_seconds).toBeGreaterThanOrEqual(4);
+    expect(byId["redis:1"].snapshot_age_seconds).toBeLessThanOrEqual(7);
+    expect(byId["redis:1"].degraded).toBeUndefined();
+
+    expect(byId["redis:2"].key_count).toBe(2000);
+    expect(byId["redis:2"].write_ops_per_sec).toBe(175.25);
+    expect(byId["redis:2"].index_lag).toBe(12);
+  });
+
+  it("accepts the pre-parsed shards[] envelope shape (script produces ready-to-serve rows)", async () => {
+    const fr = fakeRedis();
+    setSnapshot(fr, snapshotEnvelope({
+      ageSeconds: 2,
+      shards: [
+        {
+          shard_id: "redis:1",
+          role: "master",
+          memory_used: 64_000_000,
+          key_count: 42,
+          write_ops_per_sec: 1.5,
+          index_lag: 3,
+        },
+        {
+          shard_id: "redis:3",
+          role: "slave",
+          memory_used: 64_000_000,
+        },
+      ],
+    }));
+    app = await createServer({ redis: fr });
+
+    const res = await app.inject({ method: "GET", url: "/observability/per-shard" });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as PerShardRow[];
+    // Slaves filtered out at the endpoint layer.
+    expect(body).toHaveLength(1);
+    expect(body[0].shard_id).toBe("redis:1");
+    expect(body[0].memory_used).toBe(64_000_000);
+    expect(body[0].key_count).toBe(42);
+    expect(body[0].write_ops_per_sec).toBe(1.5);
+    expect(body[0].index_lag).toBe(3);
+  });
+
+  it("falls back to a degraded aggregated row when no snapshot is set", async () => {
+    const fr = fakeRedis();
+    setSnapshot(fr, null);
+    fr.setDbsize(987_654);
+    fr.setInfo([
+      "# Memory",
+      "used_memory:33554432",
+      "# Stats",
+      "instantaneous_ops_per_sec:42",
+      "total_net_input_bytes:1",
+      "total_net_output_bytes:2",
+    ].join("\r\n"));
+    app = await createServer({ redis: fr });
+
+    const res = await app.inject({ method: "GET", url: "/observability/per-shard" });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as PerShardRow[];
+    expect(body).toHaveLength(1);
+    expect(body[0].shard_id).toBe("aggregate");
+    expect(body[0].role).toBe("master");
+    expect(body[0].memory_used).toBe(33554432);
+    expect(body[0].key_count).toBe(987_654);
+    expect(body[0].write_ops_per_sec).toBe(42);
+    expect(body[0].index_lag).toBeNull();
+    expect(body[0].last_observed_at).toBeNull();
+    expect(body[0].snapshot_age_seconds).toBeNull();
+    expect(body[0].degraded).toBe(true);
+  });
+
+  it("falls back to a degraded row when the snapshot is older than 30s", async () => {
+    const fr = fakeRedis();
+    setSnapshot(fr, snapshotEnvelope({
+      ageSeconds: 120,
+      shards_raw: RLADMIN_INFO_SHARDS_TWO_MASTERS,
+    }));
+    fr.setDbsize(100);
+    fr.setInfo([
+      "# Memory",
+      "used_memory:1000",
+      "# Stats",
+      "instantaneous_ops_per_sec:0",
+    ].join("\r\n"));
+    app = await createServer({ redis: fr });
+
+    const res = await app.inject({ method: "GET", url: "/observability/per-shard" });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as PerShardRow[];
+    expect(body).toHaveLength(1);
+    expect(body[0].shard_id).toBe("aggregate");
+    expect(body[0].degraded).toBe(true);
+    // The stale snapshot's captured_at + age are still surfaced for diagnosis.
+    expect(body[0].last_observed_at).toBeTruthy();
+    expect(body[0].snapshot_age_seconds).toBeGreaterThanOrEqual(118);
+  });
+
+  it("falls back to a degraded row when the snapshot JSON is unparseable", async () => {
+    const fr = fakeRedis();
+    setSnapshot(fr, "{ not json");
+    fr.setDbsize(1);
+    fr.setInfo([
+      "# Memory",
+      "used_memory:2048",
+      "# Stats",
+      "instantaneous_ops_per_sec:7",
+    ].join("\r\n"));
+    app = await createServer({ redis: fr });
+
+    const res = await app.inject({ method: "GET", url: "/observability/per-shard" });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as PerShardRow[];
+    expect(body).toHaveLength(1);
+    expect(body[0].shard_id).toBe("aggregate");
+    expect(body[0].degraded).toBe(true);
+    expect(body[0].memory_used).toBe(2048);
+    expect(body[0].write_ops_per_sec).toBe(7);
   });
 });
