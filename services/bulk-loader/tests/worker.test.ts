@@ -107,6 +107,148 @@ describe("rowToHashFields — slim contract", () => {
   });
 });
 
+// Wave 7.0.6.14 — writer-side dense zero-pad. The slim-index FT.AGGREGATE
+// LOAD on RediSearch 2.10 raises "Could not find the value …" when a per-
+// tenor field is missing from every doc in the response set; padding at
+// write time keeps the field present (always "0") without touching calc.
+describe("rowToHashFields — per-tenor zero-pad (Wave 7.0.6.14)", () => {
+  const GIRR_TENORS: readonly string[] = ["3M", "6M", "1Y", "5Y", "10Y"];
+  const tenorsByClass = new Map<string, readonly string[]>([
+    ["GIRR", GIRR_TENORS],
+  ]);
+
+  function toMap(args: string[]): Record<string, string> {
+    const m: Record<string, string> = {};
+    for (let i = 0; i < args.length; i += 2) m[args[i] as string] = args[i + 1] as string;
+    return m;
+  }
+
+  it("GIRR Delta — pads missing tenors to 0 and preserves real values", () => {
+    const args = rowToHashFields(
+      girrDeltaPerTenor("u1", { "3M": 0.1, "6M": 0.2 }),
+      tenorsByClass,
+    );
+    const f = toMap(args);
+    expect(f.s_girr_delta_3M).toBe("0.1");
+    expect(f.s_girr_delta_6M).toBe("0.2");
+    expect(f.s_girr_delta_1Y).toBe("0");
+    expect(f.s_girr_delta_5Y).toBe("0");
+    expect(f.s_girr_delta_10Y).toBe("0");
+    // Only `delta` legs — never pad vega/curvature for a Delta row.
+    expect(args.some((a) => /^s_girr_vega_/.test(a))).toBe(false);
+    expect(args.some((a) => /^s_girr_cvr_/.test(a))).toBe(false);
+  });
+
+  it("GIRR Vega — pads missing vega tenors only", () => {
+    const args = rowToHashFields(
+      {
+        id: "u2", risk_class: "GIRR", bucket: "USD", sensitivity_type: "Vega",
+        risk_value: { "3M": 0.3 },
+      },
+      tenorsByClass,
+    );
+    const f = toMap(args);
+    expect(f.s_girr_vega_3M).toBe("0.3");
+    expect(f.s_girr_vega_6M).toBe("0");
+    expect(f.s_girr_vega_1Y).toBe("0");
+    expect(f.s_girr_vega_5Y).toBe("0");
+    expect(f.s_girr_vega_10Y).toBe("0");
+    expect(args.some((a) => /^s_girr_delta_/.test(a))).toBe(false);
+    expect(args.some((a) => /^s_girr_cvr_/.test(a))).toBe(false);
+  });
+
+  it("GIRR Curvature — pads BOTH cvr_up and cvr_down per tenor", () => {
+    const args = rowToHashFields(
+      {
+        id: "u3", risk_class: "GIRR", bucket: "USD", sensitivity_type: "Curvature",
+        risk_value: { cvr_up: [0.1, 0.2], cvr_down: [-0.1, -0.2] },
+        tenor: ["3M", "6M"],
+      },
+      tenorsByClass,
+    );
+    const f = toMap(args);
+    expect(f.s_girr_cvr_up_3M).toBe("0.1");
+    expect(f.s_girr_cvr_up_6M).toBe("0.2");
+    expect(f.s_girr_cvr_down_3M).toBe("-0.1");
+    expect(f.s_girr_cvr_down_6M).toBe("-0.2");
+    for (const t of ["1Y", "5Y", "10Y"]) {
+      expect(f[`s_girr_cvr_up_${t}`]).toBe("0");
+      expect(f[`s_girr_cvr_down_${t}`]).toBe("0");
+    }
+    // No delta/vega pollution on a Curvature row.
+    expect(args.some((a) => /^s_girr_delta_/.test(a))).toBe(false);
+    expect(args.some((a) => /^s_girr_vega_/.test(a))).toBe(false);
+  });
+
+  it("EQUITY Delta scalar — class absent from map → no padding emitted", () => {
+    const args = rowToHashFields(
+      {
+        id: "u4", risk_class: "EQUITY", bucket: "1", sensitivity_type: "Delta",
+        risk_value: { spot: 5 },
+      },
+      tenorsByClass,
+    );
+    expect(args).toContain("s_equity_delta");
+    expect(args).toContain("5");
+    // No per-tenor padding for scalar classes.
+    expect(args.some((a) => /^s_equity_delta_/.test(a))).toBe(false);
+    // Padding never invents fields for other classes.
+    expect(args.some((a) => /^s_girr_/.test(a))).toBe(false);
+  });
+
+  it("class present in map but with empty tenor list → no padding", () => {
+    const emptyMap = new Map<string, readonly string[]>([["EQUITY", []]]);
+    const args = rowToHashFields(
+      {
+        id: "u5", risk_class: "EQUITY", bucket: "1", sensitivity_type: "Delta",
+        risk_value: { spot: 5 },
+      },
+      emptyMap,
+    );
+    expect(args).toContain("s_equity_delta");
+    expect(args.some((a) => /^s_equity_delta_/.test(a))).toBe(false);
+  });
+
+  it("does not overwrite a real per-tenor value with 0", () => {
+    const args = rowToHashFields(
+      girrDeltaPerTenor("u6", { "5Y": 0.42 }),
+      tenorsByClass,
+    );
+    const f = toMap(args);
+    expect(f.s_girr_delta_5Y).toBe("0.42");
+    expect(f.s_girr_delta_3M).toBe("0");
+    expect(f.s_girr_delta_6M).toBe("0");
+    expect(f.s_girr_delta_1Y).toBe("0");
+    expect(f.s_girr_delta_10Y).toBe("0");
+  });
+
+  it("calling without tenorsByClass leaves output identical to the unpadded path", () => {
+    const row = girrDeltaPerTenor("u7", { "3M": 0.1 });
+    const without = rowToHashFields(row);
+    const withMap = rowToHashFields(row, new Map());
+    expect(without).toEqual(withMap);
+    // And no `0` padding appears.
+    expect(without.some((a) => /^s_girr_delta_(6M|1Y|5Y|10Y)$/.test(a))).toBe(false);
+  });
+
+  it("empty TAG fields still filter out (pad does not synthesize empty TAGs)", () => {
+    // Row missing optional TAGs (book/desk/etc.). Pad should not invent TAGs.
+    const args = rowToHashFields(
+      {
+        id: "u8", risk_class: "GIRR", bucket: "USD", sensitivity_type: "Delta",
+        risk_value: { "3M": 0.1 },
+      },
+      tenorsByClass,
+    );
+    const f = toMap(args);
+    expect(f.book).toBeUndefined();
+    expect(f.desk).toBeUndefined();
+    expect(f.trade_id).toBeUndefined();
+    // …but per-tenor pad is still present.
+    expect(f.s_girr_delta_10Y).toBe("0");
+  });
+});
+
 describe("isPermanentError", () => {
   it("flags WRONGTYPE / syntax error / Protocol error as permanent", () => {
     expect(isPermanentError(new Error("WRONGTYPE Operation against a key …"))).toBe(true);

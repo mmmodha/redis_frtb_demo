@@ -38,6 +38,10 @@ export interface DispatcherOptions {
     warn?: (obj: object, msg: string) => void;
     info?: (obj: object, msg: string) => void;
   };
+  // Wave 7.0.6.14 — per-class tenor list forwarded to every worker so
+  // sparse per-tenor rows get dense `s_<class>_<leg>_<tenor>="0"` padding.
+  // See WorkerOptions.tenorsByClass for the contract.
+  tenorsByClass?: ReadonlyMap<string, readonly string[]>;
 }
 
 export interface DispatcherStatus {
@@ -94,6 +98,7 @@ export function createDispatcher(opts: DispatcherOptions): DispatcherHandle {
       onSettle: settle,
       now: opts.now,
       logger: opts.logger,
+      tenorsByClass: opts.tenorsByClass,
     }),
   );
 

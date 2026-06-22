@@ -12,7 +12,11 @@
 // reports the connection-pool shape so an operator can sanity-check
 // (CLIENT LIST on each master node should show ~even spread).
 
+import { existsSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createRedisClient, resolveRedisTarget } from "@frtb/redis-client";
+import { loadSchema, type Schema } from "@frtb/schema";
 import { createServer } from "./server.ts";
 import { createWorkerPool, type PoolClient } from "./pool.ts";
 import { createDispatcher, type WorkerClient } from "./dispatcher.ts";
@@ -35,6 +39,43 @@ const CHECKPOINT_INTERVAL_MS = Number(
   process.env.BULK_LOADER_CHECKPOINT_INTERVAL_MS ?? DEFAULT_CHECKPOINT_INTERVAL_MS,
 );
 const API_BASE = process.env.API_BASE ?? `http://localhost:${process.env.API_PORT ?? 8080}`;
+// Wave 7.0.6.14 — schema location mirrors services/api/src/index.ts so the
+// bulk-loader and the api read the same per-class tenor list. Resolved
+// relative to this source file so it works both under tsx (cwd=services/
+// bulk-loader/) and the Docker image (file at /app/services/bulk-loader/
+// src/index.ts → REPO_ROOT = /app). SCHEMA_FILE env overrides for tests.
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+const SCHEMA_PATH = resolve(
+  process.env.SCHEMA_FILE ?? join(REPO_ROOT, "config/schema/frtb-default.yaml"),
+);
+
+// Wave 7.0.6.14 — build the per-class tenor map injected into the dispatcher
+// so each worker can dense-zero-pad sparse per-tenor rows.
+//
+// The pad set MUST match the slim-index field declaration in
+// shared/rqe/src/index.mjs `buildSlimSchemaFields` exactly — only classes the
+// slim index treats as per-tenor get `s_<class>_<leg>_<tenor>` fields
+// declared in FT.CREATE; every other class is scalar (`s_<class>_<leg>`) and
+// must NOT receive per-tenor padding (the index would not declare those
+// fields and the calc LOAD would not request them either, but the wasted
+// bytes would inflate HASH size and obscure the contract). Mirrors the
+// hardcoded `PER_TENOR_CLASSES = ["GIRR"]` in shared/rqe — kept inline
+// rather than re-exported to avoid plumbing a JS module into the TS
+// service for one constant. If shared/rqe grows the per-tenor list, update
+// here in lockstep.
+const SLIM_PER_TENOR_CLASSES: readonly string[] = ["GIRR"] as const;
+
+function buildTenorsByClass(schema: Schema): Map<string, readonly string[]> {
+  const out = new Map<string, readonly string[]>();
+  for (const cls of SLIM_PER_TENOR_CLASSES) {
+    const cfg = schema.risk_classes[cls];
+    const nodes = cfg?.tenor?.nodes;
+    if (Array.isArray(nodes) && nodes.length > 0) {
+      out.set(cls.toUpperCase(), Object.freeze(nodes.slice()));
+    }
+  }
+  return out;
+}
 
 function log(level: "info" | "warn" | "error", msg: string, extra: object = {}): void {
   const line = JSON.stringify({ service: "bulk-loader", level, msg, ...extra });
@@ -65,6 +106,32 @@ async function main(): Promise<void> {
     pool_size: POOL_SIZE,
   });
 
+  // Wave 7.0.6.14 — load the active schema to derive per-class tenor lists
+  // for writer-side zero-pad. A missing or unreadable schema is non-fatal:
+  // the dispatcher just runs without pad and behaviour collapses to pre-7.0.
+  // 6.14, so a misconfigured bulk-loader continues to ingest (it just
+  // reintroduces the per-tenor calc crash until the schema is restored).
+  let tenorsByClass: Map<string, readonly string[]> | undefined;
+  if (existsSync(SCHEMA_PATH)) {
+    try {
+      const schema = loadSchema(SCHEMA_PATH);
+      tenorsByClass = buildTenorsByClass(schema);
+      log("info", "schema loaded for tenor zero-pad", {
+        path: SCHEMA_PATH,
+        per_tenor_classes: [...tenorsByClass.keys()],
+      });
+    } catch (err) {
+      log("warn", "schema load failed; writer zero-pad disabled", {
+        path: SCHEMA_PATH,
+        err: String(err),
+      });
+    }
+  } else {
+    log("warn", "schema file not found; writer zero-pad disabled", {
+      path: SCHEMA_PATH,
+    });
+  }
+
   const pool = createWorkerPool({
     size: POOL_SIZE,
     redisFactory: (workerId) => {
@@ -90,6 +157,7 @@ async function main(): Promise<void> {
       warn: (obj, m) => log("warn", m, obj),
       info: (obj, m) => log("info", m, obj),
     },
+    tenorsByClass,
   });
 
   // Wave 7.0.5.A — checkpointer. Borrows pool worker[0]'s connection for

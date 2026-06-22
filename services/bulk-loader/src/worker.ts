@@ -80,6 +80,12 @@ export interface WorkerOptions {
     warn?: (obj: object, msg: string) => void;
     info?: (obj: object, msg: string) => void;
   };
+  // Wave 7.0.6.14 — per-class tenor list used to dense-zero-pad per-tenor
+  // s_<class>_<leg>_<tenor> fields that are absent from a sparse row. Keyed
+  // by UPPERCASE risk-class id (matches schema.risk_classes keys). Classes
+  // missing from the map (or with empty tenor lists) emit byte-identical
+  // HSET argv to the unpadded path — scalar legs (EQUITY/FX) stay untouched.
+  tenorsByClass?: ReadonlyMap<string, readonly string[]>;
 }
 
 export interface WorkerHandle {
@@ -124,7 +130,16 @@ export function isPermanentError(err: Error): boolean {
 // Curvature perTenor (`{cvr_up: [], cvr_down: []}`) → per-tenor pair.
 // Bare-number / legacy-array shapes are supported for parity with the
 // existing ingest path (enrichDoc in services/ingest/src/consumer.ts).
-export function rowToHashFields(row: Row): string[] {
+//
+// Wave 7.0.6.14 — when `tenorsByClass` is supplied and the row's risk_class
+// is per-tenor (non-empty tenor list), any per-tenor field that the row did
+// not emit is zero-padded so the slim-index FT.AGGREGATE LOAD never trips
+// "Could not find the value …" on RediSearch 2.10 (no null-coercion APPLY).
+// Scalar classes (no tenor entry, or empty list) are left untouched.
+export function rowToHashFields(
+  row: Row,
+  tenorsByClass?: ReadonlyMap<string, readonly string[]>,
+): string[] {
   const args: string[] = [];
   for (const k of TAG_FIELDS) {
     const v = row[k];
@@ -160,36 +175,63 @@ export function rowToHashFields(row: Row): string[] {
         args.push(`s_${lower}_cvr_down`, String(dn));
       }
     }
-    return args;
+  } else {
+    const leg = sens === "Vega" ? "vega" : "delta";
+    if (rv != null && typeof rv === "object" && !Array.isArray(rv)) {
+      const obj = rv as Record<string, unknown>;
+      const keys = Object.keys(obj);
+      if (keys.length === 1 && keys[0] === "spot" && typeof obj.spot === "number") {
+        args.push(`s_${lower}_${leg}`, String(obj.spot));
+      } else {
+        for (const k of keys) {
+          const v = obj[k];
+          if (typeof v === "number") args.push(`s_${lower}_${leg}_${k}`, String(v));
+        }
+      }
+    } else if (Array.isArray(rv)) {
+      const tenor = row.tenor;
+      const labels = Array.isArray(tenor) ? (tenor as readonly string[]) : null;
+      if (labels) {
+        const n = Math.min(rv.length, labels.length);
+        for (let i = 0; i < n; i++) {
+          const v = rv[i];
+          const t = labels[i];
+          if (typeof v === "number" && typeof t === "string") {
+            args.push(`s_${lower}_${leg}_${t}`, String(v));
+          }
+        }
+      }
+    } else if (typeof rv === "number") {
+      args.push(`s_${lower}_${leg}`, String(rv));
+    }
   }
 
-  const leg = sens === "Vega" ? "vega" : "delta";
-  if (rv != null && typeof rv === "object" && !Array.isArray(rv)) {
-    const obj = rv as Record<string, unknown>;
-    const keys = Object.keys(obj);
-    if (keys.length === 1 && keys[0] === "spot" && typeof obj.spot === "number") {
-      args.push(`s_${lower}_${leg}`, String(obj.spot));
-    } else {
-      for (const k of keys) {
-        const v = obj[k];
-        if (typeof v === "number") args.push(`s_${lower}_${leg}_${k}`, String(v));
-      }
-    }
-  } else if (Array.isArray(rv)) {
-    const tenor = row.tenor;
-    const labels = Array.isArray(tenor) ? (tenor as readonly string[]) : null;
-    if (labels) {
-      const n = Math.min(rv.length, labels.length);
-      for (let i = 0; i < n; i++) {
-        const v = rv[i];
-        const t = labels[i];
-        if (typeof v === "number" && typeof t === "string") {
-          args.push(`s_${lower}_${leg}_${t}`, String(v));
+  // Wave 7.0.6.14 — dense zero-pad. For per-tenor classes (GIRR), emit
+  // `s_<class>_<leg>_<tenor>="0"` for every declared tenor that the row did
+  // not already populate. Curvature pads BOTH `cvr_up` and `cvr_down` legs;
+  // Delta/Vega pad only their own leg. Scalar classes (no tenor entry in
+  // the map, or empty list) are not padded — keeps EQUITY/FX byte-identical
+  // to the unpadded path. Skipping when `args` is empty preserves the
+  // worker's malformed-row dead-letter heuristic in flushBatch.
+  if (tenorsByClass && args.length > 0) {
+    const upper = String(row.risk_class).toUpperCase();
+    const tenors = tenorsByClass.get(upper);
+    if (tenors && tenors.length > 0) {
+      const present = new Set<string>();
+      for (let i = 0; i < args.length; i += 2) present.add(args[i] as string);
+      const legs: readonly string[] = sens === "Curvature"
+        ? ["cvr_up", "cvr_down"]
+        : [sens === "Vega" ? "vega" : "delta"];
+      for (const padLeg of legs) {
+        for (const t of tenors) {
+          const name = `s_${lower}_${padLeg}_${t}`;
+          if (!present.has(name)) {
+            args.push(name, "0");
+            present.add(name);
+          }
         }
       }
     }
-  } else if (typeof rv === "number") {
-    args.push(`s_${lower}_${leg}`, String(rv));
   }
 
   return args;
@@ -210,6 +252,7 @@ export function createWorker(opts: WorkerOptions): WorkerHandle {
   const onSettle = opts.onSettle;
   const now = opts.now ?? Date.now;
   const log = opts.logger;
+  const tenorsByClass = opts.tenorsByClass;
 
   if (!Number.isInteger(batchSize) || batchSize < 1) {
     throw new Error(`createWorker(${id}): batchSize must be a positive integer`);
@@ -304,7 +347,7 @@ export function createWorker(opts: WorkerOptions): WorkerHandle {
     const pipeline = opts.client.pipeline();
     const indexed: Array<{ entry: BufferedRow; piped: boolean }> = [];
     for (const entry of batch) {
-      const fields = rowToHashFields(entry.row);
+      const fields = rowToHashFields(entry.row, tenorsByClass);
       if (fields.length === 0) {
         // Row had no writable fields — treat as a permanent malformed row
         // and dead-letter it directly without occupying a pipeline slot.
