@@ -124,6 +124,21 @@ the underlying API on :8080), `--risk-class GIRR`, `--sens Delta`,
 `--rows 1000`. Exits 0 with `smoke OK · risk_class=… · sens=… · buckets=… ·
 total_charge=…`; non-zero with the full response body dumped to stderr.
 
+## diagnose-ingest.mjs (Wave 7.0.6.8)
+
+Operator-side ingest throughput profiler. Pre-flight by default (no
+writes): probes Redis, `idx:sens:slim`, bulk-loader, and api; prints a
+`MODE=bulk-loader|stream-only|unknown` verdict. With `--probe --yes`,
+FLUSHDBs the target and drives two 30s windows (stream via
+`/api/generator/start`, then bulk-loader via `/load/rows`) to diagnose
+INDEXER / HSET / CONNECTION-POOL / STREAM-CONSUMER / SINGLE-SHARD
+bottlenecks; FLUSHDB cleanup runs between and after windows.
+
+```bash
+REDIS_URL='redis://…' node scripts/diagnose-ingest.mjs                 # pre-flight only
+REDIS_URL='redis://…' node scripts/diagnose-ingest.mjs --probe --yes   # 60s controlled probe
+```
+
 ## Other helpers
 
 - `_check-xlen.mjs` — XLEN + XPENDING across the 16 hash-tag shard streams.
