@@ -117,7 +117,13 @@ function mockFetch(opts: MockOpts = {}) {
   return fetchMock;
 }
 
-function renderPanel() {
+function renderPanel(opts?: { stream?: boolean }) {
+  // Wave 7.0.6.18 — the legacy stream-mode selector is hidden unless the
+  // page URL carries `?ingestMode=stream`. Push the override here BEFORE
+  // mount because IngestPanel reads `window.location.search` once via
+  // `useMemo([])`. Default ("/") matches production: selector hidden.
+  if (opts?.stream) window.history.pushState({}, "", "/?ingestMode=stream");
+  else window.history.pushState({}, "", "/");
   return render(
     <MemoryRouter>
       <GeneratorRunProvider>
@@ -136,7 +142,9 @@ function findCall(fetchMock: ReturnType<typeof vi.fn>, urlMatcher: RegExp, metho
 // Wave 7.0.6.13 — these legacy-stream tests target the /generator/start/stream
 // XADD path. The IngestPanel default mode flipped to "bulk-loader" in 7.0.6.13,
 // so each test that asserts the stream-path orchestrator must first flip the
-// Mode dropdown to "stream" before clicking Start.
+// Mode dropdown to "stream" before clicking Start. Wave 7.0.6.18 — callers
+// must additionally mount the panel via `renderPanel({ stream: true })` so
+// the selector is rendered (the URL override is the only way to expose it).
 function selectStreamMode() {
   fireEvent.change(screen.getByTestId("ingest-mode-select"), { target: { value: "stream" } });
 }
@@ -204,7 +212,7 @@ describe("IngestPanel — Wave 6.17 presets-only run", () => {
 
   it("Quick preset Start runs preflight, posts /ingest/shards=1, then starts the stream with rows=10000 / shards=1 / maxlen=100000", async () => {
     const fetchMock = mockFetch();
-    renderPanel();
+    renderPanel({ stream: true });
     await screen.findByTestId("ingest-preset-start-btn");
     selectStreamMode();
     fireEvent.click(screen.getByTestId("ingest-preset-start-btn"));
@@ -231,7 +239,7 @@ describe("IngestPanel — Wave 6.17 presets-only run", () => {
 
   it("Large preset submits rows=10000000 / shards=8 / stream_maxlen=0 / defer_trim=true", async () => {
     const fetchMock = mockFetch();
-    renderPanel();
+    renderPanel({ stream: true });
     await screen.findByTestId("ingest-preset-start-btn");
     selectStreamMode();
     fireEvent.click(screen.getByTestId("ingest-preset-large"));
@@ -250,7 +258,7 @@ describe("IngestPanel — Wave 6.17 presets-only run", () => {
 
   it("Overnight preset submits rows=100000000 / shards=16 / stream_maxlen=0 / defer_trim=true", async () => {
     const fetchMock = mockFetch();
-    renderPanel();
+    renderPanel({ stream: true });
     await screen.findByTestId("ingest-preset-start-btn");
     selectStreamMode();
     fireEvent.click(screen.getByTestId("ingest-preset-overnight"));
@@ -266,7 +274,7 @@ describe("IngestPanel — Wave 6.17 presets-only run", () => {
 
   it("auto-fixes the index when preflight returns ok=false / can_rebuild=true (POST /admin/rebuild-indexes then re-runs preflight)", async () => {
     const fetchMock = mockFetch({ initialState: "fail", rebuildHeals: true });
-    renderPanel();
+    renderPanel({ stream: true });
     await screen.findByTestId("ingest-preset-start-btn");
     selectStreamMode();
     fireEvent.click(screen.getByTestId("ingest-preset-start-btn"));
@@ -294,7 +302,7 @@ describe("IngestPanel — Wave 6.17 presets-only run", () => {
 
   it("disables the Start button while the orchestrator runs (preflight + shards), re-enables on terminal frame", async () => {
     mockFetch();
-    renderPanel();
+    renderPanel({ stream: true });
     const start = await screen.findByTestId("ingest-preset-start-btn") as HTMLButtonElement;
     expect(start.disabled).toBe(false);
     selectStreamMode();
@@ -325,7 +333,7 @@ describe("IngestPanel — Wave 6.17 presets-only run", () => {
   // firing. (Distinct from the manual fan-out Apply button's 409 path.)
   it("halts the flow and surfaces a 409 inline when the orchestrator's POST /ingest/shards conflicts", async () => {
     const fetchMock = mockFetch({ shardsPostStatus: 409, shardsPostError: "rebuild already in progress" });
-    renderPanel();
+    renderPanel({ stream: true });
     await screen.findByTestId("ingest-preset-start-btn");
     selectStreamMode();
     fireEvent.click(screen.getByTestId("ingest-preset-start-btn"));
@@ -417,7 +425,7 @@ describe("IngestPanel — Wave 6.17 presets-only run", () => {
     mockFetch({
       terminalFrame: { run_id: "01HXRUN", rows_done: 5, rows_total: 100, elapsed_ms: 10, rows_per_sec: 100 },
     });
-    renderPanel();
+    renderPanel({ stream: true });
     await screen.findByTestId("ingest-preset-start-btn");
     selectStreamMode();
     fireEvent.click(screen.getByTestId("ingest-preset-start-btn"));

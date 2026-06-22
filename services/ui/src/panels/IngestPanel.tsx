@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { EnterpriseCallout } from "../components/EnterpriseCallout";
 import { MetricTile } from "../components/MetricTile";
 import { PanelCard } from "../components/PanelCard";
+import { PhaseProgress } from "../components/PhaseProgress";
 import {
   useGeneratorRun,
   type GeneratorRunState,
@@ -194,6 +195,40 @@ export function buildRunPresetConfig(p: RunPreset): GeneratorConfig {
 
 const POLL_MS = 1000;
 const MAX_SAMPLES = 60;
+
+// Wave 7.0.6.18 — dev override for the legacy stream mode selector. Reads
+// `?ingestMode=stream` off window.location.search exactly once on mount
+// (callers wrap this in useMemo with an empty dep list). Returns false in
+// SSR or when window.location.search is unavailable.
+export function readStreamOverride(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    const search = window.location?.search ?? "";
+    if (!search) return false;
+    const params = new URLSearchParams(search);
+    return params.get("ingestMode") === "stream";
+  } catch {
+    return false;
+  }
+}
+
+// Wave 7.0.6.18 — fixed-window rolling-buffer helpers used to smooth the
+// bulk-run rps counters (5-sample mean). Exported for unit tests; the
+// IngestPanel polling tick is the only production caller.
+export const PHASE_RATE_WINDOW = 5;
+export function pushPhaseRateSample(buf: number[], next: number): number[] {
+  if (!Number.isFinite(next) || next < 0) return buf;
+  const out = buf.length >= PHASE_RATE_WINDOW
+    ? [...buf.slice(buf.length - PHASE_RATE_WINDOW + 1), next]
+    : [...buf, next];
+  return out;
+}
+export function meanPhaseRate(buf: number[]): number {
+  if (buf.length === 0) return 0;
+  let sum = 0;
+  for (const v of buf) sum += v;
+  return sum / buf.length;
+}
 
 interface ChartSample { t: number; v: number }
 
@@ -485,6 +520,12 @@ export function IngestPanel() {
   // Wave 7.0.6.13 — ingest mode toggle. "bulk-loader" (default) drives
   // POST /ingest/bulk/start → bulk-loader fast path; "stream" preserves the
   // legacy /generator/start XADD path for replay tests.
+  // Wave 7.0.6.18 — stream mode is hidden from the UI by default. The
+  // selector reappears when the page URL contains `?ingestMode=stream`
+  // (read once on mount); the default mode stays "bulk-loader" so the
+  // ingest-mode selector behaviour is identical to 7.0.6.13–17 once the
+  // dev override is on.
+  const streamOverride = useMemo<boolean>(() => readStreamOverride(), []);
   const [ingestMode, setIngestMode] = useState<"bulk-loader" | "stream">("bulk-loader");
   // Wave 7.0.6.13 — bulk-run state. `bulkRun` is the most recent
   // /ingest/bulk/runs/:id response; `bulkLoad` is the most recent
@@ -493,6 +534,18 @@ export function IngestPanel() {
   const [bulkRun, setBulkRun] = useState<BulkIngestRunStatus | null>(null);
   const [bulkLoad, setBulkLoad] = useState<BulkLoadStatus | null>(null);
   const [bulkRunId, setBulkRunId] = useState<string | null>(null);
+  // Wave 7.0.6.18 — rolling rate buffers (5 samples) for the bulk-loader
+  // run. `smoothedGenRps` averages the producer-side `rows_per_sec` from
+  // /ingest/bulk/runs/:id; `smoothedIngestRps` averages the per-tick delta
+  // of dispatched bulk-loader writes (sum of worker `flushed`) per second.
+  // Sampled inside the existing polling effect — no new timer. Buffers are
+  // reset whenever the tracked `bulkRunId` changes so a new run starts with
+  // a fresh smoothing window instead of inheriting stale samples.
+  const genRpsBufferRef = useRef<number[]>([]);
+  const ingestRpsBufferRef = useRef<number[]>([]);
+  const lastIngestSampleRef = useRef<{ flushed: number; ms: number } | null>(null);
+  const [smoothedGenRps, setSmoothedGenRps] = useState<number>(0);
+  const [smoothedIngestRps, setSmoothedIngestRps] = useState<number>(0);
   // Wave 7.0.6.15 — worker_threads fan-out for the bulk-loader run. Defaults
   // to 1 (single-worker bit-equivalent path) until /admin/host-info reports
   // the recommended cap, at which point we bump the slider to that value.
@@ -825,6 +878,18 @@ export function IngestPanel() {
   // the operator sees the final flushed counter). The polls stop when the
   // run reaches a terminal status AND the bulk-loader dispatcher has drained
   // its in-flight queue.
+  // Wave 7.0.6.18 — reset the rps smoothing buffers whenever the tracked
+  // bulk run id changes (new run = fresh smoothing window; cleared run =
+  // zeroed-out smoothed values so the next render of the bars doesn't
+  // inherit stale samples).
+  useEffect(() => {
+    genRpsBufferRef.current = [];
+    ingestRpsBufferRef.current = [];
+    lastIngestSampleRef.current = null;
+    setSmoothedGenRps(0);
+    setSmoothedIngestRps(0);
+  }, [bulkRunId]);
+
   useEffect(() => {
     if (!bulkRunId) return;
     let cancelled = false;
@@ -838,6 +903,32 @@ export function IngestPanel() {
         if (cancelled) return;
         if (r) setBulkRun(r);
         if (s) setBulkLoad(s);
+        // Wave 7.0.6.18 — push raw rps samples into the rolling buffers and
+        // recompute the means in-place so the three PhaseProgress bars
+        // render smoothed numbers instead of the cumulative-elapsed values
+        // that flicker between 0 and burst peaks.
+        if (r) {
+          const rawGen = typeof r.rows_per_sec === "number" && Number.isFinite(r.rows_per_sec)
+            ? r.rows_per_sec
+            : 0;
+          genRpsBufferRef.current = pushPhaseRateSample(genRpsBufferRef.current, rawGen);
+          setSmoothedGenRps(meanPhaseRate(genRpsBufferRef.current));
+        }
+        if (r && s) {
+          const totalFlushed = (s.workers ?? []).reduce((a, w) => a + (w.flushed ?? 0), 0);
+          const elapsedMs = typeof r.ms === "number" ? r.ms : 0;
+          const prev = lastIngestSampleRef.current;
+          if (prev !== null) {
+            const dMs = elapsedMs - prev.ms;
+            const dFlushed = totalFlushed - prev.flushed;
+            if (dMs > 0 && dFlushed >= 0) {
+              const rawIngest = (dFlushed * 1000) / dMs;
+              ingestRpsBufferRef.current = pushPhaseRateSample(ingestRpsBufferRef.current, rawIngest);
+              setSmoothedIngestRps(meanPhaseRate(ingestRpsBufferRef.current));
+            }
+          }
+          lastIngestSampleRef.current = { flushed: totalFlushed, ms: elapsedMs };
+        }
         const terminal = r && (r.status === "done" || r.status === "error");
         const drained = !s?.dispatcher || s.dispatcher.in_flight === 0;
         if (terminal && drained) {
@@ -1004,6 +1095,9 @@ export function IngestPanel() {
         bulkRun={bulkRun}
         bulkLoad={bulkLoad}
         onCancelBulkRun={onCancelBulkRun}
+        streamOverride={streamOverride}
+        smoothedGenRps={smoothedGenRps}
+        smoothedIngestRps={smoothedIngestRps}
         workers={workers}
         onWorkersChange={setWorkers}
         hostInfo={hostInfo}
@@ -1211,6 +1305,15 @@ function RunPresetCard(props: {
   bulkRun: BulkIngestRunStatus | null;
   bulkLoad: BulkLoadStatus | null;
   onCancelBulkRun: () => void;
+  // Wave 7.0.6.18 — when true (set by `?ingestMode=stream` URL override),
+  // the legacy mode selector is visible. Otherwise it is hidden and the
+  // panel is permanently locked to the bulk-loader fast path.
+  streamOverride: boolean;
+  // Wave 7.0.6.18 — smoothed rps inputs for the unified PhaseProgress bars
+  // (Generation + Ingest). Owned by IngestPanel so the 5-sample mean is
+  // computed on the existing 1s polling tick rather than per-render here.
+  smoothedGenRps: number;
+  smoothedIngestRps: number;
   // Wave 7.0.6.15 — worker_threads fan-out controls. `workers` is the
   // current slider value; `hostInfo` is the cached /admin/host-info response
   // used to cap the slider at recommended_max_workers and to render the
@@ -1219,7 +1322,7 @@ function RunPresetCard(props: {
   onWorkersChange: (n: number) => void;
   hostInfo: HostInfo | null;
 }) {
-  const { presetKey, onSelect, onStart, startDisabled, inflight, runStatus, step, error, trackedRun, onCancelRun, ingestMode, onModeChange, bulkRun, bulkLoad, onCancelBulkRun, workers, onWorkersChange, hostInfo } = props;
+  const { presetKey, onSelect, onStart, startDisabled, inflight, runStatus, step, error, trackedRun, onCancelRun, ingestMode, onModeChange, bulkRun, bulkLoad, onCancelBulkRun, streamOverride, smoothedGenRps, smoothedIngestRps, workers, onWorkersChange, hostInfo } = props;
   // Wave 7.0.6.15 — cap the slider at the host's recommended_max_workers
   // when /admin/host-info is available; failsafe to 8 when the call errored
   // (hostInfo === null) so the operator can still bump above 1.
@@ -1278,22 +1381,30 @@ function RunPresetCard(props: {
         })}
       </div>
       <div className="ingest-presets__actions">
-        <label className="ingest-presets__mode" data-testid="ingest-mode-label">
-          <span className="ingest-presets__mode-label">Mode:</span>
-          <select
-            value={ingestMode}
-            disabled={startDisabled}
-            onChange={(e) => onModeChange(e.target.value as "bulk-loader" | "stream")}
-            data-testid="ingest-mode-select"
-          >
-            <option value="bulk-loader">Bulk-loader (fast)</option>
-            <option value="stream">Stream (legacy)</option>
-          </select>
-        </label>
+        {/* Wave 7.0.6.18 — legacy stream selector is hidden by default. It
+            renders only when the page URL carries `?ingestMode=stream`, so
+            the production view stays single-path (bulk-loader). */}
+        {streamOverride ? (
+          <label className="ingest-presets__mode" data-testid="ingest-mode-label">
+            <span className="ingest-presets__mode-label">Mode:</span>
+            <select
+              value={ingestMode}
+              disabled={startDisabled}
+              onChange={(e) => onModeChange(e.target.value as "bulk-loader" | "stream")}
+              data-testid="ingest-mode-select"
+            >
+              <option value="bulk-loader">Bulk-loader (fast)</option>
+              <option value="stream">Stream (legacy)</option>
+            </select>
+          </label>
+        ) : null}
         {/* Wave 7.0.6.15 — worker_threads fan-out slider. Only meaningful in
             bulk-loader mode; disabled in stream mode (which stays
             single-consumer). Min=1 (bit-equivalent), Max clamped to the
-            host's recommended_max_workers (or 8 failsafe). */}
+            host's recommended_max_workers (or 8 failsafe).
+            Wave 7.0.6.18 — when streamOverride is off, the input is only
+            gated by `startDisabled`; the stream-mode special case is moot
+            because the selector that would set it is also hidden. */}
         <label className="ingest-presets__workers" data-testid="ingest-workers-label">
           <span className="ingest-presets__workers-label">Workers:</span>
           <input
@@ -1350,48 +1461,62 @@ function RunPresetCard(props: {
         <GeneratorProgress run={trackedRun!} onCancel={onCancelRun} />
       ) : null}
       {showBulkProgress ? (
-        <BulkIngestProgress run={bulkRun!} load={bulkLoad} onCancel={onCancelBulkRun} />
+        <BulkIngestProgress
+          run={bulkRun!}
+          load={bulkLoad}
+          onCancel={onCancelBulkRun}
+          smoothedGenRps={smoothedGenRps}
+          smoothedIngestRps={smoothedIngestRps}
+        />
       ) : null}
       <IndexingProgress />
     </PanelCard>
   );
 }
 
-// Wave 7.0.6.13 — bulk-loader run progress strip. Mirrors the look of
-// GeneratorProgress but reads from /ingest/bulk/runs/:id (producer-side
-// rows_sent + rps) and /load/status (dispatcher flushed / in_flight). The
-// "queued" tile is the bulk-loader worker queue total — distinct from the
-// producer's in-flight POST window and useful for spotting backpressure.
+// Wave 7.0.6.13 — bulk-loader run progress strip. Reads /ingest/bulk/runs/:id
+// (producer-side rows_sent + rps) and /load/status (dispatcher flushed /
+// in_flight + per-worker queue depth) and renders the producer + consumer
+// phases of a run.
+// Wave 7.0.6.18 — replaced the legacy single-bar + horizontal metrics row
+// with two stacked PhaseProgress instances ("Generation" and "Ingest") so
+// the operator sees rows-emitted and rows-flushed-to-Redis as visually
+// identical bars. Smoothed rps values are computed by the IngestPanel
+// polling tick (5-sample mean) and threaded through props; status text
+// (running / done / error) is appended to the meta line, and a single
+// Cancel button sits on the Generation bar.
 function BulkIngestProgress(props: {
   run: BulkIngestRunStatus;
   load: BulkLoadStatus | null;
   onCancel: () => void;
+  smoothedGenRps: number;
+  smoothedIngestRps: number;
 }) {
-  const { run, load } = props;
+  const { run, load, onCancel, smoothedGenRps, smoothedIngestRps } = props;
   const total = run.rows_total;
   const sent = run.rows_sent;
-  const pct = total > 0 ? Math.min(100, (sent / total) * 100) : 0;
   const flushed = (load?.workers ?? []).reduce((acc, w) => acc + (w.flushed ?? 0), 0);
-  const queued = (load?.workers ?? []).reduce((acc, w) => acc + (w.queued ?? 0), 0);
-  const inFlight = load?.dispatcher?.in_flight ?? 0;
-  const elapsedSec = run.ms / 1000;
-  const indexRps = run.rows_per_sec || (elapsedSec > 0 ? Math.round(sent / elapsedSec) : 0);
+  const cancellable = run.status === "running";
   return (
     <div className="bulk-progress" data-testid="bulk-progress">
-      <div className="bulk-progress__bar" role="progressbar" aria-valuenow={Math.round(pct)} aria-valuemin={0} aria-valuemax={100}>
-        <div className="bulk-progress__fill" style={{ width: `${pct}%` }} />
-      </div>
-      <div className="bulk-progress__metrics">
-        <span data-testid="bulk-progress-sent"><strong>{fmtInt(sent)}</strong> / {fmtInt(total)} sent</span>
-        <span data-testid="bulk-progress-flushed"><strong>{fmtInt(flushed)}</strong> flushed</span>
-        <span data-testid="bulk-progress-queued"><strong>{fmtInt(queued)}</strong> queued</span>
-        <span data-testid="bulk-progress-inflight"><strong>{fmtInt(inFlight)}</strong> in flight</span>
-        <span data-testid="bulk-progress-rps"><strong>{fmtInt(indexRps)}</strong> rows/s</span>
-        <span data-testid="bulk-progress-status">status: {run.status}</span>
-      </div>
-      {run.error ? (
-        <div className="bulk-progress__error" role="alert" data-testid="bulk-progress-error">{run.error}</div>
-      ) : null}
+      <PhaseProgress
+        label="Generation (producer → bulk-loader)"
+        done={sent}
+        total={total}
+        ratePerSec={smoothedGenRps}
+        status={run.status}
+        error={run.error ?? null}
+        onCancel={cancellable ? onCancel : undefined}
+        testIdPrefix="phase-progress-generation"
+      />
+      <PhaseProgress
+        label="Ingest (bulk-loader → redis)"
+        done={flushed}
+        total={total}
+        ratePerSec={smoothedIngestRps}
+        status={run.status}
+        testIdPrefix="phase-progress-ingest"
+      />
     </div>
   );
 }
@@ -2999,49 +3124,41 @@ function IndexingProgress() {
     ? projectedRemaining / ratePerSec
     : null;
 
-  const metaContent: JSX.Element = showingComplete ? (
-    <span data-testid="indexing-complete">Indexing complete</span>
-  ) : (
-    <>
-      <span data-testid="indexing-progress-text">
-        {indexed.toLocaleString()} / {denomLabel.toLocaleString()} indexed ({Math.round(pct)}%)
-      </span>
-      <span className="generator-form__progress-stats" data-testid="indexing-progress-stats">
-        {ratePerSec === null || denomLabel <= 0 ? (
-          "ETA unknown"
-        ) : (
-          <>
-            {formatIntCompact(ratePerSec)} rows/s · ETA {etaSeconds !== null ? formatEtaSeconds(etaSeconds) : "—"}
-          </>
-        )}
-      </span>
-    </>
-  );
-
+  // Wave 7.0.6.18 — render via the shared PhaseProgress so the Indexing bar
+  // is visually identical to the Generation + Ingest bars stacked above it
+  // in the same card. The testIdPrefix "indexing-progress" preserves the
+  // legacy testids (`indexing-progress`, `indexing-progress-text`,
+  // `indexing-progress-stats`) and the `unit="indexed"` suffix preserves
+  // the legacy text format ("N / Total indexed (P%)"). The "Indexing
+  // complete" toast piggy-backs on `metaOverride` so its testid is
+  // unchanged.
+  if (showingComplete) {
+    return (
+      <PhaseProgress
+        label="Indexing (sens → redis)"
+        done={denomLabel}
+        total={denomLabel}
+        ratePerSec={0}
+        testIdPrefix="indexing-progress"
+        unit="indexed"
+        fillClassName="indexing-progress__fill"
+        metaOverride={<span data-testid="indexing-complete">Indexing complete</span>}
+      />
+    );
+  }
+  // Suppress the etaSeconds local — PhaseProgress recomputes its own ETA
+  // from (done, total, ratePerSec) so passing the rate is sufficient.
+  void etaSeconds;
   return (
-    <div
-      className="generator-form__progress indexing-progress"
-      data-testid="indexing-progress"
-      role="status"
-      aria-live="polite"
-    >
-      <div className="indexing-progress__label">Indexing (sens → redis)</div>
-      <div
-        className="generator-form__progress-bar"
-        role="progressbar"
-        aria-valuemin={0}
-        aria-valuemax={100}
-        aria-valuenow={Math.round(pct)}
-      >
-        <div
-          className="generator-form__progress-fill indexing-progress__fill"
-          style={{ width: `${pct}%` }}
-        />
-      </div>
-      <div className="generator-form__progress-meta">
-        {metaContent}
-      </div>
-    </div>
+    <PhaseProgress
+      label="Indexing (sens → redis)"
+      done={indexed}
+      total={denomLabel}
+      ratePerSec={ratePerSec ?? 0}
+      testIdPrefix="indexing-progress"
+      unit="indexed"
+      fillClassName="indexing-progress__fill"
+    />
   );
 }
 

@@ -86,7 +86,11 @@ function mockFetch(hostInfo: any | null) {
   return { fetchMock, bulkStartCalls };
 }
 
-function renderPanel() {
+function renderPanel(opts?: { stream?: boolean }) {
+  // Wave 7.0.6.18 — push `?ingestMode=stream` before mount when the test
+  // needs the (hidden-by-default) legacy mode selector visible.
+  if (opts?.stream) window.history.pushState({}, "", "/?ingestMode=stream");
+  else window.history.pushState({}, "", "/");
   return render(
     <MemoryRouter>
       <GeneratorRunProvider>
@@ -142,7 +146,10 @@ describe("IngestPanel — Wave 7.0.6.15 workers slider", () => {
 
   it("disables the workers input in stream (legacy) mode", async () => {
     mockFetch({ cores: 8, recommended_max_workers: 6, max_workers_hard_cap: 32, bulk_loader_pool_size: 32, shards: null, target_label: null });
-    renderPanel();
+    // Wave 7.0.6.18 — the stream mode selector is hidden by default and
+    // only mounted when `?ingestMode=stream` is in the URL. Render with the
+    // override so the selector exists for the toggle assertion below.
+    renderPanel({ stream: true });
     const input = await screen.findByTestId("ingest-workers-input") as HTMLInputElement;
     expect(input.disabled).toBe(false);
     fireEvent.change(screen.getByTestId("ingest-mode-select"), { target: { value: "stream" } });

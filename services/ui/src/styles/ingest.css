@@ -145,6 +145,62 @@
   background: var(--redis-text-link, #8AB4C7);
 }
 
+/* Wave 7.0.6.18 — Shared phase progress bar. Three stacked instances render
+   the Generation, Ingest, and Indexing phases of a bulk-loader run with
+   identical layout/typography so the operator can compare progress at a
+   glance. Visual primitives mirror .generator-form__progress so the look
+   stays continuous with the legacy stream bar. */
+.phase-progress {
+  display: grid;
+  gap: 0.3rem;
+  margin-top: 0.4rem;
+}
+.phase-progress + .phase-progress {
+  margin-top: 0.6rem;
+}
+.phase-progress__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 0.85em;
+  color: var(--redis-text-secondary);
+}
+.phase-progress__label {
+  font-weight: 600;
+  color: var(--redis-text-primary);
+}
+.phase-progress__bar {
+  position: relative;
+  width: 100%;
+  height: 8px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.phase-progress__fill {
+  height: 100%;
+  background: var(--redis-hyper, #ff4438);
+  transition: width 200ms linear;
+}
+.phase-progress__meta {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  align-items: center;
+  font-size: 0.85em;
+  color: var(--redis-text-secondary);
+}
+.phase-progress__stats {
+  margin-left: auto;
+}
+.phase-progress__error {
+  color: var(--redis-hyper);
+  background: rgba(255, 68, 56, 0.10);
+  border-left: 3px solid var(--redis-hyper);
+  padding: 0.35rem 0.6rem;
+  border-radius: 3px;
+}
+
 /* Wave 5.20a — collapsible advanced options. Toggle button mirrors the
    shared .btn--secondary tone; the body is hidden by default. */
 .generator-form__advanced {
