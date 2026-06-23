@@ -245,6 +245,36 @@ services:
       retries: 5
       start_period: 5s
 
+  # Wave 7.0.7: bulk-loader service with horizontal scaling support. Each
+  # replica spawns BULK_LOADER_POOL_SIZE workers (default 8), so scaling to
+  # 4 replicas on a 32vCPU VM distributes 32 total workers across the VM's
+  # cores. No ports exposed — generator/UI reach bulk-loader via internal
+  # network only. Scale with: `docker compose up -d --scale bulk-loader=4`.
+  bulk-loader:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: services/bulk-loader/Dockerfile
+    env_file: *env-file
+    environment:
+      <<: *app-env
+      HEALTH_PORT: 8086
+      # Wave 7.0.7: default pool size per container. Scaling 4× with
+      # BULK_LOADER_POOL_SIZE=8 yields 32 total workers (8 per replica).
+      BULK_LOADER_POOL_SIZE: ${BULK_LOADER_POOL_SIZE:-8}
+      # Wave 7.0.7: point the active-target watcher at the api container's
+      # service hostname for cross-container resolution.
+      API_BASE: http://api:8080
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8086/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
   # Dev-only Redis Stack container, NOT started in the demo compose flow.
   # Activate with: `docker compose --profile dev-redis up`.
   redis:
