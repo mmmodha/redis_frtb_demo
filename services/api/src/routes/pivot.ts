@@ -150,6 +150,98 @@ function entriesFromHashReply(reply: unknown): Array<[string, string]> | null {
   return null;
 }
 
+// Wave 7.0.6.23 — reconstruct `risk_value` from the flattened `s_*` HASH
+// fields the Wave 7.0.0.B bulk-loader writes onto the parent `sens:<ulid>`
+// HASH (services/bulk-loader/src/worker.ts `rowToHashFields`). The loader is
+// now the canonical ingest path but it does NOT write the legacy
+// `{sens:<ulid>}:tenors` sidetable, so the HGETALL fallback below returns
+// empty and the UI drilldown's risk_value column went blank. Per Wave 6.31
+// (ULID-only key shape for uniform CRC16) and explicit operator direction
+// for this wave, introducing any new `{...}:suffix` companion key is
+// disallowed — the only allowed remediation is to read existing fields
+// already on the parent HASH and synthesise the response object from them.
+// Returns undefined when no relevant `s_*` field is present so the legacy
+// sidetable HGETALL path can still serve pre-7.0 `hash-sidetable` rows.
+function reconstructRiskValueFromParent(
+  doc: Record<string, unknown>,
+  schema: Schema | undefined,
+): unknown {
+  if (!schema) return undefined;
+  const rc = doc.risk_class;
+  const sens = doc.sensitivity_type;
+  if (typeof rc !== "string" || typeof sens !== "string") return undefined;
+  const lower = rc.toLowerCase();
+  const nodes = schema.risk_classes?.[rc]?.tenor?.nodes;
+  const isPerTenor = Array.isArray(nodes) && nodes.length > 0;
+
+  if (sens === "Curvature") {
+    if (isPerTenor) {
+      // Positional `number[]` arrays in `nodes` order — must keep length
+      // aligned with the schema's tenor list so the UI's index-keyed
+      // sparkline lines up. Wave 7.0.6.14's dense zero-pad fills missing
+      // fields with "0" on the writer side; we mirror that here for any
+      // stragglers so the array never has a structural gap.
+      const up: number[] = [];
+      const down: number[] = [];
+      let any = false;
+      for (const t of nodes as string[]) {
+        const rawU = doc[`s_${lower}_cvr_up_${t}`];
+        const rawD = doc[`s_${lower}_cvr_down_${t}`];
+        const u = Number(rawU);
+        const d = Number(rawD);
+        if (rawU !== undefined) { any = true; up.push(Number.isFinite(u) ? u : 0); } else { up.push(0); }
+        if (rawD !== undefined) { any = true; down.push(Number.isFinite(d) ? d : 0); } else { down.push(0); }
+      }
+      return any ? { cvr_up: up, cvr_down: down } : undefined;
+    }
+    const out: Record<string, number> = {};
+    const rawU = doc[`s_${lower}_cvr_up`];
+    const rawD = doc[`s_${lower}_cvr_down`];
+    if (rawU !== undefined) {
+      const u = Number(rawU);
+      if (Number.isFinite(u)) out.cvr_up = u;
+    }
+    if (rawD !== undefined) {
+      const d = Number(rawD);
+      if (Number.isFinite(d)) out.cvr_down = d;
+    }
+    return Object.keys(out).length > 0 ? out : undefined;
+  }
+
+  // Delta / Vega share the same `s_<lower>_<leg>[_<tenor>]` layout.
+  const leg = sens === "Vega" ? "vega" : "delta";
+  if (isPerTenor) {
+    const out: Record<string, number> = {};
+    for (const t of nodes as string[]) {
+      const raw = doc[`s_${lower}_${leg}_${t}`];
+      if (raw === undefined) continue;
+      const n = Number(raw);
+      // NaN/Infinity from a malformed write are skipped — Wave 7.0.6.14
+      // zero-padding stores explicit "0" strings for absent tenors so a
+      // healthy row surfaces every schema-declared tenor as a finite 0.
+      if (Number.isFinite(n)) out[t] = n;
+    }
+    return Object.keys(out).length > 0 ? out : undefined;
+  }
+  const raw = doc[`s_${lower}_${leg}`];
+  if (raw === undefined) return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) ? { spot: n } : undefined;
+}
+
+// Wave 7.0.6.23 — strip the flat `s_*` HASH fields from the response doc
+// after reconstruction so the response shape stays compatible with
+// pre-regression /pivot consumers (no `s_*` keys leak into the JSON drawer
+// or group-by logic on the UI). Matches both per-tenor (`s_girr_delta_3M`)
+// and scalar (`s_fx_delta`, `s_fx_cvr_up`) field names. Class portion uses
+// `[a-z_]+` to cover multi-token lowercase classes (e.g. `csr_non_sec`).
+const STRIP_S_FIELD_RE = /^s_[a-z][a-z_]*_(delta|vega|cvr_up|cvr_down)(_.+)?$/;
+function stripFlatSensitivityFields(doc: Record<string, unknown>): void {
+  for (const k of Object.keys(doc)) {
+    if (STRIP_S_FIELD_RE.test(k)) delete doc[k];
+  }
+}
+
 // Wave 6.47.B — schema-derived weight lookup for a single row. Mirrors the
 // `RiskWeightTable` discriminator in shared/schema/src/types.ts:
 //   - `by_tenor` (GIRR) → return the full tenor → weight object so the UI
@@ -287,6 +379,17 @@ export function registerPivotRoute(
       enrichTargets.push({ row, docObj: row.doc as Record<string, unknown> });
     }
 
+    // Wave 7.0.6.23 — primary risk_value source for Wave 7.0+ bulk-loaded
+    // rows is the flattened `s_*` fields already on the parent HASH
+    // (returned in the same FT.SEARCH reply, no extra round-trip). This runs
+    // BEFORE the legacy sidetable HGETALL so the HGETALL is only issued for
+    // rows that still need it (pre-7.0 `hash-sidetable` data).
+    for (const { docObj } of enrichTargets) {
+      if (docObj.risk_value !== undefined) continue;
+      const rv = reconstructRiskValueFromParent(docObj, opts.schema);
+      if (rv !== undefined) docObj.risk_value = rv;
+    }
+
     // Pipeline one HGETALL per row that still needs raw risk_value. Scalar
     // Equity/FX rows have no side-table key (the writer skips them) — the
     // reply will be empty and `parseSideTableRiskValue` returns undefined,
@@ -323,6 +426,14 @@ export function registerPivotRoute(
         const w = resolveWeightFromSchema(opts.schema, docObj);
         if (w !== undefined) docObj.weight = w;
       }
+    }
+
+    // Wave 7.0.6.23 — drop the flat `s_*` HASH fields from the response;
+    // they were consumed for risk_value reconstruction above and would
+    // otherwise leak into the UI JSON drawer / group-by logic that predates
+    // the bulk-loader's HASH layout.
+    for (const { docObj } of enrichTargets) {
+      stripFlatSensitivityFields(docObj);
     }
 
     return { rows, total, limit, offset, ms: Math.round(ms * 1000) / 1000 };

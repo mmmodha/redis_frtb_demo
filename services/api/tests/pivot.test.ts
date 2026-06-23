@@ -384,4 +384,327 @@ describe("GET /pivot", () => {
       expect(fr.calls.filter((c) => c.command === "HGETALL")).toHaveLength(0);
     });
   });
+
+  // Wave 7.0.6.23 — the bulk-loader (services/bulk-loader/src/worker.ts
+  // `rowToHashFields`) is the canonical ingest path on Wave 7.0+ and writes
+  // the raw sensitivity onto the parent `sens:<ulid>` HASH as flattened
+  // `s_<class>_<leg>[_<tenor>]` fields, but it does NOT populate the legacy
+  // `{sens:<ulid>}:tenors` sidetable (introducing one would re-create the
+  // hash-tag hot-shard pattern Wave 6.31 eliminated). /pivot reconstructs
+  // `risk_value` from those parent-HASH fields before falling through to
+  // the sidetable HGETALL for pre-7.0 `hash-sidetable` rows.
+  describe("Wave 7.0.6.23 — parent-HASH risk_value reconstruction", () => {
+    function girrFullSchema(): Schema {
+      return {
+        version: 1,
+        dimensions: [],
+        risk_classes: {
+          GIRR: {
+            dimensions: [],
+            buckets: { naming: "currency", values: ["USD-IRS"] },
+            tenor: { count: 3, nodes: ["3M", "6M", "1Y"] },
+            risk_weights_ref: "girr_delta_weights",
+            intra_bucket_correlation_ref: "girr_rho_kl",
+            cross_bucket_correlation_ref: "girr_gamma_bc",
+          },
+        },
+        frtb_binding: {
+          risk_class: "risk_class", bucket: "bucket", tenor: "tenor",
+          risk_value: "risk_value", weight: "weight", sensitivity_type: "sensitivity_type",
+        },
+        risk_weights: {
+          girr_delta_weights: { by_tenor: { "3M": 0.017, "6M": 0.017, "1Y": 0.016 } },
+        },
+        correlations: {},
+      } as unknown as Schema;
+    }
+
+    function scalarOnlySchema(): Schema {
+      return {
+        version: 1,
+        dimensions: [],
+        risk_classes: {
+          FX: {
+            dimensions: [],
+            buckets: { naming: "currency-pair", values: ["EURUSD"] },
+            risk_weights_ref: "fx_delta_weights",
+            intra_bucket_correlation_ref: "fx_rho",
+            cross_bucket_correlation_ref: "fx_gamma",
+          },
+          Equity: {
+            dimensions: [],
+            buckets: { naming: "bucket-id", values: ["6"] },
+            risk_weights_ref: "equity_weights",
+            intra_bucket_correlation_ref: "equity_rho",
+            cross_bucket_correlation_ref: "equity_gamma",
+          },
+        },
+        frtb_binding: {
+          risk_class: "risk_class", bucket: "bucket", tenor: "tenor",
+          risk_value: "risk_value", weight: "weight", sensitivity_type: "sensitivity_type",
+        },
+        risk_weights: {
+          fx_delta_weights: { constant: 0.15 },
+          equity_weights: { by_bucket: { "6": 0.35 } },
+        },
+        correlations: {},
+      } as unknown as Schema;
+    }
+
+    it("GIRR Delta per-tenor — reconstructs tenor-keyed object including zero-padded tenors", async () => {
+      const fr = fakeRedis();
+      fr.setResponse(
+        "FT.SEARCH",
+        ftSearchReply(1, [
+          {
+            key: "sens:01HXAA",
+            doc: {
+              risk_class: "GIRR", bucket: "USD-IRS", sensitivity_type: "Delta",
+              s_girr_delta_3M: "0.1", s_girr_delta_6M: "0.2", s_girr_delta_1Y: "0",
+            },
+          },
+        ]),
+      );
+      fr.setResponse("HGETALL", []);
+      app = await createServer({ redis: fr, schema: girrFullSchema() });
+      const res = await app.inject({
+        method: "GET",
+        url: "/pivot?risk_class=GIRR&bucket=USD-IRS&sensitivity_type=Delta",
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.rows[0].doc.risk_value).toEqual({ "3M": 0.1, "6M": 0.2, "1Y": 0 });
+      // s_* fields stripped from the response.
+      expect(body.rows[0].doc.s_girr_delta_3M).toBeUndefined();
+      expect(body.rows[0].doc.s_girr_delta_6M).toBeUndefined();
+      expect(body.rows[0].doc.s_girr_delta_1Y).toBeUndefined();
+    });
+
+    it("GIRR Vega per-tenor — reads s_girr_vega_<t> fields", async () => {
+      const fr = fakeRedis();
+      fr.setResponse(
+        "FT.SEARCH",
+        ftSearchReply(1, [
+          {
+            key: "sens:01HXVA",
+            doc: {
+              risk_class: "GIRR", bucket: "USD-IRS", sensitivity_type: "Vega",
+              s_girr_vega_3M: "0.5", s_girr_vega_6M: "0.6", s_girr_vega_1Y: "0",
+            },
+          },
+        ]),
+      );
+      fr.setResponse("HGETALL", []);
+      app = await createServer({ redis: fr, schema: girrFullSchema() });
+      const res = await app.inject({
+        method: "GET",
+        url: "/pivot?risk_class=GIRR&sensitivity_type=Vega",
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().rows[0].doc.risk_value).toEqual({ "3M": 0.5, "6M": 0.6, "1Y": 0 });
+    });
+
+    it("GIRR Curvature per-tenor — reconstructs positional cvr_up/cvr_down arrays in nodes order", async () => {
+      const fr = fakeRedis();
+      fr.setResponse(
+        "FT.SEARCH",
+        ftSearchReply(1, [
+          {
+            key: "sens:01HXCV",
+            doc: {
+              risk_class: "GIRR", bucket: "USD-IRS", sensitivity_type: "Curvature",
+              s_girr_cvr_up_3M: "0.1", s_girr_cvr_up_6M: "0.2", s_girr_cvr_up_1Y: "0.3",
+              s_girr_cvr_down_3M: "-0.1", s_girr_cvr_down_6M: "-0.2", s_girr_cvr_down_1Y: "-0.3",
+            },
+          },
+        ]),
+      );
+      fr.setResponse("HGETALL", []);
+      app = await createServer({ redis: fr, schema: girrFullSchema() });
+      const res = await app.inject({
+        method: "GET",
+        url: "/pivot?risk_class=GIRR&sensitivity_type=Curvature",
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().rows[0].doc.risk_value).toEqual({
+        cvr_up: [0.1, 0.2, 0.3],
+        cvr_down: [-0.1, -0.2, -0.3],
+      });
+    });
+
+    it("FX Delta scalar — reconstructs {spot} from s_fx_delta", async () => {
+      const fr = fakeRedis();
+      fr.setResponse(
+        "FT.SEARCH",
+        ftSearchReply(1, [
+          {
+            key: "sens:01HXFD",
+            doc: {
+              risk_class: "FX", bucket: "EURUSD", sensitivity_type: "Delta",
+              s_fx_delta: "-0.143",
+            },
+          },
+        ]),
+      );
+      fr.setResponse("HGETALL", []);
+      app = await createServer({ redis: fr, schema: scalarOnlySchema() });
+      const res = await app.inject({
+        method: "GET",
+        url: "/pivot?risk_class=FX&sensitivity_type=Delta",
+      });
+      expect(res.statusCode).toBe(200);
+      const doc = res.json().rows[0].doc;
+      expect(doc.risk_value).toEqual({ spot: -0.143 });
+      expect(doc.s_fx_delta).toBeUndefined();
+    });
+
+    it("FX Vega scalar — reconstructs {spot} from s_fx_vega", async () => {
+      const fr = fakeRedis();
+      fr.setResponse(
+        "FT.SEARCH",
+        ftSearchReply(1, [
+          {
+            key: "sens:01HXFV",
+            doc: {
+              risk_class: "FX", bucket: "EURUSD", sensitivity_type: "Vega",
+              s_fx_vega: "0.5",
+            },
+          },
+        ]),
+      );
+      fr.setResponse("HGETALL", []);
+      app = await createServer({ redis: fr, schema: scalarOnlySchema() });
+      const res = await app.inject({
+        method: "GET",
+        url: "/pivot?risk_class=FX&sensitivity_type=Vega",
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().rows[0].doc.risk_value).toEqual({ spot: 0.5 });
+    });
+
+    it("FX Curvature scalar — reconstructs {cvr_up, cvr_down} numerics", async () => {
+      const fr = fakeRedis();
+      fr.setResponse(
+        "FT.SEARCH",
+        ftSearchReply(1, [
+          {
+            key: "sens:01HXFC",
+            doc: {
+              risk_class: "FX", bucket: "EURUSD", sensitivity_type: "Curvature",
+              s_fx_cvr_up: "1.2", s_fx_cvr_down: "-0.8",
+            },
+          },
+        ]),
+      );
+      fr.setResponse("HGETALL", []);
+      app = await createServer({ redis: fr, schema: scalarOnlySchema() });
+      const res = await app.inject({
+        method: "GET",
+        url: "/pivot?risk_class=FX&sensitivity_type=Curvature",
+      });
+      expect(res.statusCode).toBe(200);
+      const doc = res.json().rows[0].doc;
+      expect(doc.risk_value).toEqual({ cvr_up: 1.2, cvr_down: -0.8 });
+      expect(doc.s_fx_cvr_up).toBeUndefined();
+      expect(doc.s_fx_cvr_down).toBeUndefined();
+    });
+
+    it("Equity Delta scalar (bucket-based class, no tenor nodes) — {spot} from s_equity_delta", async () => {
+      const fr = fakeRedis();
+      fr.setResponse(
+        "FT.SEARCH",
+        ftSearchReply(1, [
+          {
+            key: "sens:01HXED",
+            doc: {
+              risk_class: "Equity", bucket: "6", sensitivity_type: "Delta",
+              s_equity_delta: "0.1",
+            },
+          },
+        ]),
+      );
+      fr.setResponse("HGETALL", []);
+      app = await createServer({ redis: fr, schema: scalarOnlySchema() });
+      const res = await app.inject({
+        method: "GET",
+        url: "/pivot?risk_class=Equity&bucket=6&sensitivity_type=Delta",
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().rows[0].doc.risk_value).toEqual({ spot: 0.1 });
+    });
+
+    it("NaN tolerance — non-finite per-tenor field is skipped, surrounding tenors still present", async () => {
+      const fr = fakeRedis();
+      fr.setResponse(
+        "FT.SEARCH",
+        ftSearchReply(1, [
+          {
+            key: "sens:01HXNA",
+            doc: {
+              risk_class: "GIRR", bucket: "USD-IRS", sensitivity_type: "Delta",
+              s_girr_delta_3M: "NaN", s_girr_delta_6M: "0.2", s_girr_delta_1Y: "0",
+            },
+          },
+        ]),
+      );
+      fr.setResponse("HGETALL", []);
+      app = await createServer({ redis: fr, schema: girrFullSchema() });
+      const res = await app.inject({ method: "GET", url: "/pivot?risk_class=GIRR" });
+      expect(res.statusCode).toBe(200);
+      // 3M is dropped (NaN, non-finite); 6M / 1Y are retained as numbers.
+      expect(res.json().rows[0].doc.risk_value).toEqual({ "6M": 0.2, "1Y": 0 });
+    });
+
+    it("no s_* fields → reconstruction is a no-op and the legacy sidetable HGETALL path runs", async () => {
+      const fr = fakeRedis();
+      fr.setResponse(
+        "FT.SEARCH",
+        ftSearchReply(1, [
+          {
+            key: "sens:01HXLG",
+            // Pre-7.0 hash-sidetable row: parent HASH has no s_* fields.
+            doc: { risk_class: "GIRR", bucket: "USD-IRS", sensitivity_type: "Delta" },
+          },
+        ]),
+      );
+      fr.setResponse("HGETALL", (args) => {
+        if (String(args[0]) === "{sens:01HXLG}:tenors") {
+          return ["3M", "0.5", "6M", "1.25"];
+        }
+        return [];
+      });
+      app = await createServer({ redis: fr, schema: girrFullSchema() });
+      const res = await app.inject({ method: "GET", url: "/pivot?risk_class=GIRR" });
+      expect(res.statusCode).toBe(200);
+      // Sidetable HGETALL filled risk_value.
+      expect(res.json().rows[0].doc.risk_value).toEqual({ "3M": 0.5, "6M": 1.25 });
+      // Sidetable HGETALL was issued (one row, one HGETALL).
+      expect(fr.calls.filter((c) => c.command === "HGETALL")).toHaveLength(1);
+    });
+
+    it("response cleanup — every s_* field is stripped from the doc after reconstruction", async () => {
+      const fr = fakeRedis();
+      fr.setResponse(
+        "FT.SEARCH",
+        ftSearchReply(1, [
+          {
+            key: "sens:01HXST",
+            doc: {
+              risk_class: "GIRR", bucket: "USD-IRS", sensitivity_type: "Curvature",
+              s_girr_cvr_up_3M: "0.1", s_girr_cvr_up_6M: "0.2", s_girr_cvr_up_1Y: "0.3",
+              s_girr_cvr_down_3M: "-0.1", s_girr_cvr_down_6M: "-0.2", s_girr_cvr_down_1Y: "-0.3",
+            },
+          },
+        ]),
+      );
+      fr.setResponse("HGETALL", []);
+      app = await createServer({ redis: fr, schema: girrFullSchema() });
+      const res = await app.inject({ method: "GET", url: "/pivot?risk_class=GIRR" });
+      expect(res.statusCode).toBe(200);
+      const doc = res.json().rows[0].doc;
+      for (const k of Object.keys(doc)) {
+        expect(k.startsWith("s_")).toBe(false);
+      }
+    });
+  });
 });
