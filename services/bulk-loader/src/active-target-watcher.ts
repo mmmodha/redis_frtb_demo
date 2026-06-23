@@ -1,17 +1,20 @@
-// Wave 7.0.6.17 — bulk-loader active-target watcher.
+// Wave 7.0.6.25 — bulk-loader active-target watcher.
 //
-// Mirrors services/loadgen/src/active-target-watcher.ts but adds an
-// `onSwitch(next, prev)` callback the bulk-loader wires to its swapTarget
-// routine. Polls /internal/redis/active-target/full every 5s; whenever the
-// monotonic `version` field changes we treat it as a swap signal and fire
-// the callback. The callback's promise is awaited inside the tick so two
-// rapid-fire version bumps don't queue concurrent swaps — swap-target.ts
-// has its own mutex too, but this gives swapTarget contiguous control of
-// the tick loop while a swap is mid-flight.
+// Polls the api's active-target endpoint every 5s; whenever the monotonic
+// `version` field changes we treat it as a swap signal and fire the onSwitch
+// callback. Supports two modes:
+//   1. token provided: polls /internal/redis/active-target/full (password included)
+//   2. token empty: polls /admin/active-target-identity (public, no password)
+//
+// The public-endpoint mode is used when bulk-loader boots with no Redis target
+// configured (awaiting_target state). Once user configures via UI, the watcher
+// picks it up, fires onSwitch to establish the first connection, and transitions
+// to token-gated mode if INTERNAL_API_TOKEN is set.
 //
 // NEVER log the bearer token or the active-target password.
 
 import type { ActiveTargetFull } from "@frtb/redis-client";
+import { fetchActiveTargetIdentity, type ActiveTargetIdentity } from "./active-target-identity.ts";
 
 export interface WatcherLogger {
   info(obj: object, msg: string): void;
@@ -77,11 +80,29 @@ export function createActiveTargetWatcher(opts: WatcherOpts): ActiveTargetWatche
   let pollTimer: NodeJS.Timeout | null = null;
   let tickInFlight = false;
 
+  // Wave 7.0.6.25 — fetch from token-gated /internal endpoint when token is
+  // provided, otherwise from public /admin/active-target-identity. The public
+  // endpoint returns host/port/label/version but NO password/tls/db, so we
+  // default those fields to passwordless standalone Redis (tls=false, db=0).
   async function fetchTarget(): Promise<ActiveTargetFull> {
-    const url = `${opts.apiBase}/internal/redis/active-target/full`;
-    const r = await fetchImpl(url, { headers: { Authorization: `Bearer ${opts.token}` } });
-    if (!r.ok) throw new Error(`api ${r.status}`);
-    return (await r.json()) as ActiveTargetFull;
+    if (opts.token) {
+      const url = `${opts.apiBase}/internal/redis/active-target/full`;
+      const r = await fetchImpl(url, { headers: { Authorization: `Bearer ${opts.token}` } });
+      if (!r.ok) throw new Error(`api ${r.status}`);
+      return (await r.json()) as ActiveTargetFull;
+    } else {
+      const identity: ActiveTargetIdentity | null = await fetchActiveTargetIdentity(opts.apiBase);
+      if (!identity) throw new Error("public active-target-identity fetch failed");
+      // Enrich identity to ActiveTargetFull with default standalone Redis shape.
+      return {
+        host: identity.host,
+        port: identity.port,
+        label: identity.label,
+        version: identity.version,
+        tls: false,
+        db: 0,
+      };
+    }
   }
 
   async function applySwitch(next: ActiveTargetFull): Promise<void> {

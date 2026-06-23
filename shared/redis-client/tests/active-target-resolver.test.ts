@@ -1,9 +1,10 @@
-// Wave 6.39.F — unit tests for the one-shot Redis target resolver. Covers
-// the 4-tier precedence used by the generator CLI:
+// Wave 7.0.6.25 — unit tests for the one-shot Redis target resolver. Covers
+// the 5-tier precedence used by generator CLI and bulk-loader:
 //   1. Explicit URL wins (operator escape hatch).
-//   2. Live active-target wins when apiBase + token configured + api reachable.
-//   3. envRedisUrl is the bootstrap fallback when the api is unreachable.
-//   4. No source available → hard error with a clear message.
+//   2. Live active-target from /internal endpoint (token-gated, includes password).
+//   3. Public active-target from /admin/active-target-identity (no auth, no password).
+//   4. envRedisUrl is the bootstrap fallback when all endpoints are unreachable.
+//   5. No source available → sentinel { url: null, source: "none" }.
 
 import { describe, it, expect, vi } from "vitest";
 import { resolveRedisTarget, buildRedisUrlFromTarget, type ActiveTargetFull } from "../src/active-target-resolver.ts";
@@ -93,7 +94,7 @@ describe("resolveRedisTarget — 4-tier precedence", () => {
     );
   });
 
-  it("Test 3: API unreachable + REDIS_URL set → fallback works, warning emitted", async () => {
+  it("Test 3: API unreachable + REDIS_URL set → fallback works, warnings emitted for both tiers", async () => {
     const logger = makeLogger();
     const r = await resolveRedisTarget({
       apiBase: "http://api:8080",
@@ -106,22 +107,37 @@ describe("resolveRedisTarget — 4-tier precedence", () => {
     expect(r.url).toBe("redis://env-host:2222");
     expect(r.host).toBe("env-host");
     expect(r.port).toBe(2222);
-    expect(logger.warn).toHaveBeenCalledWith(
+    // Wave 7.0.6.25 — two warnings now: tier 2 (internal) + tier 3 (public).
+    expect(logger.warn).toHaveBeenCalledTimes(2);
+    expect(logger.warn).toHaveBeenNthCalledWith(
+      1,
       expect.objectContaining({ apiBase: "http://api:8080" }),
-      expect.stringMatching(/active-target fetch failed/),
+      expect.stringMatching(/active-target \(internal\) fetch failed/),
+    );
+    expect(logger.warn).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ apiBase: "http://api:8080" }),
+      expect.stringMatching(/active-target \(public\) fetch failed/),
     );
   });
 
-  it("Test 4: API unreachable + no REDIS_URL → fatal error with clear message", async () => {
+  it("Test 4: API unreachable + no REDIS_URL → returns sentinel (source=none)", async () => {
     const logger = makeLogger();
-    await expect(
-      resolveRedisTarget({
-        apiBase: "http://api:8080",
-        token: "tok",
-        fetchImpl: makeUnreachableFetch(),
-        logger,
-      }),
-    ).rejects.toThrow(/redis target missing.*--redis-url.*API_URL.*INTERNAL_API_TOKEN.*REDIS_URL/s);
+    const r = await resolveRedisTarget({
+      apiBase: "http://api:8080",
+      token: "tok",
+      fetchImpl: makeUnreachableFetch(),
+      logger,
+    });
+    // Wave 7.0.6.25 — tier 5 now returns sentinel instead of throwing.
+    expect(r.source).toBe("none");
+    expect(r.url).toBeNull();
+    expect(r.host).toBe("");
+    expect(r.port).toBe(0);
+    expect(logger.info).toHaveBeenCalledWith(
+      { source: "none" },
+      "no redis target configured",
+    );
   });
 
   it("API returns non-200 → falls back to env with warning", async () => {

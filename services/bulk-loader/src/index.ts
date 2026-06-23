@@ -150,12 +150,21 @@ async function main(): Promise<void> {
       warn: (obj, m) => log("warn", m, obj),
     },
   });
-  log("info", "redis target resolved", {
-    source: resolved.source,
-    host: resolved.host,
-    port: resolved.port,
-    pool_size: POOL_SIZE,
-  });
+
+  // Wave 7.0.6.25 — sentinel detection: when no target is configured, boot
+  // successfully in awaiting_target state. The active-target watcher will
+  // poll /admin/active-target-identity every 5s and invoke buildRuntime +
+  // onSwitch when the user configures via UI.
+  if (resolved.url === null) {
+    log("info", "No Redis target configured; waiting for active-target from API. Configure via UI or set REDIS_URL.");
+  } else {
+    log("info", "redis target resolved", {
+      source: resolved.source,
+      host: resolved.host,
+      port: resolved.port,
+      pool_size: POOL_SIZE,
+    });
+  }
 
   // Wave 7.0.6.14 — load the active schema to derive per-class tenor lists
   // for writer-side zero-pad. A missing or unreadable schema is non-fatal:
@@ -241,29 +250,33 @@ async function main(): Promise<void> {
     return { pool, dispatcher, checkpointer, bootstrapCheckpoints: bootstrap };
   }
 
-  // Boot triple — built against the URL we just resolved.
-  const initial = await buildRuntime(resolved.url);
+  // Wave 7.0.6.25 — boot triple. If resolved.url is null (sentinel), skip
+  // runtime build and boot with null pool/dispatcher/checkpointer. The
+  // active-target watcher's onSwitch will build the runtime when the user
+  // configures via UI.
+  let initial: RebuiltRuntime | null = null;
+  if (resolved.url !== null) {
+    initial = await buildRuntime(resolved.url);
+  }
 
-  // Wave 7.0.6.17 / 7.0.6.17a — fetch the api's labelled identity via the
-  // unauthenticated /admin/active-target-identity endpoint so the state
-  // holder's bound_target.label is populated correctly EVEN when
-  // INTERNAL_API_TOKEN is unset (the pre-7.0.6.17a path short-circuited
-  // here and fell back to a synthetic label, which combined with the
-  // gated stale-poll let token-unset deploys silently write to the wrong
-  // DB). Best-effort; on failure we fall back to a synthetic label derived
-  // from the resolver source so /load/status still has something printable.
+  // Wave 7.0.6.17 / 7.0.6.17a / 7.0.6.25 — fetch the api's labelled identity
+  // via the unauthenticated /admin/active-target-identity endpoint so the
+  // state holder's bound_target.label is populated correctly EVEN when
+  // INTERNAL_API_TOKEN is unset. Best-effort; on failure we fall back to a
+  // synthetic label. When resolved.url is null (awaiting_target), there is
+  // no bound target yet so we use null.
   const token = process.env.INTERNAL_API_TOKEN;
   const apiInitial = await fetchActiveTargetIdentity(API_BASE);
   const boundLabel = apiInitial?.label
-    ?? (resolved.source === "active-target" ? "active-target" : resolved.source === "explicit" ? "explicit-url" : "env-redis");
+    ?? (resolved.source === "active-target" ? "active-target" : resolved.source === "explicit" ? "explicit-url" : resolved.source === "env" ? "env-redis" : null);
   const state: BulkLoaderState = createBulkLoaderState({
-    pool: initial.pool,
-    dispatcher: initial.dispatcher,
-    checkpointer: initial.checkpointer,
-    bootstrapCheckpoints: initial.bootstrapCheckpoints,
-    boundTarget: { host: resolved.host, port: resolved.port, label: boundLabel },
+    pool: initial?.pool ?? null,
+    dispatcher: initial?.dispatcher ?? null,
+    checkpointer: initial?.checkpointer ?? null,
+    bootstrapCheckpoints: initial?.bootstrapCheckpoints ?? new Map(),
+    boundTarget: resolved.url !== null ? { host: resolved.host, port: resolved.port, label: boundLabel ?? "unknown" } : null,
     boundVersion: apiInitial?.version ?? null,
-    targetWatcher: token ? "enabled" : "disabled",
+    targetWatcher: resolved.url === null ? "awaiting" : (token ? "enabled" : "disabled"),
   });
   // Wave 7.0.6.17a — seed apiActiveTarget at boot so the very first
   // /load/status reflects any pre-existing divergence (e.g. operator
@@ -277,16 +290,17 @@ async function main(): Promise<void> {
     );
   }
 
-  // Wave 7.0.6.17 — active-target watcher. When INTERNAL_API_TOKEN is set,
-  // poll /internal/redis/active-target/full every 5s and invoke
-  // swapTarget on any version bump. The onPoll hook keeps the
-  // api_active_target snapshot fresh on /load/status so the UI banner can
-  // detect divergence even between version bumps.
+  // Wave 7.0.6.25 — active-target watcher. When INTERNAL_API_TOKEN is set,
+  // poll /internal/redis/active-target/full every 5s and invoke swapTarget
+  // on any version bump. When token is NOT set but we're in awaiting_target
+  // state (resolved.url === null), poll the public /admin/active-target-
+  // identity endpoint instead so the bulk-loader can establish the first
+  // connection when user configures via UI.
   let watcher: ActiveTargetWatcher | null = null;
-  if (token) {
+  if (token || resolved.url === null) {
     watcher = createActiveTargetWatcher({
       apiBase: API_BASE,
-      token,
+      token: token ?? "",
       pollMs: ACTIVE_TARGET_POLL_MS,
       logger: {
         info: (obj, m) => log("info", m, obj),

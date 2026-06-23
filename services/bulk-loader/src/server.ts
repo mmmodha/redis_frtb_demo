@@ -104,6 +104,19 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
   }
 
   app.get("/healthz", async (_req, reply) => {
+    // Wave 7.0.6.25 — when state.pool is null (awaiting_target), return 503
+    // with status="awaiting" so operators see the bulk-loader is waiting for
+    // a Redis target to be configured via the UI or REDIS_URL env.
+    if (!state.pool) {
+      reply.code(503);
+      return {
+        service: "bulk-loader",
+        status: "awaiting",
+        connected: 0,
+        pool_size: 0,
+        reason: "awaiting Redis target configuration",
+      };
+    }
     const s = state.pool.status();
     const healthy = state.pool.isHealthy();
     // Wave 7.0.6.17 — fail-loud on stale target. /healthz must reflect the
@@ -132,6 +145,34 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
   });
 
   app.get("/load/status", async () => {
+    // Wave 7.0.6.25 — when state.pool is null (awaiting_target), return a
+    // minimal status response with bound_target: null and empty workers array.
+    // The UI banner + operator tools use this to detect the awaiting state.
+    if (!state.pool) {
+      return {
+        pool_size: 0,
+        connected: 0,
+        dispatcher: null,
+        throttled: false,
+        headroom_pct: null,
+        recent_429_count: 0,
+        body_drain_errors: bodyDrainErrors,
+        bound_target: null,
+        target_stale: state.targetStale,
+        target_stale_reason: state.targetStaleReason,
+        api_active_target: state.apiActiveTarget ? { ...state.apiActiveTarget } : null,
+        target_swap_count: state.targetSwapCount,
+        last_swap_error: state.lastSwapError,
+        target_watcher: state.targetWatcher,
+        accepting: state.accepting,
+        oom_rejected_total: 0,
+        seen_sadds_emitted: 0,
+        seen_sadds_failed: 0,
+        workers: [],
+        checkpoints: [],
+      };
+    }
+
     const s = state.pool.status();
     // Wave 7.0.1.B — merge per-worker write metrics onto each pool worker
     // entry so operators see a single combined view. last_flush_at is
@@ -199,11 +240,9 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
       headroom_pct: headroomPct,
       recent_429_count: recent429Count,
       body_drain_errors: bodyDrainErrors,
-      // Wave 7.0.6.17 — target identity + swap observability. UI banner
-      // reads bound_target + api_active_target to render divergence; ops
-      // tools read target_swap_count + last_swap_error to confirm a
-      // operator-triggered switch landed.
-      bound_target: { ...state.boundTarget },
+      // Wave 7.0.6.17 / 7.0.6.25 — target identity + swap observability.
+      // bound_target is null when in awaiting_target state.
+      bound_target: state.boundTarget ? { ...state.boundTarget } : null,
       target_stale: state.targetStale,
       target_stale_reason: state.targetStaleReason,
       api_active_target: state.apiActiveTarget ? { ...state.apiActiveTarget } : null,

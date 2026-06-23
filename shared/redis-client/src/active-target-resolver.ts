@@ -1,17 +1,19 @@
-// Wave 6.39.F — one-shot Redis target resolver for CLI tools (e.g. generator).
+// Wave 7.0.6.25 — one-shot Redis target resolver for CLI tools (e.g. generator, bulk-loader).
 //
 // Long-running services (source, ingest, loadgen) poll the api's
 // /internal/redis/active-target/full endpoint via per-service watchers. A
 // one-shot CLI doesn't need polling, but it MUST still honour the api's
 // current active target so the UI "active connection" widget reflects where
 // the data actually lands. This resolver performs a single fetch and returns
-// a redis URL with a 4-tier precedence (highest → lowest):
+// a redis URL with a 5-tier precedence (highest → lowest):
 //
 //   1. Explicit URL (e.g. `--redis-url` CLI flag) — operator escape hatch.
 //   2. Live active-target from `GET ${apiBase}/internal/redis/active-target/full`
 //      (requires bearer token; skipped if apiBase or token are unset).
-//   3. `envRedisUrl` (typically `process.env.REDIS_URL` — bootstrap fallback).
-//   4. Hard error with a clear message.
+//   3. Public active-target from `GET ${apiBase}/admin/active-target-identity`
+//      (no auth required; returns host/port/label/version but NOT password).
+//   4. `envRedisUrl` (typically `process.env.REDIS_URL` — bootstrap fallback).
+//   5. Sentinel { url: null, source: "none" } — caller decides to fail or await.
 //
 // Secrets-safety: the resolved URL embeds the active-target password when
 // present, so callers MUST NEVER log the URL. The logger emits host/port only.
@@ -26,10 +28,17 @@ export interface ActiveTargetFull {
   version: number;
 }
 
-export type ResolvedRedisSource = "explicit" | "active-target" | "env";
+export interface ActiveTargetIdentity {
+  host: string;
+  port: number;
+  label: string;
+  version: number;
+}
+
+export type ResolvedRedisSource = "explicit" | "active-target" | "active-target-public" | "env" | "none";
 
 export interface ResolvedRedisTarget {
-  url: string;
+  url: string | null;
   source: ResolvedRedisSource;
   host: string;
   port: number;
@@ -92,6 +101,33 @@ async function fetchActiveTarget(
   }
 }
 
+async function fetchActiveTargetIdentity(
+  apiBase: string,
+  fetchImpl: typeof fetch,
+  timeoutMs: number,
+): Promise<ActiveTargetIdentity> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  if (typeof (timer as NodeJS.Timeout).unref === "function") (timer as NodeJS.Timeout).unref();
+  try {
+    const url = `${apiBase}/admin/active-target-identity`;
+    const r = await fetchImpl(url, { signal: ctrl.signal });
+    if (!r.ok) throw new Error(`api ${r.status}`);
+    const body = (await r.json()) as Partial<ActiveTargetIdentity>;
+    if (
+      typeof body.host !== "string" ||
+      typeof body.port !== "number" ||
+      typeof body.label !== "string" ||
+      typeof body.version !== "number"
+    ) {
+      throw new Error("invalid response shape");
+    }
+    return { host: body.host, port: body.port, label: body.label, version: body.version };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function resolveRedisTarget(
   opts: ResolveRedisTargetOptions,
 ): Promise<ResolvedRedisTarget> {
@@ -106,8 +142,9 @@ export async function resolveRedisTarget(
     return { url: opts.explicitUrl, source: "explicit", host, port };
   }
 
-  // Tier 2 — live active-target. Only attempted when both apiBase and token
-  // are configured; otherwise the tier is silently skipped (CI/unit tests).
+  // Tier 2 — live active-target (token-gated internal endpoint with password).
+  // Only attempted when both apiBase and token are configured; otherwise the
+  // tier is silently skipped (CI/unit tests).
   if (opts.apiBase && opts.token) {
     try {
       const target = await fetchActiveTarget(opts.apiBase, opts.token, fetchImpl, timeoutMs);
@@ -120,22 +157,43 @@ export async function resolveRedisTarget(
     } catch (err) {
       logger?.warn(
         { err: String(err), apiBase: opts.apiBase },
-        "active-target fetch failed; falling back to REDIS_URL env",
+        "active-target (internal) fetch failed; trying public endpoint",
       );
     }
   }
 
-  // Tier 3 — bootstrap fallback from env.
+  // Tier 3 — public active-target identity (no auth, no password).
+  // Used by bulk-loader on remote deployments where Redis has no auth, or
+  // where REDIS_URL will supply the password if needed. This tier allows
+  // services to pick up UI connection changes without INTERNAL_API_TOKEN.
+  if (opts.apiBase) {
+    try {
+      const identity = await fetchActiveTargetIdentity(opts.apiBase, fetchImpl, timeoutMs);
+      // Build URL without password/tls/db — caller must layer credentials from
+      // REDIS_URL if needed, or target must be passwordless.
+      const url = `redis://${identity.host}:${identity.port}/0`;
+      logger?.info(
+        { source: "active-target-public", host: identity.host, port: identity.port, label: identity.label, version: identity.version },
+        "redis target resolved",
+      );
+      return { url, source: "active-target-public", host: identity.host, port: identity.port };
+    } catch (err) {
+      logger?.warn(
+        { err: String(err), apiBase: opts.apiBase },
+        "active-target (public) fetch failed; falling back to REDIS_URL env",
+      );
+    }
+  }
+
+  // Tier 4 — bootstrap fallback from env.
   if (opts.envRedisUrl) {
     const { host, port } = hostFromUrl(opts.envRedisUrl);
     logger?.info({ source: "env", host, port }, "redis target resolved");
     return { url: opts.envRedisUrl, source: "env", host, port };
   }
 
-  // Tier 4 — hard error.
-  throw new Error(
-    "redis target missing: pass --redis-url, or set API_URL + INTERNAL_API_TOKEN " +
-    "so the api's /internal/redis/active-target/full endpoint can be consulted, " +
-    "or set REDIS_URL as a bootstrap fallback.",
-  );
+  // Tier 5 — no source available. Return sentinel so caller can decide whether
+  // to hard-fail (generator) or boot in awaiting_target state (bulk-loader).
+  logger?.info({ source: "none" }, "no redis target configured");
+  return { url: null, source: "none", host: "", port: 0 };
 }

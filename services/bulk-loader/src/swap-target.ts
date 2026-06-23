@@ -55,14 +55,17 @@ export interface SwapDeps {
 }
 
 export interface BulkLoaderState {
-  // Mutable runtime — replaced atomically by swapTarget.
-  pool: WorkerPool;
+  // Wave 7.0.6.25 — mutable runtime. Can be null when bulk-loader boots with
+  // no Redis target configured (awaiting_target state); replaced atomically
+  // by swapTarget when user configures via UI.
+  pool: WorkerPool | null;
   dispatcher: DispatcherHandle | null;
   checkpointer: Checkpointer | null;
   bootstrapCheckpoints: ReadonlyMap<number, CheckpointRecord>;
 
-  // Identity of the Redis target the current pool is bound to.
-  boundTarget: BoundTarget;
+  // Identity of the Redis target the current pool is bound to. Null when in
+  // awaiting_target state (no pool yet).
+  boundTarget: BoundTarget | null;
   // Monotonic `version` from /internal/redis/active-target/full at the time
   // the current pool was built. Null until the first watcher tick lands.
   boundVersion: number | null;
@@ -81,20 +84,20 @@ export interface BulkLoaderState {
   // Swap observability.
   targetSwapCount: number;
   lastSwapError: string | null;
-  targetWatcher: "enabled" | "disabled";
+  targetWatcher: "enabled" | "disabled" | "awaiting";
 
   // Swap-in-progress mutex. Concurrent ticks no-op.
   swapInFlight: boolean;
 }
 
 export interface CreateBulkLoaderStateOpts {
-  pool: WorkerPool;
+  pool: WorkerPool | null;
   dispatcher: DispatcherHandle | null;
   checkpointer: Checkpointer | null;
   bootstrapCheckpoints: ReadonlyMap<number, CheckpointRecord>;
-  boundTarget: BoundTarget;
+  boundTarget: BoundTarget | null;
   boundVersion?: number | null;
-  targetWatcher: "enabled" | "disabled";
+  targetWatcher: "enabled" | "disabled" | "awaiting";
   accepting?: boolean;
 }
 
@@ -104,7 +107,7 @@ export function createBulkLoaderState(opts: CreateBulkLoaderStateOpts): BulkLoad
     dispatcher: opts.dispatcher,
     checkpointer: opts.checkpointer,
     bootstrapCheckpoints: opts.bootstrapCheckpoints,
-    boundTarget: { ...opts.boundTarget },
+    boundTarget: opts.boundTarget ? { ...opts.boundTarget } : null,
     boundVersion: opts.boundVersion ?? null,
     accepting: opts.accepting !== false,
     targetStale: false,
@@ -155,11 +158,13 @@ export interface SwapResult {
   skipped?: boolean;
 }
 
-// Update the api-side active-target snapshot on the state holder + recompute
-// `targetStale`. Stale is only set when the watcher is disabled OR the most
-// recent swap failed — when the watcher is enabled and healthy, the next
-// tick will swap and clear the stale flag itself. Returns true when the
-// stale flag flipped, so callers can log the transition.
+// Wave 7.0.6.25 — Update the api-side active-target snapshot on the state
+// holder + recompute `targetStale`. Stale is only set when the watcher is
+// disabled OR the most recent swap failed — when the watcher is enabled and
+// healthy, the next tick will swap and clear the stale flag itself. When
+// state.boundTarget is null (awaiting_target), never set stale because the
+// watcher will establish the first connection on the next poll. Returns true
+// when the stale flag flipped, so callers can log the transition.
 export function updateApiActiveTarget(
   state: BulkLoaderState,
   next: BoundTarget | null,
@@ -169,6 +174,10 @@ export function updateApiActiveTarget(
   state.apiActiveTargetVersion = nextVersion;
   const wasStale = state.targetStale;
   if (!next) {
+    return false;
+  }
+  // When boundTarget is null (awaiting_target), the watcher will pick it up.
+  if (!state.boundTarget) {
     return false;
   }
   const diverged = !targetsEqual(state.boundTarget, next);
@@ -220,11 +229,12 @@ export async function swapTarget(
     return { ok: true, skipped: true };
   }
 
-  // No-op when the new identity matches what's already bound AND the prior
-  // swap (if any) succeeded. A failed prior swap stays "stale" — caller
-  // should retry the full routine, not skip.
+  // Wave 7.0.6.25 — no-op when the new identity matches what's already bound
+  // AND the prior swap (if any) succeeded. When state.boundTarget is null
+  // (awaiting_target), always perform the swap to establish the first connection.
   const nextBound: BoundTarget = { host: next.host, port: next.port, label: next.label };
   if (
+    state.boundTarget !== null &&
     targetsEqual(state.boundTarget, nextBound) &&
     state.lastSwapError === null
   ) {
@@ -247,40 +257,43 @@ export async function swapTarget(
   const drainTimeoutMs = deps.drainTimeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS;
   const old = state.boundTarget;
   const log = deps.logger;
+  const fromLog = old ? { from_label: old.label, from_host: old.host, from_port: old.port } : { from_label: "none" };
   log.info(
-    { from_label: old.label, from_host: old.host, from_port: old.port, to_label: next.label, to_host: next.host, to_port: next.port, version: next.version },
-    "target swap starting",
+    { ...fromLog, to_label: next.label, to_host: next.host, to_port: next.port, version: next.version },
+    old ? "target swap starting" : "establishing first connection",
   );
   try {
-    // 1. Drain the dispatcher with a hard cap. Anything still queued past
-    //    the cap is left to settle (or be lost) against the OLD pool — the
-    //    spec says abort the swap, NOT force-close, so in-flight rows still
-    //    have a chance to land before the new pool replaces them.
-    if (state.dispatcher) {
+    // Wave 7.0.6.25 — 1. Drain the dispatcher with a hard cap (only if pool
+    //    exists; first connection has no pool to drain). Anything still queued
+    //    past the cap is left to settle against the OLD pool.
+    if (state.dispatcher && state.pool !== null) {
       const drained = await withTimeout(state.dispatcher.drain(), drainTimeoutMs);
       if (drained.timedOut) {
         const reason = `dispatcher drain exceeded ${drainTimeoutMs}ms`;
         state.lastSwapError = reason;
         log.warn(
-          { from_label: old.label, drain_timeout_ms: drainTimeoutMs },
+          { from_label: old?.label ?? "none", drain_timeout_ms: drainTimeoutMs },
           "target swap aborted — drain timed out",
         );
         // accepting stays false so /load/rows fails loud.
         state.targetStale = true;
-        state.targetStaleReason = formatStaleReason(old, nextBound, false);
+        state.targetStaleReason = old ? formatStaleReason(old, nextBound, false) : `stale target: ${nextBound.label}`;
         return { ok: false, reason };
       }
     }
 
     // 2. Stop the checkpointer (final flush) and dispatcher + pool before
     //    building the new triple. Each is wrapped so a failing teardown of
-    //    one component still tries to tear down the rest.
-    try { if (state.checkpointer) await state.checkpointer.stop(); }
-    catch (err) { log.warn({ err: String(err) }, "checkpointer stop failed during swap"); }
-    try { if (state.dispatcher) await state.dispatcher.stop(); }
-    catch (err) { log.warn({ err: String(err) }, "dispatcher stop failed during swap"); }
-    try { await state.pool.stop(); }
-    catch (err) { log.warn({ err: String(err) }, "pool stop failed during swap"); }
+    //    one component still tries to tear down the rest. Skip when pool is
+    //    null (first connection).
+    if (state.pool !== null) {
+      try { if (state.checkpointer) await state.checkpointer.stop(); }
+      catch (err) { log.warn({ err: String(err) }, "checkpointer stop failed during swap"); }
+      try { if (state.dispatcher) await state.dispatcher.stop(); }
+      catch (err) { log.warn({ err: String(err) }, "dispatcher stop failed during swap"); }
+      try { await state.pool.stop(); }
+      catch (err) { log.warn({ err: String(err) }, "pool stop failed during swap"); }
+    }
 
     // 3. Build the new pool / dispatcher / checkpointer triple. If this
     //    throws (resolveRedisTarget failed, connection refused, etc.) we
@@ -292,22 +305,22 @@ export async function swapTarget(
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       state.lastSwapError = `rebuild failed: ${reason}`;
-      // The old pool is already torn down at this point. We have no live
-      // pool to fall back to; accepting stays false and the state's pool
-      // ref still points at the (now-stopped) old instance so /load/status
-      // can still report the previously-bound identity. The next swap will
-      // build a fresh pool.
+      // The old pool is already torn down at this point (or never existed on
+      // first connection). We have no live pool to fall back to; accepting
+      // stays false and the state's pool ref points at null or the old
+      // instance. The next swap will build a fresh pool.
       state.targetStale = true;
-      state.targetStaleReason = formatStaleReason(old, nextBound, false);
+      state.targetStaleReason = old ? formatStaleReason(old, nextBound, false) : `rebuild failed: ${reason}`;
       log.error(
-        { from_label: old.label, to_label: next.label, err: reason },
+        { from_label: old?.label ?? "none", to_label: next.label, err: reason },
         "target swap failed — rebuild errored",
       );
       return { ok: false, reason: state.lastSwapError };
     }
 
-    // 4. Atomic swap of the runtime pointers. After this line, /load/rows
-    //    enqueues land on the new pool's workers.
+    // Wave 7.0.6.25 — 4. Atomic swap of the runtime pointers. After this
+    //    line, /load/rows enqueues land on the new pool's workers. Update
+    //    targetWatcher from "awaiting" to "enabled" on first connection.
     state.pool = built.pool;
     state.dispatcher = built.dispatcher;
     state.checkpointer = built.checkpointer;
@@ -322,13 +335,17 @@ export async function swapTarget(
     state.apiActiveTarget = { ...nextBound };
     state.apiActiveTargetVersion = next.version;
     state.accepting = true;
+    // Transition from "awaiting" to "enabled" on first connection.
+    if (state.targetWatcher === "awaiting") {
+      state.targetWatcher = "enabled";
+    }
     log.info(
       {
-        from_label: old.label, from_host: old.host, from_port: old.port,
+        ...fromLog,
         to_label: next.label, to_host: next.host, to_port: next.port,
         version: next.version, swap_count: state.targetSwapCount,
       },
-      "target swap complete",
+      old ? "target swap complete" : "first connection established",
     );
     return { ok: true };
   } finally {
