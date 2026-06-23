@@ -103,6 +103,11 @@ services:
       # http://loadgen:8085 to http://localhost:8085 for laptop use, so
       # compose must override it to restore inter-container resolution.
       LOADGEN_BASE: http://loadgen:8085
+      # Wave 7.0.7.4: point the /ingest bulk-loader at the bulk-loader
+      # container. The code default in services/api/src/routes/ingest.ts is
+      # http://localhost:8086, which doesn't work in Docker where services
+      # communicate via internal DNS using service names.
+      BULK_LOADER_URL: http://bulk-loader:8086
     ports:
       - "8080:8080"
     volumes:
