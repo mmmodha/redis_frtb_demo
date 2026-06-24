@@ -1,0 +1,8 @@
+#!/bin/sh
+# Strip Cursor co-author trailers so GitHub does not attribute commits to cursoragent.
+# Enable: git config core.hooksPath .githooks
+MSG_FILE=$1
+case "$(uname -s)" in
+  Darwin*) sed -i '' '/cursoragent@cursor\.com/d' "$MSG_FILE" ;;
+  *) sed -i '/cursoragent@cursor\.com/d' "$MSG_FILE" ;;
+esac
