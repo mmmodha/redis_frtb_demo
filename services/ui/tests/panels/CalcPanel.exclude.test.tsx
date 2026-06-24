@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { CalcPanel } from "../../src/panels/CalcPanel";
+import { renderCalcPanel } from "../helpers/renderCalcPanel";
 import type { CalcSbmResponse } from "../../src/lib/calc";
 
 const originalFetch = globalThis.fetch;
@@ -39,7 +40,7 @@ afterEach(() => {
 
 describe("Advanced disclosure — row-exclusion combos (book / trade_id / risk_factor)", () => {
   it("renders the Advanced disclosure collapsed by default with a plain 'Show advanced…' summary", () => {
-    render(<CalcPanel />);
+    renderCalcPanel();
     const details = screen.getByTestId("advanced-filters") as HTMLDetailsElement;
     expect(details).toBeInTheDocument();
     expect(details.open).toBe(false);
@@ -47,7 +48,7 @@ describe("Advanced disclosure — row-exclusion combos (book / trade_id / risk_f
   });
 
   it("shows three exclude combos (book / trade_id / risk_factor) when expanded", () => {
-    render(<CalcPanel />);
+    renderCalcPanel();
     const details = screen.getByTestId("advanced-filters") as HTMLDetailsElement;
     details.open = true;
     expect(screen.getByTestId("exclude-book")).toBeInTheDocument();
@@ -57,7 +58,7 @@ describe("Advanced disclosure — row-exclusion combos (book / trade_id / risk_f
 
   it("Calculate with no exclude touched sends NO `exclude` field (byte-identical default-path body)", async () => {
     const sent = mockCalcWithCapture(baseResponse);
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
     await waitFor(() => expect(sent.length).toBe(1));
     expect(sent[0]).toEqual({ risk_class: "GIRR", sensitivity_type: "Delta" });
@@ -66,7 +67,7 @@ describe("Advanced disclosure — row-exclusion combos (book / trade_id / risk_f
 
   it("adding a book chip and clicking Calculate sends exclude.book in the request body", async () => {
     const sent = mockCalcWithCapture(baseResponse);
-    render(<CalcPanel />);
+    renderCalcPanel();
     (screen.getByTestId("advanced-filters") as HTMLDetailsElement).open = true;
     const bookInput = screen.getByLabelText(/^Books to exclude$/i);
     fireEvent.change(bookInput, { target: { value: "BookA" } });
@@ -82,7 +83,7 @@ describe("Advanced disclosure — row-exclusion combos (book / trade_id / risk_f
 
   it("comma-separated typing commits multiple chips at once (CSV paste path)", async () => {
     mockCalcWithCapture(baseResponse);
-    render(<CalcPanel />);
+    renderCalcPanel();
     (screen.getByTestId("advanced-filters") as HTMLDetailsElement).open = true;
     const tradeInput = screen.getByLabelText(/^Trades to exclude$/i);
     fireEvent.change(tradeInput, { target: { value: "T1,T2,T3," } });
@@ -94,7 +95,7 @@ describe("Advanced disclosure — row-exclusion combos (book / trade_id / risk_f
 
   it("clicking × on a chip removes it from the exclude set", async () => {
     mockCalcWithCapture(baseResponse);
-    render(<CalcPanel />);
+    renderCalcPanel();
     (screen.getByTestId("advanced-filters") as HTMLDetailsElement).open = true;
     const factorInput = screen.getByLabelText(/^Risk factors to exclude$/i);
     fireEvent.change(factorInput, { target: { value: "RF1,RF2," } });
@@ -113,7 +114,7 @@ describe("Advanced disclosure — row-exclusion combos (book / trade_id / risk_f
 
   it("Exclude-rows section heading shows the running excluded count when chips are present", async () => {
     mockCalcWithCapture(baseResponse);
-    render(<CalcPanel />);
+    renderCalcPanel();
     (screen.getByTestId("advanced-filters") as HTMLDetailsElement).open = true;
     fireEvent.change(screen.getByLabelText(/^Books to exclude$/i), { target: { value: "A,B," } });
     fireEvent.change(screen.getByLabelText(/^Trades to exclude$/i), { target: { value: "T1," } });

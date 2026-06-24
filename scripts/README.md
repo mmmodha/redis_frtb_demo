@@ -1,7 +1,26 @@
 # scripts/
 
-Operational scripts for the FRTB demo. Service-level commands live in
-`./run-local.sh`; the entries below are diagnostic helpers and one-shots.
+Operational scripts for the FRTB demo.
+
+## docker-up.sh (default deployment)
+
+Primary entrypoint for Docker Compose — replaces manual `docker compose up`.
+
+```bash
+scripts/docker-up.sh              # 4 bulk-loader replicas (default)
+scripts/docker-up.sh --dev          # 1 replica (laptop)
+scripts/docker-up.sh --scale 400m # 400M-row profile
+npm start                           # alias for docker-up.sh
+```
+
+See [`docs/docker-deploy.md`](../docs/docker-deploy.md) for the full guide and
+400M ingest + calc optimisation playbook.
+
+## run-local.sh (bare-metal debug)
+
+`run-local.sh` boots services outside Docker for laptop debugging. Service-level
+commands live in `./run-local.sh`; the entries below are diagnostic helpers
+and one-shots.
 
 ## run-local.sh stack defaults
 

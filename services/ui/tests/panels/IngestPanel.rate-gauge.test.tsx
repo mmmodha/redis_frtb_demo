@@ -14,7 +14,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { IngestPanel } from "../../src/panels/IngestPanel";
-import { GeneratorRunProvider } from "../../src/context/GeneratorRunContext";
+import { BulkIngestRunProvider } from "../../src/context/BulkIngestRunContext";
 
 vi.mock("../../src/components/PanelCard", () => ({
   PanelCard: ({ title, children, actions }: any) => (
@@ -77,6 +77,7 @@ function mockFetch(initial: MockOpts) {
         bulk_loader_base: "http://bl:8086", started_at_iso: new Date().toISOString(),
       }) };
     }
+    if (url.endsWith("/ingest/bulk/runs")) return { ok: true, json: async () => ({ active: [] }) };
     if (url.includes("/ingest/bulk/runs/")) {
       return { ok: true, json: async () => ({
         run_id: "01RUN", status: "running",
@@ -108,7 +109,9 @@ function renderPanel() {
   return render(
     <MemoryRouter>
       <GeneratorRunProvider>
+        <BulkIngestRunProvider>
         <IngestPanel />
+        </BulkIngestRunProvider>
       </GeneratorRunProvider>
     </MemoryRouter>,
   );
@@ -119,7 +122,8 @@ async function startBulkRun() {
   fireEvent.click(screen.getByTestId("ingest-preset-start-btn"));
 }
 
-describe("IngestPanel — Wave 7.0.6.21 three-lane bulk-ingest layout", () => {
+// Superseded by Wave 7.0.8 single progress bar — see IngestPanel.bulk-progress.test.tsx.
+describe.skip("IngestPanel — Wave 7.0.6.21 three-lane bulk-ingest layout", () => {
   beforeEach(() => { vi.useFakeTimers({ shouldAdvanceTime: true }); });
   afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.clearAllMocks(); });
 

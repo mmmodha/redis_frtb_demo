@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { CalcPanel } from "../../src/panels/CalcPanel";
+import { renderCalcPanel } from "../helpers/renderCalcPanel";
 import type { CalcSbmResponse } from "../../src/lib/calc";
 
 const originalFetch = globalThis.fetch;
@@ -69,13 +70,13 @@ afterEach(() => {
 
 describe("<CalcPanel />", () => {
   it("renders the Calculation heading and a dominant Calculate SBM risk charge button", () => {
-    render(<CalcPanel />);
+    renderCalcPanel();
     expect(screen.getByRole("heading", { name: /^Calculation$/, level: 1 })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /calculate sbm risk charge/i })).toBeInTheDocument();
   });
 
   it("renders risk_class and sensitivity selectors with GIRR/Delta defaults", () => {
-    render(<CalcPanel />);
+    renderCalcPanel();
     const rc = screen.getByLabelText(/risk class/i) as HTMLSelectElement;
     const st = screen.getByLabelText(/^sensitivity$/i) as HTMLSelectElement;
     expect(rc.value).toBe("GIRR");
@@ -103,7 +104,7 @@ describe("<CalcPanel />", () => {
       }
       return new Response("{}", { headers: { "content-type": "application/json" } });
     }) as typeof fetch;
-    render(<CalcPanel />);
+    renderCalcPanel();
     const rc = await screen.findByLabelText(/risk class/i) as HTMLSelectElement;
     await waitFor(() => {
       const vals = Array.from(rc.options).map((o) => o.value);
@@ -117,7 +118,7 @@ describe("<CalcPanel />", () => {
   });
 
   it("renders three EnterpriseCallout banners for in-database compute / map-reduce / hash-tag locality", () => {
-    render(<CalcPanel />);
+    renderCalcPanel();
     const callouts = screen.getAllByText(/business value/i);
     expect(callouts.length).toBeGreaterThanOrEqual(3);
     expect(screen.getByText("In-database compute")).toBeInTheDocument();
@@ -126,13 +127,13 @@ describe("<CalcPanel />", () => {
   });
 
   it("renders an empty-state hint before the first calc", () => {
-    render(<CalcPanel />);
+    renderCalcPanel();
     expect(screen.getByText(/press calculate/i)).toBeInTheDocument();
   });
 
   it("disables the button and shows a loading state while the calc is in flight", async () => {
     const release = deferredCalcResponse(baseResponse);
-    render(<CalcPanel />);
+    renderCalcPanel();
     const button = screen.getByRole("button", { name: /calculate sbm risk charge/i });
     fireEvent.click(button);
     await waitFor(() => expect(button).toBeDisabled());
@@ -143,7 +144,7 @@ describe("<CalcPanel />", () => {
 
   it("renders the headline charge and per-bucket table on success", async () => {
     mockCalcResponse(baseResponse);
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
     await waitFor(() => expect(screen.getByTestId("calc-charge")).toBeInTheDocument());
     const charge = screen.getByTestId("calc-charge");
@@ -156,7 +157,7 @@ describe("<CalcPanel />", () => {
 
   it("renders the TimingStrip with per-shard timings from shard_breakdown", async () => {
     mockCalcResponse(baseResponse);
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
     await waitFor(() => expect(screen.getByText("shard-1")).toBeInTheDocument());
     expect(screen.getByText("shard-2")).toBeInTheDocument();
@@ -166,7 +167,7 @@ describe("<CalcPanel />", () => {
 
   it("sorts the per-bucket table by K_b descending when the K_b header is clicked", async () => {
     mockCalcResponse(baseResponse);
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
     await waitFor(() => expect(screen.getByTestId("calc-charge")).toBeInTheDocument());
     const initialRows = screen.getAllByTestId("bucket-row").map((r) => r.getAttribute("data-bucket"));
@@ -207,7 +208,7 @@ describe("<CalcPanel />", () => {
       },
     };
     mockCalcResponse(responseWithCommands);
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByTestId("calc-show-redis-commands-toggle"));
     fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
     await waitFor(() =>
@@ -228,7 +229,7 @@ describe("<CalcPanel />", () => {
 
   it("does NOT render the Redis commands panel when commands are absent (back-compat)", async () => {
     mockCalcResponse(baseResponse);
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByTestId("calc-show-redis-commands-toggle"));
     fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
     await waitFor(() => expect(screen.getByTestId("calc-charge")).toBeInTheDocument());
@@ -260,7 +261,7 @@ describe("<CalcPanel />", () => {
 
     async function renderWithResponse(body: CalcSbmResponse) {
       mockCalcResponse(body);
-      render(<CalcPanel />);
+      renderCalcPanel();
       fireEvent.click(screen.getByTestId("calc-show-redis-commands-toggle"));
       fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
       await waitFor(() =>
@@ -318,7 +319,7 @@ describe("<CalcPanel />", () => {
   describe("Wave 5.96F: wallclock-badge cache-hit wording", () => {
     it("cache miss leaves the chip text unchanged", async () => {
       mockCalcResponse({ ...baseResponse, total_ms: 1500.4, fanout_ms: 14.6, cache: "miss" });
-      render(<CalcPanel />);
+      renderCalcPanel();
       fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
       const badge = await screen.findByTestId("wallclock-badge");
       expect(badge.textContent).toMatch(/Computed in 1500\.4 ms \(14\.6 ms of Redis fan-out\)/);
@@ -334,7 +335,7 @@ describe("<CalcPanel />", () => {
         original_compute_ms: 21051.134,
         original_fanout_ms: 14.6,
       });
-      render(<CalcPanel />);
+      renderCalcPanel();
       fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
       const badge = await screen.findByTestId("wallclock-badge");
       // Both numbers appear: "21.05 s" (cold) and "12 ms" (served).
@@ -355,7 +356,7 @@ describe("<CalcPanel />", () => {
       shard_breakdown: [{ shard: "shard-1", buckets: ["USD-IRS", "EUR-IRS", "JPY-IRS"], ms: 0 }],
     };
     mockCalcResponse(standalone);
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
     await waitFor(() => expect(screen.getByTestId("calc-charge")).toBeInTheDocument());
     expect(screen.queryByText(/per-bucket timing/i)).toBeNull();
@@ -363,7 +364,7 @@ describe("<CalcPanel />", () => {
 
   it("Wave 5.16n: still renders the per-bucket timing panel on multi-shard cluster with non-zero ms", async () => {
     mockCalcResponse(baseResponse);
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
     await waitFor(() => expect(screen.getByTestId("calc-charge")).toBeInTheDocument());
     expect(screen.getByText(/per-bucket timing/i)).toBeInTheDocument();
@@ -379,7 +380,7 @@ describe("<CalcPanel />", () => {
       ],
     };
     mockCalcResponse(varied);
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
     await waitFor(() => expect(screen.getByTestId("bucket-chart")).toBeInTheDocument());
     const chart = screen.getByTestId("bucket-chart");
@@ -405,7 +406,7 @@ describe("<CalcPanel />", () => {
       curvature_branch: "positive_interior",
     };
     mockCalcResponse(curvatureResp);
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
     await waitFor(() => expect(screen.getByTestId("curvature-branch-pill")).toBeInTheDocument());
     const pill = screen.getByTestId("curvature-branch-pill");
@@ -421,7 +422,7 @@ describe("<CalcPanel />", () => {
       curvature_branch: "fallback_clipped_s",
     };
     mockCalcResponse(curvatureResp);
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
     await waitFor(() => expect(screen.getByTestId("curvature-branch-pill")).toBeInTheDocument());
     const pill = screen.getByTestId("curvature-branch-pill");
@@ -433,14 +434,14 @@ describe("<CalcPanel />", () => {
 
   it("Wave 5.19: omits the curvature-branch pill from Delta/Vega responses", async () => {
     mockCalcResponse(baseResponse); // no curvature_branch field
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
     await waitFor(() => expect(screen.getByTestId("calc-charge")).toBeInTheDocument());
     expect(screen.queryByTestId("curvature-branch-pill")).toBeNull();
   });
 
   it("Wave 5.19: the curvature-branch pill is absent before the first calc", () => {
-    render(<CalcPanel />);
+    renderCalcPanel();
     expect(screen.queryByTestId("curvature-branch-pill")).toBeNull();
   });
 
@@ -454,7 +455,7 @@ describe("<CalcPanel />", () => {
       ],
     };
     mockCalcResponse(skewed);
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
     await waitFor(() => expect(screen.getByTestId("bucket-chart")).toBeInTheDocument());
     const chart = screen.getByTestId("bucket-chart");
@@ -492,7 +493,7 @@ describe("<CalcPanel />", () => {
 
     async function openDrilldownAndGetPill() {
       mockCalcAndPivotResponses(baseResponse, pivotBody);
-      render(<CalcPanel />);
+      renderCalcPanel();
       fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
       await waitFor(() => expect(screen.getByTestId("calc-charge")).toBeInTheDocument());
       const usdRow = screen

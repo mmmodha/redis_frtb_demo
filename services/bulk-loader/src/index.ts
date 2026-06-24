@@ -2,7 +2,8 @@
 //
 // Resolves the active Redis target once at boot (4-tier precedence from
 // @frtb/redis-client: explicit url → live api /internal active-target → env
-// REDIS_URL → hard error), then opens BULK_LOADER_POOL_SIZE (default 32)
+// Wave 7.0.6.25 — resolves target via active-target API (UI-first) with
+// REDIS_URL env as optional bootstrap fallback, then opens BULK_LOADER_POOL_SIZE
 // parallel non-cluster ioredis connections to that proxy endpoint. OSS
 // Cluster API is NOT enabled — we connect each client as standalone, and
 // proxy_policy=all-master-shards spreads the connections across master
@@ -144,7 +145,10 @@ async function main(): Promise<void> {
   const resolved = await resolveRedisTarget({
     apiBase: API_BASE,
     token: process.env.INTERNAL_API_TOKEN,
-    envRedisUrl: process.env.REDIS_URL,
+    // UI-first: bind only via api active-target (watcher). REDIS_URL in
+    // .env.local must not bypass the Connections panel. Escape hatch:
+    // BULK_LOADER_REDIS_URL for headless/CI only.
+    envRedisUrl: process.env.BULK_LOADER_REDIS_URL,
     logger: {
       info: (obj, m) => log("info", m, obj),
       warn: (obj, m) => log("warn", m, obj),
@@ -203,7 +207,12 @@ async function main(): Promise<void> {
       redisFactory: (workerId) => {
         // ioredis default retry strategy stays enabled so dropped
         // connections reconnect on their own.
-        const client = createRedisClient({ url, cluster: false }) as unknown as PoolClient;
+        const client = createRedisClient({
+          url,
+          cluster: false,
+          connectTimeout: 5_000,
+          commandTimeout: 5_000,
+        }) as unknown as PoolClient;
         client.on("ready", () => log("info", "worker ready", { worker_id: workerId }));
         return client;
       },
@@ -237,43 +246,41 @@ async function main(): Promise<void> {
         logger: { warn: (obj, m) => log("warn", m, obj) },
       });
       try {
-        bootstrap = await checkpointer.loadAll(POOL_SIZE);
+        bootstrap = await Promise.race([
+          checkpointer.loadAll(POOL_SIZE),
+          new Promise<Map<number, CheckpointRecord>>((_resolve, reject) => {
+            const t = setTimeout(
+              () => reject(new Error("checkpoint bootstrap timeout")),
+              5_000,
+            );
+            if (typeof t.unref === "function") t.unref();
+          }),
+        ]);
         log("info", "bulk-loader checkpoints loaded", {
           count: bootstrap.size,
           interval_ms: CHECKPOINT_INTERVAL_MS,
         });
       } catch (err) {
         log("warn", "bulk-loader checkpoint bootstrap failed", { err: String(err) });
+        bootstrap = new Map();
       }
       checkpointer.start();
     }
     return { pool, dispatcher, checkpointer, bootstrapCheckpoints: bootstrap };
   }
 
-  // Wave 7.0.6.25 — boot triple. If resolved.url is null (sentinel), skip
-  // runtime build and boot with null pool/dispatcher/checkpointer. The
-  // active-target watcher's onSwitch will build the runtime when the user
-  // configures via UI.
-  let initial: RebuiltRuntime | null = null;
-  if (resolved.url !== null) {
-    initial = await buildRuntime(resolved.url);
-  }
-
-  // Wave 7.0.6.17 / 7.0.6.17a / 7.0.6.25 — fetch the api's labelled identity
-  // via the unauthenticated /admin/active-target-identity endpoint so the
-  // state holder's bound_target.label is populated correctly EVEN when
-  // INTERNAL_API_TOKEN is unset. Best-effort; on failure we fall back to a
-  // synthetic label. When resolved.url is null (awaiting_target), there is
-  // no bound target yet so we use null.
+  // Wave 7.0.8 — never block HTTP listen on Redis connect / checkpoint load.
+  // Start in awaiting (pool=null); wire the runtime in the background when a
+  // target is resolved so Docker /healthz passes before Redis is reachable.
   const token = process.env.INTERNAL_API_TOKEN;
   const apiInitial = await fetchActiveTargetIdentity(API_BASE);
   const boundLabel = apiInitial?.label
     ?? (resolved.source === "active-target" ? "active-target" : resolved.source === "explicit" ? "explicit-url" : resolved.source === "env" ? "env-redis" : null);
   const state: BulkLoaderState = createBulkLoaderState({
-    pool: initial?.pool ?? null,
-    dispatcher: initial?.dispatcher ?? null,
-    checkpointer: initial?.checkpointer ?? null,
-    bootstrapCheckpoints: initial?.bootstrapCheckpoints ?? new Map(),
+    pool: null,
+    dispatcher: null,
+    checkpointer: null,
+    bootstrapCheckpoints: new Map(),
     boundTarget: resolved.url !== null ? { host: resolved.host, port: resolved.port, label: boundLabel ?? "unknown" } : null,
     boundVersion: apiInitial?.version ?? null,
     targetWatcher: resolved.url === null ? "awaiting" : (token ? "enabled" : "disabled"),
@@ -367,13 +374,35 @@ async function main(): Promise<void> {
     pool_size: POOL_SIZE,
     batch_size: BATCH_SIZE,
     idle_flush_ms: IDLE_FLUSH_MS,
-    high_water: initial.dispatcher.status().highWater,
     checkpoint_interval_ms: CHECKPOINT_INTERVAL_MS,
     target_watcher: state.targetWatcher,
-    bound_label: state.boundTarget.label,
+    bound_label: state.boundTarget?.label ?? null,
+    redis_target: resolved.url === null ? "awaiting" : resolved.source,
   });
 
+  if (resolved.url !== null) {
+    void (async () => {
+      try {
+        const built = await buildRuntime(resolved.url!);
+        state.pool = built.pool;
+        state.dispatcher = built.dispatcher;
+        state.checkpointer = built.checkpointer;
+        state.bootstrapCheckpoints = built.bootstrapCheckpoints;
+        log("info", "bulk-loader runtime wired", {
+          connected: built.pool.status().connected,
+          pool_size: built.pool.status().poolSize,
+        });
+      } catch (err) {
+        state.lastSwapError = String(err);
+        log("warn", "background runtime build failed; /load/rows unavailable until target reachable", {
+          err: String(err),
+        });
+      }
+    })();
+  }
+
   if (process.env.SMOKE === "1") {
+    await new Promise((r) => setTimeout(r, 500));
     await app.close();
     if (watcher) await watcher.stop();
     clearInterval(staleTimer);
@@ -390,7 +419,7 @@ async function main(): Promise<void> {
       try { clearInterval(staleTimer); } catch { /* ignore */ }
       try { if (state.checkpointer) await state.checkpointer.stop(); } catch { /* ignore */ }
       try { if (state.dispatcher) await state.dispatcher.stop(); } catch { /* ignore */ }
-      try { await state.pool.stop(); } catch { /* ignore */ }
+      try { if (state.pool) await state.pool.stop(); } catch { /* ignore */ }
       process.exit(0);
     });
   }

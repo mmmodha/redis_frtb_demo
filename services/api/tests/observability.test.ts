@@ -96,4 +96,18 @@ describe("GET /observability/memory", () => {
     expect(body.dbsize).toBe(0);
     expect(body.total_system_memory_bytes).toBe(1073741824);
   });
+
+  it("returns 503 (not 500) when Redis is busy during a calc", async () => {
+    const fr = fakeRedis();
+    fr.info = async () => {
+      throw new Error(
+        "pool-command-fail-fast: Command timed out after 1500ms (category=light member=light:0 method=info)",
+      );
+    };
+    app = await createServer({ redis: fr });
+    const res = await app.inject({ method: "GET", url: "/observability/memory" });
+    expect(res.statusCode).toBe(503);
+    const body = res.json() as { error?: string };
+    expect(body.error ?? "").toMatch(/busy/i);
+  });
 });

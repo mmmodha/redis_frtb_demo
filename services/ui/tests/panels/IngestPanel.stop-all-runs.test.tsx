@@ -106,7 +106,7 @@ describe("IngestPanel — Stop generators button (Wave 5.44 / 6.53.A)", () => {
     fireEvent.click(await screen.findByTestId("stop-all-runs-btn"));
     const modal = await screen.findByTestId("stop-all-runs-modal");
     expect(modal).toBeInTheDocument();
-    expect(within(modal).getByRole("heading", { name: /stop active generators/i })).toBeInTheDocument();
+    expect(within(modal).getByRole("heading", { name: /stop active ingest runs/i })).toBeInTheDocument();
     // Wave 6.53.B — modal copy makes it explicit that the in-flight stream
     // backlog is discarded while existing sens data is kept, and points
     // users at "Flush DB" for the destructive wipe path.

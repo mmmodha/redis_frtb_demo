@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { CalcPanel } from "../../src/panels/CalcPanel";
+import { renderCalcPanel } from "../helpers/renderCalcPanel";
 import type { CalcSbmResponse } from "../../src/lib/calc";
 
 const originalFetch = globalThis.fetch;
@@ -58,7 +59,7 @@ async function runCalc(button: HTMLElement) {
 describe("CalcPanel Wave 5.18 polish + drill-down", () => {
   it("Curvature is selectable and renders a result table", async () => {
     fetchRouter({});
-    render(<CalcPanel />);
+    renderCalcPanel();
     const st = screen.getByLabelText(/^sensitivity$/i) as HTMLSelectElement;
     expect(within(st).getByRole("option", { name: "Curvature" })).toBeInTheDocument();
     fireEvent.change(st, { target: { value: "Curvature" } });
@@ -69,7 +70,7 @@ describe("CalcPanel Wave 5.18 polish + drill-down", () => {
 
   it("Basel caption switches when sensitivity type changes", async () => {
     fetchRouter({});
-    render(<CalcPanel />);
+    renderCalcPanel();
     await runCalc(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
     const cap1 = screen.getByTestId("basel-caption").textContent ?? "";
     expect(cap1).toMatch(/§21\.4\(5\)/);
@@ -94,7 +95,7 @@ describe("CalcPanel Wave 5.18 polish + drill-down", () => {
           headers: { "content-type": "application/json" },
         }),
     });
-    render(<CalcPanel />);
+    renderCalcPanel();
     await runCalc(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
 
     const chart = screen.getByTestId("bucket-chart");
@@ -131,7 +132,7 @@ describe("CalcPanel Wave 5.18 polish + drill-down", () => {
           headers: { "content-type": "application/json" },
         }),
     });
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.change(screen.getByLabelText(/risk class/i), { target: { value: "Equity" } });
     await runCalc(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
     const chart = screen.getByTestId("bucket-chart");
@@ -159,7 +160,7 @@ describe("CalcPanel Wave 5.18 polish + drill-down", () => {
         });
       },
     });
-    render(<CalcPanel />);
+    renderCalcPanel();
     await runCalc(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
     fireEvent.click(
       within(screen.getByTestId("bucket-chart"))
@@ -189,7 +190,7 @@ describe("CalcPanel Wave 5.18 polish + drill-down", () => {
           headers: { "content-type": "application/json" },
         }),
     });
-    render(<CalcPanel />);
+    renderCalcPanel();
     await runCalc(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
     fireEvent.click(
       within(screen.getByTestId("bucket-chart"))
@@ -216,7 +217,7 @@ describe("CalcPanel Wave 5.18 polish + drill-down", () => {
           headers: { "content-type": "application/json" },
         }),
     });
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.change(screen.getByLabelText(/^sensitivity$/i), { target: { value: "Vega" } });
     await runCalc(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
     fireEvent.click(
@@ -244,7 +245,7 @@ describe("CalcPanel Wave 5.18 polish + drill-down", () => {
           headers: { "content-type": "application/json" },
         }),
     });
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.change(screen.getByLabelText(/^sensitivity$/i), { target: { value: "Curvature" } });
     await runCalc(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
     fireEvent.click(
@@ -276,7 +277,7 @@ describe("CalcPanel Wave 5.18 polish + drill-down", () => {
           headers: { "content-type": "application/json" },
         }),
     });
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.change(screen.getByLabelText(/risk class/i), { target: { value: "Equity" } });
     fireEvent.change(screen.getByLabelText(/^sensitivity$/i), { target: { value: "Curvature" } });
     await runCalc(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
@@ -307,7 +308,7 @@ describe("CalcPanel Wave 5.18 polish + drill-down", () => {
           headers: { "content-type": "application/json" },
         }),
     });
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.change(screen.getByLabelText(/risk class/i), { target: { value: "FX" } });
     await runCalc(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
     fireEvent.click(within(screen.getByTestId("bucket-chart")).getAllByTestId("bucket-chart-row")[0]!);
@@ -327,7 +328,7 @@ describe("CalcPanel Wave 5.18 polish + drill-down", () => {
           headers: { "content-type": "application/json" },
         }),
     });
-    render(<CalcPanel />);
+    renderCalcPanel();
     await runCalc(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
     fireEvent.click(
       within(screen.getByTestId("bucket-chart"))
@@ -361,7 +362,7 @@ describe("CalcPanel Wave 5.18 polish + drill-down", () => {
           headers: { "content-type": "application/json" },
         }),
     });
-    render(<CalcPanel />);
+    renderCalcPanel();
     await runCalc(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
     fireEvent.click(
       within(screen.getByTestId("bucket-chart"))
@@ -387,7 +388,7 @@ describe("CalcPanel Wave 5.18 polish + drill-down", () => {
           { status: 503, headers: { "content-type": "application/json" } },
         ),
     });
-    render(<CalcPanel />);
+    renderCalcPanel();
     await runCalc(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
     fireEvent.click(
       within(screen.getByTestId("bucket-chart"))
@@ -416,7 +417,7 @@ describe("CalcPanel Wave 5.18 polish + drill-down", () => {
             }],
           }), { headers: { "content-type": "application/json" } }),
       });
-      render(<CalcPanel />);
+      renderCalcPanel();
       await runCalc(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
       fireEvent.click(
         within(screen.getByTestId("bucket-chart"))
@@ -455,7 +456,7 @@ describe("CalcPanel Wave 5.18 polish + drill-down", () => {
             }],
           }), { headers: { "content-type": "application/json" } }),
       });
-      render(<CalcPanel />);
+      renderCalcPanel();
       fireEvent.change(screen.getByLabelText(/^sensitivity$/i), { target: { value: "Curvature" } });
       await runCalc(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
       fireEvent.click(
@@ -485,7 +486,7 @@ describe("CalcPanel Wave 5.18 polish + drill-down", () => {
             }],
           }), { headers: { "content-type": "application/json" } }),
       });
-      render(<CalcPanel />);
+      renderCalcPanel();
       await runCalc(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
       fireEvent.click(
         within(screen.getByTestId("bucket-chart"))
@@ -542,7 +543,7 @@ describe("CalcPanel Wave 5.18 polish + drill-down", () => {
             headers: { "content-type": "application/json" },
           }),
       });
-      render(<CalcPanel />);
+      renderCalcPanel();
       await runCalc(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
       fireEvent.click(
         within(screen.getByTestId("bucket-chart"))
@@ -563,7 +564,7 @@ describe("CalcPanel Wave 5.18 polish + drill-down", () => {
             headers: { "content-type": "application/json" },
           }),
       });
-      render(<CalcPanel />);
+      renderCalcPanel();
       await runCalc(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
       fireEvent.click(
         within(screen.getByTestId("bucket-chart"))
@@ -607,7 +608,7 @@ describe("CalcPanel Wave 5.18 polish + drill-down", () => {
         }
         return new Response("not found", { status: 404 });
       }) as typeof fetch;
-      render(<CalcPanel />);
+      renderCalcPanel();
       await runCalc(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
       fireEvent.click(
         within(screen.getByTestId("bucket-chart"))
@@ -651,7 +652,7 @@ describe("CalcPanel Wave 5.18 polish + drill-down", () => {
             }],
           }), { headers: { "content-type": "application/json" } }),
       });
-      render(<CalcPanel />);
+      renderCalcPanel();
       fireEvent.change(screen.getByLabelText(/^sensitivity$/i), { target: { value: "Curvature" } });
       await runCalc(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
       fireEvent.click(
@@ -683,7 +684,7 @@ describe("CalcPanel Wave 5.18 polish + drill-down", () => {
             }],
           }), { headers: { "content-type": "application/json" } }),
       });
-      render(<CalcPanel />);
+      renderCalcPanel();
       await runCalc(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
       fireEvent.click(
         within(screen.getByTestId("bucket-chart"))

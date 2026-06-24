@@ -9,6 +9,10 @@
     "tools/*"
   ],
   "scripts": {
+    "start": "scripts/docker-up.sh",
+    "docker:up": "scripts/docker-up.sh",
+    "docker:up:dev": "scripts/docker-up.sh --dev",
+    "docker:up:400m": "scripts/docker-up.sh --scale 400m --build",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "npm run typecheck --workspaces --if-present",

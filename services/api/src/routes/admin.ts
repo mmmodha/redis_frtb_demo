@@ -48,6 +48,8 @@ import {
   DEFAULT_STREAM_KEY,
 } from "../jobs/stream-retention.ts";
 import { registerAdminCalcRoutes } from "./admin-calc.ts";
+import { cancelAllBulkRuns, haltBulkLoaderAccept, resumeBulkLoaderAccept } from "./ingest.ts";
+import { cancelAllActiveRuns } from "./generator.ts";
 
 export interface AdminRoutesOpts {
   // Threaded through from createServer so the post-flush bootstrap can rebuild
@@ -191,6 +193,11 @@ export function registerAdminRoutes(
     }
     const redis = await getRedis();
     const t0 = process.hrtime.bigint();
+    // Stop producers before FLUSHDB so workers cannot repopulate sens:* while
+    // we wipe and rebuild indexes (mirrors /admin/stop-runs bookkeeping).
+    cancelAllActiveRuns();
+    cancelAllBulkRuns();
+    await haltBulkLoaderAccept();
     try {
       // Wave 6.24 — FLUSHDB clears every key in the active DB, including
       // the materialized discovery sets (`seen:risk_class`,
@@ -260,6 +267,8 @@ export function registerAdminRoutes(
         };
       }
     }
+
+    await resumeBulkLoaderAccept();
 
     return { ok: true, ms, target_label, bootstrap };
   });

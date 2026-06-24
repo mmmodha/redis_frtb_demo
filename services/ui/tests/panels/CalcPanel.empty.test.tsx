@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { CalcPanel } from "../../src/panels/CalcPanel";
+import { renderCalcPanel } from "../helpers/renderCalcPanel";
 
 const originalFetch = globalThis.fetch;
 
@@ -19,7 +20,7 @@ function mock(status: number, body: unknown) {
 }
 
 async function clickCalculate() {
-  render(<CalcPanel />);
+  renderCalcPanel();
   fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
 }
 

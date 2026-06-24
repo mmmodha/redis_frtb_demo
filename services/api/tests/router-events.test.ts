@@ -51,14 +51,9 @@ describe("getActiveRedisClient", () => {
     resetActiveTarget();
   });
 
-  it("returns null when there is no usable target", () => {
-    // No env, no override — getActiveTarget falls back to default; client
-    // factory should still produce a client (lazyConnect), but callers can
-    // check resolveActiveTarget().label === 'default' for diagnostics.
+  it("returns null when there is no configured target", () => {
     const c = getActiveRedisClient();
-    expect(c).not.toBeNull();
-    // Cleanup: client is lazyConnect so no connection actually opened.
-    c?.disconnect();
+    expect(c).toBeNull();
   });
 
   it("rebuilds the client when the active target changes", () => {

@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { act, render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { CalcPanel } from "../../src/panels/CalcPanel";
+import { renderCalcPanel } from "../helpers/renderCalcPanel";
 import type { TotalSbmResponse } from "../../src/lib/calc";
 
 const originalFetch = globalThis.fetch;
@@ -75,14 +76,14 @@ afterEach(() => {
 
 describe("<CalcPanel /> — Total SBM card (Wave 5.96B)", () => {
   it("renders the Total SBM card with a Calculate Total SBM button", () => {
-    render(<CalcPanel />);
+    renderCalcPanel();
     expect(screen.getByTestId("calc-total-cta")).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: /total sbm/i })).toBeInTheDocument();
   });
 
   it("on click, fetches /calc/sbm/total and renders charge, parallelism factor and scenario columns", async () => {
     mockTotalResponse(buildTotalResponse());
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByTestId("calc-total-cta"));
     await waitFor(() => expect(screen.getByTestId("calc-total-result")).toBeInTheDocument());
 
@@ -125,7 +126,7 @@ describe("<CalcPanel /> — Total SBM card (Wave 5.96B)", () => {
         parallelism_factor: 20, redis_ops_count: 18, ops_skipped: 9,
       },
     }));
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByTestId("calc-total-cta"));
     await waitFor(() => expect(screen.getByTestId("calc-total-result")).toBeInTheDocument());
     expect(screen.getByTestId("calc-total-performance").textContent).toMatch(/9 skipped/);
@@ -142,7 +143,7 @@ describe("<CalcPanel /> — Total SBM card (Wave 5.96B)", () => {
       }
       return new Response("{}", { headers: { "content-type": "application/json" } });
     }) as typeof fetch;
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByTestId("calc-total-cta"));
     await waitFor(() => expect(screen.queryByTestId("calc-total-cta")?.textContent).toMatch(/Calculate Total SBM/i));
     expect(screen.getAllByRole("alert").length).toBeGreaterThan(0);
@@ -153,7 +154,7 @@ describe("<CalcPanel /> — Total SBM card (Wave 5.96B)", () => {
   // formula block was wired through the existing KaTeX integration.
   it("renders the §21.4(8) derivation through KaTeX (symbolic + substituted)", async () => {
     mockTotalResponse(buildTotalResponse());
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByTestId("calc-total-cta"));
     await waitFor(() => expect(screen.getByTestId("calc-total-result")).toBeInTheDocument());
 
@@ -174,7 +175,7 @@ describe("<CalcPanel /> — Total SBM card (Wave 5.96B)", () => {
   // from buildTotalResponse() under the binding (high) scenario.
   it("computes per-class subtotals correctly from scenarios.{low,med,high}.charge", async () => {
     mockTotalResponse(buildTotalResponse());
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByTestId("calc-total-cta"));
     await waitFor(() => expect(screen.getByTestId("calc-total-result")).toBeInTheDocument());
 
@@ -198,7 +199,7 @@ describe("<CalcPanel /> — Total SBM card (Wave 5.96B)", () => {
   // avoid breaking selectors used by other tests/screenshots (Wave 5.96H).
   it("marks the binding scenario column with the --winner modifier", async () => {
     mockTotalResponse(buildTotalResponse());
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByTestId("calc-total-cta"));
     await waitFor(() => expect(screen.getByTestId("calc-total-result")).toBeInTheDocument());
 
@@ -232,7 +233,7 @@ describe("<CalcPanel /> — Total SBM card (Wave 5.96B)", () => {
         cache_hits: 27,
       },
     }));
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByTestId("calc-total-cta"));
     await waitFor(() => expect(screen.getByTestId("calc-total-result")).toBeInTheDocument());
 
@@ -269,7 +270,7 @@ describe("<CalcPanel /> — Total SBM card (Wave 5.96B)", () => {
         cache_hits: 27,
       },
     }));
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByTestId("calc-total-cta"));
     await waitFor(() => expect(screen.getByTestId("calc-total-result")).toBeInTheDocument());
 
@@ -306,7 +307,7 @@ describe("<CalcPanel /> — Total SBM card (Wave 5.96B)", () => {
         cache_hits: 27,
       },
     }));
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByTestId("calc-total-cta"));
     await waitFor(() => expect(screen.getByTestId("calc-total-result")).toBeInTheDocument());
 
@@ -338,7 +339,7 @@ describe("<CalcPanel /> — Total SBM card (Wave 5.96B)", () => {
         cache: "miss",
       },
     }));
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByTestId("calc-total-cta"));
     await waitFor(() => expect(screen.getByTestId("calc-total-result")).toBeInTheDocument());
     expect(screen.getByTestId("calc-total-parallelism").textContent).toMatch(/20\.00/);
@@ -360,7 +361,7 @@ describe("<CalcPanel /> — Total SBM card (Wave 5.96B)", () => {
         cache_hits: 15,
       },
     }));
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByTestId("calc-total-cta"));
     await waitFor(() => expect(screen.getByTestId("calc-total-result")).toBeInTheDocument());
     const cacheChip = screen.getByTestId("calc-total-perf-cache-chip");
@@ -379,7 +380,7 @@ describe("<CalcPanel /> — Total SBM card (Wave 5.96B)", () => {
         cache: "miss",
       },
     }));
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByTestId("calc-total-cta"));
     await waitFor(() => expect(screen.getByTestId("calc-total-result")).toBeInTheDocument());
     expect(screen.queryByTestId("calc-total-perf-cache-chip")).toBeNull();
@@ -392,7 +393,7 @@ describe("<CalcPanel /> — Total SBM card (Wave 5.96B)", () => {
   // "(no data)" to the more demo-friendly "class not ingested".
   it("renders fully-skipped classes as 'class not ingested' rather than $0.00", async () => {
     mockTotalResponse(buildTotalResponse());
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByTestId("calc-total-cta"));
     await waitFor(() => expect(screen.getByTestId("calc-total-result")).toBeInTheDocument());
 
@@ -441,7 +442,7 @@ describe("<CalcPanel /> — Total SBM progressive UX (Wave 5.96D)", () => {
 
   it("transitions the CTA label idle → in-flight → resolved with risk-class-aware copy", async () => {
     const deferred = deferredTotalFetch(buildTotalResponse());
-    render(<CalcPanel />);
+    renderCalcPanel();
     const cta = screen.getByTestId("calc-total-cta");
     expect(cta.textContent).toMatch(/Calculate Total SBM/);
     expect(cta.textContent).not.toMatch(/27/);
@@ -464,7 +465,7 @@ describe("<CalcPanel /> — Total SBM progressive UX (Wave 5.96D)", () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const deferred = deferredTotalFetch(buildTotalResponse());
     try {
-      render(<CalcPanel />);
+      renderCalcPanel();
       fireEvent.click(screen.getByTestId("calc-total-cta"));
       await waitFor(() => expect(screen.queryByTestId("calc-total-elapsed")).not.toBeNull());
 
@@ -491,7 +492,7 @@ describe("<CalcPanel /> — Total SBM progressive UX (Wave 5.96D)", () => {
 
   it("renders a 9-cell skeleton grid during in-flight and replaces it with the real result", async () => {
     const deferred = deferredTotalFetch(buildTotalResponse());
-    render(<CalcPanel />);
+    renderCalcPanel();
     expect(screen.queryByTestId("calc-total-skeleton")).toBeNull();
     fireEvent.click(screen.getByTestId("calc-total-cta"));
     await waitFor(() => expect(screen.getByTestId("calc-total-skeleton")).toBeInTheDocument());
@@ -504,7 +505,7 @@ describe("<CalcPanel /> — Total SBM progressive UX (Wave 5.96D)", () => {
 
   it("surfaces a 3×3×3 = 27 tooltip on the perf-chip describing the parallel kernel calls", async () => {
     mockTotalResponse(buildTotalResponse());
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByTestId("calc-total-cta"));
     await waitFor(() => expect(screen.getByTestId("calc-total-result")).toBeInTheDocument());
 
@@ -608,7 +609,7 @@ describe("<CalcPanel /> — empty-cell badges & banner (Wave 5.96G-ui)", () => {
 
   it("renders the 'no data ingested' badge + tooltip on cells with data_status='empty'", async () => {
     mockTotalResponse(buildEmptyResponse());
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByTestId("calc-total-cta"));
     await waitFor(() => expect(screen.getByTestId("calc-total-result")).toBeInTheDocument());
 
@@ -634,7 +635,7 @@ describe("<CalcPanel /> — empty-cell badges & banner (Wave 5.96G-ui)", () => {
 
   it("renders the distinct 'class not ingested' badge for data_status='skipped' cells", async () => {
     mockTotalResponse(buildEmptyResponse());
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByTestId("calc-total-cta"));
     await waitFor(() => expect(screen.getByTestId("calc-total-result")).toBeInTheDocument());
 
@@ -661,7 +662,7 @@ describe("<CalcPanel /> — empty-cell badges & banner (Wave 5.96G-ui)", () => {
   it("renders the cells_empty banner above the grid only when cells_empty > 0", async () => {
     // Case 1 — cells_empty=3 → banner present with count + generator flag.
     mockTotalResponse(buildEmptyResponse());
-    const { unmount } = render(<CalcPanel />);
+    const { unmount } = renderCalcPanel();
     fireEvent.click(screen.getByTestId("calc-total-cta"));
     await waitFor(() => expect(screen.getByTestId("calc-total-result")).toBeInTheDocument());
 
@@ -681,7 +682,7 @@ describe("<CalcPanel /> — empty-cell badges & banner (Wave 5.96G-ui)", () => {
     // buildTotalResponse helper (no cells_empty field set) to also cover
     // backward compat with pre-5.96G-api response shapes.
     mockTotalResponse(buildTotalResponse());
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByTestId("calc-total-cta"));
     await waitFor(() => expect(screen.getByTestId("calc-total-result")).toBeInTheDocument());
     expect(screen.queryByTestId("calc-total-empty-banner")).toBeNull();
@@ -719,7 +720,7 @@ describe("<CalcPanel /> — Total SBM elapsed pill polish (Wave 6.02)", () => {
 
   it("applies --running on the in-flight pill and removes it after the result lands", async () => {
     const deferred = deferredTotalFetch(buildTotalResponse());
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByTestId("calc-total-cta"));
     await waitFor(() => expect(screen.queryByTestId("calc-total-elapsed")).not.toBeNull());
 
@@ -734,7 +735,7 @@ describe("<CalcPanel /> — Total SBM elapsed pill polish (Wave 6.02)", () => {
 
   it("renders a static 'computed in Ns' pill in the headline once the result lands", async () => {
     const deferred = deferredTotalFetch(buildTotalResponse());
-    render(<CalcPanel />);
+    renderCalcPanel();
     // No final pill before any run.
     expect(screen.queryByTestId("calc-total-elapsed-final")).toBeNull();
     fireEvent.click(screen.getByTestId("calc-total-cta"));
@@ -754,7 +755,7 @@ describe("<CalcPanel /> — Total SBM elapsed pill polish (Wave 6.02)", () => {
 
   it("clears the final pill on a second run and restores the spinning pill", async () => {
     const first = deferredTotalFetch(buildTotalResponse());
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByTestId("calc-total-cta"));
     first.resolve();
     await waitFor(() => expect(screen.getByTestId("calc-total-elapsed-final")).toBeInTheDocument());

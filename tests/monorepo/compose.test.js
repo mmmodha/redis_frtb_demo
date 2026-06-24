@@ -6,7 +6,14 @@ import { parse } from 'yaml';
 const ROOT = resolve(__dirname, '..', '..');
 const COMPOSE = resolve(ROOT, 'docker-compose.yml');
 
-const APP_SERVICES = ['ui', 'api', 'generator', 'source', 'ingest', 'calc', 'loadgen'];
+const APP_SERVICES = ['ui', 'api', 'generator', 'source', 'ingest', 'calc', 'loadgen', 'bulk-loader'];
+
+/** Resolve `${VAR:-default}` literals from compose environment blocks. */
+function composeDefault(value) {
+  if (typeof value !== 'string') return value;
+  const m = value.match(/^\$\{[^:]+:-(.+)\}$/);
+  return m ? m[1] : value;
+}
 
 describe('docker-compose.yml', () => {
   let doc;
@@ -17,7 +24,7 @@ describe('docker-compose.yml', () => {
     doc = parse(readFileSync(COMPOSE, 'utf8'), { merge: true });
   });
 
-  it('defines all 7 application services', () => {
+  it('defines all 8 application services', () => {
     for (const name of APP_SERVICES) {
       expect(doc.services, `service "${name}" should be defined`).toHaveProperty(name);
     }
@@ -60,10 +67,23 @@ describe('docker-compose.yml', () => {
   });
 
   it('services that need Redis read REDIS_TARGET_URL from the api router, not hardcoded hosts', () => {
-    for (const name of ['ingest', 'calc', 'generator', 'source', 'loadgen']) {
+    for (const name of ['ingest', 'calc', 'generator', 'source', 'loadgen', 'bulk-loader']) {
       const env = doc.services[name].environment || {};
       const apiUrl = env.API_URL || env.api_url;
       expect(apiUrl, `service "${name}" must declare API_URL env so it can fetch the active Redis target from api`).toBeDefined();
     }
+  });
+
+  it('api enables Wave 7 lazy-math + slim index (Docker parity with run-local.sh)', () => {
+    const env = doc.services.api.environment || {};
+    expect(composeDefault(env.CALC_LAZY_MATH)).toBe('1');
+    expect(composeDefault(env.ENABLE_SLIM_SENS_INDEX)).toBe('1');
+    expect(env.BULK_LOADER_URL).toBe('http://bulk-loader:8086');
+  });
+
+  it('bulk-loader defaults to production-oriented pool sizing', () => {
+    const env = doc.services['bulk-loader'].environment || {};
+    expect(Number(composeDefault(env.BULK_LOADER_POOL_SIZE))).toBeGreaterThanOrEqual(16);
+    expect(Number(composeDefault(env.BULK_LOADER_BATCH_SIZE))).toBeGreaterThanOrEqual(2000);
   });
 });

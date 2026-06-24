@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { CalcPanel } from "../../src/panels/CalcPanel";
+import { renderCalcPanel } from "../helpers/renderCalcPanel";
 import type { CalcSbmResponse } from "../../src/lib/calc";
 
 // Wave 5.53 — Scenario dropdown (plain-English regulatory framing for the
@@ -73,7 +74,7 @@ afterEach(() => {
 
 describe("Scenario dropdown", () => {
   it("renders a Scenario select with 'Standard charge' as the default option", () => {
-    render(<CalcPanel />);
+    renderCalcPanel();
     const select = screen.getByLabelText(/scenario/i) as HTMLSelectElement;
     expect(select.value).toBe("standard");
     // No Low/Med/High letters in the happy-path UI.
@@ -84,7 +85,7 @@ describe("Scenario dropdown", () => {
   });
 
   it("lists the three plain-English scenario options with tooltips", () => {
-    render(<CalcPanel />);
+    renderCalcPanel();
     const select = screen.getByLabelText(/scenario/i) as HTMLSelectElement;
     const options = Array.from(select.options).map((o) => ({
       value: o.value,
@@ -112,7 +113,7 @@ describe("Scenario dropdown", () => {
 
   it("Standard charge (default) → request body omits correlation_regime", async () => {
     const sent = mockCalcWithCapture(makeResponse("medium"));
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
     await waitFor(() => expect(sent.length).toBe(1));
     expect(sent[0]).toEqual({ risk_class: "GIRR", sensitivity_type: "Delta" });
@@ -121,7 +122,7 @@ describe("Scenario dropdown", () => {
 
   it("Stress: low correlation → request body includes correlation_regime: 'low'", async () => {
     const sent = mockCalcWithCapture(makeResponse("low"));
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.change(screen.getByLabelText(/scenario/i), { target: { value: "stress-low" } });
     fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
     await waitFor(() => expect(sent.length).toBe(1));
@@ -130,7 +131,7 @@ describe("Scenario dropdown", () => {
 
   it("Stress: high correlation → request body includes correlation_regime: 'high'", async () => {
     const sent = mockCalcWithCapture(makeResponse("high"));
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.change(screen.getByLabelText(/scenario/i), { target: { value: "stress-high" } });
     fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
     await waitFor(() => expect(sent.length).toBe(1));
@@ -142,7 +143,7 @@ describe("Scenario dropdown", () => {
     // the badge must trust the wire response so we don't lie about what was
     // actually applied to the charge.
     mockCalcWithCapture(makeResponse("high"));
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
     const badge = await screen.findByTestId("regime-badge");
     expect(badge).toHaveAttribute("data-regime", "high");
@@ -151,7 +152,7 @@ describe("Scenario dropdown", () => {
 
   it("RegimeBadge is omitted when the api response carries no correlation_regime field (legacy back-compat)", async () => {
     mockCalcWithCapture(makeResponse());
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
     await waitFor(() => expect(screen.getByTestId("calc-charge")).toBeInTheDocument());
     expect(screen.queryByTestId("regime-badge")).toBeNull();
@@ -181,7 +182,7 @@ describe("Show Redis commands toggle", () => {
 
   it("Redis commands panel is hidden by default even when commands are present in the response", async () => {
     mockCalcWithCapture(responseWithCommands);
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
     await waitFor(() => expect(screen.getByTestId("calc-charge")).toBeInTheDocument());
     expect(screen.queryByTestId("redis-commands")).toBeNull();
@@ -189,7 +190,7 @@ describe("Show Redis commands toggle", () => {
 
   it("flipping the toggle on shows the panel; flipping off hides it again", async () => {
     mockCalcWithCapture(responseWithCommands);
-    render(<CalcPanel />);
+    renderCalcPanel();
     fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
     await waitFor(() => expect(screen.getByTestId("calc-charge")).toBeInTheDocument());
     const toggle = screen.getByTestId("calc-show-redis-commands-toggle");
@@ -202,7 +203,7 @@ describe("Show Redis commands toggle", () => {
   });
 
   it("flipping the toggle on forces the Advanced disclosure open", () => {
-    render(<CalcPanel />);
+    renderCalcPanel();
     const details = screen.getByTestId("advanced-filters") as HTMLDetailsElement;
     expect(details.open).toBe(false);
     fireEvent.click(screen.getByTestId("calc-show-redis-commands-toggle"));
@@ -210,11 +211,11 @@ describe("Show Redis commands toggle", () => {
   });
 
   it("persists the choice in localStorage and restores it on next mount", async () => {
-    const { unmount } = render(<CalcPanel />);
+    const { unmount } = renderCalcPanel();
     fireEvent.click(screen.getByTestId("calc-show-redis-commands-toggle"));
     expect(window.localStorage.getItem("calc.show-redis-commands")).toBe("true");
     unmount();
-    render(<CalcPanel />);
+    renderCalcPanel();
     expect(screen.getByTestId("calc-show-redis-commands-toggle")).toHaveAttribute(
       "aria-pressed",
       "true",
@@ -224,7 +225,7 @@ describe("Show Redis commands toggle", () => {
   it("?demo=1 URL param auto-enables the toggle on first load (and writes to localStorage)", async () => {
     setSearch("?demo=1");
     mockCalcWithCapture(responseWithCommands);
-    render(<CalcPanel />);
+    renderCalcPanel();
     const toggle = screen.getByTestId("calc-show-redis-commands-toggle");
     expect(toggle).toHaveAttribute("aria-pressed", "true");
     expect(window.localStorage.getItem("calc.show-redis-commands")).toBe("true");

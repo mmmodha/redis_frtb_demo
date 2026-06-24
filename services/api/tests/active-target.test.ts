@@ -32,11 +32,11 @@ describe("active-target singleton", () => {
     expect(getActiveTarget().tls).toBe(true);
   });
 
-  it("defaults to localhost:6379 when no env and no override", () => {
+  it("returns unconfigured sentinel when no env and no override", () => {
     const t = getActiveTarget();
-    expect(t.host).toBe("127.0.0.1");
-    expect(t.port).toBe(6379);
-    expect(t.label).toBe("default");
+    expect(t.host).toBe("");
+    expect(t.port).toBe(0);
+    expect(t.label).toBe("");
   });
 
   it("setActiveTarget overrides env and persists across calls", () => {

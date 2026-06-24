@@ -86,9 +86,15 @@ export function Observability() {
       setPulseKey((k) => k + 1);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      const isBusy = msg.includes("503") || /busy|calculation/i.test(msg);
       // Only blow away the page on first-load failure. After we have data,
-      // keep showing it and surface the failure as an inline pill.
-      setStatus((prev) => (prev.kind === "loading" ? { kind: "error", message: msg } : prev));
+      // keep showing it and surface the failure as an inline pill. When Redis
+      // is busy with a calc, stay in loading — the cadence loop retries.
+      setStatus((prev) => {
+        if (prev.kind !== "loading") return prev;
+        if (isBusy) return prev;
+        return { kind: "error", message: msg };
+      });
       setLastError(msg);
     } finally {
       inFlightRef.current = false;
@@ -237,6 +243,12 @@ export function Observability() {
       {status.kind === "loading" && (
         <div className="observability__loading" role="status">
           loading observability…
+          {lastError ? (
+            <span className="observability__loading-hint">
+              {" "}
+              Redis may be busy with an in-flight calculation — retrying…
+            </span>
+          ) : null}
         </div>
       )}
 

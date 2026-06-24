@@ -143,7 +143,7 @@ export interface BulkIngestStartResponse {
 
 export interface BulkIngestRunStatus {
   run_id: string;
-  status: "running" | "done" | "error" | "cancelled";
+  status: "running" | "cancelling" | "done" | "error" | "cancelled";
   rows_total: number;
   rows_sent: number;
   rows_skipped: number;
@@ -250,6 +250,21 @@ export async function startBulkIngest(config: BulkIngestConfig): Promise<BulkIng
     throw new Error(`api /ingest/bulk/start ${detail}`);
   }
   return (await res.json()) as BulkIngestStartResponse;
+}
+
+export interface ActiveBulkIngestRun {
+  run_id: string;
+  status: string;
+  rows_sent: number;
+  rows_total: number;
+  started_at_iso?: string;
+  workers?: number;
+}
+
+export async function getActiveBulkIngestRuns(): Promise<{ active: ActiveBulkIngestRun[] }> {
+  const res = await fetch(`${apiBase()}/ingest/bulk/runs`);
+  if (!res.ok) throw new Error(`api /ingest/bulk/runs ${res.status}`);
+  return (await res.json()) as { active: ActiveBulkIngestRun[] };
 }
 
 export async function getBulkIngestRun(runId: string): Promise<BulkIngestRunStatus | null> {
@@ -485,6 +500,8 @@ export interface StopAllRunsResponse {
   ok: true;
   cancelled: number;
   run_ids: string[];
+  bulk_cancelled?: number;
+  bulk_run_ids?: string[];
   trim?: { streams_trimmed: number } | null;
 }
 

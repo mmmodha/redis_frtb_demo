@@ -252,12 +252,10 @@ describe("/connections HTTP routes", () => {
     }
   });
 
-  it("GET /redis/active-target falls back to default when nothing is active (per existing contract)", async () => {
+  it("GET /redis/active-target returns 503 when nothing is active (UI-first bootstrap)", async () => {
     const res = await app.inject({ method: "GET", url: "/redis/active-target" });
-    expect(res.statusCode).toBe(200);
-    const body = res.json();
-    expect(body.label).toBe("default");
-    expect(body.password).toBeUndefined();
+    expect(res.statusCode).toBe(503);
+    expect(res.json().error).toMatch(/no active target/i);
   });
 
   describe("Wave 5.60 — duplicate-endpoint guard", () => {

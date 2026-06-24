@@ -16,15 +16,16 @@ All three live inside one Redis target — switchable at runtime through the UI.
 
 ## Architecture
 
-Seven application services. No Redis container; the active target is nominated at runtime.
+Eight application services. No Redis container; the active target is nominated at runtime.
 
 | Service       | Purpose                                                                                                       |
 |---------------|---------------------------------------------------------------------------------------------------------------|
 | `ui`          | Next.js frontend — Connections, Ingest, Search, Calc, Observability panels                                    |
 | `api`         | Fastify gateway — proxies UI → Redis, owns the active-target router                                           |
-| `generator`   | Synthetic FRTB sensitivity producer — streams into Redis Streams                                              |
+| `generator`   | Synthetic FRTB sensitivity producer — CLI (`docker compose run --rm generator --rows N`); idle under `compose up` |
 | `source`      | File/upload ingestion — column-mapping wizard, CSV/JSONL/Parquet readers                                      |
 | `ingest`      | Stream consumer — writes HASH sensitivity docs (default `STORAGE_FORMAT=hash-sidetable`) into the active target |
+| `bulk-loader` | Fast-path writer — connection-pool HSET pipelines for large-scale bulk ingest (UI "Start ingest")             |
 | `calc`        | SBM Delta/Vega orchestrator — loads Redis Functions, fans out `FCALL`                                         |
 | `loadgen`     | Concurrent-analyst load generator — drives the scale moments                                                  |
 
@@ -53,25 +54,47 @@ There is no Redis in this compose stack — the Connections panel nominates the 
 
 Hard requirement: Redis **7.0+** (Functions are core from 7.0 onward) with the Search and JSON modules loaded.
 
-## Quick start
-
-`.env.local` is gitignored and auto-created with generated secrets on first run; you do not need to edit anything by hand.
-
-### Docker
+## Quick start (Docker — default)
 
 ```bash
-docker compose up -d --wait
-open http://localhost:3000           # → Connections panel → Add → Test → Set active
+scripts/docker-up.sh              # or: npm start
+open http://localhost:3000        # → Connections → Add → Test → Set active
 ```
 
-### Local (no Docker)
+Full guide: [`docs/docker-deploy.md`](docs/docker-deploy.md) — includes the **400M-row ingest playbook** and calc tuning.
+
+`.env.local` is gitignored and auto-created on first `docker-up.sh` run. **No `REDIS_URL` is required** — all eight services start without Redis; configure the active target from the Connections panel.
+
+### 400M-scale ingest
+
+```bash
+npm run docker:up:400m            # 8 bulk-loader replicas, tuned pool/batch
+# … run ingest from UI …
+node --env-file=.env.local scripts/finalise-rollups.mjs
+node --env-file=.env.local scripts/finalise-seen-sets.mjs
+```
+
+### Local Redis (optional dev profile)
+
+```bash
+docker compose --profile dev-redis up -d redis
+echo 'REDIS_URL=redis://host.docker.internal:6379' >> .env.local
+scripts/docker-up.sh --dev
+```
+
+### Bare-metal (debug only)
 
 ```bash
 scripts/run-local.sh start
-open http://localhost:3000           # same Connections flow
+open http://localhost:3000
 ```
 
-All seven services come up healthy. The UI serves on :3000, the api on :8080. Until you nominate an active Redis in the Connections panel, the UI shows *"No active connection"*.
+### Raw Compose (equivalent)
+
+```bash
+docker compose up -d --wait --scale bulk-loader=4
+open http://localhost:3000
+```
 
 ## Connecting Redis (cold vs warm)
 

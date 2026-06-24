@@ -6,6 +6,7 @@ import type { CorrelationSpec } from "./sbm/reduce.ts";
 import {
   getActiveTarget,
   setActiveTarget,
+  isActiveTargetConfigured,
   onActiveTargetChange,
   getActiveRedisClient,
   getActiveRedisRuntimeClient,
@@ -226,7 +227,20 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
   // streams). Defaults from MAX_INFLIGHT_HEAVY / MAX_INFLIGHT_LIGHT.
   registerBackpressure(app);
 
-  if (opts.activeTarget) setActiveTarget(opts.activeTarget);
+  if (opts.activeTarget) {
+    setActiveTarget(opts.activeTarget);
+  } else if (opts.redis && !isActiveTargetConfigured()) {
+    // Unit tests inject fakeRedis without wiring the active-target singleton.
+    // Install a stable label so routes that key off target_label keep working
+    // without reintroducing the production localhost fallback.
+    setActiveTarget({
+      host: "127.0.0.1",
+      port: 6379,
+      tls: false,
+      db: 0,
+      label: "test-default",
+    });
+  }
 
   // Wave 5.97D.1 — split health into k8s-style liveness + readiness probes.
   //   /healthz: liveness. Always 200 once the api process is accepting
@@ -288,7 +302,14 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
   // Wave 6.21 — `/redis/active-target` is a tiny in-memory read (no Redis
   // call) but the GET is exempted from heavy/light backpressure already; mark
   // it `light` for symmetry with the rest of the read endpoints.
-  app.get("/redis/active-target", { config: { category: "light" } }, async () => getActiveTarget());
+  app.get("/redis/active-target", { config: { category: "light" } }, async (_req, reply) => {
+    const t = getActiveTarget();
+    if (!t.label) {
+      reply.code(503);
+      return { error: "no active target" };
+    }
+    return t;
+  });
   registerInternalTargetRoutes(app, opts.store as RealConnectionsStore | undefined);
 
   // Wave 5.16t — surface bootstrap progress to the UI so a freshly-activated

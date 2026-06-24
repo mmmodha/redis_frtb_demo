@@ -86,10 +86,8 @@ async function probe(redis: RedisLike): Promise<number> {
   // Tests set `testCacheKeyOverride` and exercise the helper against synthetic
   // RedisLike fakes — skip the boot-client path entirely in that mode so a
   // missing active-target singleton cannot stall the unit suite waiting on a
-  // real socket. Production code that has not explicitly activated a profile
-  // (active-target label === "default", i.e. the un-set fallback) is treated
-  // the same way: we have nothing to gain from probing the loopback default.
-  const useBoot = testCacheKeyOverride === null && resolveCacheKey() !== "default";
+  // real socket. Skip probing until a UI profile or REDIS_URL is configured.
+  const useBoot = testCacheKeyOverride === null && resolveCacheKey() !== "";
   if (useBoot) {
     // Prefer the boot client (offline queue enabled, default ioredis retry
     // budget) for the probe so a pool-member wrapper in mid-recycle does not

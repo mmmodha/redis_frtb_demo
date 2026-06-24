@@ -35,6 +35,63 @@ x-app-env: &app-env
   # but MUST be replaced for any reachable demo.
   INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-dev-internal-token}
 
+# Wave 7 defaults — mirror scripts/run-local.sh `apply_defaults` so Docker
+# and bare-metal behave identically for bulk ingest + lazy-math calc.
+x-wave7-env: &wave7-env
+  CALC_LAZY_MATH: ${CALC_LAZY_MATH:-1}
+  ENABLE_SLIM_SENS_INDEX: ${ENABLE_SLIM_SENS_INDEX:-1}
+  LIVE_TAIL_MODE: ${LIVE_TAIL_MODE:-true}
+
+# app + wave7 (Compose allows one `<<:` merge key per mapping).
+x-app-wave7-env: &app-wave7-env
+  <<: *app-env
+  CALC_LAZY_MATH: ${CALC_LAZY_MATH:-1}
+  ENABLE_SLIM_SENS_INDEX: ${ENABLE_SLIM_SENS_INDEX:-1}
+  LIVE_TAIL_MODE: ${LIVE_TAIL_MODE:-true}
+
+# Calc/query pool sizing for large clusters (override in .env.local for 400M).
+x-calc-pool-env: &calc-pool-env
+  RUNTIME_REDIS_POOL_SIZE_HEAVY_CALC: ${RUNTIME_REDIS_POOL_SIZE_HEAVY_CALC:-8}
+  RUNTIME_REDIS_POOL_SIZE_HEAVY_INGEST: ${RUNTIME_REDIS_POOL_SIZE_HEAVY_INGEST:-4}
+  RUNTIME_REDIS_POOL_SIZE_LIGHT: ${RUNTIME_REDIS_POOL_SIZE_LIGHT:-4}
+  MAX_INFLIGHT_HEAVY: ${MAX_INFLIGHT_HEAVY:-24}
+  MAX_INFLIGHT_LIGHT: ${MAX_INFLIGHT_LIGHT:-12}
+
+x-api-env: &api-env
+  <<: *app-wave7-env
+  RUNTIME_REDIS_POOL_SIZE_HEAVY_CALC: ${RUNTIME_REDIS_POOL_SIZE_HEAVY_CALC:-8}
+  RUNTIME_REDIS_POOL_SIZE_HEAVY_INGEST: ${RUNTIME_REDIS_POOL_SIZE_HEAVY_INGEST:-4}
+  RUNTIME_REDIS_POOL_SIZE_LIGHT: ${RUNTIME_REDIS_POOL_SIZE_LIGHT:-4}
+  MAX_INFLIGHT_HEAVY: ${MAX_INFLIGHT_HEAVY:-24}
+  MAX_INFLIGHT_LIGHT: ${MAX_INFLIGHT_LIGHT:-12}
+  HEALTH_PORT: 8080
+  CONN_STORE_FILE: /data/connections.enc.json
+  CONN_STORE_KEY: ${CONN_STORE_KEY:-dev-only-change-in-prod}
+  ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000}
+  SCHEMA_FILE: ${SCHEMA_FILE:-/app/config/schema/frtb-default.yaml}
+  SOURCE_BASE: http://source:8082
+  LOADGEN_BASE: http://loadgen:8085
+  BULK_LOADER_URL: http://bulk-loader:8086
+
+x-ingest-env: &ingest-env
+  <<: *app-wave7-env
+  HEALTH_PORT: 8083
+  STREAM_SHARDS: ${STREAM_SHARDS:-1}
+  SHARD_ASSIGNMENT: ${SHARD_ASSIGNMENT:-all}
+
+x-bulk-loader-env: &bulk-loader-env
+  BULK_LOADER_POOL_SIZE: ${BULK_LOADER_POOL_SIZE:-16}
+  BULK_LOADER_BATCH_SIZE: ${BULK_LOADER_BATCH_SIZE:-2000}
+  BULK_LOADER_IDLE_FLUSH_MS: ${BULK_LOADER_IDLE_FLUSH_MS:-50}
+
+x-bulk-loader-service-env: &bulk-loader-service-env
+  <<: *app-env
+  BULK_LOADER_POOL_SIZE: ${BULK_LOADER_POOL_SIZE:-16}
+  BULK_LOADER_BATCH_SIZE: ${BULK_LOADER_BATCH_SIZE:-2000}
+  BULK_LOADER_IDLE_FLUSH_MS: ${BULK_LOADER_IDLE_FLUSH_MS:-50}
+  HEALTH_PORT: 8086
+  API_BASE: http://api:8080
+
 # Redis connection env (REDIS_URL / REDIS_TLS / REDIS_CLUSTER) is sourced
 # from the host's `.env.local` (gitignored) via the `env_file` directive on
 # every Redis-touching service. This means `docker compose up` (with NO
@@ -75,39 +132,7 @@ services:
       dockerfile: services/api/Dockerfile
     env_file: *env-file
     environment:
-      <<: *app-env
-      HEALTH_PORT: 8080
-      # Wave 5.79: persist the encrypted connections store on the named `data`
-      # volume mounted at /data below. Wave 5.78 dropped the Docker-only path
-      # default in services/api/src/index.ts, so compose must set this
-      # explicitly to keep the legacy behaviour.
-      CONN_STORE_FILE: /data/connections.enc.json
-      CONN_STORE_KEY: ${CONN_STORE_KEY:-dev-only-change-in-prod}
-      # Wave 5.16g: CORS allow-list for the browser-facing api. The ui
-      # container fetches the api cross-origin from the host's nginx port
-      # (http://localhost:3000 → http://localhost:8080); without this every
-      # call surfaces in the browser as "Failed to fetch". Comma-separated
-      # list supported; `*` allowed for local dev only.
-      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000}
-      # Wave 5.12.1: point the api bootstrap at the schema baked into the image
-      # (see services/api/Dockerfile). Mirrors the generator service for parity
-      # and makes SCHEMA_FILE overridable at runtime for alt-schema testing.
-      SCHEMA_FILE: ${SCHEMA_FILE:-/app/config/schema/frtb-default.yaml}
-      # Wave 5.16l: point the /sources/* proxy at the source container's actual
-      # listen port (PORT=8082 below). The code default in
-      # services/api/src/routes/sources-proxy.ts is http://source:3002 for
-      # non-compose runs; under compose we must override or the proxy 502s.
-      SOURCE_BASE: http://source:8082
-      # Wave 5.79: point the /loadgen/* proxy at the loadgen container's
-      # service hostname. Wave 5.78 swapped the code default from
-      # http://loadgen:8085 to http://localhost:8085 for laptop use, so
-      # compose must override it to restore inter-container resolution.
-      LOADGEN_BASE: http://loadgen:8085
-      # Wave 7.0.7.4: point the /ingest bulk-loader at the bulk-loader
-      # container. The code default in services/api/src/routes/ingest.ts is
-      # http://localhost:8086, which doesn't work in Docker where services
-      # communicate via internal DNS using service names.
-      BULK_LOADER_URL: http://bulk-loader:8086
+      <<: *api-env
     ports:
       - "8080:8080"
     volumes:
@@ -121,18 +146,9 @@ services:
 
   generator:
     <<: *service-defaults
-    # Wave 5.15d.2: generator is an explicit-invocation tool, NOT an autostart
-    # service. Putting it behind the `tools` profile keeps it out of
-    # `docker compose up -d --wait` (so the bogus HTTP healthcheck below — the
-    # generator has no HTTP server — can no longer make `compose ps` report
-    # "6/7 with generator unhealthy", and the default ENTRYPOINT no longer
-    # pumps rows into a freshly-booted 2 GB cluster behind the smoke runbook's
-    # explicit step-4 invocation). `docker compose run --rm generator …` still
-    # works: Compose auto-activates the profile of any named service when
-    # invoked via `run`, so the smoke runbook's
-    #   `docker compose run --rm generator --rows N --classes X,Y`
-    # contract from Wave 5.14b.2 is unchanged.
-    profiles: ["tools"]
+    # Wave 7.0.8: included in the default stack. docker-entrypoint.sh sleeps
+    # when no args are passed so `compose up --wait` stays healthy; invoke
+    # the CLI with `docker compose run --rm generator --rows N`.
     build:
       context: .
       dockerfile: services/generator/Dockerfile
@@ -144,9 +160,16 @@ services:
       # /app/config/schema/ (see services/generator/Dockerfile). Without this
       # the container exits with "schema file path missing".
       SCHEMA_FILE: ${SCHEMA_FILE:-/app/config/schema/frtb-default.yaml}
+      API_BASE: http://api:8080
     depends_on:
       api:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
 
   source:
     <<: *service-defaults
@@ -191,10 +214,7 @@ services:
       dockerfile: services/ingest/Dockerfile
     env_file: *env-file
     environment:
-      <<: *app-env
-      HEALTH_PORT: 8083
-      STREAM_SHARDS: ${STREAM_SHARDS:-1}
-      SHARD_ASSIGNMENT: ${SHARD_ASSIGNMENT:-all}
+      <<: *ingest-env
     volumes:
       - data:/data
     depends_on:
@@ -262,14 +282,7 @@ services:
       dockerfile: services/bulk-loader/Dockerfile
     env_file: *env-file
     environment:
-      <<: *app-env
-      HEALTH_PORT: 8086
-      # Wave 7.0.7: default pool size per container. Scaling 4× with
-      # BULK_LOADER_POOL_SIZE=8 yields 32 total workers (8 per replica).
-      BULK_LOADER_POOL_SIZE: ${BULK_LOADER_POOL_SIZE:-8}
-      # Wave 7.0.7: point the active-target watcher at the api container's
-      # service hostname for cross-container resolution.
-      API_BASE: http://api:8080
+      <<: *bulk-loader-service-env
     depends_on:
       api:
         condition: service_healthy

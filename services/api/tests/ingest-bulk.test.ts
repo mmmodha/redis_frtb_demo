@@ -13,7 +13,7 @@ import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import Fastify, { type FastifyInstance } from "fastify";
 import { loadSchema, type Schema } from "@frtb/schema";
-import { registerIngestRoutes, _testResetBulkRuns, _testGetBulkRun } from "../src/routes/ingest.ts";
+import { registerIngestRoutes, _testResetBulkRuns, _testGetBulkRun, cancelAllBulkRuns } from "../src/routes/ingest.ts";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -141,5 +141,52 @@ describe("POST /ingest/bulk/cancel", () => {
     // id; what we don't want is a 404/5xx.
     expect([200, 409]).toContain(res.statusCode);
     expect(_testGetBulkRun(run_id)).toBeDefined();
+  });
+
+  it("cancelAllBulkRuns flips cancel on running entries", async () => {
+    app = mountIngest(loadFixtureSchema(), 8);
+    const start = await app.inject({
+      method: "POST",
+      url: "/ingest/bulk/start",
+      payload: { rows: 1_000_000, workers: 1 },
+    });
+    const run_id = start.json().run_id as string;
+    const record = _testGetBulkRun(run_id);
+    expect(record?.cancelled).not.toBe(true);
+    const cancelled = cancelAllBulkRuns();
+    expect(cancelled).toContain(run_id);
+    expect(_testGetBulkRun(run_id)?.cancelled).toBe(true);
+  });
+});
+
+describe("GET /ingest/bulk/runs", () => {
+  let app: FastifyInstance;
+  afterEach(async () => {
+    if (app) await app.close();
+    _testResetBulkRuns();
+  });
+
+  it("lists running bulk ingest runs", async () => {
+    app = Fastify({ logger: false });
+    app.addHook("onRequest", async (req) => {
+      (req as unknown as { poolCategory: string }).poolCategory = "light";
+    });
+    registerIngestRoutes(app, loadFixtureSchema(), {
+      bulkLoaderBase: "http://127.0.0.1:1",
+      fetchImpl: () => new Promise<Response>(() => { /* never settles */ }),
+      availableCores: () => 8,
+    });
+    await app.ready();
+    const start = await app.inject({
+      method: "POST",
+      url: "/ingest/bulk/start",
+      payload: { rows: 10, workers: 1 },
+    });
+    const run_id = start.json().run_id as string;
+    const res = await app.inject({ method: "GET", url: "/ingest/bulk/runs" });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(Array.isArray(body.active)).toBe(true);
+    expect(body.active.some((r: { run_id: string }) => r.run_id === run_id)).toBe(true);
   });
 });

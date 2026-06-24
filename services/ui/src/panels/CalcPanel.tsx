@@ -5,8 +5,6 @@ import { SuggestCombobox } from "../components/SuggestCombobox";
 import type { ShardTiming } from "../components/TimingStrip";
 import {
   postBucketCrossDetail,
-  postCalcSbm,
-  postCalcSbmTotal,
   type BucketResult,
   type CalcCacheState,
   type CalcCommands,
@@ -25,6 +23,8 @@ import { EmptyTargetError } from "../lib/empty-target";
 import { formatCharge } from "../lib/format";
 import { fetchPivot, type PivotDoc, type PivotRow } from "../lib/pivot";
 import { useFacets } from "../hooks/useFacets";
+import { useCalcRun } from "../context/CalcRunContext";
+import type { CalcResultContext } from "../lib/calcRunState";
 
 type RiskClass = "GIRR" | "Equity" | "FX";
 type SortKey = "bucket" | "K_b" | "S_b" | "count" | "ms";
@@ -300,18 +300,24 @@ function readInitialShowRedisCommands(): boolean {
 export function CalcPanel() {
   const [riskClass, setRiskClass] = useState<RiskClass>("GIRR");
   const [sensitivityType, setSensitivityType] = useState<SensitivityType>("Delta");
-  // Wave 5.56 — facet counts narrow the risk_class / sensitivity_type
-  // dropdowns to what's actually in the active index, with row counts
-  // shown next to each label.
+  const {
+    perClass: perClassRun,
+    total: totalRun,
+    perClassLoading,
+    totalLoading,
+    startPerClassCalc,
+    startTotalCalc,
+  } = useCalcRun();
+  const loading = perClassLoading;
+  const result = perClassRun.result ?? null;
+  const resultContext = perClassRun.resultContext ?? null;
+  const error = perClassRun.error ?? null;
+  const emptyError = perClassRun.emptyError
+    ? new EmptyTargetError(perClassRun.emptyErrorStatus ?? 503, perClassRun.emptyError)
+    : null;
+  const totalResult = totalRun.result ?? null;
+  const totalError = totalRun.error ?? null;
   const { facets } = useFacets();
-  const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState<CalcSbmResponse | null>(null);
-  // Wave 5.18: capture the (risk_class, sensitivity_type) at compute time so
-  // the Basel caption and drill-down /pivot queries stay aligned with the
-  // displayed result even if the user edits the form afterwards.
-  const [resultContext, setResultContext] = useState<{ riskClass: RiskClass; sensitivityType: SensitivityType } | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [emptyError, setEmptyError] = useState<EmptyTargetError | null>(null);
   const [sortKey, setSortKey] = useState<SortKey | null>(null);
   // Separate expansion sets for chart vs table so clicking a row in one view
   // doesn't echo an accordion in the other — drill-down sits directly below
@@ -349,14 +355,6 @@ export function CalcPanel() {
   // details stay open regardless.
   const [advancedManuallyOpened, setAdvancedManuallyOpened] = useState<boolean>(false);
 
-  // Wave 5.96B — Total SBM orchestrator state. Independent of the per-cell
-  // form so a Total run doesn't disturb the active risk_class / sensitivity
-  // / scenario picks. bucket_subset + exclude are shared because the same
-  // filters apply uniformly across every cell of the 27-cell matrix.
-  const [totalLoading, setTotalLoading] = useState(false);
-  const [totalResult, setTotalResult] = useState<TotalSbmResponse | null>(null);
-  const [totalError, setTotalError] = useState<string | null>(null);
-
   useEffect(() => {
     try {
       window.localStorage.setItem(
@@ -393,85 +391,47 @@ export function CalcPanel() {
       .map((s) => ({ value: s, count: liveFacets.sensitivity_type[s]! }));
   }, [liveFacets]);
 
-  async function onCalculate() {
-    setLoading(true);
-    setError(null);
-    setEmptyError(null);
+  function onCalculate() {
     setSortKey(null);
     setChartExpanded(new Set());
     setTableExpanded(new Set());
-    try {
-      // Only send `bucket_subset` when the user has actively narrowed below
-      // the available bucket set — sending a full-list subset wastes bytes
-      // and clutters the "Redis commands executed" panel.
-      const sendSubset =
-        result !== null &&
-        bucketSubset !== null &&
-        bucketSubset.size < result.per_bucket.length;
-      const subsetArr = sendSubset ? Array.from(bucketSubset!) : undefined;
-      // Only send `correlation_regime` when the Scenario maps to a non-null
-      // regime (i.e. anything other than "Standard charge") — preserves the
-      // byte-identical default-path body shape.
-      const scenarioOpt = SCENARIO_OPTIONS.find((s) => s.value === scenario);
-      const scenarioRegime = scenarioOpt?.regime ?? null;
-      // Build the optional `exclude` only when at least one list is non-empty
-      // — same "don't send the default" convention.
-      const excludeBody: Record<string, string[]> = {};
-      if (excludeBooks.size > 0) excludeBody.book = Array.from(excludeBooks);
-      if (excludeTrades.size > 0) excludeBody.trade_id = Array.from(excludeTrades);
-      if (excludeFactors.size > 0) excludeBody.risk_factor = Array.from(excludeFactors);
-      const sendExclude = Object.keys(excludeBody).length > 0;
-      const r = await postCalcSbm({
-        risk_class: riskClass,
-        sensitivity_type: sensitivityType,
-        ...(subsetArr ? { bucket_subset: subsetArr } : {}),
-        ...(scenarioRegime ? { correlation_regime: scenarioRegime } : {}),
-        ...(sendExclude ? { exclude: excludeBody } : {}),
-      });
-      setResult(r);
-      setResultContext({ riskClass, sensitivityType });
-    } catch (e) {
-      setResult(null);
-      setResultContext(null);
-      if (e instanceof EmptyTargetError) {
-        setEmptyError(e);
-      } else {
-        setError(e instanceof Error ? e.message : String(e));
-      }
-    } finally {
-      setLoading(false);
-    }
+    const sendSubset =
+      result !== null &&
+      bucketSubset !== null &&
+      bucketSubset.size < result.per_bucket.length;
+    const subsetArr = sendSubset ? Array.from(bucketSubset!) : undefined;
+    const scenarioOpt = SCENARIO_OPTIONS.find((s) => s.value === scenario);
+    const scenarioRegime = scenarioOpt?.regime ?? null;
+    const excludeBody: Record<string, string[]> = {};
+    if (excludeBooks.size > 0) excludeBody.book = Array.from(excludeBooks);
+    if (excludeTrades.size > 0) excludeBody.trade_id = Array.from(excludeTrades);
+    if (excludeFactors.size > 0) excludeBody.risk_factor = Array.from(excludeFactors);
+    const sendExclude = Object.keys(excludeBody).length > 0;
+    const request = {
+      risk_class: riskClass,
+      sensitivity_type: sensitivityType,
+      ...(subsetArr ? { bucket_subset: subsetArr } : {}),
+      ...(scenarioRegime ? { correlation_regime: scenarioRegime } : {}),
+      ...(sendExclude ? { exclude: excludeBody } : {}),
+    };
+    startPerClassCalc(request, { riskClass, sensitivityType });
   }
 
-  // Wave 5.96B — Total SBM orchestrator handler. Fires a single
-  // /calc/sbm/total request that fans out the 27-cell matrix server-side;
-  // bucket_subset + exclude carry the same "don't send the default" rule
-  // as onCalculate so the body stays byte-minimal on the default path.
-  async function onCalculateTotal() {
-    setTotalLoading(true);
-    setTotalError(null);
-    try {
-      const excludeBody: Record<string, string[]> = {};
-      if (excludeBooks.size > 0) excludeBody.book = Array.from(excludeBooks);
-      if (excludeTrades.size > 0) excludeBody.trade_id = Array.from(excludeTrades);
-      if (excludeFactors.size > 0) excludeBody.risk_factor = Array.from(excludeFactors);
-      const sendExclude = Object.keys(excludeBody).length > 0;
-      const sendSubset =
-        result !== null &&
-        bucketSubset !== null &&
-        bucketSubset.size < result.per_bucket.length;
-      const subsetArr = sendSubset ? Array.from(bucketSubset!) : undefined;
-      const r = await postCalcSbmTotal({
-        ...(subsetArr ? { bucket_subset: subsetArr } : {}),
-        ...(sendExclude ? { exclude: excludeBody } : {}),
-      });
-      setTotalResult(r);
-    } catch (e) {
-      setTotalResult(null);
-      setTotalError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setTotalLoading(false);
-    }
+  function onCalculateTotal() {
+    const excludeBody: Record<string, string[]> = {};
+    if (excludeBooks.size > 0) excludeBody.book = Array.from(excludeBooks);
+    if (excludeTrades.size > 0) excludeBody.trade_id = Array.from(excludeTrades);
+    if (excludeFactors.size > 0) excludeBody.risk_factor = Array.from(excludeFactors);
+    const sendExclude = Object.keys(excludeBody).length > 0;
+    const sendSubset =
+      result !== null &&
+      bucketSubset !== null &&
+      bucketSubset.size < result.per_bucket.length;
+    const subsetArr = sendSubset ? Array.from(bucketSubset!) : undefined;
+    startTotalCalc({
+      ...(subsetArr ? { bucket_subset: subsetArr } : {}),
+      ...(sendExclude ? { exclude: excludeBody } : {}),
+    });
   }
 
   function toggleSubsetBucket(bucket: string) {
@@ -577,7 +537,7 @@ export function CalcPanel() {
           }}
           excludeTotal={excludeTotal}
           buckets={result?.per_bucket ?? []}
-          riskClass={resultContext?.riskClass ?? riskClass}
+          riskClass={(resultContext?.riskClass ?? riskClass) as RiskClass}
           subset={bucketSubset}
           onToggleSubsetBucket={toggleSubsetBucket}
           onResetSubset={resetSubset}
@@ -611,7 +571,7 @@ export function CalcPanel() {
       {result && resultContext ? (
         <CalcResult
           result={result}
-          context={resultContext}
+          context={resultContext as { riskClass: RiskClass; sensitivityType: SensitivityType }}
           sortKey={sortKey}
           setSortKey={setSortKey}
           sortedBuckets={sortedBuckets}
@@ -625,6 +585,8 @@ export function CalcPanel() {
 
       <TotalSbmCard
         loading={totalLoading}
+        startedAt={totalRun.startedAt ?? null}
+        finishedAt={totalRun.finishedAt ?? null}
         result={totalResult}
         error={totalError}
         onCalculate={onCalculateTotal}
@@ -639,38 +601,35 @@ export function CalcPanel() {
 // concrete numbers (wall-clock vs cumulative ms, parallelism factor).
 function TotalSbmCard({
   loading,
+  startedAt,
+  finishedAt,
   result,
   error,
   onCalculate,
 }: {
   loading: boolean;
+  startedAt: number | null;
+  finishedAt: number | null;
   result: TotalSbmResponse | null;
   error: string | null;
   onCalculate: () => void;
 }) {
-  // Wave 5.96D — elapsed-time counter that ticks every 250ms while the
-  // orchestrator is in-flight. Sets expectation that this is a multi-second
-  // operation (cold ~35s, warm ~6s) and resets cleanly between runs because
-  // the effect re-runs whenever `loading` flips.
-  // Wave 6.02 — also capture the final elapsed ms in the cleanup so the
-  // result headline can surface a static "computed in Ns" pill alongside
-  // the binding-scenario pill. Reset to null on each new run.
   const [elapsedMs, setElapsedMs] = useState(0);
   const [finalElapsedMs, setFinalElapsedMs] = useState<number | null>(null);
   useEffect(() => {
     if (!loading) {
+      if (startedAt != null && finishedAt != null) {
+        setFinalElapsedMs(Math.max(0, finishedAt - startedAt));
+      }
       setElapsedMs(0);
       return;
     }
-    const start = Date.now();
-    setElapsedMs(0);
+    const origin = startedAt ?? Date.now();
+    setElapsedMs(Math.max(0, Date.now() - origin));
     setFinalElapsedMs(null);
-    const id = setInterval(() => setElapsedMs(Date.now() - start), 250);
-    return () => {
-      clearInterval(id);
-      setFinalElapsedMs(Date.now() - start);
-    };
-  }, [loading]);
+    const id = setInterval(() => setElapsedMs(Math.max(0, Date.now() - origin)), 250);
+    return () => clearInterval(id);
+  }, [loading, startedAt, finishedAt]);
   const elapsedSeconds = elapsedMs / 1000;
   return (
     <PanelCard title="Total SBM (all classes × legs × scenarios)">

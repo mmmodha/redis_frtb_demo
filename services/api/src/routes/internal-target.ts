@@ -50,6 +50,10 @@ export function registerInternalTargetRoutes(
       return { error: "unauthorized" };
     }
     const t = getActiveTarget();
+    if (!t.label) {
+      reply.code(503);
+      return { error: "no active target" };
+    }
     // Wave 5.99B — surface clusterMode so the source watcher can branch between
     // ioredis Cluster (true OSS Redis Cluster) and the single-node client
     // (proxy-endpoint / Enterprise-style). Always emitted as a boolean; legacy

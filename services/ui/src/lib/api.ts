@@ -45,24 +45,45 @@ export function apiBase(): string {
   return fromEnv ?? "/api";
 }
 
-async function getJson<T>(path: string): Promise<T> {
-  const res = await fetch(`${apiBase()}${path}`);
-  if (!res.ok) {
-    throw new Error(`api ${path} ${res.status}`);
+async function getJson<T>(
+  path: string,
+  opts?: { retries?: number; retryDelayMs?: number },
+): Promise<T> {
+  const retries = opts?.retries ?? 0;
+  const retryDelayMs = opts?.retryDelayMs ?? 1_500;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const res = await fetch(`${apiBase()}${path}`);
+    if (res.ok) {
+      return (await res.json()) as T;
+    }
+    if (res.status === 503 && attempt < retries) {
+      await new Promise((r) => setTimeout(r, retryDelayMs * (attempt + 1)));
+      continue;
+    }
+    let detail = "";
+    try {
+      const body = (await res.json()) as { error?: string };
+      if (body?.error) detail = `: ${body.error}`;
+    } catch {
+      // ignore non-JSON bodies
+    }
+    throw new Error(`api ${path} ${res.status}${detail}`);
   }
-  return (await res.json()) as T;
+  throw new Error(`api ${path} failed after retries`);
 }
 
+const OBS_FETCH_OPTS = { retries: 4, retryDelayMs: 2_000 } as const;
+
 export function getObservabilityKeys(prefix = "sens:"): Promise<ObservabilityKeysResponse> {
-  return getJson<ObservabilityKeysResponse>(`/observability/keys?prefix=${prefix}`);
+  return getJson<ObservabilityKeysResponse>(`/observability/keys?prefix=${prefix}`, OBS_FETCH_OPTS);
 }
 
 export function getObservabilityMemory(): Promise<ObservabilityMemoryResponse> {
-  return getJson<ObservabilityMemoryResponse>(`/observability/memory`);
+  return getJson<ObservabilityMemoryResponse>(`/observability/memory`, OBS_FETCH_OPTS);
 }
 
 export function getObservabilityShards(): Promise<ObservabilityShardsResponse> {
-  return getJson<ObservabilityShardsResponse>(`/observability/shards`);
+  return getJson<ObservabilityShardsResponse>(`/observability/shards`, OBS_FETCH_OPTS);
 }
 
 // Wave 5.57 — historical samples for the Cluster snapshot sparkline / popout

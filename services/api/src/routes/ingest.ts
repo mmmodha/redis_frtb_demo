@@ -84,6 +84,11 @@ interface BulkRunRecord {
   // poll Atomics.load(cancelView, 0)); `cancelled` flag for inline.
   cancelView?: Int32Array;
   cancelled?: boolean;
+  // Immediate abort for inline runs (workers=1) and worker termination for
+  // multi-worker runs — set by cancel handlers so in-flight HTTP retries
+  // unwind without waiting for the next row-boundary poll.
+  httpAbort?: AbortController;
+  workerHandles?: Worker[];
   // Wave 7.0.6.22 — bulk-load backpressure surface for the UI rate-gauge.
   //   throttled       true while at least one in-flight batch on any worker
   //                   is in the 429 retry loop.
@@ -125,6 +130,34 @@ const DEFAULT_SENSITIVITY_TYPES = ["Delta", "Vega", "Curvature"] as const;
 const RUN_GRACE_MS = 60_000;
 
 const activeRuns = new Map<string, BulkRunRecord>();
+
+// Wave 7.0.8 — bulk-loader lifecycle hooks shared by cancel + stop-runs.
+let bulkLoaderHaltBase = "";
+let bulkLoaderHaltFetch: typeof fetch = globalThis.fetch;
+
+function configureBulkLoaderHalt(base: string, fetchImpl: typeof fetch): void {
+  bulkLoaderHaltBase = base.replace(/\/+$/, "");
+  bulkLoaderHaltFetch = fetchImpl;
+}
+
+/** POST /load/stop on every replica (round-robin fan-out). */
+export async function haltBulkLoaderAccept(): Promise<void> {
+  if (!bulkLoaderHaltBase) return;
+  const attempts = Math.max(1, Number(process.env.BULK_LOADER_STOP_ATTEMPTS ?? 8));
+  await Promise.allSettled(
+    Array.from({ length: attempts }, () =>
+      bulkLoaderHaltFetch(`${bulkLoaderHaltBase}/load/stop`, { method: "POST" }),
+    ),
+  );
+}
+
+/** Re-enable bulk-loader after a deliberate stop. */
+export async function resumeBulkLoaderAccept(): Promise<void> {
+  if (!bulkLoaderHaltBase) return;
+  try {
+    await bulkLoaderHaltFetch(`${bulkLoaderHaltBase}/load/start`, { method: "POST" });
+  } catch { /* tolerate unreachable bulk-loader */ }
+}
 
 function pickInt(...vals: Array<number | undefined>): number | undefined {
   for (const v of vals) {
@@ -198,6 +231,7 @@ export function registerIngestRoutes(
   const fetchImpl = opts.fetchImpl ?? (globalThis.fetch as typeof fetch);
   const availableCores = opts.availableCores ?? availableParallelism;
   const schemaPath = resolveSchemaPath(opts);
+  configureBulkLoaderHalt(bulkBase, fetchImpl);
 
   app.post<{ Body: BulkRunBody }>(
     "/ingest/bulk/start",
@@ -232,6 +266,8 @@ export function registerIngestRoutes(
       const sensitivityTypes = Array.isArray(body.sensitivity_types) && body.sensitivity_types.length > 0
         ? body.sensitivity_types.map(String)
         : [...DEFAULT_SENSITIVITY_TYPES];
+
+      await resumeBulkLoaderAccept();
 
       const run_id = ulid();
       const started_at_iso = new Date().toISOString();
@@ -325,9 +361,29 @@ export function registerIngestRoutes(
         reply.code(409);
         return { ok: false, error: `run already ${r.status}` };
       }
-      r.cancelled = true;
-      if (r.cancelView) Atomics.store(r.cancelView, 0, 1);
-      return { ok: true, run_id, status: r.status };
+      applyBulkRunCancel(r);
+      void haltBulkLoaderAccept();
+      return { ok: true, run_id, status: "cancelled" };
+    },
+  );
+
+  // Wave 7.0.8 — orphan discovery for UI reconnect after refresh (mirrors
+  // GET /generator/runs). Returns running bulk-loader producer runs only.
+  app.get(
+    "/ingest/bulk/runs",
+    { config: { category: "light" } },
+    async () => {
+      const active = Array.from(activeRuns.values())
+        .filter((r) => r.status === "running")
+        .map((r) => ({
+          run_id: r.run_id,
+          status: r.status,
+          rows_sent: r.rows_sent,
+          rows_total: r.rows_total,
+          started_at_iso: r.started_at_iso,
+          workers: r.workers,
+        }));
+      return { active };
     },
   );
 
@@ -340,7 +396,9 @@ export function registerIngestRoutes(
         reply.code(404);
         return { error: "run not found" };
       }
-      const rps = r.ms > 0 ? Math.round((r.rows_sent * 1000) / r.ms) : 0;
+      const rps = r.status === "running" && r.ms > 0
+        ? Math.round((r.rows_sent * 1000) / r.ms)
+        : 0;
       // Strip non-serialisable fields (Int32Array view over SAB) and the
       // per-worker bookkeeping maps (only the run-wide aggregates are part
       // of the wire shape). Spread preserves every other key so the UI and
@@ -382,6 +440,30 @@ export function _testGetBulkRun(run_id: string): BulkRunRecord | undefined {
 
 export function _testResetBulkRuns(): void {
   activeRuns.clear();
+}
+
+function applyBulkRunCancel(record: BulkRunRecord): void {
+  record.cancelled = true;
+  record.status = "cancelled";
+  if (record.cancelView) Atomics.store(record.cancelView, 0, 1);
+  if (record.httpAbort && !record.httpAbort.signal.aborted) record.httpAbort.abort();
+  if (record.workerHandles) {
+    for (const w of record.workerHandles) void w.terminate();
+  }
+}
+
+// Wave 7.0.8 — shared cancel surface for POST /ingest/bulk/cancel and
+// POST /admin/stop-runs (mirrors generator.cancelAllActiveRuns).
+export function cancelAllBulkRuns(): string[] {
+  const run_ids: string[] = [];
+  for (const entry of activeRuns.values()) {
+    if (entry.status === "running" && !entry.cancelled) {
+      applyBulkRunCancel(entry);
+      run_ids.push(entry.run_id);
+    }
+  }
+  if (run_ids.length > 0) void haltBulkLoaderAccept();
+  return run_ids;
 }
 
 // ---------------------------------------------------------------------------
@@ -439,6 +521,7 @@ function runInline(args: InlineRunArgs): void {
   // never observes record.cancelled (the row-boundary poll runs only
   // BETWEEN rows, never inside producer.add()'s infinite-retry inner loop).
   const httpAbort = new AbortController();
+  record.httpAbort = httpAbort;
   const producer = createHttpProducer({
     url: bulkBase,
     batchSize,
@@ -526,6 +609,8 @@ function runWithWorkers(args: WorkerRunArgs): void {
   const cancelView = new Int32Array(cancelBuffer);
   record.cancelView = cancelView;
   const perWorkerRows = new Int32Array(workers);
+  const workerHandles: Worker[] = [];
+  record.workerHandles = workerHandles;
   // Wave 7.0.6.22 — per-worker backpressure trackers. Aggregated into
   // record.{throttled,retries_total,throttled_at_ms} on every progress
   // frame so the UI's /ingest/bulk/runs/:id poll always sees an up-to-
@@ -603,6 +688,7 @@ function runWithWorkers(args: WorkerRunArgs): void {
       httpInFlight: perWorkerInFlight,
     };
     const worker = new Worker(workerEntryUrl, { workerData: init });
+    workerHandles.push(worker);
     workerPromises.push(new Promise<void>((resolveP) => {
       worker.on("message", (msg: WorkerMessage) => {
         if (msg.type === "progress") {

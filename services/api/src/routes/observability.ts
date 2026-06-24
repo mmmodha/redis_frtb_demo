@@ -3,7 +3,7 @@ import { Cluster } from "ioredis";
 import type { RedisLike } from "../redis-like.ts";
 import { getActiveTarget, type RuntimeCategory } from "../active-target.ts";
 import { getBootstrapStatus } from "../bootstrap-status.ts";
-import { translateRedisError } from "../redis-errors.ts";
+import { translateObservabilityRedisError } from "../redis-errors.ts";
 import { corsHeadersForRequest } from "../cors-headers.ts";
 import {
   RETENTION_MS,
@@ -464,7 +464,7 @@ export function registerObservabilityRoutes(
         ms: Math.round(ms * 1000) / 1000,
       };
     } catch (err) {
-      const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
+      const translated = translateObservabilityRedisError(err, target_label, getBootstrapStatus().phase);
       if (translated) {
         reply.code(translated.status);
         return translated.body;
@@ -500,7 +500,7 @@ export function registerObservabilityRoutes(
         ms: Math.round(ms * 1000) / 1000,
       };
     } catch (err) {
-      const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
+      const translated = translateObservabilityRedisError(err, target_label, getBootstrapStatus().phase);
       if (translated) {
         reply.code(translated.status);
         return translated.body;
@@ -519,7 +519,7 @@ export function registerObservabilityRoutes(
       void writeMetric(redis, "ops_per_sec", totalOps, target_label);
       return shards;
     } catch (err) {
-      const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
+      const translated = translateObservabilityRedisError(err, target_label, getBootstrapStatus().phase);
       if (translated) {
         reply.code(translated.status);
         return translated.body;
@@ -538,7 +538,7 @@ export function registerObservabilityRoutes(
       const topology = await readTopology(redis, req.log);
       return topology;
     } catch (err) {
-      const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
+      const translated = translateObservabilityRedisError(err, target_label, getBootstrapStatus().phase);
       if (translated) {
         reply.code(translated.status);
         return translated.body;
@@ -574,7 +574,7 @@ export function registerObservabilityRoutes(
           }
         }
       } catch (err) {
-        const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
+        const translated = translateObservabilityRedisError(err, target_label, getBootstrapStatus().phase);
         if (translated) {
           reply.code(translated.status);
           return translated.body;
@@ -653,7 +653,7 @@ export function registerObservabilityRoutes(
       }
       return rows;
     } catch (err) {
-      const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
+      const translated = translateObservabilityRedisError(err, target_label, getBootstrapStatus().phase);
       if (translated) {
         reply.code(translated.status);
         return translated.body;

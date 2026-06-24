@@ -48,6 +48,7 @@ import {
   parseStreamShardsFlag,
   type StreamShardsConfig,
 } from "@frtb/stream-router";
+import { cancelAllBulkRuns, haltBulkLoaderAccept } from "./ingest.ts";
 import type { RedisLike } from "../redis-like.ts";
 import { getActiveTarget } from "../active-target.ts";
 import { corsHeadersForRequest } from "../cors-headers.ts";
@@ -1128,8 +1129,10 @@ export function registerGeneratorRoutes(
   app.post("/admin/cancel-all-runs", async () => {
     const run_ids = cancelAllActiveRuns();
     await drainAndForceTerminal(run_ids);
+    const bulk_run_ids = cancelAllBulkRuns();
+    await haltBulkLoaderAccept();
     const flush = await callIngestHaltAndFlush(app, opts.ingestBase, cancelFetch);
-    return { ok: true, cancelled: run_ids.length, run_ids, flush };
+    return { ok: true, cancelled: run_ids.length, run_ids, bulk_cancelled: bulk_run_ids.length, bulk_run_ids, flush };
   });
 
   // Wave 6.53.A / 6.53.B — non-destructive admin "stop generators" route.
@@ -1145,8 +1148,10 @@ export function registerGeneratorRoutes(
   app.post("/admin/stop-runs", async () => {
     const run_ids = cancelAllActiveRuns();
     await drainAndForceTerminal(run_ids);
+    const bulk_run_ids = cancelAllBulkRuns();
+    await haltBulkLoaderAccept();
     const trim = await callIngestHaltAndTrim(app, opts.ingestBase, cancelFetch);
-    return { ok: true, cancelled: run_ids.length, run_ids, trim };
+    return { ok: true, cancelled: run_ids.length, run_ids, bulk_cancelled: bulk_run_ids.length, bulk_run_ids, trim };
   });
 
   // Wave 6.53.A — shared drain + force-terminal helper used by both

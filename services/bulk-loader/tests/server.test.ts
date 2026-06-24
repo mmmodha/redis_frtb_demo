@@ -45,9 +45,27 @@ afterEach(async () => {
 });
 
 describe("GET /healthz", () => {
-  it("returns 503 with no workers connected (degraded)", async () => {
+  it("returns 200 awaiting when no pool is wired (UI-first bootstrap)", async () => {
+    const awaiting = createBulkLoaderState({
+      pool: null,
+      dispatcher: null,
+      checkpointer: null,
+      bootstrapCheckpoints: new Map(),
+      boundTarget: null,
+      boundVersion: null,
+      targetWatcher: "awaiting",
+    });
+    const awaitingApp = await createServer({ state: awaiting });
+    await awaitingApp.ready();
+    const res = await awaitingApp.inject({ method: "GET", url: "/healthz" });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ status: "awaiting", service: "bulk-loader" });
+    await awaitingApp.close();
+  });
+
+  it("returns 200 with 0 workers connected (degraded liveness)", async () => {
     const res = await app.inject({ method: "GET", url: "/healthz" });
-    expect(res.statusCode).toBe(503);
+    expect(res.statusCode).toBe(200);
     const body = res.json() as { service: string; status: string; connected: number; pool_size: number };
     expect(body.service).toBe("bulk-loader");
     expect(body.status).toBe("degraded");
@@ -67,11 +85,12 @@ describe("GET /healthz", () => {
     expect(body.pool_size).toBe(4);
   });
 
-  it("returns 503 at 50% (2 of 4)", async () => {
+  it("returns 200 at 50% (2 of 4) — liveness, readiness on /load/status", async () => {
     clients[0]!.becomeReady();
     clients[1]!.becomeReady();
     const res = await app.inject({ method: "GET", url: "/healthz" });
-    expect(res.statusCode).toBe(503);
+    expect(res.statusCode).toBe(200);
+    expect(res.json().status).toBe("degraded");
   });
 });
 

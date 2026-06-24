@@ -5,6 +5,7 @@ import { BootstrapStatusOverlay } from "./BootstrapStatusOverlay";
 import { LockoutBanner } from "./LockoutBanner";
 import { useBootstrapStatus } from "../hooks/useBootstrapStatus";
 import { getActiveTarget, type ActiveTarget } from "../lib/connections";
+import { CalcRunContext } from "../context/CalcRunContext";
 import { GeneratorRunContext } from "../context/GeneratorRunContext";
 import { PivotBurstContext } from "../context/PivotBurstContext";
 
@@ -29,6 +30,7 @@ export function AppShell({ children }: AppShellProps) {
   const { phase: bootstrapPhase } = useBootstrapStatus();
   const burstCtx = useContext(PivotBurstContext);
   const generatorCtx = useContext(GeneratorRunContext);
+  const calcCtx = useContext(CalcRunContext);
   const location = useLocation();
   const burst = burstCtx?.burst ?? null;
   const showBurstPill = burst !== null && location.pathname !== "/pivot";
@@ -37,6 +39,8 @@ export function AppShell({ children }: AppShellProps) {
     generatorRun !== null &&
     generatorRun.status === "running" &&
     location.pathname !== "/ingest";
+  const calcBusy = calcCtx !== null && (calcCtx.perClassLoading || calcCtx.totalLoading);
+  const showCalcPill = calcBusy && location.pathname !== "/calc";
 
   const refreshTarget = useCallback(async () => {
     try {
@@ -95,6 +99,17 @@ export function AppShell({ children }: AppShellProps) {
                   aria-label={`Generator running, ${generatorRun.rowsDone} of ${generatorRun.rowsTotal}`}
                 >
                   {generatorRun.rowsDone} / {generatorRun.rowsTotal}
+                </span>
+              )}
+              {s.to === "/calc" && showCalcPill && (
+                <span
+                  className="app-shell__nav-pill"
+                  data-testid="calc-run-nav-pill"
+                  role="status"
+                  aria-live="polite"
+                  aria-label="Calculation in progress"
+                >
+                  Calculating…
                 </span>
               )}
             </li>

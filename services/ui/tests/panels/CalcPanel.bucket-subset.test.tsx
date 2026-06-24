@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { CalcPanel } from "../../src/panels/CalcPanel";
+import { renderCalcPanel } from "../helpers/renderCalcPanel";
 import type { CalcSbmResponse } from "../../src/lib/calc";
 
 const originalFetch = globalThis.fetch;
@@ -52,7 +53,7 @@ afterEach(() => {
 
 async function firstRun(body: CalcSbmResponse = baseResponse) {
   const sent = mockCalcWithCapture(body);
-  render(<CalcPanel />);
+  renderCalcPanel();
   fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
   await waitFor(() => expect(screen.getByTestId("calc-charge")).toBeInTheDocument());
   return sent;
@@ -60,7 +61,7 @@ async function firstRun(body: CalcSbmResponse = baseResponse) {
 
 describe("Wave 5.31a — Calc bucket-subset refine row", () => {
   it("does not render the Refine buckets row before the first /calc/sbm response", () => {
-    render(<CalcPanel />);
+    renderCalcPanel();
     expect(screen.queryByTestId("refine-buckets")).toBeNull();
   });
 

@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { CalcPanel } from "../../src/panels/CalcPanel";
+import { renderCalcPanel } from "../helpers/renderCalcPanel";
 
 // Calc-side fuzzy toggle. Mirrors PivotPanel's toggle behaviour onto the
 // three exclude comboboxes (book / trade_id / risk_factor). The toggle
@@ -52,7 +53,7 @@ afterEach(() => {
 
 describe("CalcPanel fuzzy-suggestions toggle (in Advanced)", () => {
   it("renders a fuzzy toggle with default state 'on'", () => {
-    render(<CalcPanel />);
+    renderCalcPanel();
     const toggle = screen.getByTestId("calc-fuzzy-toggle");
     expect(toggle).toBeInTheDocument();
     expect(toggle).toHaveAttribute("aria-pressed", "true");
@@ -60,7 +61,7 @@ describe("CalcPanel fuzzy-suggestions toggle (in Advanced)", () => {
   });
 
   it("flipping the toggle off ⇒ typing in Books to exclude does NOT open the listbox", async () => {
-    render(<CalcPanel />);
+    renderCalcPanel();
     const toggle = screen.getByTestId("calc-fuzzy-toggle");
     fireEvent.click(toggle);
     expect(toggle).toHaveAttribute("aria-pressed", "false");
@@ -78,7 +79,7 @@ describe("CalcPanel fuzzy-suggestions toggle (in Advanced)", () => {
   });
 
   it("flipping the toggle back on ⇒ listbox opens on next keystroke", async () => {
-    render(<CalcPanel />);
+    renderCalcPanel();
     const toggle = screen.getByTestId("calc-fuzzy-toggle");
     // Off first
     fireEvent.click(toggle);
@@ -98,7 +99,7 @@ describe("CalcPanel fuzzy-suggestions toggle (in Advanced)", () => {
   });
 
   it("disclosure stays collapsed by default (pristine state with fuzzy on, no chips)", () => {
-    render(<CalcPanel />);
+    renderCalcPanel();
     const details = screen.getByTestId("advanced-filters") as HTMLDetailsElement;
     expect(details.open).toBe(false);
   });

@@ -233,6 +233,16 @@ describe("GET /internal/redis/active-target/full", () => {
     expect(res.statusCode).toBe(503);
     expect(res.json()).toEqual({ error: "INTERNAL_API_TOKEN not configured" });
   });
+
+  it("returns 503 when no Redis target is configured (UI-first bootstrap)", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: "/internal/redis/active-target/full",
+      headers: { authorization: "Bearer test-internal-token" },
+    });
+    expect(res.statusCode).toBe(503);
+    expect(res.json()).toEqual({ error: "no active target" });
+  });
 });
 
 // Wave 6.43.B.1 — switch coordinator: prepare/commit handoff plus the ACK

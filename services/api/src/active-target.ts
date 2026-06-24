@@ -2,10 +2,9 @@
 //
 // Other services (ingest, generator, source, calc, loadgen) and our own
 // endpoints obtain the current target via `GET /redis/active-target`. The
-// Connections store agent (task c496f7e8) will set the active target on
-// profile-switch via `setActiveTarget(...)`. With no override, we fall back
-// to the REDIS_URL env var, then to localhost — keeping CI / unit tests
-// trivially configurable.
+// Connections store sets the active target on profile activation via
+// `setActiveTarget(...)`. With no override and no REDIS_URL env, the target
+// is unconfigured — callers must configure Redis via the UI Connections panel.
 
 import { randomUUID } from "node:crypto";
 import { Redis } from "ioredis";
@@ -121,7 +120,7 @@ const CIRCUIT_BACKOFF_DEFAULT_MS = 5_000;
 // (and therefore the `"heavy"` deprecated alias).
 const POOL_COMMAND_TIMEOUT_HEAVY_CALC_DEFAULT_MS = 35_000;
 const POOL_COMMAND_TIMEOUT_HEAVY_INGEST_DEFAULT_MS = 5_000;
-const POOL_COMMAND_TIMEOUT_LIGHT_DEFAULT_MS = 1_500;
+const POOL_COMMAND_TIMEOUT_LIGHT_DEFAULT_MS = 8_000;
 
 // Wave 6.30.B4 — scheduled half-open probe backoff. Once a member opens, a
 // background timer fires after `initial` to issue a single PING via the
@@ -1226,6 +1225,7 @@ function buildClient(
 // are where blast-radius reduction matters.
 export function getActiveRedisClient(): Redis | null {
   const t = getActiveTarget();
+  if (!t.label) return null;
   const c = overrideCreds;
   const key = targetKey(t);
   if (cachedBootClient && key === cachedBootClientKey) return cachedBootClient;
@@ -1341,6 +1341,7 @@ function ensurePoolSized(pool: Pool, size: number): void {
 // uses `awaitMemberReady` — the same readiness bridge `/readyz` relies on.
 async function acquireFromPool(pool: Pool, category: NormalizedCategory): Promise<Redis | null> {
   const t = getActiveTarget();
+  if (!t.label) return null;
   const c = overrideCreds;
   const key = targetKey(t);
   ensurePoolSized(pool, getRuntimePoolSize(category));
@@ -1994,11 +1995,25 @@ export function __resetRuntimeReadinessCacheForTests(): void {
   runtimeReadinessInFlight = null;
 }
 
+/** True when a UI profile or REDIS_URL env has been wired (not awaiting Connections). */
+export function isActiveTargetConfigured(): boolean {
+  if (override) return true;
+  return !!process.env.REDIS_URL;
+}
+
+const UNCONFIGURED_ACTIVE_TARGET: ActiveTarget = {
+  host: "",
+  port: 0,
+  tls: false,
+  db: 0,
+  label: "",
+};
+
 export function getActiveTarget(): ActiveTarget {
   if (override) return override;
   const url = process.env.REDIS_URL;
   if (url) return parseRedisUrl(url);
-  return { host: "127.0.0.1", port: 6379, tls: false, db: 0, label: "default" };
+  return UNCONFIGURED_ACTIVE_TARGET;
 }
 
 function parseRedisUrl(raw: string): ActiveTarget {

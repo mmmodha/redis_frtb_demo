@@ -68,3 +68,33 @@ export function translateRedisError(
 
   return null;
 }
+
+// Wave 7.0.9 — observability routes use the light pool (INFO, SCAN, DBSIZE).
+// During an in-flight FT.AGGREGATE / FCALL calc Redis is single-threaded, so
+// those cheap reads queue behind the calc and can exceed the light pool's
+// per-command fail-fast budget. Map that to 503 (retry) instead of an opaque
+// 500 so the UI can keep polling instead of showing a hard failure.
+export function translateObservabilityRedisError(
+  err: unknown,
+  target_label: string,
+  bootstrap_phase: BootstrapPhase,
+): TranslatedError | null {
+  const bootstrap = translateRedisError(err, target_label, bootstrap_phase);
+  if (bootstrap) return bootstrap;
+
+  const raw = err instanceof Error ? err.message : String(err);
+  if (
+    raw.includes("pool-command-fail-fast") ||
+    raw.includes("Command timed out")
+  ) {
+    return {
+      status: 503,
+      body: {
+        error: `Redis on '${target_label}' is busy — an in-flight calculation may be blocking lightweight reads. Retry in a moment.`,
+        target_label,
+        bootstrap_phase,
+      },
+    };
+  }
+  return null;
+}

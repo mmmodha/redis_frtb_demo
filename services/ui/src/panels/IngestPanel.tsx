@@ -1,17 +1,25 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { EnterpriseCallout } from "../components/EnterpriseCallout";
 import { MetricTile } from "../components/MetricTile";
 import { PanelCard } from "../components/PanelCard";
 import { PhaseProgress } from "../components/PhaseProgress";
-import { RateGauge } from "./RateGauge";
-import {
-  pushPhaseRateSample,
-  meanPhaseRate,
-} from "../lib/rate-smoothing";
 import {
   useGeneratorRun,
   type GeneratorRunState,
 } from "../context/GeneratorRunContext";
+import { BulkIngestBackpressureHint, shouldShowBulkBackpressureHint } from "../components/BulkIngestBackpressureHint";
+import { useBulkIngestRun } from "../context/BulkIngestRunContext";
+import {
+  meanTelemetryRate,
+  pushTelemetryRateSample,
+  stabilizeIndexCount,
+  pickBulkDisplayRps,
+} from "../lib/telemetrySmoothing";
+import {
+  computeBulkRunDone,
+  sumBulkLoaderFlushed,
+  type BulkRunProgressBaseline,
+} from "../lib/bulkIngestProgress";
 import {
   getObservabilityKeys,
   getObservabilityMemory,
@@ -21,8 +29,6 @@ import {
 import {
   stopAllRuns,
   flushDb,
-  getBulkIngestRun,
-  getBulkLoadStatus,
   getGeneratorRunStatus,
   getIndexCount,
   getIngestShards,
@@ -35,7 +41,6 @@ import {
   startBulkIngest,
   startIngest,
   getHostInfo,
-  cancelBulkIngest,
   type BulkIngestRunStatus,
   type BulkLoadStatus,
   type GeneratorConfig,
@@ -184,6 +189,15 @@ export const RUN_PRESETS: Record<RunPresetKey, RunPreset> = {
   xxl:       { key: "xxl",       label: "200M rows", rows: 200_000_000, shards: 20, maxlen: 0,         deferTrim: true,  description: "" },
 };
 const RUN_PRESET_ORDER: RunPresetKey[] = ["quick", "demo", "medium", "large", "xl", "overnight", "xxl"];
+
+/** Docker-friendly worker count by preset size (1M → 4, 10M → 6, etc.). */
+export function suggestWorkersForPreset(key: RunPresetKey): number {
+  const rows = RUN_PRESETS[key].rows;
+  if (rows <= 100_000) return 2;
+  if (rows <= 1_000_000) return 4;
+  if (rows <= 10_000_000) return 6;
+  return 8;
+}
 
 export function buildRunPresetConfig(p: RunPreset): GeneratorConfig {
   // Wave 6.17 — emit defer_trim verbatim (true or false) so the request body
@@ -496,6 +510,53 @@ export function IngestPanel() {
   // cancelled list, we clear it immediately so the progress UI doesn't sit
   // on "running" for the next polling tick.
   const { run: trackedRun, clearRun: clearTrackedRun, startRun, cancelRun } = useGeneratorRun();
+  const {
+    bulkRunId,
+    bulkRun,
+    bulkLoad,
+    runBaseline,
+    smoothedGenRps,
+    smoothedIngestRps,
+    trackRun: trackBulkRun,
+    cancelRun: cancelBulkRun,
+    clearRun: clearBulkRun,
+  } = useBulkIngestRun();
+
+  function pauseIngestTelemetry(): void {
+    telemetryPausedRef.current = true;
+    telemetryRpsBufferRef.current = [];
+    throughput.current = [];
+    setTelemetryRps(0);
+    forceRender((n) => n + 1);
+  }
+
+  function resetTelemetryBaselines(): void {
+    lastIndexCount.current = null;
+    lastStableIndexCount.current = 0;
+    telemetryRpsBufferRef.current = [];
+    throughput.current = [];
+    setTelemetryRps(0);
+  }
+
+  function resumeIngestTelemetry(): void {
+    telemetryPausedRef.current = false;
+    resetTelemetryBaselines();
+  }
+
+  const prevBulkRunIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    const prev = prevBulkRunIdRef.current;
+    prevBulkRunIdRef.current = bulkRunId;
+    if (prev !== null && bulkRunId === null) {
+      telemetryPausedRef.current = false;
+      resetTelemetryBaselines();
+    }
+  }, [bulkRunId]);
+
+  function onCancelBulkRun(): void {
+    pauseIngestTelemetry();
+    cancelBulkRun();
+  }
   // Wave 5.47b — pre-flight banner + submit gate shared with SyntheticGeneratorCard.
   const preflightHandle = usePreflight();
   // Wave 6.53.C — active-target label drives the indexing-anchor snap path
@@ -525,32 +586,19 @@ export function IngestPanel() {
   // dev override is on.
   const streamOverride = useMemo<boolean>(() => readStreamOverride(), []);
   const [ingestMode, setIngestMode] = useState<"bulk-loader" | "stream">("bulk-loader");
-  // Wave 7.0.6.13 — bulk-run state. `bulkRun` is the most recent
-  // /ingest/bulk/runs/:id response; `bulkLoad` is the most recent
-  // /ingest/bulk/load-status snapshot. Both refresh on the 1s telemetry tick
-  // while a bulk run is active.
-  const [bulkRun, setBulkRun] = useState<BulkIngestRunStatus | null>(null);
-  const [bulkLoad, setBulkLoad] = useState<BulkLoadStatus | null>(null);
-  const [bulkRunId, setBulkRunId] = useState<string | null>(null);
-  // Wave 7.0.6.18 — rolling rate buffers (5 samples) for the bulk-loader
-  // run. `smoothedGenRps` averages the producer-side `rows_per_sec` from
-  // /ingest/bulk/runs/:id; `smoothedIngestRps` averages the per-tick delta
-  // of dispatched bulk-loader writes (sum of worker `flushed`) per second.
-  // Sampled inside the existing polling effect — no new timer. Buffers are
-  // reset whenever the tracked `bulkRunId` changes so a new run starts with
-  // a fresh smoothing window instead of inheriting stale samples.
-  const genRpsBufferRef = useRef<number[]>([]);
-  const ingestRpsBufferRef = useRef<number[]>([]);
-  const lastIngestSampleRef = useRef<{ flushed: number; ms: number } | null>(null);
-  const [smoothedGenRps, setSmoothedGenRps] = useState<number>(0);
-  const [smoothedIngestRps, setSmoothedIngestRps] = useState<number>(0);
-  // Wave 7.0.6.15 — worker_threads fan-out for the bulk-loader run. Defaults
-  // to 1 (single-worker bit-equivalent path) until /admin/host-info reports
-  // the recommended cap, at which point we bump the slider to that value.
-  // `hostInfo` is fetched once on mount; failures fall back to a 1-worker
-  // run + the existing legacy single-worker code path.
-  const [workers, setWorkers] = useState<number>(1);
+  // Wave 7.0.6.15 / 7.0.8 — worker_threads fan-out for bulk-loader runs.
+  // Default 4 suits Docker Compose (4 bulk-loader replicas); preset select
+  // bumps to 4/6/8 for 1M/10M+ runs. Clamped to host recommended_max_workers.
+  const [workers, setWorkers] = useState<number>(4);
   const [hostInfo, setHostInfo] = useState<HostInfo | null>(null);
+  const onSelectPreset = useCallback((k: RunPresetKey) => {
+    setPresetKey(k);
+    setWorkers(() => {
+      let n = suggestWorkersForPreset(k);
+      if (hostInfo) n = Math.min(n, Math.max(1, hostInfo.recommended_max_workers));
+      return n;
+    });
+  }, [hostInfo]);
   // Wave 6.12b — ingest fan-out card state. `ingestShards` mirrors the most
   // recent GET /ingest/shards; `producerDial` is the resolved
   // dials.stream_shards from the active run (when one exists). Both are
@@ -575,18 +623,32 @@ export function IngestPanel() {
   // changes; the poll tick reads the ref each tick to decide whether to
   // fetch /generator/runs/:id/status.
   const trackedRunIdRef = useRef<string | null>(null);
+  const trackedRunLiveRef = useRef(false);
+  const bulkRunIdRef = useRef<string | null>(null);
+  const bulkRunLiveRef = useRef(false);
   useEffect(() => {
     trackedRunIdRef.current = trackedRun?.runId ?? null;
+    trackedRunLiveRef.current = trackedRun?.status === "running";
     if (!trackedRun?.runId) setProducerDial(null);
-  }, [trackedRun?.runId]);
+  }, [trackedRun?.runId, trackedRun?.status]);
+  useEffect(() => {
+    bulkRunIdRef.current = bulkRunId;
+    bulkRunLiveRef.current = bulkRun?.status === "running";
+  }, [bulkRunId, bulkRun?.status]);
 
   const throughput = useRef<ChartSample[]>([]);
   const memorySeries = useRef<ChartSample[]>([]);
+  // Wave 7.0.8 — freeze index-count rows/sec after Stop/Cancel so the
+  // telemetry tiles don't keep climbing while bulk-loader drains.
+  const telemetryPausedRef = useRef(false);
   // Wave 6.51.A — throughput is now derived from FT.SEARCH index-count
   // deltas (sens/sec) rather than DBSIZE deltas, so the "Rows/sec" tile
   // reflects sensitivities indexed per second instead of all-keys churn
   // (rollup:*, processed:*, RediSearch internals, duplicate-hash keys).
   const lastIndexCount = useRef<{ t: number; count: number } | null>(null);
+  const lastStableIndexCount = useRef(0);
+  const telemetryRpsBufferRef = useRef<number[]>([]);
+  const [telemetryRps, setTelemetryRps] = useState(0);
   const [indexCount, setIndexCount] = useState<number>(0);
   const [, forceRender] = useState(0);
 
@@ -604,15 +666,17 @@ export function IngestPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Wave 7.0.6.15 — fetch host info once on mount. The hint line surfaces
-  // `cores · pool · shards` and the max attribute on the workers input is
-  // clamped to `recommended_max_workers`. The slider stays at its default
-  // value of 1 (single-worker bit-equivalent path) until the operator
-  // explicitly bumps it; we never auto-scale workers on the user's behalf.
+  // Wave 7.0.6.15 — fetch host info once on mount for the workers hint and
+  // recommended cap. Clamp the default when the host advertises fewer.
   useEffect(() => {
     let cancelled = false;
     getHostInfo()
-      .then((info) => { if (!cancelled) setHostInfo(info); })
+      .then((info) => {
+        if (cancelled) return;
+        setHostInfo(info);
+        const cap = Math.max(1, info.recommended_max_workers);
+        setWorkers((prev) => Math.min(prev, cap));
+      })
       .catch(() => { /* tolerate missing /admin/host-info */ });
     return () => { cancelled = true; };
   }, []);
@@ -632,18 +696,29 @@ export function IngestPanel() {
         ]);
         if (cancelled) return;
         const now = Date.now();
-        const icCount = typeof ic.count === "number" ? ic.count : 0;
-        if (lastIndexCount.current) {
-          const dt = (now - lastIndexCount.current.t) / 1000;
-          const dn = icCount - lastIndexCount.current.count;
-          const rate = dt > 0 ? Math.max(0, dn / dt) : 0;
-          throughput.current = [...throughput.current, { t: now, v: rate }].slice(-MAX_SAMPLES);
+        const rawCount = typeof ic.count === "number" ? ic.count : 0;
+        if (!telemetryPausedRef.current) {
+          const ingestLive = bulkRunLiveRef.current || trackedRunLiveRef.current;
+          const stableCount = stabilizeIndexCount(lastStableIndexCount.current, rawCount, {
+            indexName: ic.index_name,
+            monotonic: ingestLive,
+          });
+          lastStableIndexCount.current = stableCount;
+          if (lastIndexCount.current) {
+            const dt = (now - lastIndexCount.current.t) / 1000;
+            const dn = Math.max(0, stableCount - lastIndexCount.current.count);
+            const instantRate = dt > 0 ? dn / dt : 0;
+            telemetryRpsBufferRef.current = pushTelemetryRateSample(telemetryRpsBufferRef.current, instantRate);
+            const smoothed = meanTelemetryRate(telemetryRpsBufferRef.current);
+            setTelemetryRps(smoothed);
+            throughput.current = [...throughput.current, { t: now, v: smoothed }].slice(-MAX_SAMPLES);
+          }
+          lastIndexCount.current = { t: now, count: stableCount };
+          setIndexCount(stableCount);
         }
-        lastIndexCount.current = { t: now, count: icCount };
         memorySeries.current = [...memorySeries.current, { t: now, v: m.used_memory ?? 0 }].slice(-MAX_SAMPLES);
         setKeys(k);
         setMemory(m);
-        setIndexCount(icCount);
         setError(null);
         setLoaded(true);
         forceRender((n) => n + 1);
@@ -694,7 +769,11 @@ export function IngestPanel() {
   }, []);
 
   const activeSource = useMemo(() => sources.find((s) => s.is_active) ?? sources[0], [sources]);
-  const rowsPerSec = throughput.current.length > 0 ? throughput.current[throughput.current.length - 1]!.v : 0;
+  const bulkTelemetryLive = bulkRun?.status === "running" || bulkRun?.status === "cancelling";
+  const displayRowsPerSec = bulkTelemetryLive
+    ? pickBulkDisplayRps(smoothedIngestRps, telemetryRps, smoothedGenRps)
+    : telemetryRps;
+  const rowsPerSec = displayRowsPerSec;
   const usedMem = memory?.used_memory ?? 0;
   // Wave 6.51.A — empty-state heuristic keyed on the same FT.SEARCH count
   // the user sees in the "Sensitivities" tile so the "Awaiting data" card
@@ -720,7 +799,19 @@ export function IngestPanel() {
     setFlushPending(false);
     setFlushBusy(true);
     setError(null);
+    pauseIngestTelemetry();
     try {
+      if (bulkRun?.status === "running" || bulkRun?.status === "cancelling") {
+        cancelBulkRun();
+      }
+      try {
+        await stopAllRuns();
+      } catch { /* tolerate stop failure; flush still attempts the wipe */ }
+      clearBulkRun();
+      clearTrackedRun();
+      resetTelemetryBaselines();
+      if (ingestTargetLabel) clearAnchor(ingestTargetLabel);
+
       const r = await flushDb();
       // Wave 5.46 — the api re-runs bootstrapFrtb after FLUSHDB. When it
       // succeeds the banner advertises the rebuilt index so the presenter
@@ -745,13 +836,19 @@ export function IngestPanel() {
         setMemory(m);
         const icCount = typeof ic.count === "number" ? ic.count : 0;
         setIndexCount(icCount);
+        lastStableIndexCount.current = icCount;
         lastIndexCount.current = { t: Date.now(), count: icCount };
+        telemetryRpsBufferRef.current = [];
+        throughput.current = [];
+        setTelemetryRps(0);
       } catch { /* tolerate transient refresh failure; next poll tick will catch up */ }
+      resumeIngestTelemetry();
       // Wave 5.47b — flush re-bootstraps server-side, so re-run preflight to
       // refresh the banner state (typically clears it). Tolerate failures.
       void preflightHandle.runPreflight();
     } catch (e) {
       setError(`Flush failed: ${(e as Error).message}`);
+      resumeIngestTelemetry();
     } finally {
       setFlushBusy(false);
     }
@@ -772,11 +869,23 @@ export function IngestPanel() {
     setStopAllPending(false);
     setStopAllBusy(true);
     setError(null);
+    pauseIngestTelemetry();
+    if (bulkRun?.status === "running" || bulkRun?.status === "cancelling") {
+      cancelBulkRun();
+    }
     try {
       const r = await stopAllRuns();
-      let banner = r.cancelled === 0
+      const genCount = r.cancelled;
+      const bulkCount = r.bulk_cancelled ?? r.bulk_run_ids?.length ?? 0;
+      const totalStopped = genCount + bulkCount;
+      let banner = totalStopped === 0
         ? "No active runs."
-        : `Stopped ${r.cancelled} generator${r.cancelled === 1 ? "" : "s"}.`;
+        : (() => {
+          const parts: string[] = [];
+          if (genCount > 0) parts.push(`${genCount} generator${genCount === 1 ? "" : "s"}`);
+          if (bulkCount > 0) parts.push(`${bulkCount} bulk ingest run${bulkCount === 1 ? "" : "s"}`);
+          return `Stopped ${parts.join(" and ")}.`;
+        })();
       if (r.trim && typeof r.trim.streams_trimmed === "number") {
         const n = r.trim.streams_trimmed;
         banner += ` Discarded backlog (${n} stream${n === 1 ? "" : "s"} trimmed).`;
@@ -785,6 +894,10 @@ export function IngestPanel() {
       if (trackedRun?.runId && r.run_ids.includes(trackedRun.runId)) {
         clearTrackedRun();
       }
+      clearBulkRun();
+      resetTelemetryBaselines();
+      if (ingestTargetLabel) clearAnchor(ingestTargetLabel);
+      resumeIngestTelemetry();
       // Wave 6.53.C — snap the indexing bar to "complete" via the existing
       // 3s auto-clear path. Runs whether or not the cancelled list included
       // the tracked run — the user explicitly asked to stop, so the bar
@@ -797,6 +910,7 @@ export function IngestPanel() {
       window.setTimeout(() => setStopAllBanner(null), 4000);
     } catch (e) {
       setError(`Stop generators failed: ${(e as Error).message}`);
+      resumeIngestTelemetry();
     } finally {
       setStopAllBusy(false);
     }
@@ -832,25 +946,12 @@ export function IngestPanel() {
       // when the operator explicitly selects it.
       if (ingestMode === "bulk-loader") {
         setPresetStep(`Starting ${p.label} bulk-loader run…`);
+        resumeIngestTelemetry();
         // Wave 7.0.6.15 — thread the workers slider through. workers=1
         // (default) lands on the inline bit-equivalent path; >1 spawns
         // worker_threads in the api process.
         const start = await startBulkIngest({ rows: p.rows, workers });
-        setBulkRunId(start.run_id);
-        setBulkRun({
-          run_id: start.run_id,
-          status: "running",
-          rows_total: start.rows_total,
-          rows_sent: 0,
-          rows_skipped: 0,
-          batch_size: start.batch_size,
-          concurrency: start.concurrency,
-          workers: start.workers,
-          ms: 0,
-          started_at_iso: start.started_at_iso,
-          bulk_loader_base: start.bulk_loader_base,
-          rows_per_sec: 0,
-        });
+        trackBulkRun(start, { indexCountAtStart: indexCount });
         setPresetStep(null);
         return;
       }
@@ -871,98 +972,8 @@ export function IngestPanel() {
     }
   }
 
-  // Wave 7.0.6.13 — poll /ingest/bulk/runs/:id + /ingest/bulk/load-status
-  // every 1s while a bulk run is active (and for ~3s after it terminates so
-  // the operator sees the final flushed counter). The polls stop when the
-  // run reaches a terminal status AND the bulk-loader dispatcher has drained
-  // its in-flight queue.
-  // Wave 7.0.6.18 — reset the rps smoothing buffers whenever the tracked
-  // bulk run id changes (new run = fresh smoothing window; cleared run =
-  // zeroed-out smoothed values so the next render of the bars doesn't
-  // inherit stale samples).
-  useEffect(() => {
-    genRpsBufferRef.current = [];
-    ingestRpsBufferRef.current = [];
-    lastIngestSampleRef.current = null;
-    setSmoothedGenRps(0);
-    setSmoothedIngestRps(0);
-  }, [bulkRunId]);
-
-  useEffect(() => {
-    if (!bulkRunId) return;
-    let cancelled = false;
-    let terminalSince: number | null = null;
-    const tick = async (): Promise<void> => {
-      try {
-        const [r, s] = await Promise.all([
-          getBulkIngestRun(bulkRunId),
-          getBulkLoadStatus().catch(() => null),
-        ]);
-        if (cancelled) return;
-        if (r) setBulkRun(r);
-        if (s) setBulkLoad(s);
-        // Wave 7.0.6.18 — push raw rps samples into the rolling buffers and
-        // recompute the means in-place so the three PhaseProgress bars
-        // render smoothed numbers instead of the cumulative-elapsed values
-        // that flicker between 0 and burst peaks.
-        if (r) {
-          const rawGen = typeof r.rows_per_sec === "number" && Number.isFinite(r.rows_per_sec)
-            ? r.rows_per_sec
-            : 0;
-          genRpsBufferRef.current = pushPhaseRateSample(genRpsBufferRef.current, rawGen);
-          setSmoothedGenRps(meanPhaseRate(genRpsBufferRef.current));
-        }
-        if (r && s) {
-          const totalFlushed = (s.workers ?? []).reduce((a, w) => a + (w.flushed ?? 0), 0);
-          const elapsedMs = typeof r.ms === "number" ? r.ms : 0;
-          const prev = lastIngestSampleRef.current;
-          if (prev !== null) {
-            const dMs = elapsedMs - prev.ms;
-            const dFlushed = totalFlushed - prev.flushed;
-            if (dMs > 0 && dFlushed >= 0) {
-              const rawIngest = (dFlushed * 1000) / dMs;
-              ingestRpsBufferRef.current = pushPhaseRateSample(ingestRpsBufferRef.current, rawIngest);
-              setSmoothedIngestRps(meanPhaseRate(ingestRpsBufferRef.current));
-            }
-          }
-          lastIngestSampleRef.current = { flushed: totalFlushed, ms: elapsedMs };
-        }
-        const terminal = r && (r.status === "done" || r.status === "error");
-        const drained = !s?.dispatcher || s.dispatcher.in_flight === 0;
-        if (terminal && drained) {
-          if (terminalSince === null) terminalSince = Date.now();
-          if (Date.now() - terminalSince >= 3_000) return;
-        } else {
-          terminalSince = null;
-        }
-        if (!cancelled) timer = window.setTimeout(() => { void tick(); }, POLL_MS);
-      } catch {
-        if (!cancelled) timer = window.setTimeout(() => { void tick(); }, POLL_MS);
-      }
-    };
-    let timer: number = window.setTimeout(() => { void tick(); }, 0);
-    return () => { cancelled = true; window.clearTimeout(timer); };
-  }, [bulkRunId]);
-
-  function onCancelBulkRun(): void {
-    // Wave 7.0.6.15 — fire-and-forget POST /ingest/bulk/cancel so the api
-    // can flip the SharedArrayBuffer cancel flag (workers>1) or the inline
-    // `cancelled` boolean (workers=1). Tolerate failures: the local
-    // polling tear-down below is what the operator sees most reliably.
-    if (bulkRunId) {
-      void cancelBulkIngest(bulkRunId).catch(() => { /* tolerated */ });
-    }
-    setBulkRunId(null);
-  }
-
-  // Wave 6.17 — Start stays disabled while any step is in flight: the
-  // orchestrator's own pre-startRun window, plus the entire tracked-run
-  // lifetime ("running" + "cancelling"). Once the run hits a terminal
-  // status the button re-enables for the next preset selection.
-  // Wave 7.0.6.13 — bulk-loader runs also gate Start until the tracked bulk
-  // run reaches a terminal status (so back-to-back clicks don't stack).
   const presetRunInflight = trackedRun?.status === "running" || trackedRun?.status === "cancelling";
-  const bulkRunInflight = bulkRun?.status === "running";
+  const bulkRunInflight = bulkRun?.status === "running" || bulkRun?.status === "cancelling";
   // Wave 7.0.6.17 — lock Start when the bulk-loader is bound to a target
   // the api no longer considers active. The banner above explains the
   // remediation; disabling the button prevents the operator from issuing
@@ -1079,7 +1090,7 @@ export function IngestPanel() {
           disclosure below. */}
       <RunPresetCard
         presetKey={presetKey}
-        onSelect={setPresetKey}
+        onSelect={onSelectPreset}
         onStart={() => { void onStartPreset(); }}
         startDisabled={presetStartDisabled}
         inflight={presetInflight}
@@ -1092,6 +1103,7 @@ export function IngestPanel() {
         onModeChange={setIngestMode}
         bulkRun={bulkRun}
         bulkLoad={bulkLoad}
+        runBaseline={runBaseline}
         onCancelBulkRun={onCancelBulkRun}
         streamOverride={streamOverride}
         smoothedGenRps={smoothedGenRps}
@@ -1303,6 +1315,7 @@ function RunPresetCard(props: {
   onModeChange: (m: "bulk-loader" | "stream") => void;
   bulkRun: BulkIngestRunStatus | null;
   bulkLoad: BulkLoadStatus | null;
+  runBaseline: BulkRunProgressBaseline | null;
   onCancelBulkRun: () => void;
   // Wave 7.0.6.18 — when true (set by `?ingestMode=stream` URL override),
   // the legacy mode selector is visible. Otherwise it is hidden and the
@@ -1317,26 +1330,19 @@ function RunPresetCard(props: {
   // index. Already polled by the IngestPanel telemetry tick; threaded down
   // here so the bulk-ingest Indexing lane can render without a second poll.
   indexCount: number;
-  // Wave 7.0.6.15 — worker_threads fan-out controls. `workers` is the
-  // current slider value; `hostInfo` is the cached /admin/host-info response
-  // used to cap the slider at recommended_max_workers and to render the
-  // "Host: N cores · pool P · shards S" hint line.
   workers: number;
   onWorkersChange: (n: number) => void;
   hostInfo: HostInfo | null;
 }) {
-  const { presetKey, onSelect, onStart, startDisabled, inflight, runStatus, step, error, trackedRun, onCancelRun, ingestMode, onModeChange, bulkRun, bulkLoad, onCancelBulkRun, streamOverride, smoothedGenRps, smoothedIngestRps, indexCount, workers, onWorkersChange, hostInfo } = props;
-  // Wave 7.0.6.15 — cap the slider at the host's recommended_max_workers
-  // when /admin/host-info is available; failsafe to 8 when the call errored
-  // (hostInfo === null) so the operator can still bump above 1.
-  const workersMax = hostInfo ? Math.max(1, hostInfo.recommended_max_workers) : 8;
-  const workersDisabled = startDisabled || ingestMode !== "bulk-loader";
-  const hostHint = hostInfo
-    ? `Host: ${hostInfo.cores} cores · pool ${hostInfo.bulk_loader_pool_size ?? "?"} · shards ${hostInfo.shards ?? "?"}`
-    : "Host: ? cores · pool ? · shards ?";
+  const { presetKey, onSelect, onStart, startDisabled, inflight, runStatus, step, error, trackedRun, onCancelRun, ingestMode, onModeChange, bulkRun, bulkLoad, runBaseline, onCancelBulkRun, streamOverride, smoothedGenRps, smoothedIngestRps, indexCount, workers, onWorkersChange, hostInfo } = props;
   const showProgress = trackedRun !== null
     && (trackedRun.status === "running" || trackedRun.status === "cancelling");
-  const showBulkProgress = bulkRun !== null;
+  const showBulkProgress = bulkRun !== null
+    && (bulkRun.status === "running"
+      || bulkRun.status === "cancelling"
+      || bulkRun.status === "done"
+      || bulkRun.status === "cancelled"
+      || bulkRun.status === "error");
   const selected = RUN_PRESETS[presetKey];
   // Button label tracks the high-level state: idle / pre-run automation /
   // run in flight / cancelling / done. Idle text names the staged preset so
@@ -1348,8 +1354,10 @@ function RunPresetCard(props: {
       : runStatus === "cancelling"
         ? "Cancelling…"
         : bulkRun?.status === "running"
-          ? "Loading…"
-          : `Start ${selected.label}`;
+          ? "Ingesting…"
+          : bulkRun?.status === "cancelling"
+            ? "Cancelling…"
+            : `Start ${selected.label}`;
   return (
     <PanelCard title="Run preset">
       <div
@@ -1383,83 +1391,71 @@ function RunPresetCard(props: {
           );
         })}
       </div>
-      <div className="ingest-presets__actions">
-        {/* Wave 7.0.6.18 — legacy stream selector is hidden by default. It
-            renders only when the page URL carries `?ingestMode=stream`, so
-            the production view stays single-path (bulk-loader). */}
-        {streamOverride ? (
-          <label className="ingest-presets__mode" data-testid="ingest-mode-label">
-            <span className="ingest-presets__mode-label">Mode:</span>
-            <select
-              value={ingestMode}
-              disabled={startDisabled}
-              onChange={(e) => onModeChange(e.target.value as "bulk-loader" | "stream")}
-              data-testid="ingest-mode-select"
-            >
-              <option value="bulk-loader">Bulk-loader (fast)</option>
-              <option value="stream">Stream (legacy)</option>
-            </select>
-          </label>
-        ) : null}
-        {/* Wave 7.0.6.15 — worker_threads fan-out slider. Only meaningful in
-            bulk-loader mode; disabled in stream mode (which stays
-            single-consumer). Min=1 (bit-equivalent), Max clamped to the
-            host's recommended_max_workers (or 8 failsafe).
-            Wave 7.0.6.18 — when streamOverride is off, the input is only
-            gated by `startDisabled`; the stream-mode special case is moot
-            because the selector that would set it is also hidden. */}
-        <label className="ingest-presets__workers" data-testid="ingest-workers-label">
-          <span className="ingest-presets__workers-label">Workers:</span>
-          <input
-            type="number"
-            min={1}
-            max={workersMax}
-            step={1}
-            value={workers}
-            disabled={workersDisabled}
-            onChange={(e) => {
-              const n = Number(e.target.value);
-              if (!Number.isFinite(n)) return;
-              const clamped = Math.max(1, Math.min(workersMax, Math.floor(n)));
-              onWorkersChange(clamped);
-            }}
-            data-testid="ingest-workers-input"
-            aria-label="Workers"
-            style={{ width: "5em" }}
+      <div className="ingest-run-toolbar" data-testid="ingest-run-toolbar">
+        {ingestMode === "bulk-loader" ? (
+          <BulkIngestWorkersControl
+            workers={workers}
+            onWorkersChange={onWorkersChange}
+            hostInfo={hostInfo}
+            disabled={startDisabled}
           />
-          <span className="ingest-presets__workers-hint" data-testid="ingest-workers-hint">
-            {hostHint}
-          </span>
-        </label>
-        <button
-          type="button"
-          className="btn btn--primary"
-          disabled={startDisabled}
-          onClick={onStart}
-          data-testid="ingest-preset-start-btn"
-        >
-          {buttonLabel}
-        </button>
-        {step ? (
-          <span
-            className="ingest-presets__step"
-            data-testid="ingest-preset-step"
-            role="status"
-            aria-live="polite"
-          >
-            {step}
-          </span>
         ) : null}
-        {error ? (
-          <span
-            className="ingest-presets__error"
-            data-testid="ingest-preset-error"
-            role="alert"
+        <div className="ingest-run-toolbar__primary">
+          {streamOverride ? (
+            <label className="ingest-run-toolbar__mode" data-testid="ingest-mode-label">
+              <span className="ingest-run-toolbar__mode-label">Mode</span>
+              <select
+                value={ingestMode}
+                disabled={startDisabled}
+                onChange={(e) => onModeChange(e.target.value as "bulk-loader" | "stream")}
+                data-testid="ingest-mode-select"
+              >
+                <option value="bulk-loader">Bulk-loader</option>
+                <option value="stream">Stream</option>
+              </select>
+            </label>
+          ) : null}
+          <button
+            type="button"
+            className="btn btn--primary ingest-run-toolbar__start"
+            disabled={startDisabled}
+            onClick={onStart}
+            data-testid="ingest-preset-start-btn"
           >
-            {error}
-          </span>
-        ) : null}
+            {buttonLabel}
+          </button>
+        </div>
       </div>
+      {ingestMode === "bulk-loader" ? (
+        <p className="ingest-run-toolbar__meta" data-testid="ingest-workers-hint">
+          {hostInfo
+            ? `${hostInfo.cores} cores · pool ${hostInfo.bulk_loader_pool_size ?? "—"} · recommended ${Math.min(8, Math.max(1, hostInfo.recommended_max_workers))} workers for Docker`
+            : "Configure Redis in Connections, then pick a preset and start ingest."}
+        </p>
+      ) : null}
+      {(step || error) ? (
+        <div className="ingest-run-toolbar__status">
+          {step ? (
+            <span
+              className="ingest-presets__step"
+              data-testid="ingest-preset-step"
+              role="status"
+              aria-live="polite"
+            >
+              {step}
+            </span>
+          ) : null}
+          {error ? (
+            <span
+              className="ingest-presets__error"
+              data-testid="ingest-preset-error"
+              role="alert"
+            >
+              {error}
+            </span>
+          ) : null}
+        </div>
+      ) : null}
       {showProgress ? (
         <GeneratorProgress run={trackedRun!} onCancel={onCancelRun} />
       ) : null}
@@ -1467,95 +1463,131 @@ function RunPresetCard(props: {
         <BulkIngestProgress
           run={bulkRun!}
           load={bulkLoad}
+          runBaseline={runBaseline}
           onCancel={onCancelBulkRun}
           smoothedGenRps={smoothedGenRps}
           smoothedIngestRps={smoothedIngestRps}
           indexCount={indexCount}
           throttled={(bulkLoad?.throttled ?? bulkRun!.throttled ?? false) === true}
-          headroomPct={typeof bulkLoad?.headroom_pct === "number" ? bulkLoad.headroom_pct : 1}
           recent429Count={bulkLoad?.recent_429_count ?? 0}
         />
       ) : null}
-      <IndexingProgress />
+      {!showBulkProgress ? <IndexingProgress /> : null}
     </PanelCard>
   );
 }
 
-// Wave 7.0.6.13 — bulk-loader run progress strip. Reads /ingest/bulk/runs/:id
-// (producer-side rows_sent + rps) and /load/status (dispatcher flushed /
-// in_flight + per-worker queue depth) and renders the producer + consumer
-// phases of a run.
-// Wave 7.0.6.18 — replaced the legacy single-bar + horizontal metrics row
-// with two stacked PhaseProgress instances ("Generation" and "Ingest") so
-// the operator sees rows-emitted and rows-flushed-to-Redis as visually
-// identical bars. Smoothed rps values are computed by the IngestPanel
-// polling tick (5-sample mean) and threaded through props; status text
-// (running / done / error) is appended to the meta line, and a single
-// Cancel button sits on the Generation bar.
-// Wave 7.0.6.21 — three-lane layout: Generation (progress %) → Ingest
-// (RateGauge, no denominator) → Indexing (progress %, denominator =
-// generated count, not the original requested total — indexing trails
-// generation, never the original target). The middle lane is a rate gauge
-// rather than a progress bar because the bulk-loader has no exact "rows it
-// will eventually have flushed" denominator at request time, which is what
-// produced the historical >100% Ingest bar.
+// Compact worker stepper on the preset toolbar (Redis developer-tool recipe).
+function BulkIngestWorkersControl(props: {
+  workers: number;
+  onWorkersChange: (n: number) => void;
+  hostInfo: HostInfo | null;
+  disabled: boolean;
+}): JSX.Element {
+  const { workers, onWorkersChange, hostInfo, disabled } = props;
+  const workersMax = hostInfo ? Math.max(1, hostInfo.recommended_max_workers) : 16;
+  const dec = () => onWorkersChange(Math.max(1, workers - 1));
+  const inc = () => onWorkersChange(Math.min(workersMax, workers + 1));
+  return (
+    <div className="ingest-run-toolbar__workers" data-testid="ingest-workers-control">
+      <span className="ingest-run-toolbar__label" id="ingest-workers-label">Workers</span>
+      <div className="ingest-run-toolbar__stepper" role="group" aria-labelledby="ingest-workers-label">
+        <button
+          type="button"
+          className="ingest-run-toolbar__step"
+          disabled={disabled || workers <= 1}
+          onClick={dec}
+          aria-label="Decrease workers"
+          data-testid="ingest-workers-dec"
+        >
+          −
+        </button>
+        <span className="ingest-run-toolbar__value" data-testid="ingest-workers-value" aria-live="polite">
+          {workers}
+        </span>
+        <input
+          type="number"
+          className="ingest-run-toolbar__input"
+          min={1}
+          max={workersMax}
+          step={1}
+          value={workers}
+          disabled={disabled}
+          onChange={(e) => {
+            const n = Number(e.target.value);
+            if (!Number.isFinite(n)) return;
+            onWorkersChange(Math.max(1, Math.min(workersMax, Math.floor(n))));
+          }}
+          data-testid="ingest-workers-input"
+          aria-label="Generator workers"
+        />
+        <button
+          type="button"
+          className="ingest-run-toolbar__step"
+          disabled={disabled || workers >= workersMax}
+          onClick={inc}
+          aria-label="Increase workers"
+          data-testid="ingest-workers-inc"
+        >
+          +
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// Wave 7.0.8 — single progress bar for Docker bulk ingest: "how many of the
+// requested rows are in Redis?" Uses FT.SEARCH index count as the primary
+// done metric (what calc queries see), with bulk-loader flushed count as
+// fallback while the index lags.
 function BulkIngestProgress(props: {
   run: BulkIngestRunStatus;
   load: BulkLoadStatus | null;
+  runBaseline: BulkRunProgressBaseline | null;
   onCancel: () => void;
   smoothedGenRps: number;
   smoothedIngestRps: number;
-  // Indexing-lane inputs. `indexCount` is the live FT.SEARCH * doc count
-  // against the active sens-index (already polled by the IngestPanel
-  // telemetry tick via getIndexCount); the lane only renders once the
-  // generator has produced rows so the denominator is non-zero.
   indexCount: number;
-  // Backpressure inputs for the RateGauge throttle chip. Sourced primarily
-  // from /load/status; we fall back to the BulkRunRecord aggregates from
-  // /ingest/bulk/runs/:id when /load/status is unavailable so the chip
-  // still flips on 429 storms during a partial outage.
   throttled: boolean;
-  headroomPct: number;
   recent429Count: number;
 }) {
-  const { run, load, onCancel, smoothedGenRps, smoothedIngestRps, indexCount, throttled, headroomPct, recent429Count } = props;
+  const { run, load, runBaseline, onCancel, smoothedIngestRps, smoothedGenRps, indexCount, throttled, recent429Count } = props;
   const total = run.rows_total;
-  const sent = run.rows_sent;
-  const cancellable = run.status === "running";
-  const dispatcher = load?.dispatcher ?? null;
-  const inFlight = dispatcher?.in_flight ?? 0;
-  const highWater = dispatcher?.high_water ?? 0;
+  const totalFlushed = sumBulkLoaderFlushed(load);
+  const done = computeBulkRunDone({
+    rowsTotal: total,
+    rowsSent: run.rows_sent,
+    indexCount,
+    baseline: runBaseline,
+    totalFlushed,
+  });
+  const live = run.status === "running";
+  const rate = live ? (smoothedIngestRps > 0 ? smoothedIngestRps : smoothedGenRps) : 0;
+  const cancellable = live;
+  const showBackpressure = shouldShowBulkBackpressureHint(live, throttled, recent429Count);
+  const statusLabel = run.status === "cancelling"
+    ? "Stopping…"
+    : run.status === "cancelled"
+      ? "Stopped"
+      : run.status === "running"
+        ? throttled ? "Ingesting (slowed)…" : "Ingesting…"
+        : run.status === "done"
+          ? "Complete"
+          : run.status;
   return (
     <div className="bulk-progress" data-testid="bulk-progress">
+      {showBackpressure ? (
+        <BulkIngestBackpressureHint workers={run.workers} />
+      ) : null}
       <PhaseProgress
-        label="Generation (producer → bulk-loader)"
-        done={sent}
+        label="Rows ingested"
+        done={done}
         total={total}
-        ratePerSec={smoothedGenRps}
-        status={run.status}
+        ratePerSec={rate}
+        status={statusLabel}
         error={run.error ?? null}
         onCancel={cancellable ? onCancel : undefined}
-        testIdPrefix="phase-progress-generation"
-      />
-      <RateGauge
-        label="Ingest (bulk-loader → redis)"
-        rps={smoothedIngestRps}
-        smoothedRps={smoothedIngestRps}
-        inFlight={inFlight}
-        high_water={highWater}
-        throttled={throttled}
-        headroomPct={headroomPct}
-        recent429Count={recent429Count}
-        testId="rate-gauge-ingest"
-      />
-      <PhaseProgress
-        label="Indexing (redis → ft.search)"
-        done={Math.min(indexCount, sent)}
-        total={sent}
-        ratePerSec={0}
-        status={run.status}
-        testIdPrefix="phase-progress-indexing"
-        unit="indexed"
+        testIdPrefix="phase-progress-ingest"
       />
     </div>
   );
@@ -3296,9 +3328,9 @@ function StopAllRunsConfirmModal(props: {
   return (
     <div className="dialog-backdrop" role="dialog" aria-modal="true" aria-label="Stop generators confirmation">
       <div className="dialog sanity-modal--block" data-testid="stop-all-runs-modal">
-        <h2>Stop active generators?</h2>
+        <h2>Stop active ingest runs?</h2>
         <div className="sanity-modal__body">
-          Stops generators and discards the in-flight stream backlog. Existing sens data in Redis is kept. Use &apos;Flush DB&apos; to wipe.
+          Stops stream generators and bulk-loader ingest runs, and discards the in-flight stream backlog. Existing sens data in Redis is kept. Use &apos;Flush DB&apos; to wipe.
         </div>
         <div className="dialog__actions">
           <button type="button" className="btn" onClick={onCancel} data-testid="stop-all-runs-cancel">

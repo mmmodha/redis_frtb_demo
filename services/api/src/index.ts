@@ -81,20 +81,9 @@ async function main(): Promise<void> {
   const store = await createStore({ filePath: STORE_FILE, masterKey: MASTER_KEY });
   await seedConnections(store);
 
-  // Wave 5.16y — if nothing was activated before this boot but the store has
-  // at least one profile (seeded or persisted), auto-activate the first one
-  // so `GET /redis/active-target` and `GET /internal/redis/active-target/full`
-  // agree on a stable identity without requiring operator intervention.
-  if (!store.getActiveRaw()) {
-    const list = await store.list();
-    const first = list[0];
-    if (first) await store.setActive(first.id);
-  }
-
-  // If a profile was already active when the process started, publish it to
-  // the active-target singleton so /redis/active-target and the Redis client
-  // below both pick up the persisted choice. Wave 5.16y — also thread the
-  // stored username/password so getActiveRedisClient() authenticates.
+  // UI-first bootstrap: only restore a profile that was explicitly marked
+  // active in the persisted store. Do NOT auto-activate the first seeded
+  // profile — operators nominate the target via the Connections panel.
   const activeRaw = store.getActiveRaw();
   // Wave 5.97B — surface a one-shot operator-facing prompt when the boot
   // finds no active Redis profile (and REDIS_URL was not pre-seeded). The UI
@@ -124,10 +113,12 @@ async function main(): Promise<void> {
   }
 
   const target = getActiveTarget();
+  const targetConfigured = !!activeRaw || !!process.env.REDIS_URL;
   // Prefer REDIS_URL (Wave 5.2 wiring): when set, construct a cluster-aware
   // client straight from the URL — password and TLS scheme included. The
   // active-target singleton still drives per-route routing via the UI.
-  let redis: Redis | Cluster;
+  let redis: Redis | Cluster | null = null;
+  let redisConnected = false;
   if (process.env.REDIS_URL) {
     // Wave 6.35.A — pass an explicit `cluster` flag derived from the active
     // profile's topology so a standalone target does not get a Cluster client
@@ -140,20 +131,15 @@ async function main(): Promise<void> {
       maxRetriesPerRequest: 3,
       ...(activeRaw ? { cluster: target.clusterMode === true } : {}),
     });
-  } else {
+  } else if (activeRaw) {
     const { Redis: RedisCtor } = await import("ioredis");
     redis = new RedisCtor({
-      host: target.host,
-      port: target.port,
-      db: target.db,
-      tls: target.tls ? {} : undefined,
-      // Wave 5.16y — when no REDIS_URL is set, fall back to the activeRaw
-      // credentials (if any) so the boot-time bootstrapFrtb() call below
-      // authenticates against profiles that require username/password. The
-      // active-target singleton's getActiveRedisClient() handles all per-
-      // request traffic separately and also includes these creds.
-      ...(activeRaw?.username ? { username: activeRaw.username } : {}),
-      ...(activeRaw?.password ? { password: activeRaw.password } : {}),
+      host: activeRaw.host,
+      port: activeRaw.port,
+      db: activeRaw.db ?? 0,
+      tls: activeRaw.tls?.enabled ? {} : undefined,
+      ...(activeRaw.username ? { username: activeRaw.username } : {}),
+      ...(activeRaw.password ? { password: activeRaw.password } : {}),
       lazyConnect: true,
       maxRetriesPerRequest: 3,
     });
@@ -162,18 +148,20 @@ async function main(): Promise<void> {
   // call .connect() on it (throws "already connecting/connected"). Use a
   // bounded readiness wait that handles both shapes; either way the api
   // still starts and serves /healthz when Redis is unreachable.
-  const readiness = await ensureRedisReady(redis, { cluster: redis instanceof Cluster });
-  const redisConnected = readiness.connected;
-  if (!redisConnected) {
-    // Don't crash the api just because Redis isn't reachable yet — the demo
-    // flow has the SA pointing at a cluster via the Connections panel after
-    // the api is already up. Endpoints will surface the Redis error per-call.
-    console.log(
-      JSON.stringify({ service: "api", status: "redis-unreachable", target: target.label, err: String(readiness.err) })
-    );
-  } else if (readiness.mode === "cluster") {
-    // Smoke runs grep for this exact line to confirm bootstrap is reachable.
-    console.log(JSON.stringify({ service: "api", status: "redis-ready", mode: "cluster" }));
+  if (redis) {
+    const readiness = await ensureRedisReady(redis, { cluster: redis instanceof Cluster });
+    redisConnected = readiness.connected;
+    if (!redisConnected) {
+      // Don't crash the api just because Redis isn't reachable yet — the demo
+      // flow has the SA pointing at a cluster via the Connections panel after
+      // the api is already up. Endpoints will surface the Redis error per-call.
+      console.log(
+        JSON.stringify({ service: "api", status: "redis-unreachable", target: target.label, err: String(readiness.err) })
+      );
+    } else if (readiness.mode === "cluster") {
+      // Smoke runs grep for this exact line to confirm bootstrap is reachable.
+      console.log(JSON.stringify({ service: "api", status: "redis-ready", mode: "cluster" }));
+    }
   }
 
   const schema = existsSync(SCHEMA_PATH) ? loadSchema(SCHEMA_PATH) : undefined;
@@ -240,10 +228,8 @@ async function main(): Promise<void> {
     // Wave 5.14b.1 — schema-missing leaves /healthz 503 (no idx:sens behind us).
     markBootstrapSkipped("schema-missing");
   } else {
-    // Redis unreachable: bootstrap never ran. Leave the flag at {ok:false}
-    // so /healthz stays 503 until an operator wires a reachable target and
-    // restarts the api.
-    markBootstrapSkipped("redis-unreachable");
+    // No Redis target yet (UI-first boot) or unreachable: bootstrap never ran.
+    markBootstrapSkipped(targetConfigured ? "redis-unreachable" : "no-target-configured");
   }
 
   // Wave 5.16t — wire the per-request accessor so routes follow the
@@ -270,7 +256,9 @@ async function main(): Promise<void> {
   // now awaits per-member socket readiness inside `acquireFromPool`.
   const getRedis = async (category: RuntimeCategory = "heavy-calc"): Promise<RedisLike> => {
     const active = await getActiveRedisRuntimeClient(category);
-    return (active ?? redis) as unknown as RedisLike;
+    if (active) return active as unknown as RedisLike;
+    if (redis) return redis as unknown as RedisLike;
+    throw new Error("no active Redis target configured");
   };
   const app = await createServer({ getRedis, correlations, schema, store, logger: true });
 

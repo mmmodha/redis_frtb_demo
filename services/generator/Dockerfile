@@ -35,7 +35,9 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
     npm ci --workspace=@frtb/generator --include-workspace-root --omit=dev --no-audit --no-fund
 
 COPY services/generator/tsconfig.json ./services/generator/tsconfig.json
+COPY services/generator/docker-entrypoint.sh ./services/generator/docker-entrypoint.sh
 COPY services/generator/src ./services/generator/src
+RUN chmod +x ./services/generator/docker-entrypoint.sh
 # Schema YAMLs are loaded at runtime via SCHEMA_FILE (set in docker-compose.yml
 # to /app/config/schema/frtb-default.yaml). Copied here so the generator runs
 # inside the container without bind-mounting the repo.
@@ -46,9 +48,6 @@ EXPOSE 8081
 
 USER node
 WORKDIR /app/services/generator
-# Wave 5.14b.2: ENTRYPOINT (not CMD) so `docker compose run generator --rows N
-# --classes girr,equity` appends user flags to the script invocation rather than
-# replacing the whole command (which previously made docker try to exec `--rows`
-# directly). Default `docker compose up generator` still runs the entrypoint
-# with no extra args — commander uses its built-in defaults.
-ENTRYPOINT ["npx", "tsx", "src/cli.ts"]
+# Wave 7.0.8: idle under `docker compose up` (sleep infinity); CLI flags via
+# `docker compose run --rm generator --rows N`.
+ENTRYPOINT ["./docker-entrypoint.sh"]

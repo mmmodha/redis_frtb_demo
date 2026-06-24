@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { CalcPanel } from "../../src/panels/CalcPanel";
+import { renderCalcPanel } from "../helpers/renderCalcPanel";
 import type { CalcSbmResponse } from "../../src/lib/calc";
 
 const originalFetch = globalThis.fetch;
@@ -56,7 +57,7 @@ describe("Wave 6.48.B — BucketDrilldown group-by control", () => {
       { key: "k1", doc: { trade_id: "t-1", risk_factor: "USD-IRS-3M", risk_value: 0.1, weight: 1.0, book: "DESK_A" } },
       { key: "k2", doc: { trade_id: "t-2", risk_factor: "USD-IRS-1Y", risk_value: 0.2, weight: 1.0, book: "DESK_B" } },
     ]);
-    render(<CalcPanel />);
+    renderCalcPanel();
     await openUsdDrilldown();
     const sel = screen.getByTestId("bucket-drilldown-groupby-select") as HTMLSelectElement;
     expect(sel.value).toBe("none");
@@ -70,7 +71,7 @@ describe("Wave 6.48.B — BucketDrilldown group-by control", () => {
       { key: "k2", doc: { trade_id: "t-2", risk_factor: "USD-IRS-3M", risk_value: 0.4, weight: 1.0 } },
       { key: "k3", doc: { trade_id: "t-3", risk_factor: "USD-IRS-1Y", risk_value: 2.0, weight: 1.0 } },
     ]);
-    render(<CalcPanel />);
+    renderCalcPanel();
     await openUsdDrilldown();
     fireEvent.change(screen.getByTestId("bucket-drilldown-groupby-select"), { target: { value: "risk_factor" } });
     const groups = screen.getAllByTestId("drilldown-group-row");
@@ -86,7 +87,7 @@ describe("Wave 6.48.B — BucketDrilldown group-by control", () => {
       { key: "k1", doc: { trade_id: "t-1", risk_factor: "USD-IRS-3M", risk_value: 0.1, weight: 1.0, book: "DESK_A" } },
       { key: "k2", doc: { trade_id: "t-2", risk_factor: "USD-IRS-1Y", risk_value: 0.2, weight: 1.0, book: "DESK_B" } },
     ]);
-    render(<CalcPanel />);
+    renderCalcPanel();
     await openUsdDrilldown();
     const sel = screen.getByTestId("bucket-drilldown-groupby-select") as HTMLSelectElement;
     const regionOpt = within(sel).getByRole("option", { name: "Region" }) as HTMLOptionElement;
@@ -109,7 +110,7 @@ describe("Wave 6.48.B — BucketDrilldown group-by control", () => {
       // per-tenor object shape: Σ|v| = 0.1+0.2 = 0.3, weight 1 → 0.3
       { key: "n5", doc: { trade_id: "t-n5", book: "TEN", risk_value: { "3M": 0.1, "6M": -0.2 }, weight: 1 } },
     ]);
-    render(<CalcPanel />);
+    renderCalcPanel();
     await openUsdDrilldown();
     fireEvent.change(screen.getByTestId("bucket-drilldown-groupby-select"), { target: { value: "book" } });
     const groups = screen.getAllByTestId("drilldown-group-row");
@@ -137,7 +138,7 @@ describe("Wave 6.48.B — BucketDrilldown group-by control", () => {
         ],
       },
     );
-    render(<CalcPanel />);
+    renderCalcPanel();
     await openUsdDrilldown();
     const sel = screen.getByTestId("bucket-drilldown-groupby-select") as HTMLSelectElement;
     fireEvent.change(sel, { target: { value: "risk_factor" } });

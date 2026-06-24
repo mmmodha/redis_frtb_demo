@@ -1,6 +1,7 @@
 // Wave 7.0.1.A / 7.0.1.B / 7.0.1.C — bulk-loader HTTP control surface.
 //
-//   GET  /healthz        → 200 iff pool isHealthy() (≥75% workers connected).
+//   GET  /healthz        → 200 liveness (process up; status=awaiting before Redis
+//                          is configured via UI). Pool health on /load/status.
 //   GET  /load/status    → pool size, connected count, per-worker pool state
 //                          + dispatcher in-flight / per-worker write metrics
 //                          (queued, flushed, errors, retries, dead-lettered,
@@ -104,11 +105,9 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
   }
 
   app.get("/healthz", async (_req, reply) => {
-    // Wave 7.0.6.25 — when state.pool is null (awaiting_target), return 503
-    // with status="awaiting" so operators see the bulk-loader is waiting for
-    // a Redis target to be configured via the UI or REDIS_URL env.
+    // Wave 7.0.6.25 / 7.0.8 — liveness: process is up even while awaiting a
+    // UI-configured Redis target. Readiness (pool connected) is on /load/status.
     if (!state.pool) {
-      reply.code(503);
       return {
         service: "bulk-loader",
         status: "awaiting",
@@ -119,11 +118,9 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
     }
     const s = state.pool.status();
     const healthy = state.pool.isHealthy();
-    // Wave 7.0.6.17 — fail-loud on stale target. /healthz must reflect the
-    // stale state so run-local.sh status, k8s liveness probes, and any other
-    // health-aware harness sees the degraded verdict instead of green-while-
-    // bound-to-wrong-DB. Reason is included verbatim so the operator sees
-    // exactly why writes are rejected.
+    // Wave 7.0.6.17 — fail-loud on stale target only. Connectivity degradation
+    // (pool not yet connected) stays 200 liveness so compose --wait passes
+    // before the operator activates a reachable target in the UI.
     if (state.targetStale) {
       reply.code(503);
       return {
@@ -135,12 +132,12 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
         reason: state.targetStaleReason ?? "stale target",
       };
     }
-    reply.code(healthy ? 200 : 503);
     return {
       service: "bulk-loader",
       status: healthy ? "ok" : "degraded",
       connected: s.connected,
       pool_size: s.poolSize,
+      ...(healthy ? {} : { reason: "redis pool not ready — check Connections target" }),
     };
   });
 

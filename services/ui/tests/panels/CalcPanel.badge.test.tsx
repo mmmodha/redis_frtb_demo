@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { CalcPanel } from "../../src/panels/CalcPanel";
+import { renderCalcPanel } from "../helpers/renderCalcPanel";
 import type { CalcSbmResponse } from "../../src/lib/calc";
 
 const originalFetch = globalThis.fetch;
@@ -25,7 +26,7 @@ function mockResponse(total_ms: number) {
 
 async function runCalc(total_ms: number) {
   mockResponse(total_ms);
-  render(<CalcPanel />);
+  renderCalcPanel();
   fireEvent.click(screen.getByRole("button", { name: /calculate sbm risk charge/i }));
   await waitFor(() => expect(screen.getByTestId("wallclock-badge")).toBeInTheDocument());
   return screen.getByTestId("wallclock-badge");
@@ -62,7 +63,7 @@ describe("<CalcPanel /> error handling", () => {
         headers: { "content-type": "application/json" },
       }),
     ) as typeof fetch;
-    render(<CalcPanel />);
+    renderCalcPanel();
     const button = screen.getByRole("button", { name: /calculate sbm risk charge/i });
     fireEvent.click(button);
     await waitFor(() =>
