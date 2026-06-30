@@ -5,12 +5,13 @@
 // also rebuilds idx:sens + the frtb library and surfaces the outcome under
 // `bootstrap: { ok, error? }` so the UI can render "indexes rebuilt".
 
-import { describe, it, expect, afterEach, vi } from "vitest";
+import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import type { Schema } from "@frtb/schema";
 import { rollupKey } from "@frtb/calc-shared/rollup-keys";
 import { createServer } from "../src/server.ts";
 import { fakeRedis } from "./helpers/fake-redis.ts";
 import { resetActiveTarget } from "../src/active-target.ts";
+import { _testResetSensKeyCountCache } from "../src/lib/sens-key-count-cache.ts";
 
 // Minimal stub — the route only forwards the schema to the (mocked)
 // bootstrap runner, so the real shape is irrelevant inside these unit tests.
@@ -244,60 +245,32 @@ describe("POST /admin/flush", () => {
   });
 });
 
-// Wave 6.44.D — GET /admin/index-count returns the live FT.SEARCH * doc
-// count against the active versioned sens-index so the IngestPanel
-// indexing bar can reflect what a calc query would actually see (vs. the
-// stream-consumed counter, which leads the index by the ingest-write
-// lag). The route degrades gracefully to `{ count: 0, index_name: null }`
-// on every failure mode (no active target, index missing during
-// bootstrap, FT.SEARCH error) rather than 5xx so the UI's 2.5s polling
-// loop never surfaces a spurious error.
+// Wave 6.44.D — GET /admin/index-count returns DBSIZE (total keys).
 describe("GET /admin/index-count (Wave 6.44.D)", () => {
   let app: Awaited<ReturnType<typeof createServer>>;
+  beforeEach(() => { _testResetSensKeyCountCache(); });
   afterEach(async () => {
     if (app) await app.close();
     resetActiveTarget();
   });
 
-  it("returns count parsed from FT.SEARCH * LIMIT 0 0 reply against the active sens-index", async () => {
+  it("returns DBSIZE immediately on the first request", async () => {
     const fr = fakeRedis();
-    // No schema-hash key → getSensIndexName falls back to the unversioned
-    // base "idx:sens". FT.SEARCH replies in the standard RediSearch shape
-    // `[total, ...docs]` — with LIMIT 0 0 it is `[total]`.
-    fr.setResponse("GET", null);
-    fr.setResponse("FT.SEARCH", [42]);
+    fr.setDbsize(3);
     app = await createServer({
       redis: fr,
       activeTarget: { host: "127.0.0.1", port: 6379, tls: false, db: 0, label: "redis-primary" },
     });
     const res = await app.inject({ method: "GET", url: "/admin/index-count" });
     expect(res.statusCode).toBe(200);
-    const body = res.json();
-    expect(body.ok).toBe(true);
-    expect(body.count).toBe(42);
-    expect(body.index_name).toBe("idx:sens");
-    // FT.SEARCH was issued exactly once with the index, "*", and LIMIT 0 0.
-    const search = fr.calls.find((c) => c.command === "FT.SEARCH");
-    expect(search).toBeDefined();
-    expect(search!.args).toEqual(["idx:sens", "*", "LIMIT", "0", "0"]);
-  });
-
-  it("returns count:0 with index_name:null when FT.SEARCH errors (index missing during bootstrap)", async () => {
-    const fr = fakeRedis();
-    fr.setResponse("GET", null);
-    fr.setResponse("FT.SEARCH", () => { throw new Error("Unknown Index name"); });
-    app = await createServer({
-      redis: fr,
-      activeTarget: { host: "127.0.0.1", port: 6379, tls: false, db: 0, label: "redis-primary" },
-    });
-    const res = await app.inject({ method: "GET", url: "/admin/index-count" });
-    expect(res.statusCode).toBe(200);
-    expect(res.json()).toEqual({ ok: true, count: 0, index_name: null });
+    expect(res.json()).toMatchObject({ ok: true, count: 3, index_name: "dbsize", refreshing: false });
+    expect(fr.calls.find((c) => c.command === "DBSIZE")).toBeDefined();
+    expect(fr.calls.find((c) => c.command === "SCAN")).toBeUndefined();
   });
 
   it("returns count:0 with index_name:null when no active target is set", async () => {
     const fr = fakeRedis();
-    fr.setResponse("FT.SEARCH", [99]);
+    fr.setDbsize(99);
     app = await createServer({
       redis: fr,
       activeTarget: { host: "127.0.0.1", port: 6379, tls: false, db: 0, label: "" },
@@ -305,27 +278,21 @@ describe("GET /admin/index-count (Wave 6.44.D)", () => {
     const res = await app.inject({ method: "GET", url: "/admin/index-count" });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual({ ok: true, count: 0, index_name: null });
-    // FT.SEARCH must NOT have run — the route short-circuits before
-    // touching Redis when there's no active label.
-    expect(fr.calls.find((c) => c.command === "FT.SEARCH")).toBeUndefined();
+    expect(fr.calls.find((c) => c.command === "DBSIZE")).toBeUndefined();
   });
 
-  it("resolves the versioned sens-index name when a schema hash is persisted", async () => {
+  it("serves a cached count without a second DBSIZE within the refresh window", async () => {
     const fr = fakeRedis();
-    // 7-char schema hash → getSensIndexName returns "idx:sens:v<hash7>".
-    fr.setResponse("GET", "abc1234");
-    fr.setResponse("FT.SEARCH", [7]);
+    fr.setDbsize(2);
     app = await createServer({
       redis: fr,
       activeTarget: { host: "127.0.0.1", port: 6379, tls: false, db: 0, label: "redis-primary" },
     });
-    const res = await app.inject({ method: "GET", url: "/admin/index-count" });
-    expect(res.statusCode).toBe(200);
-    const body = res.json();
-    expect(body.count).toBe(7);
-    expect(body.index_name).toBe("idx:sens:v" + "abc1234".slice(0, 7));
-    const search = fr.calls.find((c) => c.command === "FT.SEARCH");
-    expect(search!.args[0]).toBe(body.index_name);
+    await app.inject({ method: "GET", url: "/admin/index-count" });
+    const dbsizeAfterWarm = fr.calls.filter((c) => c.command === "DBSIZE").length;
+    const second = await app.inject({ method: "GET", url: "/admin/index-count" });
+    expect(second.json().count).toBe(2);
+    expect(fr.calls.filter((c) => c.command === "DBSIZE").length).toBe(dbsizeAfterWarm);
   });
 });
 
@@ -398,6 +365,8 @@ describe("GET /admin/host-info", () => {
     fr.setResponse("CLUSTER", "cluster_enabled:0\r\n");
     const fetchSpy = vi.fn(async () =>
       new Response(JSON.stringify({
+        instance_id: "bulk-loader-test:1",
+        pool_size: 16,
         bound_target: { host: "127.0.0.1", port: 12000, label: "localcluster" },
         target_stale: false,
         target_watcher: "enabled",
@@ -415,9 +384,8 @@ describe("GET /admin/host-info", () => {
       expect(body.bulk_loader_bound_target).toEqual({ host: "127.0.0.1", port: 12000, label: "localcluster" });
       expect(body.bulk_loader_target_stale).toBe(false);
       expect(body.bulk_loader_target_watcher).toBe("enabled");
-      // Existing fields untouched.
-      expect(body.cores).toBeGreaterThanOrEqual(1);
-      expect(body.bulk_loader_pool_size).toBe(32);
+      expect(body.bulk_loader_replicas).toBe(1);
+      expect(body.bulk_loader_pool_size).toBe(16);
     } finally {
       vi.unstubAllGlobals();
     }
@@ -439,6 +407,7 @@ describe("GET /admin/host-info", () => {
       expect(body.bulk_loader_bound_target).toBeNull();
       expect(body.bulk_loader_target_stale).toBeNull();
       expect(body.bulk_loader_target_watcher).toBeNull();
+      expect(body.bulk_loader_replicas).toBeNull();
     } finally {
       vi.unstubAllGlobals();
     }
@@ -459,6 +428,7 @@ describe("GET /admin/host-info", () => {
       expect(body.bulk_loader_bound_target).toBeNull();
       expect(body.bulk_loader_target_stale).toBeNull();
       expect(body.bulk_loader_target_watcher).toBeNull();
+      expect(body.bulk_loader_replicas).toBeNull();
     } finally {
       vi.unstubAllGlobals();
     }

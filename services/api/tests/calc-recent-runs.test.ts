@@ -95,6 +95,9 @@ describe("Wave 6.01 — GET /calc/recent route", () => {
   });
 
   it("default limit is 5; explicit limit clamps to 1..20", async () => {
+    const fr = fakeRedis();
+    primeFakeRedis(fr);
+    app = await createServer({ redis: fr, correlations: {} });
     for (let i = 0; i < 25; i += 1) {
       pushRecentRun({
         kind: "per_class", risk_class: "GIRR", leg: "delta",
@@ -102,9 +105,6 @@ describe("Wave 6.01 — GET /calc/recent route", () => {
         cache: "miss", engine: "fast",
       });
     }
-    const fr = fakeRedis();
-    primeFakeRedis(fr);
-    app = await createServer({ redis: fr, correlations: {} });
     const def = await app.inject({ method: "GET", url: "/calc/recent" });
     expect(def.json().items).toHaveLength(5);
     const ten = await app.inject({ method: "GET", url: "/calc/recent?limit=10" });

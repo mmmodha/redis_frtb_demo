@@ -7,6 +7,7 @@ import "./styles/tokens.css";
 import "./styles/shell.css";
 import "./styles/observability.css";
 import "./styles/connections.css";
+import "./styles/connections-wizard.css";
 import "./styles/sources.css";
 import "./styles/calc.css";
 import "./styles/pivot.css";

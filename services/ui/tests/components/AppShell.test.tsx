@@ -1,7 +1,9 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+import type { ReactNode } from "react";
 import { render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { AppShell } from "../../src/components/AppShell";
+import { BulkIngestRunProvider } from "../../src/context/BulkIngestRunContext";
 import {
   PivotBurstContext,
   type PivotBurstContextValue,
@@ -12,13 +14,27 @@ import {
   type GeneratorRunState,
 } from "../../src/context/GeneratorRunContext";
 
+vi.mock("../../src/hooks/useBootstrapStatus", () => ({
+  useBootstrapStatus: () => ({ phase: "ready" as const, label: "test", err: null, failures: [] }),
+}));
+
+vi.mock("../../src/lib/connections", () => ({
+  getActiveTarget: vi.fn(async () => null),
+}));
+
+function shell(children: ReactNode, initialPath = "/observability") {
+  return (
+    <BulkIngestRunProvider>
+      <MemoryRouter initialEntries={[initialPath]}>
+        <AppShell>{children}</AppShell>
+      </MemoryRouter>
+    </BulkIngestRunProvider>
+  );
+}
+
 function renderShell(initialPath = "/observability") {
   return render(
-    <MemoryRouter initialEntries={[initialPath]}>
-      <AppShell>
-        <div data-testid="slot">slot-content</div>
-      </AppShell>
-    </MemoryRouter>,
+    shell(<div data-testid="slot">slot-content</div>, initialPath),
   );
 }
 
@@ -28,11 +44,7 @@ function renderShellWithBurst(
 ) {
   return render(
     <PivotBurstContext.Provider value={burstValue}>
-      <MemoryRouter initialEntries={[initialPath]}>
-        <AppShell>
-          <div data-testid="slot">slot-content</div>
-        </AppShell>
-      </MemoryRouter>
+      {shell(<div data-testid="slot">slot-content</div>, initialPath)}
     </PivotBurstContext.Provider>,
   );
 }
@@ -43,11 +55,7 @@ function renderShellWithGenerator(
 ) {
   return render(
     <GeneratorRunContext.Provider value={generatorValue}>
-      <MemoryRouter initialEntries={[initialPath]}>
-        <AppShell>
-          <div data-testid="slot">slot-content</div>
-        </AppShell>
-      </MemoryRouter>
+      {shell(<div data-testid="slot">slot-content</div>, initialPath)}
     </GeneratorRunContext.Provider>,
   );
 }

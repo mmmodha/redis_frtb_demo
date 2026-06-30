@@ -6,7 +6,7 @@
 //   • /load/start is wired but stubbed (503 until 7.0.1.B).
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { createServer } from "../src/server.ts";
+import { createServer, BULK_LOADER_INSTANCE_ID } from "../src/server.ts";
 import { createWorkerPool, type WorkerPool } from "../src/pool.ts";
 import { createDispatcher, type DispatcherHandle, type Row } from "../src/dispatcher.ts";
 import {
@@ -100,10 +100,12 @@ describe("GET /load/status", () => {
     const res = await app.inject({ method: "GET", url: "/load/status" });
     expect(res.statusCode).toBe(200);
     const body = res.json() as {
+      instance_id: string;
       pool_size: number;
       connected: number;
       workers: Array<{ id: number; state: string; last_heartbeat: number | null; last_flush_at: number | null }>;
     };
+    expect(body.instance_id).toBe(BULK_LOADER_INSTANCE_ID);
     expect(body.pool_size).toBe(4);
     expect(body.connected).toBe(1);
     expect(body.workers).toHaveLength(4);

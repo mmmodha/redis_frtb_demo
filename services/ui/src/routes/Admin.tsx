@@ -8,12 +8,14 @@ import { DriftStatusCard } from "../components/DriftStatusCard";
 import { SnapshotsCard } from "../components/SnapshotsCard";
 import { StreamStatusCard } from "../components/StreamStatusCard";
 import { ReconcileBucketAction } from "../components/ReconcileBucketAction";
+import { IngestCapacityTestCard } from "../components/IngestCapacityTestCard";
 
 export function Admin() {
   return (
     <>
       <h1>Admin</h1>
       <div className="admin-grid">
+        <IngestCapacityTestCard />
         <CalcCoverageCard />
         <DriftStatusCard />
         <SnapshotsCard />

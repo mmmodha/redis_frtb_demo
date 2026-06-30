@@ -4,6 +4,7 @@ import {
   meanTelemetryRate,
   medianTelemetryRate,
   pickBulkDisplayRps,
+  pickHeadlineRowsPerSec,
   pushTelemetryRateSample,
   stabilizeIndexCount,
 } from "../../src/lib/telemetrySmoothing";
@@ -49,8 +50,38 @@ describe("telemetry rate smoothing", () => {
   });
 
   it("prefers write-side rates for bulk headline tiles", () => {
-    expect(pickBulkDisplayRps(3_000, 2_500, 20_000)).toBe(3_000);
-    expect(pickBulkDisplayRps(0, 2_500, 20_000)).toBe(2_500);
-    expect(pickBulkDisplayRps(0, 0, 20_000)).toBe(20_000);
+    expect(pickBulkDisplayRps(3_000, 20_000)).toBe(3_000);
+    expect(pickBulkDisplayRps(0, 20_000)).toBe(20_000);
+    expect(pickBulkDisplayRps(0, 0)).toBe(0);
+  });
+});
+
+describe("pickHeadlineRowsPerSec", () => {
+  it("shows flush rate while bulk-loader drains after producers stopped", () => {
+    const r = pickHeadlineRowsPerSec({
+      bulkRunLive: false,
+      producerLive: false,
+      bulkLoaderDraining: true,
+      flushRps: 18_000,
+      smoothedIngestRps: 0,
+      telemetryRps: 45_000,
+      smoothedGenRps: 0,
+    });
+    expect(r.value).toBe(18_000);
+    expect(r.source).toBe("bulk-flush");
+  });
+
+  it("shows zero when idle even if index-derived rate is high", () => {
+    const r = pickHeadlineRowsPerSec({
+      bulkRunLive: false,
+      producerLive: false,
+      bulkLoaderDraining: false,
+      flushRps: 0,
+      smoothedIngestRps: 0,
+      telemetryRps: 40_000,
+      smoothedGenRps: 0,
+    });
+    expect(r.value).toBe(0);
+    expect(r.source).toBe("idle");
   });
 });

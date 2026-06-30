@@ -6,20 +6,18 @@ describe("computeBulkRunDone", () => {
     const done = computeBulkRunDone({
       rowsTotal: 1_000_000,
       rowsSent: 42_000,
-      indexCount: 1_000_000,
       baseline: { indexCountAtStart: 1_000_000, flushedAtStart: 500_000 },
       totalFlushed: 542_000,
     });
     expect(done).toBe(42_000);
   });
 
-  it("uses indexed delta from baseline", () => {
+  it("uses flushed delta from baseline", () => {
     const done = computeBulkRunDone({
       rowsTotal: 10_000,
       rowsSent: 2_000,
-      indexCount: 3_000,
       baseline: { indexCountAtStart: 0, flushedAtStart: 0 },
-      totalFlushed: 2_500,
+      totalFlushed: 3_000,
     });
     expect(done).toBe(3_000);
   });
@@ -28,7 +26,6 @@ describe("computeBulkRunDone", () => {
     const done = computeBulkRunDone({
       rowsTotal: 1_000,
       rowsSent: 5_000,
-      indexCount: 5_000,
       baseline: { indexCountAtStart: 0, flushedAtStart: null },
       totalFlushed: 5_000,
     });

@@ -9,7 +9,7 @@ import { render, screen } from "@testing-library/react";
 afterEach(() => { vi.resetModules(); vi.restoreAllMocks(); });
 
 function mockHook(snapshot: {
-  phase: "idle" | "running" | "ready" | "failed";
+  phase: "idle" | "running" | "ready" | "partial" | "failed";
   target_label?: string;
   err?: string;
 }): void {
@@ -37,6 +37,13 @@ describe("<BootstrapStatusOverlay/>", () => {
 
   it("renders nothing when phase=ready", async () => {
     mockHook({ phase: "ready", target_label: "demo-cluster" });
+    const Overlay = await freshOverlay();
+    const { container } = render(<Overlay />);
+    expect(container.firstChild).toBeNull();
+  });
+
+  it("renders nothing when phase=partial (cluster is usable)", async () => {
+    mockHook({ phase: "partial", target_label: "demo-cluster", err: "bootstrap partial: 1 per-node step(s) failed" });
     const Overlay = await freshOverlay();
     const { container } = render(<Overlay />);
     expect(container.firstChild).toBeNull();

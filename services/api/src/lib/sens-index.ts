@@ -190,6 +190,24 @@ export function clearSensIndexNameCache(_target_label?: string): void {
   void _target_label;
 }
 
+/** Parse `num_docs` from an FT.INFO flat reply (cluster-coordinator summed). */
+export function parseFtInfoNumDocs(reply: unknown): number {
+  if (Array.isArray(reply)) {
+    for (let i = 0; i < reply.length - 1; i += 2) {
+      if (String(reply[i]) === "num_docs") {
+        const n = Number(reply[i + 1]);
+        return Number.isFinite(n) && n >= 0 ? n : 0;
+      }
+    }
+    return 0;
+  }
+  if (reply && typeof reply === "object") {
+    const n = Number((reply as Record<string, unknown>).num_docs);
+    return Number.isFinite(n) && n >= 0 ? n : 0;
+  }
+  return 0;
+}
+
 export async function getSensIndexName(
   client: RedisLike,
   target_label: string,

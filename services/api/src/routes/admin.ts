@@ -32,6 +32,7 @@ import {
   type RedisLike as BootstrapRedis,
 } from "../bootstrap.ts";
 import { getSensIndexName } from "../lib/sens-index.ts";
+import { getSensKeyCountSnapshot, setSensKeyCountSnapshot } from "../lib/sens-key-count-cache.ts";
 import { translateRedisError } from "../redis-errors.ts";
 import { bumpDataVersion } from "../sbm/calc-cache.ts";
 import { invalidateFacetsCache } from "./facets.ts";
@@ -50,6 +51,11 @@ import {
 import { registerAdminCalcRoutes } from "./admin-calc.ts";
 import { cancelAllBulkRuns, haltBulkLoaderAccept, resumeBulkLoaderAccept } from "./ingest.ts";
 import { cancelAllActiveRuns } from "./generator.ts";
+import { runIngestCapacityTest, type CapacityTestOptions } from "../jobs/ingest-capacity-test.ts";
+import {
+  createBulkLoaderStatusFetch,
+  discoverBulkLoaderTopology,
+} from "../bulk-loader-topology.ts";
 
 export interface AdminRoutesOpts {
   // Threaded through from createServer so the post-flush bootstrap can rebuild
@@ -146,37 +152,22 @@ export function registerAdminRoutes(
     recomputeBucketSum,
   });
 
-  // Wave 6.44.D — GET /admin/index-count. Returns the live FT.SEARCH * count
-  // against the active versioned sens-index so the IngestPanel indexing bar
-  // can reflect what a calc query would actually see (vs. the stream-consumed
-  // counter, which leads the index by the ingest-write lag). Bootstrap races
-  // (index briefly missing during rebuild, no active target) degrade to
-  // { ok: true, count: 0, index_name: null } rather than 5xx so the UI's
-  // 2.5s polling loop never surfaces a spurious error.
-  app.get("/admin/index-count", { config: { category: "light" } }, async (req) => {
+  // Wave 6.44.D — GET /admin/index-count. Returns DBSIZE (total keys in the
+  // active DB). Matches observability — fast O(1); cached 60s per target.
+  app.get<{ Querystring: { refresh?: string } }>("/admin/index-count", { config: { category: "light" } }, async (req) => {
     let target_label = "";
     try { target_label = getActiveTarget().label; } catch { /* no active target */ }
     if (!target_label) return { ok: true, count: 0, index_name: null };
     const redis = await getRedis(req.poolCategory);
-    let indexName: string;
-    try {
-      indexName = await getSensIndexName(redis, target_label);
-    } catch {
-      return { ok: true, count: 0, index_name: null };
-    }
-    try {
-      const reply = await redis.call("FT.SEARCH", indexName, "*", "LIMIT", "0", "0");
-      let count = 0;
-      if (Array.isArray(reply) && reply.length > 0) {
-        const n = Number(reply[0]);
-        if (Number.isFinite(n) && n >= 0) count = n;
-      } else if (typeof reply === "number" && Number.isFinite(reply) && reply >= 0) {
-        count = reply;
-      }
-      return { ok: true, count, index_name: indexName };
-    } catch {
-      return { ok: true, count: 0, index_name: null };
-    }
+    const snap = await getSensKeyCountSnapshot(target_label, redis, {
+      forceRefresh: req.query?.refresh === "1",
+    });
+    return {
+      ok: true,
+      count: snap.count,
+      index_name: snap.index_name,
+      refreshing: snap.refreshing,
+    };
   });
 
   app.post("/admin/flush", { config: { category: "heavy-ingest" } }, async (_req, reply) => {
@@ -206,6 +197,7 @@ export function registerAdminRoutes(
       // next ingest batch repopulates them in lock-step with the rollup
       // hashes.
       await redis.flushdb();
+      setSensKeyCountSnapshot(target_label, 0);
     } catch (err) {
       const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
       if (translated) {
@@ -465,8 +457,6 @@ export function registerAdminRoutes(
   app.get("/admin/host-info", { config: { category: "light" } }, async (req) => {
     const cores = Math.max(1, availableParallelism());
     const recommended_max_workers = Math.max(1, cores - 2);
-    const poolEnv = Number(process.env.BULK_LOADER_POOL_SIZE);
-    const bulk_loader_pool_size = Number.isFinite(poolEnv) && poolEnv > 0 ? poolEnv : 32;
 
     let target_label = "";
     try { target_label = getActiveTarget().label; } catch { /* no active target */ }
@@ -483,25 +473,58 @@ export function registerAdminRoutes(
       }
     }
 
-    // Wave 7.0.6.17 — poll bulk-loader /load/status. Defaults to localhost
-    // :8086 so dev (run-local.sh) "just works"; env-overridable for
-    // production where the bulk-loader runs on a different host.
-    const blStatus = await fetchBulkLoaderStatus();
+    const topo = await discoverBulkLoaderTopology(
+      createBulkLoaderStatusFetch({ timeoutMs: 800 }),
+    );
+    const poolEnv = Number(process.env.BULK_LOADER_POOL_SIZE);
+    const bulk_loader_pool_size = topo.live
+      ? topo.pool_size_per_replica
+      : (Number.isFinite(poolEnv) && poolEnv > 0 ? poolEnv : 32);
+
     return {
       cores,
       recommended_max_workers,
       max_workers_hard_cap: 32,
       bulk_loader_pool_size,
+      bulk_loader_replicas: topo.live ? topo.replicas : null,
       shards,
       target_label: target_label || null,
-      // Wave 7.0.6.17 — additive UI-banner fields. All null when the
-      // bulk-loader is unreachable or its /load/status response is
-      // missing fields (legacy bulk-loader builds).
-      bulk_loader_bound_target: blStatus?.bound_target ?? null,
-      bulk_loader_target_stale: blStatus?.target_stale ?? null,
-      bulk_loader_target_watcher: blStatus?.target_watcher ?? null,
+      bulk_loader_bound_target: topo.bound_target,
+      bulk_loader_target_stale: topo.target_stale,
+      bulk_loader_target_watcher: topo.target_watcher,
     };
   });
+
+  // Wave 7.0.9 — POST /admin/ingest-capacity-test. Runs a short worker sweep
+  // against the bulk-loader ingest path and returns recommended worker count +
+  // saturation verdict. Blocks until complete (typically 1–3 min).
+  app.post<{ Body: Partial<CapacityTestOptions> }>(
+    "/admin/ingest-capacity-test",
+    { config: { category: "light" } },
+    async (req, reply) => {
+      const body = req.body ?? {};
+      let shards: number | null = null;
+      try {
+        const redis = await getRedis(req.poolCategory);
+        const text = await (redis.call("CLUSTER", "INFO") as Promise<string>);
+        const ci = parseClusterInfo(typeof text === "string" ? text : "");
+        if (ci.enabled && ci.size > 0) shards = ci.size;
+      } catch { /* standalone */ }
+      const result = await runIngestCapacityTest({
+        rows_per_step: body.rows_per_step,
+        worker_sweep: body.worker_sweep,
+        poll_ms: body.poll_ms,
+        step_timeout_ms: body.step_timeout_ms,
+        pause_between_steps_ms: body.pause_between_steps_ms,
+        shards,
+      });
+      if (!result.ok) {
+        reply.code(result.status);
+        return { ok: false, error: result.error };
+      }
+      return result;
+    },
+  );
 
   // Wave 7.0.6.17a — GET /admin/active-target-identity. Public (no auth)
   // identity-only view of the active Redis target so the bulk-loader's

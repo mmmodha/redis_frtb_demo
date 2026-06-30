@@ -13,6 +13,7 @@ import {
   updateConnection,
   deleteConnection,
   testConnection,
+  probeConnection,
   activateConnection,
   InflightConflictError,
 } from "../../src/lib/connections";
@@ -92,6 +93,16 @@ describe("lib/connections api client", () => {
     await expect(deleteConnection("01N")).resolves.toBeUndefined();
     expect(calls[0]!.url).toMatch(/\/connections\/01N$/);
     expect(calls[0]!.init?.method).toBe("DELETE");
+  });
+
+  it("probeConnection POSTs /connections/probe with the draft body", async () => {
+    const body = { ok: true, latency_ms: 3, modules: [], errors: [] };
+    const { calls } = recorder(body);
+    const r = await probeConnection({ name: "draft", host: "h", port: 12000, password: "x" });
+    expect(r.ok).toBe(true);
+    expect(calls[0]!.url).toMatch(/\/connections\/probe$/);
+    expect(calls[0]!.init?.method).toBe("POST");
+    expect(JSON.parse(String(calls[0]!.init?.body))).toMatchObject({ host: "h", port: 12000 });
   });
 
   it("testConnection POSTs /connections/:id/test and returns ok+latency+modules", async () => {

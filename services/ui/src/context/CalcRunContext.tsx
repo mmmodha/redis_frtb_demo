@@ -39,11 +39,15 @@ const RECOVER_MAX_MS = 20 * 60 * 1000;
 // Survive CalcRunProvider remount (route change) while a POST is in flight.
 let perClassInFlight = false;
 let totalInFlight = false;
+let perClassRecoverInFlight = false;
+let totalRecoverInFlight = false;
 
 /** Test-only reset for module-level in-flight gates. */
 export function resetCalcRunInFlightForTests(): void {
   perClassInFlight = false;
   totalInFlight = false;
+  perClassRecoverInFlight = false;
+  totalRecoverInFlight = false;
 }
 
 export interface CalcRunContextValue {
@@ -215,64 +219,136 @@ export function CalcRunProvider({ children }: { children: ReactNode }): JSX.Elem
   useEffect(() => {
     let cancelled = false;
 
+    function failStaleRun(
+      kind: "perClass" | "total",
+      snap: PerClassCalcRunSnapshot | TotalCalcRunSnapshot,
+      message: string,
+    ): void {
+      const finishedAt = Date.now();
+      if (kind === "perClass") {
+        const pc = snap as PerClassCalcRunSnapshot;
+        patchStorage({
+          perClass: {
+            status: "error",
+            startedAt: pc.startedAt,
+            finishedAt,
+            request: pc.request,
+            resultContext: pc.resultContext,
+            error: message,
+          },
+        });
+        return;
+      }
+      const tot = snap as TotalCalcRunSnapshot;
+      patchStorage({
+        total: {
+          status: "error",
+          startedAt: tot.startedAt,
+          finishedAt,
+          request: tot.request,
+          error: message,
+        },
+      });
+    }
+
     async function tryRecoverPerClass(snap: PerClassCalcRunSnapshot): Promise<void> {
-      if (!snap.request || !snap.startedAt) return;
+      if (!snap.request || !snap.startedAt || perClassInFlight || perClassRecoverInFlight) return;
+      perClassRecoverInFlight = true;
       try {
         const recent = await getRecentCalcRuns(10);
         if (cancelled) return;
         const match = recent.items.find((item) => recentMatchesPerClass(item, snap));
-        if (!match) return;
-        const result = await postCalcSbm(snap.request);
-        if (cancelled) return;
-        patchStorage({
-          perClass: {
-            status: "done",
-            startedAt: snap.startedAt,
-            finishedAt: Date.now(),
-            request: snap.request,
-            resultContext: snap.resultContext,
-            result,
-          },
-        });
-      } catch {
-        /* keep polling */
+        if (!match) {
+          if (Date.now() - snap.startedAt > RECOVER_MAX_MS) {
+            failStaleRun("perClass", snap, "Calculation did not complete — try again.");
+          }
+          return;
+        }
+        perClassInFlight = true;
+        try {
+          const result = await postCalcSbm(snap.request);
+          if (cancelled) return;
+          patchStorage({
+            perClass: {
+              status: "done",
+              startedAt: snap.startedAt,
+              finishedAt: Date.now(),
+              request: snap.request,
+              resultContext: snap.resultContext,
+              result,
+            },
+          });
+        } catch (e) {
+          if (cancelled) return;
+          failStaleRun(
+            "perClass",
+            snap,
+            e instanceof Error ? e.message : "Calculation failed during recovery.",
+          );
+        } finally {
+          perClassInFlight = false;
+        }
+      } finally {
+        perClassRecoverInFlight = false;
       }
     }
 
     async function tryRecoverTotal(snap: TotalCalcRunSnapshot): Promise<void> {
-      if (!snap.request || !snap.startedAt) return;
+      if (!snap.request || !snap.startedAt || totalInFlight || totalRecoverInFlight) return;
+      totalRecoverInFlight = true;
       try {
         const recent = await getRecentCalcRuns(10);
         if (cancelled) return;
         const match = recent.items.find((item) => recentMatchesTotal(item, snap));
-        if (!match) return;
-        const result = await postCalcSbmTotal(snap.request);
-        if (cancelled) return;
-        patchStorage({
-          total: {
-            status: "done",
-            startedAt: snap.startedAt,
-            finishedAt: Date.now(),
-            request: snap.request,
-            result,
-          },
-        });
-      } catch {
-        /* keep polling */
+        if (!match) {
+          const elapsed = Date.now() - snap.startedAt;
+          if (elapsed > RECOVER_MAX_MS) {
+            failStaleRun("total", snap, "Calculation did not complete — try again.");
+          }
+          return;
+        }
+        totalInFlight = true;
+        try {
+          const result = await postCalcSbmTotal(snap.request);
+          if (cancelled) return;
+          patchStorage({
+            total: {
+              status: "done",
+              startedAt: snap.startedAt,
+              finishedAt: Date.now(),
+              request: snap.request,
+              result,
+            },
+          });
+        } catch (e) {
+          if (cancelled) return;
+          failStaleRun(
+            "total",
+            snap,
+            e instanceof Error ? e.message : "Calculation failed during recovery.",
+          );
+        } finally {
+          totalInFlight = false;
+        }
+      } finally {
+        totalRecoverInFlight = false;
       }
     }
 
-    function shouldRecover(snap: { status: string; startedAt?: number }): boolean {
+    function shouldRecover(
+      snap: { status: string; startedAt?: number },
+      graceMs: number,
+    ): boolean {
       if (snap.status !== "running" || !snap.startedAt) return false;
-      return Date.now() - snap.startedAt < RECOVER_MAX_MS;
+      return Date.now() - snap.startedAt < graceMs;
     }
 
     const tick = (): void => {
       const snap = storageRef.current;
-      if (shouldRecover(snap.perClass) && !perClassInFlight) {
+      if (shouldRecover(snap.perClass, RECOVER_MAX_MS) && !perClassRecoverInFlight) {
         void tryRecoverPerClass(snap.perClass);
       }
-      if (shouldRecover(snap.total) && !totalInFlight) {
+      if (shouldRecover(snap.total, RECOVER_MAX_MS) && !totalRecoverInFlight) {
         void tryRecoverTotal(snap.total);
       }
     };

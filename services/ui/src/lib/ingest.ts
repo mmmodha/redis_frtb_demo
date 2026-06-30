@@ -1,7 +1,7 @@
 // Typed client for ingest-related api endpoints used by the Ingest panel.
 // Kept separate from ./api.ts (which is owned by the UI shell task) so
 // cross-task ownership stays clean.
-import { apiBase } from "./api";
+import { apiBase, getObservabilityKeys } from "./api";
 
 // Wave 6.41.E — re-export the existing typed client for /admin/stream-status
 // so consumers inside the IngestPanel surface (which already imports from
@@ -9,26 +9,32 @@ import { apiBase } from "./api";
 // stays owned by ./admin; only the import path is widened.
 export { getStreamStatus, type StreamStatusResponse } from "./admin";
 
-// Wave 6.44.D — typed client for GET /admin/index-count. Surfaces the live
-// FT.SEARCH count against the active sens-index so the IngestPanel indexing
-// bar reflects what calc queries actually see rather than the ingest
-// consumed counter (which leads the index by the write lag). Errors on the
-// api side (no active target, index missing during bootstrap) degrade to
-// `{ count: 0, index_name: null }` — the route never 5xx's.
+// Wave 6.44.D — typed client for GET /admin/index-count. Returns DBSIZE
+// (total keys in the active Redis DB), cached server-side.
 export interface IndexCountResponse {
   count: number;
   index_name: string | null;
+  refreshing?: boolean;
 }
 
-export async function getIndexCount(): Promise<IndexCountResponse> {
-  const res = await fetch(`${apiBase()}/admin/index-count`);
+export async function getIndexCount(opts?: { refresh?: boolean }): Promise<IndexCountResponse> {
+  const qs = opts?.refresh ? "?refresh=1" : "";
+  const res = await fetch(`${apiBase()}/admin/index-count${qs}`);
   if (!res.ok) throw new Error(`api /admin/index-count ${res.status}`);
-  const body = (await res.json()) as { count?: unknown; index_name?: unknown };
+  const body = (await res.json()) as { count?: unknown; index_name?: unknown; refreshing?: unknown };
   const count = typeof body.count === "number" && Number.isFinite(body.count) && body.count >= 0
     ? body.count
     : 0;
   const index_name = typeof body.index_name === "string" ? body.index_name : null;
-  return { count, index_name };
+  const refreshing = body.refreshing === true;
+  return { count, index_name, refreshing };
+}
+
+/** Uncached DBSIZE — same path Observability uses for Total keys. */
+export async function fetchLiveDbKeyCount(): Promise<number> {
+  const keys = await getObservabilityKeys("sens:");
+  const n = keys.dbsize;
+  return Number.isFinite(n) && n >= 0 ? n : 0;
 }
 
 export interface Source {
@@ -141,6 +147,15 @@ export interface BulkIngestStartResponse {
   started_at_iso: string;
 }
 
+export type IngestRunPhase =
+  | "producing"
+  | "writing"
+  | "throttled"
+  | "draining"
+  | "complete"
+  | "error"
+  | "cancelled";
+
 export interface BulkIngestRunStatus {
   run_id: string;
   status: "running" | "cancelling" | "done" | "error" | "cancelled";
@@ -154,6 +169,10 @@ export interface BulkIngestRunStatus {
   started_at_iso: string;
   bulk_loader_base: string;
   rows_per_sec: number;
+  rows_written?: number;
+  rows_per_sec_write?: number;
+  rows_per_sec_producer?: number;
+  phase?: IngestRunPhase;
   error?: string;
   // Wave 7.0.6.22 — bulk-load backpressure aggregates surfaced on the wire
   // shape of GET /ingest/bulk/runs/:id. All three are optional so older api
@@ -182,6 +201,7 @@ export interface HostInfo {
   recommended_max_workers: number;
   max_workers_hard_cap: number;
   bulk_loader_pool_size: number;
+  bulk_loader_replicas: number | null;
   shards: number | null;
   target_label: string | null;
   bulk_loader_bound_target: HostInfoBulkLoaderTarget | null;
@@ -278,6 +298,48 @@ export async function getBulkLoadStatus(): Promise<BulkLoadStatus> {
   const res = await fetch(`${apiBase()}/ingest/bulk/load-status`);
   if (!res.ok) throw new Error(`api /ingest/bulk/load-status ${res.status}`);
   return (await res.json()) as BulkLoadStatus;
+}
+
+export interface IngestSnapshotRun {
+  run_id: string;
+  status: string;
+  rows_total: number;
+  rows_sent: number;
+  rows_written: number;
+  rows_per_sec_producer: number;
+  rows_per_sec_write: number;
+  phase: IngestRunPhase;
+  workers: number;
+  started_at_iso: string;
+  throttled?: boolean;
+  retries_total?: number;
+  error?: string;
+}
+
+export interface IngestSnapshot {
+  ok: true;
+  target_label: string;
+  cluster: {
+    sens_count: number;
+    sens_count_refreshing: boolean;
+    memory_bytes: number;
+    memory_human: string;
+  };
+  loader: {
+    in_flight: number;
+    flush_rps: number;
+    flushed_total: number;
+    throttled: boolean;
+    recent_429_count: number;
+  };
+  runs: IngestSnapshotRun[];
+  focused_run_id: string | null;
+}
+
+export async function getIngestSnapshot(): Promise<IngestSnapshot> {
+  const res = await fetch(`${apiBase()}/ingest/snapshot`);
+  if (!res.ok) throw new Error(`api /ingest/snapshot ${res.status}`);
+  return (await res.json()) as IngestSnapshot;
 }
 
 export async function startGenerator(config?: GeneratorConfig): Promise<GeneratorStartResponse> {

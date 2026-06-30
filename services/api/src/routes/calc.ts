@@ -3,7 +3,8 @@ import type { Schema } from "@frtb/schema";
 import { seenBucketKey } from "@frtb/calc-shared/rollup-keys";
 import { regionFromDesk } from "@frtb/calc-shared/region";
 import type { RedisLike } from "../redis-like.ts";
-import { getActiveTarget } from "../active-target.ts";
+import { getActiveTarget, getRuntimePoolSize } from "../active-target.ts";
+import { mapWithConcurrency } from "../lib/map-with-concurrency.ts";
 import { getBootstrapStatus } from "../bootstrap-status.ts";
 import { getSensIndexName, getSlimSensIndexName } from "../lib/sens-index.ts";
 import { translateRedisError } from "../redis-errors.ts";
@@ -464,77 +465,57 @@ type ComputeSbmOutcome =
   | { ok: true; body: Record<string, unknown> }
   | { ok: false; statusCode: number; body: Record<string, unknown> };
 
+// Regime-independent fan-out input shared across the 27-cell total matrix.
+interface SbmFanoutInput {
+  risk_class: string;
+  leg: Leg;
+  bucket_subset: string[];
+  excludeCsv: Record<ExcludeKey, string>;
+  includeCsv: Record<IncludeKey, string>;
+  forcePath: "lua" | "fast" | null;
+}
+
+interface SbmFanoutBundle {
+  results: BucketResultWithEngine[];
+  engineUsed: EngineTag;
+  fanoutMs: number;
+  buckets: string[];
+  indexName: string;
+  discoveryQuery: string;
+  dispatchedKeys: string[];
+  funcName: string;
+  lazyMath: boolean;
+  target_label: string;
+  bucket_subset: string[];
+  numDocs: number | null;
+}
+
+type SbmFanoutOutcome =
+  | { ok: true; bundle: SbmFanoutBundle }
+  | { ok: false; statusCode: number; body: Record<string, unknown> };
+
+// Dedupes regime-independent Redis fan-out within one /calc/sbm/total request.
+interface FanoutShareCtx {
+  inflight: Map<string, Promise<SbmFanoutOutcome>>;
+}
+
 // Wave 5.96B — extracted core compute for a single (risk_class, leg, regime)
 // triplet. Reuses the same discovery + fanout + reduce pipeline the /calc/sbm
 // route has carried since Wave 5.7, so the new /calc/sbm/total orchestrator
 // fans out without HTTP self-recursion and without duplicating Lua/fast-path
 // branching logic.
-async function computeSbmCharge(
-  input: ComputeSbmInput,
+async function runSbmFanoutPhase(
+  input: SbmFanoutInput,
   ctx: ComputeSbmCtx,
-): Promise<ComputeSbmOutcome> {
-  const { risk_class, leg, bucket_subset, regime, excludeCsv, includeCsv, forcePath, noCache } = input;
-  const { redis, schema, correlations, log } = ctx;
+): Promise<SbmFanoutOutcome> {
+  const { risk_class, leg, bucket_subset, excludeCsv, includeCsv, forcePath } = input;
+  const { redis, schema, log } = ctx;
   const funcName = funcNameFor(risk_class, leg);
-  const corr: CorrelationSpec = correlations[risk_class] ?? { kind: "constant", value: 0 };
-  const regimeFactor = CORRELATION_REGIME_FACTOR[regime];
-  // CRITICAL — Curvature scaling order (§21.5(5) + §21.6): scale γ FIRST,
-  // then square. Because reduceCurvatureCharge calls squareCorrelationSpec
-  // on whatever we pass in, feeding it the scaled spec yields
-  //   (γ × factor)²  =  γ² × factor²
-  // which is the correct Basel interpretation.
-  const scaledCorr = scaleCorrelationSpec(corr, regimeFactor, 1.0);
   const target_label = getActiveTarget().label;
-  // Wave 6.18i — resolve the live versioned `idx:sens:v{hash7}` once per
-  // request and reuse for discovery FT.AGGREGATE, the FT.INFO probe, the
-  // fast-path aggregate fan-out, and the resolved-command echo. Cached 30s.
-  // Wave 7.0.2.B — when CALC_LAZY_MATH=1, target the slim variant
-  // (`idx:sens:slim:v{hash7}`) instead. Both share the same schema-hash
-  // key so the hash7 suffix is identical by construction.
   const lazyMath = lazyMathEnabled();
   const indexName = lazyMath
     ? await getSlimSensIndexName(redis, target_label)
     : await getSensIndexName(redis, target_label);
-  const t0 = process.hrtime.bigint();
-
-  // Wave 5.83C-2 — short-TTL response cache lookup.
-  // Wave 6.41.A — `include` rides in the cache-key payload alongside
-  // `exclude` so a filtered request never collides with the unfiltered one.
-  const cacheBody = {
-    risk_class,
-    sensitivity_type: leg,
-    bucket_subset: [...bucket_subset].sort(),
-    correlation_regime: regime,
-    exclude: excludeCsv,
-    include: includeCsv,
-  };
-  const dataVersion = await getDataVersion(redis);
-  const cacheKey = calcCacheKey({ ...cacheBody, force_path: forcePath }, dataVersion);
-  if (!noCache) {
-    const hit = lookupCalcCache(cacheKey);
-    if (hit) {
-      // Wave 5.96F — truthful cache-hit timing. The cached body carries the
-      // cold-compute cost in `total_ms` / `fanout_ms`; replaying those would
-      // make Redis caching look slow. Preserve them as `original_*` and
-      // overwrite the headline timing fields with the freshly-measured hit
-      // elapsed (lookup is in-process, expected <1 ms).
-      const hitMs = Number(process.hrtime.bigint() - t0) / 1e6;
-      const cached = hit.value as Record<string, unknown>;
-      const originalTotalMs = Number(cached.total_ms);
-      const originalFanoutMs = Number(cached.fanout_ms);
-      const body: Record<string, unknown> = {
-        ...cached,
-        total_ms: Math.round(hitMs * 1000) / 1000,
-        fanout_ms: 0,
-        cache: "hit" as const,
-        cached_at_iso: hit.cachedAtIso,
-      };
-      if (Number.isFinite(originalTotalMs)) body.original_compute_ms = originalTotalMs;
-      if (Number.isFinite(originalFanoutMs)) body.original_fanout_ms = originalFanoutMs;
-      return { ok: true, body };
-    }
-  }
-
   // Wave 6.24 — bucket discovery is now a single SMEMBERS on
   // `seen:bucket:<rc>` (Wave 7.0.6.6 — tag-free) instead of an
   // FT.AGGREGATE-with-GROUPBY against
@@ -683,13 +664,10 @@ async function computeSbmCharge(
       const hasExclude = EXCLUDE_KEYS.some((k) => excludeCsv[k] !== "");
       const hasInclude = INCLUDE_KEYS.some((k) => includeCsv[k] !== "");
       const hasFilter = hasExclude || hasInclude;
-      // Wave 7.0.2.B — disable the per-bucket rollup fast-fast path under
-      // lazy-math. The rollup hashes (Wave 6.14a) store pre-weighted `sum_ws`
-      // / `sum_ws_sq` written by the fat ingest path; the slim writer does
-      // not maintain them, so HGETALL would either miss or return stale
-      // values. Falling back to FT.AGGREGATE against the slim index is the
-      // only safe path while CALC_LAZY_MATH=1.
-      const tryRollup = process.env.CALC_ROLLUP_PATH !== "0" && !hasFilter && !lazyMath;
+      // Wave 7.0.2.B — rollup hashes from finalise-rollups.mjs are compatible
+      // with tryRollupReadout even under lazy-math ingest. Missing rollups
+      // return null and fall back to FT.AGGREGATE safely.
+      const tryRollup = process.env.CALC_ROLLUP_PATH !== "0" && !hasFilter;
       // Wave 6.41.A — observable bypass counter. Bumped once per (rc, bucket)
       // we'd otherwise have served from the K_b cache so /metrics proves
       // the cache-skip-on-filter behavior without poking redis.
@@ -909,7 +887,40 @@ async function computeSbmCharge(
   }
   const fanoutMs = Number(process.hrtime.bigint() - fanoutStart) / 1e6;
 
-  // 3) Reduce per-bucket K_b/S_b → risk-class charge.
+  return {
+    ok: true,
+    bundle: {
+      results,
+      engineUsed,
+      fanoutMs,
+      buckets,
+      indexName,
+      discoveryQuery,
+      dispatchedKeys,
+      funcName,
+      lazyMath,
+      target_label,
+      bucket_subset,
+      numDocs,
+    },
+  };
+}
+
+async function finalizeSbmCharge(
+  input: ComputeSbmInput,
+  ctx: ComputeSbmCtx,
+  bundle: SbmFanoutBundle,
+  t0: bigint,
+): Promise<ComputeSbmOutcome> {
+  const { risk_class, leg, bucket_subset, regime, excludeCsv, includeCsv, forcePath, noCache } = input;
+  const { redis, correlations } = ctx;
+  const {
+    results, engineUsed, fanoutMs, buckets, indexName, discoveryQuery,
+    dispatchedKeys, funcName, lazyMath, target_label, numDocs,
+  } = bundle;
+  const corr: CorrelationSpec = correlations[risk_class] ?? { kind: "constant", value: 0 };
+  const regimeFactor = CORRELATION_REGIME_FACTOR[regime];
+  const scaledCorr = scaleCorrelationSpec(corr, regimeFactor, 1.0);
   let charge: number;
   let curvatureBranch: "positive_interior" | "fallback_clipped_s" | undefined;
   if (leg === "curvature") {
@@ -972,6 +983,17 @@ async function computeSbmCharge(
   const data_status: "populated" | "empty" =
     results.some((r) => Number(r.count) > 0) ? "populated" : "empty";
 
+  const cacheBody = {
+    risk_class,
+    sensitivity_type: leg,
+    bucket_subset: [...bucket_subset].sort(),
+    correlation_regime: regime,
+    exclude: excludeCsv,
+    include: includeCsv,
+  };
+  const dataVersion = await getDataVersion(redis);
+  const cacheKey = calcCacheKey({ ...cacheBody, force_path: forcePath }, dataVersion);
+
   const body: Record<string, unknown> = {
     charge,
     per_bucket: results,
@@ -987,6 +1009,69 @@ async function computeSbmCharge(
   };
   if (!noCache) storeCalcCache(cacheKey, body);
   return { ok: true, body: { ...body, cache: "miss" as const } };
+}
+
+async function computeSbmCharge(
+  input: ComputeSbmInput,
+  ctx: ComputeSbmCtx,
+  share?: FanoutShareCtx,
+): Promise<ComputeSbmOutcome> {
+  const { risk_class, leg, bucket_subset, regime, excludeCsv, includeCsv, forcePath, noCache } = input;
+  const { redis } = ctx;
+  const t0 = process.hrtime.bigint();
+
+  const cacheBody = {
+    risk_class,
+    sensitivity_type: leg,
+    bucket_subset: [...bucket_subset].sort(),
+    correlation_regime: regime,
+    exclude: excludeCsv,
+    include: includeCsv,
+  };
+  const dataVersion = await getDataVersion(redis);
+  const cacheKey = calcCacheKey({ ...cacheBody, force_path: forcePath }, dataVersion);
+  if (!noCache) {
+    const hit = lookupCalcCache(cacheKey);
+    if (hit) {
+      const hitMs = Number(process.hrtime.bigint() - t0) / 1e6;
+      const cached = hit.value as Record<string, unknown>;
+      const originalTotalMs = Number(cached.total_ms);
+      const originalFanoutMs = Number(cached.fanout_ms);
+      const body: Record<string, unknown> = {
+        ...cached,
+        total_ms: Math.round(hitMs * 1000) / 1000,
+        fanout_ms: 0,
+        cache: "hit" as const,
+        cached_at_iso: hit.cachedAtIso,
+      };
+      if (Number.isFinite(originalTotalMs)) body.original_compute_ms = originalTotalMs;
+      if (Number.isFinite(originalFanoutMs)) body.original_fanout_ms = originalFanoutMs;
+      return { ok: true, body };
+    }
+  }
+
+  const fanoutInput: SbmFanoutInput = {
+    risk_class,
+    leg,
+    bucket_subset,
+    excludeCsv,
+    includeCsv,
+    forcePath,
+  };
+  const fanoutKey = `${risk_class}|${leg}`;
+  let fanoutOutcome: SbmFanoutOutcome;
+  if (share) {
+    let inflight = share.inflight.get(fanoutKey);
+    if (!inflight) {
+      inflight = runSbmFanoutPhase(fanoutInput, ctx);
+      share.inflight.set(fanoutKey, inflight);
+    }
+    fanoutOutcome = await inflight;
+  } else {
+    fanoutOutcome = await runSbmFanoutPhase(fanoutInput, ctx);
+  }
+  if (!fanoutOutcome.ok) return fanoutOutcome;
+  return finalizeSbmCharge(input, ctx, fanoutOutcome.bundle, t0);
 }
 
 /**
@@ -1171,8 +1256,8 @@ export function registerCalcRoute(
   });
 
   // Wave 5.96B — Total SBM orchestrator. Fans out computeSbmCharge over the
-  // 27-cell (class × leg × scenario) matrix in parallel via Promise.all,
-  // collapses per-scenario via Σ_class (Δ + V + Crv), then takes max over
+  // 27-cell (class × leg × scenario) matrix with concurrency aligned to the
+  // heavy-calc pool, collapses per-scenario via Σ_class (Δ + V + Crv), then takes max over
   // low/medium/high to produce the final §21.4(8) risk charge. Surfaces a
   // breakdown matrix plus parallelism evidence (cumulative vs wall-clock ms)
   // so the UI can render the "Redis-fast" callout with concrete numbers.
@@ -1230,14 +1315,6 @@ export function registerCalcRoute(
           : null;
       const noCache = req.query?.nocache === "1";
 
-      const redis = await getRedis();
-      const ctx: ComputeSbmCtx = {
-        redis,
-        schema: opts.schema,
-        correlations: opts.correlations,
-        log: app.log,
-      };
-
       // Wave 5.96B — orchestration matrix: only the three supported asset
       // classes ship Redis Functions today (csr_*/commodity are out of scope
       // per the locked spec). Legs and scenarios are the full §21.4(7)/(8)
@@ -1253,11 +1330,15 @@ export function registerCalcRoute(
         plan.push({ risk_class: rc, leg: l, regime: s });
       }
 
-      // The proof-of-parallelism is here: Promise.all dispatches every cell
-      // without awaiting between them so per-cell Redis round-trips overlap
-      // on the cluster (or in-process fake) rather than serialising on the
-      // event loop. The cumulative_ms / wall_clock_ms ratio reflects this.
-      const cellPromises = plan.map(async (p) => {
+      // Fan out cells with concurrency aligned to the heavy-calc pool so we
+      // use every provisioned socket without blasting 27 cells onto one
+      // connection (which trips the 35s command timeout on Cloud) or opening
+      // more in-flight work than the pool can drain. Each cell acquires its
+      // own pool member via getRedis() so round-robin spreads load across
+      // members. The cumulative_ms / wall_clock_ms ratio still reflects overlap.
+      const cellConcurrency = getRuntimePoolSize("heavy-calc");
+      const fanoutShare: FanoutShareCtx = { inflight: new Map() };
+      const cells = await mapWithConcurrency(plan, cellConcurrency, async (p) => {
         const cellStart = process.hrtime.bigint();
         const outcome = await computeSbmCharge(
           {
@@ -1270,12 +1351,17 @@ export function registerCalcRoute(
             forcePath,
             noCache,
           },
-          ctx,
+          {
+            redis: await getRedis(),
+            schema: opts.schema,
+            correlations: opts.correlations,
+            log: app.log,
+          },
+          fanoutShare,
         );
         const cell_ms = Number(process.hrtime.bigint() - cellStart) / 1e6;
         return { plan: p, outcome, cell_ms };
       });
-      const cells = await Promise.all(cellPromises);
       const wallClockMs = Number(process.hrtime.bigint() - wallStart) / 1e6;
 
       // Surface a fatal infrastructure failure (cluster-loading / connection

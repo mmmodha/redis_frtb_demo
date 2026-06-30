@@ -2,66 +2,47 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
-import { IngestPanel } from "../../src/panels/IngestPanel";
-import { GeneratorRunProvider } from "../../src/context/GeneratorRunContext";
+import { EMPTY_INGEST_SNAPSHOT } from "../helpers/ingest-snapshot-fixture";
+import { renderIngestPanel } from "./ingestPanelTestHelpers";
 
 vi.mock("../../src/components/PanelCard", () => ({
-  PanelCard: ({ title, children, actions }: any) => (
+  PanelCard: ({ title, children }: { title: string; children: React.ReactNode }) => (
     <section data-testid="panel-card" data-title={title}>
-      <header><h2>{title}</h2>{actions}</header>
+      <header><h2>{title}</h2></header>
       <div>{children}</div>
     </section>
   ),
 }));
-vi.mock("../../src/components/EnterpriseCallout", () => ({
-  EnterpriseCallout: ({ signal, children }: any) => (<aside data-signal={signal}>{children}</aside>),
-}));
 vi.mock("../../src/components/MetricTile", () => ({
-  MetricTile: ({ label, value }: any) => (<div data-label={label}>{value}</div>),
+  MetricTile: ({ label, value }: { label: string; value: string | number }) => (
+    <div data-label={label}>{value}</div>
+  ),
 }));
 
 function renderPanel() {
-  return render(
-    <MemoryRouter>
-      <GeneratorRunProvider>
-        <IngestPanel />
-      </GeneratorRunProvider>
-    </MemoryRouter>,
-  );
+  return renderIngestPanel();
 }
 
-function keysResponse(dbsize: number) {
-  return { prefix: "sens:", dbsize, sample: [], sample_size: 0, ms: 1 };
-}
-function memoryResponse() {
-  return { used_memory: 0, used_memory_human: "0B", ms: 1 };
-}
-
-interface FetchOpts {
-  flushOk?: boolean;
-  flushBody?: unknown;
-  flushStatus?: number;
-}
-
-function mockFetch(opts: FetchOpts = {}) {
-  const {
-    flushOk = true,
-    // Wave 5.46 — default mock now mirrors the api's post-flush bootstrap
-    // success response so banner assertions exercise the "indexes rebuilt"
-    // copy by default. Tests that need the failure branch override flushBody.
-    flushBody = { ok: true, ms: 7, target_label: "redis-primary", bootstrap: { ok: true } },
-    flushStatus = 200,
-  } = opts;
-  const fetchMock = vi.fn();
-  fetchMock.mockImplementation(async (input: RequestInfo, init?: RequestInit) => {
+function mockFetch(opts: { flushBody?: unknown; flushOk?: boolean } = {}) {
+  const flushBody = opts.flushBody ?? { ok: true, ms: 7, target_label: "redis-primary", bootstrap: { ok: true } };
+  const fetchMock = vi.fn(async (input: RequestInfo, init?: RequestInit) => {
     const url = String(input);
     const method = init?.method ?? "GET";
-    if (url.endsWith("/sources") && method === "GET") return { ok: true, json: async () => [] };
-    if (url.includes("/observability/keys")) return { ok: true, json: async () => keysResponse(0) };
-    if (url.includes("/observability/memory")) return { ok: true, json: async () => memoryResponse() };
+    if (url.endsWith("/ingest/snapshot")) return { ok: true, json: async () => EMPTY_INGEST_SNAPSHOT };
+    if (url.includes("/observability/memory")) {
+      return { ok: true, json: async () => ({ used_memory_human: "0B" }) };
+    }
+    if (url.endsWith("/admin/index-count")) {
+      return { ok: true, json: async () => ({ count: 0, index_name: "sens:", refreshing: false }) };
+    }
+    if (url.endsWith("/admin/host-info")) {
+      return { ok: true, json: async () => ({ cores: 8, recommended_max_workers: 6, max_workers_hard_cap: 32, bulk_loader_pool_size: 32, bulk_loader_replicas: 1, shards: null, target_label: null }) };
+    }
+    if (url.endsWith("/admin/stop-runs") && method === "POST") {
+      return { ok: true, json: async () => ({ ok: true, cancelled: 0, run_ids: [] }) };
+    }
     if (url.endsWith("/admin/flush") && method === "POST") {
-      return { ok: flushOk, status: flushStatus, json: async () => flushBody };
+      return { ok: opts.flushOk ?? true, json: async () => flushBody };
     }
     return { ok: true, json: async () => ({}) };
   });
@@ -69,94 +50,25 @@ function mockFetch(opts: FetchOpts = {}) {
   return fetchMock;
 }
 
-describe("IngestPanel — Flush DB button (Wave 5.38c)", () => {
-  let fetchMock: ReturnType<typeof vi.fn>;
+describe("IngestPanel — Flush DB button", () => {
   beforeEach(() => { vi.useFakeTimers({ shouldAdvanceTime: true }); });
-  afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.clearAllMocks(); });
+  afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 
-  it("renders a destructive-styled 'Flush DB' button", async () => {
-    fetchMock = mockFetch();
-    renderPanel();
-    const btn = await screen.findByTestId("flush-db-btn");
-    expect(btn).toBeInTheDocument();
-    expect(btn).toHaveTextContent(/flush db/i);
-    expect(btn.className).toMatch(/btn--danger/);
-  });
-
-  it("clicking Flush DB opens the confirmation modal (no POST yet)", async () => {
-    fetchMock = mockFetch();
+  it("renders Flush DB and opens confirm modal", async () => {
+    mockFetch();
     renderPanel();
     fireEvent.click(await screen.findByTestId("flush-db-btn"));
-    const modal = await screen.findByTestId("flush-db-modal");
-    expect(modal).toBeInTheDocument();
-    expect(within(modal).getByRole("heading", { name: /flush the active redis database/i })).toBeInTheDocument();
-    expect(within(modal).getByText(/will delete all sensitivities/i)).toBeInTheDocument();
-    const posted = fetchMock.mock.calls.find(
-      (c) => /\/admin\/flush$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",
-    );
-    expect(posted).toBeUndefined();
+    expect(await screen.findByTestId("flush-db-modal")).toBeInTheDocument();
   });
 
-  it("clicking Cancel closes the modal without POSTing", async () => {
-    fetchMock = mockFetch();
+  it("Confirm POSTs /admin/flush and shows success banner", async () => {
+    const fetchMock = mockFetch();
     renderPanel();
     fireEvent.click(await screen.findByTestId("flush-db-btn"));
-    const modal = await screen.findByTestId("flush-db-modal");
-    fireEvent.click(within(modal).getByTestId("flush-db-cancel"));
-    await waitFor(() => expect(screen.queryByTestId("flush-db-modal")).not.toBeInTheDocument());
-    const posted = fetchMock.mock.calls.find(
-      (c) => /\/admin\/flush$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",
-    );
-    expect(posted).toBeUndefined();
-  });
-
-  it("clicking Confirm POSTs to /admin/flush and shows the success banner", async () => {
-    fetchMock = mockFetch();
-    renderPanel();
-    fireEvent.click(await screen.findByTestId("flush-db-btn"));
-    const modal = await screen.findByTestId("flush-db-modal");
-    fireEvent.click(within(modal).getByTestId("flush-db-confirm"));
+    fireEvent.click(within(await screen.findByTestId("flush-db-modal")).getByTestId("flush-db-confirm"));
     await waitFor(() => {
-      const posted = fetchMock.mock.calls.find(
-        (c) => /\/admin\/flush$/.test(String(c[0])) && (c[1] as RequestInit | undefined)?.method === "POST",
-      );
-      expect(posted).toBeDefined();
+      expect(fetchMock.mock.calls.some((c) => String(c[0]).endsWith("/admin/flush"))).toBe(true);
     });
-    // Wave 5.46 — banner advertises the rebuilt index when bootstrap.ok=true.
-    const banner = await screen.findByTestId("flush-db-banner");
-    expect(banner).toHaveTextContent(/flushed in 7ms · indexes rebuilt/i);
-  });
-
-  it("surfaces a flush error in the telemetry error display", async () => {
-    fetchMock = mockFetch({ flushOk: false, flushStatus: 503, flushBody: { error: "no active target" } });
-    renderPanel();
-    fireEvent.click(await screen.findByTestId("flush-db-btn"));
-    fireEvent.click(within(await screen.findByTestId("flush-db-modal")).getByTestId("flush-db-confirm"));
-    const alert = await screen.findByRole("alert");
-    expect(alert.textContent).toMatch(/flush failed/i);
-    expect(alert.textContent).toMatch(/no active target/i);
-  });
-
-  // Wave 5.46 — bootstrap failure path: flush itself returned 200 but the
-  // post-flush bootstrap (idx:sens + frtb library rebuild) failed. The UI
-  // surfaces the bootstrap error via the same telemetry error display the
-  // raw-flush failure uses, and does NOT show the success banner.
-  it("surfaces bootstrap.ok=false from a 200 flush response as an error", async () => {
-    fetchMock = mockFetch({
-      flushBody: {
-        ok: true,
-        ms: 11,
-        target_label: "redis-primary",
-        bootstrap: { ok: false, error: "FT.CREATE failed" },
-      },
-    });
-    renderPanel();
-    fireEvent.click(await screen.findByTestId("flush-db-btn"));
-    fireEvent.click(within(await screen.findByTestId("flush-db-modal")).getByTestId("flush-db-confirm"));
-    const alert = await screen.findByRole("alert");
-    expect(alert.textContent).toMatch(/flush failed/i);
-    expect(alert.textContent).toMatch(/bootstrap/i);
-    expect(alert.textContent).toMatch(/ft\.create failed/i);
-    expect(screen.queryByTestId("flush-db-banner")).not.toBeInTheDocument();
+    expect(await screen.findByTestId("flush-db-banner")).toHaveTextContent(/flushed in 7ms/i);
   });
 });

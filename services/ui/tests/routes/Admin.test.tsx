@@ -2,7 +2,7 @@
 // them under a top-level page heading.
 
 import { describe, it, expect, afterEach, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, fireEvent } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 
 const originalFetch = globalThis.fetch;
@@ -48,6 +48,30 @@ function routeFetch() {
         peak_rate_per_sec: 1, retention_hours_now: 1, retention_hours_at_cap: 96,
       }), { status: 200, headers: { "content-type": "application/json" } });
     }
+    if (url.endsWith("/admin/ingest-capacity-test")) {
+      return new Response(JSON.stringify({
+        ok: true,
+        target_label: "redis-primary",
+        deployment: {
+          cores: 8,
+          recommended_max_workers: 6,
+          bulk_loader_pool_size: 16,
+          bulk_loader_replicas: 4,
+          recommended_bulk_loader_replicas: 5,
+          shards: null,
+        },
+        worker_sweep: [2, 4],
+        rows_per_step: 50000,
+        steps: [
+          { workers: 2, gen_rps: 40000, write_rps: 39000, throttled_samples: 0, total_samples: 10, recent_429_max: 0, duration_ms: 1200, rows_sent: 50000, verdict: "optimal" },
+          { workers: 4, gen_rps: 42000, write_rps: 35000, throttled_samples: 2, total_samples: 10, recent_429_max: 1, duration_ms: 1100, rows_sent: 50000, verdict: "saturated" },
+        ],
+        recommended_workers: 2,
+        bottleneck: "bulk_loader_queue",
+        notes: ["test note"],
+        total_ms: 5000,
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
     return new Response("not found", { status: 404 });
   }) as typeof fetch;
 }
@@ -61,15 +85,27 @@ describe("<Admin /> route", () => {
     expect(screen.getByRole("heading", { name: /^admin$/i, level: 1 })).toBeInTheDocument();
   });
 
-  it("renders all five admin widgets", async () => {
+  it("renders all admin widgets including ingest capacity test", async () => {
     vi.stubGlobal("localStorage", makeMemoryStorage());
     routeFetch();
     const { Admin } = await import("../../src/routes/Admin");
     render(<MemoryRouter><Admin /></MemoryRouter>);
-    expect(await screen.findByRole("heading", { name: /^calc coverage$/i, level: 2 })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: /^ingest capacity test$/i, level: 2 })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /^calc coverage$/i, level: 2 })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: /^drift$/i, level: 2 })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: /^snapshots$/i, level: 2 })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: /^stream status$/i, level: 2 })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: /^reconcile bucket$/i, level: 2 })).toBeInTheDocument();
+  });
+
+  it("runs capacity test and shows recommended workers", async () => {
+    vi.stubGlobal("localStorage", makeMemoryStorage());
+    routeFetch();
+    const { Admin } = await import("../../src/routes/Admin");
+    render(<MemoryRouter><Admin /></MemoryRouter>);
+    fireEvent.click(screen.getByTestId("ingest-capacity-run"));
+    expect(await screen.findByTestId("ingest-capacity-recommended")).toHaveTextContent("2");
+    expect(screen.getByTestId("ingest-capacity-replicas")).toHaveTextContent("5");
+    expect(screen.getByTestId("ingest-capacity-row-2")).toBeInTheDocument();
   });
 });

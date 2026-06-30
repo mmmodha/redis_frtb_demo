@@ -129,6 +129,16 @@ describe("<SwitchBanner/>", () => {
     expect(screen.queryByTestId("switch-banner")).toBeNull();
   });
 
+  it("hides immediately when switch-status polling errors", async () => {
+    getSwitchStatusMock.mockRejectedValue(new Error("unauthorized"));
+    const Banner = await loadBanner();
+    render(<Banner triggerId={1} targetLabel="prod-cluster" />);
+    await flushMicrotasks();
+    // scheduleHide runs on error — banner clears after 2s hide delay.
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_500); });
+    expect(screen.queryByTestId("switch-banner")).toBeNull();
+  });
+
   it("safety cap forces hide after 12s even if api never goes terminal", async () => {
     getSwitchStatusMock.mockResolvedValue({
       current_switch_id: "sw-stuck",

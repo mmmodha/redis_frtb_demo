@@ -59,13 +59,44 @@ export function clampTelemetryRateSample(
 }
 
 /** Prefer write-side rates over producer-side rates for the headline tile. */
-export function pickBulkDisplayRps(
-  ingestRps: number,
-  indexDerivedRps: number,
-  genRps: number,
-): number {
+export function pickBulkDisplayRps(ingestRps: number, genRps: number): number {
   if (ingestRps > 0) return ingestRps;
-  if (indexDerivedRps > 0) return indexDerivedRps;
   if (genRps > 0) return genRps;
   return 0;
+}
+
+export type HeadlineRowsPerSecSource = "ingest" | "bulk-flush" | "idle";
+
+/** Headline rows/sec for the ingest telemetry tiles — never treat index catch-up as active ingest. */
+export function pickHeadlineRowsPerSec(opts: {
+  bulkRunLive: boolean;
+  producerLive: boolean;
+  bulkLoaderDraining: boolean;
+  flushRps: number;
+  smoothedIngestRps: number;
+  telemetryRps: number;
+  smoothedGenRps: number;
+}): { value: number; source: HeadlineRowsPerSecSource; label: string } {
+  if (opts.bulkRunLive) {
+    return {
+      value: pickBulkDisplayRps(opts.smoothedIngestRps, opts.smoothedGenRps),
+      source: "ingest",
+      label: "Rows/sec",
+    };
+  }
+  if (opts.bulkLoaderDraining) {
+    return {
+      value: opts.flushRps,
+      source: "bulk-flush",
+      label: "Rows/sec (flush)",
+    };
+  }
+  if (opts.producerLive) {
+    return {
+      value: pickBulkDisplayRps(opts.smoothedIngestRps, opts.smoothedGenRps),
+      source: "ingest",
+      label: "Rows/sec",
+    };
+  }
+  return { value: 0, source: "idle", label: "Rows/sec" };
 }

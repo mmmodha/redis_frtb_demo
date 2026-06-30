@@ -48,6 +48,45 @@ function renderPanel() {
   return render(<MemoryRouter><ConnectionsPanel /></MemoryRouter>);
 }
 
+const PROBE_OK_BODY = {
+  ok: true,
+  latency_ms: 5,
+  modules: [
+    { name: "JSON", present: true },
+    { name: "Search", present: true },
+    { name: "Time Series", present: true },
+    { name: "Probabilistic", present: true },
+  ],
+  errors: [] as string[],
+};
+
+function probeJsonResponse() {
+  return new Response(JSON.stringify(PROBE_OK_BODY), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+async function walkAddWizardToProbe(
+  dialog: HTMLElement,
+  fields: { name: string; host: string; port: string; password?: string },
+) {
+  fireEvent.change(within(dialog).getByLabelText(/cluster name/i), { target: { value: fields.name } });
+  fireEvent.click(within(dialog).getByTestId("wizard-next"));
+  await waitFor(() => expect(within(dialog).getByTestId("wizard-step-2")).toBeInTheDocument());
+  fireEvent.change(within(dialog).getByLabelText(/^host$/i), { target: { value: fields.host } });
+  fireEvent.change(within(dialog).getByLabelText(/^port$/i), { target: { value: fields.port } });
+  fireEvent.click(within(dialog).getByTestId("wizard-next"));
+  await waitFor(() => expect(within(dialog).getByTestId("wizard-step-3")).toBeInTheDocument());
+  if (fields.password) {
+    fireEvent.change(within(dialog).getByLabelText(/^password$/i), { target: { value: fields.password } });
+  }
+  fireEvent.click(within(dialog).getByTestId("wizard-next"));
+  await waitFor(() => expect(within(dialog).getByTestId("wizard-step-4")).toBeInTheDocument());
+  fireEvent.click(within(dialog).getByTestId("wizard-test"));
+  await waitFor(() => expect(within(dialog).getByTestId("connection-probe-result")).toBeInTheDocument());
+}
+
 describe("<ConnectionsPanel/>", () => {
   let fetchMock: ReturnType<typeof vi.fn>;
 
@@ -134,7 +173,7 @@ describe("<ConnectionsPanel/>", () => {
     expect(screen.getByRole("button", { name: /retry/i })).toBeInTheDocument();
   });
 
-  it("clicking Add cluster opens a dialog with name/host/port/password/TLS fields", async () => {
+  it("clicking Add cluster opens the wizard on step 1 with name and presets", async () => {
     setRoutes(
       routeJson(/\/redis\/active-target$/, "GET", { host: "h", port: 1, tls: false, db: 0, label: "x" }),
       routeJson(/\/connections$/, "GET", []),
@@ -143,20 +182,24 @@ describe("<ConnectionsPanel/>", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: /add cluster/i })).toBeInTheDocument());
     fireEvent.click(screen.getByRole("button", { name: /add cluster/i }));
     const dialog = await screen.findByRole("dialog", { name: /add cluster/i });
-    expect(within(dialog).getByLabelText(/^name$/i)).toBeInTheDocument();
-    expect(within(dialog).getByLabelText(/^host$/i)).toBeInTheDocument();
-    expect(within(dialog).getByLabelText(/^port$/i)).toBeInTheDocument();
-    expect(within(dialog).getByLabelText(/^password$/i)).toBeInTheDocument();
-    expect(within(dialog).getByLabelText(/tls/i)).toBeInTheDocument();
+    expect(within(dialog).getByTestId("wizard-step-1")).toBeInTheDocument();
+    expect(within(dialog).getByLabelText(/cluster name/i)).toBeInTheDocument();
+    expect(within(dialog).getByTestId("preset-enterprise")).toBeInTheDocument();
+    expect(within(dialog).getByTestId("wizard-next")).toBeInTheDocument();
   });
 
-  it("submitting the Add dialog POSTs /connections with the form body", async () => {
+  it("submitting the Add wizard probes then POSTs /connections", async () => {
     let postedBody: unknown = null;
+    let probeCalled = false;
     fetchMock.mockImplementation(async (input: RequestInfo, init?: RequestInit) => {
       const url = String(input);
       const method = init?.method ?? "GET";
       if (url.match(/\/redis\/active-target$/)) return new Response(JSON.stringify({ host: "h", port: 1, tls: false, db: 0, label: "x" }), { status: 200, headers: { "content-type": "application/json" } });
       if (url.match(/\/connections$/) && method === "GET") return new Response(JSON.stringify([]), { status: 200, headers: { "content-type": "application/json" } });
+      if (url.match(/\/connections\/probe$/) && method === "POST") {
+        probeCalled = true;
+        return probeJsonResponse();
+      }
       if (url.match(/\/connections$/) && method === "POST") {
         postedBody = JSON.parse(String(init?.body));
         return new Response(JSON.stringify(profile({ id: "new-1", name: "demo-cluster" })), { status: 201, headers: { "content-type": "application/json" } });
@@ -166,11 +209,14 @@ describe("<ConnectionsPanel/>", () => {
     renderPanel();
     fireEvent.click(await screen.findByRole("button", { name: /add cluster/i }));
     const dialog = await screen.findByRole("dialog", { name: /add cluster/i });
-    fireEvent.change(within(dialog).getByLabelText(/^name$/i), { target: { value: "demo-cluster" } });
-    fireEvent.change(within(dialog).getByLabelText(/^host$/i), { target: { value: "redis-1.lab" } });
-    fireEvent.change(within(dialog).getByLabelText(/^port$/i), { target: { value: "12000" } });
-    fireEvent.change(within(dialog).getByLabelText(/^password$/i), { target: { value: "s3cret" } });
-    fireEvent.click(within(dialog).getByRole("button", { name: /save/i }));
+    await walkAddWizardToProbe(dialog, {
+      name: "demo-cluster",
+      host: "redis-1.lab",
+      port: "12000",
+      password: "s3cret",
+    });
+    expect(probeCalled).toBe(true);
+    fireEvent.click(within(dialog).getByTestId("wizard-save"));
     await waitFor(() => expect(postedBody).not.toBeNull());
     expect(postedBody).toMatchObject({ name: "demo-cluster", host: "redis-1.lab", port: 12000, password: "s3cret" });
   });
@@ -686,6 +732,9 @@ describe("<ConnectionsPanel/>", () => {
         if (url.match(/\/connections$/) && method === "GET") {
           return new Response(JSON.stringify([profile({ id: "existing-1", name: "demo-cluster", host: "redis-1.lab", port: 12000 })]), { status: 200, headers: { "content-type": "application/json" } });
         }
+        if (url.match(/\/connections\/probe$/) && method === "POST") {
+          return probeJsonResponse();
+        }
         if (url.match(/\/connections\/[^/]+\/test$/) && method === "POST") {
           return new Response(JSON.stringify({ ok: true, latency_ms: 1, modules: [], errors: [] }), { status: 200, headers: { "content-type": "application/json" } });
         }
@@ -697,10 +746,12 @@ describe("<ConnectionsPanel/>", () => {
       renderPanel();
       fireEvent.click(await screen.findByRole("button", { name: /add cluster/i }));
       const dialog = await screen.findByRole("dialog", { name: /add cluster/i });
-      fireEvent.change(within(dialog).getByLabelText(/^name$/i), { target: { value: "new-cluster" } });
-      fireEvent.change(within(dialog).getByLabelText(/^host$/i), { target: { value: "redis-1.lab" } });
-      fireEvent.change(within(dialog).getByLabelText(/^port$/i), { target: { value: "12000" } });
-      fireEvent.click(within(dialog).getByRole("button", { name: /save/i }));
+      await walkAddWizardToProbe(dialog, {
+        name: "new-cluster",
+        host: "redis-1.lab",
+        port: "12000",
+      });
+      fireEvent.click(within(dialog).getByTestId("wizard-save"));
 
       const banner = await within(dialog).findByTestId("dialog-banner-error");
       expect(banner).toHaveTextContent(/already exists/i);
@@ -720,6 +771,9 @@ describe("<ConnectionsPanel/>", () => {
         if (url.match(/\/connections$/) && method === "GET") {
           return new Response(JSON.stringify([profile({ id: "existing-1", name: "demo-cluster", host: "redis-1.lab", port: 12000 })]), { status: 200, headers: { "content-type": "application/json" } });
         }
+        if (url.match(/\/connections\/probe$/) && method === "POST") {
+          return probeJsonResponse();
+        }
         if (url.match(/\/connections\/[^/]+\/test$/) && method === "POST") {
           return new Response(JSON.stringify({ ok: true, latency_ms: 1, modules: [], errors: [] }), { status: 200, headers: { "content-type": "application/json" } });
         }
@@ -732,10 +786,12 @@ describe("<ConnectionsPanel/>", () => {
       await waitFor(() => expect(screen.getByText("demo-cluster")).toBeInTheDocument());
       fireEvent.click(screen.getByRole("button", { name: /add cluster/i }));
       const addDialog = await screen.findByRole("dialog", { name: /add cluster/i });
-      fireEvent.change(within(addDialog).getByLabelText(/^name$/i), { target: { value: "dup-cluster" } });
-      fireEvent.change(within(addDialog).getByLabelText(/^host$/i), { target: { value: "redis-1.lab" } });
-      fireEvent.change(within(addDialog).getByLabelText(/^port$/i), { target: { value: "12000" } });
-      fireEvent.click(within(addDialog).getByRole("button", { name: /save/i }));
+      await walkAddWizardToProbe(addDialog, {
+        name: "dup-cluster",
+        host: "redis-1.lab",
+        port: "12000",
+      });
+      fireEvent.click(within(addDialog).getByTestId("wizard-save"));
 
       const switchBtn = await within(addDialog).findByTestId("dialog-switch-to-edit");
       fireEvent.click(switchBtn);
@@ -760,6 +816,9 @@ describe("<ConnectionsPanel/>", () => {
             profile({ id: "01A", name: "a-cluster", host: "rs.a", port: 12000 }),
             profile({ id: "01B", name: "b-cluster", host: "rs.b", port: 12000 }),
           ]), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        if (url.match(/\/connections\/probe$/) && method === "POST") {
+          return probeJsonResponse();
         }
         if (url.match(/\/connections\/[^/]+\/test$/) && method === "POST") {
           return new Response(JSON.stringify({ ok: true, latency_ms: 1, modules: [], errors: [] }), { status: 200, headers: { "content-type": "application/json" } });

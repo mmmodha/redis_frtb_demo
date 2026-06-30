@@ -94,10 +94,10 @@ export function SwitchBanner({ triggerId, targetLabel }: SwitchBannerProps) {
         }
       } catch {
         if (cancelled) return;
-        if (Date.now() - startedAtRef.current >= SAFETY_MAX_MS) {
-          stopPolling();
-          scheduleHide();
-        }
+        // Auth / network errors on switch-status should not leave a spinner up
+        // for the full safety window — the switch already committed server-side.
+        stopPolling();
+        scheduleHide();
       }
     };
 

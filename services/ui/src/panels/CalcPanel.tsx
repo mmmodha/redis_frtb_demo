@@ -307,6 +307,7 @@ export function CalcPanel() {
     totalLoading,
     startPerClassCalc,
     startTotalCalc,
+    clearTotalRun,
   } = useCalcRun();
   const loading = perClassLoading;
   const result = perClassRun.result ?? null;
@@ -590,6 +591,7 @@ export function CalcPanel() {
         result={totalResult}
         error={totalError}
         onCalculate={onCalculateTotal}
+        onDismiss={clearTotalRun}
       />
     </div>
   );
@@ -606,6 +608,7 @@ function TotalSbmCard({
   result,
   error,
   onCalculate,
+  onDismiss,
 }: {
   loading: boolean;
   startedAt: number | null;
@@ -613,6 +616,7 @@ function TotalSbmCard({
   result: TotalSbmResponse | null;
   error: string | null;
   onCalculate: () => void;
+  onDismiss: () => void;
 }) {
   const [elapsedMs, setElapsedMs] = useState(0);
   const [finalElapsedMs, setFinalElapsedMs] = useState<number | null>(null);
@@ -656,7 +660,18 @@ function TotalSbmCard({
             aria-live="polite"
           >
             elapsed {elapsedSeconds.toFixed(elapsedSeconds < 10 ? 1 : 0)}s
+            {elapsedSeconds >= 90 ? " — large portfolios can take 2–3 min" : ""}
           </span>
+        ) : null}
+        {loading ? (
+          <button
+            type="button"
+            className="btn btn--ghost calc-panel__total-dismiss"
+            onClick={onDismiss}
+            data-testid="calc-total-dismiss"
+          >
+            Dismiss
+          </button>
         ) : null}
       </div>
       {loading ? <TotalSbmSkeletonGrid /> : null}

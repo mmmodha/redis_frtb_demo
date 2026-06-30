@@ -47,6 +47,31 @@ docker compose up -d --wait --scale bulk-loader=4
 Redis is **not** included — configure via the UI **Connections** panel after
 boot. Optionally pre-seed `REDIS_URL` in `.env.local` for CI/demo shortcuts.
 
+### Redis on your laptop (outside Compose)
+
+When the app runs in Docker, **`localhost` inside a container means that
+container**, not your Mac. If Redis is listening on the host at port `12000`
+(or any port), point connections at the host gateway:
+
+| Where you configure | Host | Port |
+|---------------------|------|------|
+| **Connections** panel (recommended) | `host.docker.internal` | `12000` |
+| **`.env.local` pre-seed** | see below | |
+
+```bash
+# Optional pre-seed (password/TLS as needed):
+echo 'REDIS_URL=redis://:YOUR_PASSWORD@host.docker.internal:12000' >> .env.local
+docker compose up -d --build api
+```
+
+Then open **Connections → Test → Set active**. Use `host.docker.internal`,
+**not** `localhost`, in the profile host field.
+
+Redis must accept TCP from Docker (default `bind 127.0.0.1` on the host is
+usually fine with Docker Desktop because `host.docker.internal` routes to the
+host loopback). If Test fails with *connection refused*, check that Redis is
+listening on `12000` (`redis-cli -p 12000 ping` from your laptop).
+
 ### Local Redis (no Cloud account)
 
 ```bash
@@ -134,6 +159,8 @@ Expect per-shard doc counts within ±5% when using tag-free ULID keys.
 
 ### Not yet automated (Wave 7 backlog)
 
+See **[optimization-roadmap.md](./optimization-roadmap.md)** for the full phased plan (demo gate → performance → cleanup).
+
 - **7.0.3.A** — trigger rollup finalisation automatically when bulk ingest completes
 - **7.0.5.C** — gated 450M validation run on production cluster
 - **7.0.4.B** — per-shard observability panel in UI
@@ -144,8 +171,24 @@ Expect per-shard doc counts within ±5% when using tag-free ULID keys.
 rollup (HGETALL)  →  ft_aggregate (FT.AGGREGATE on slim index)  →  fcall_lua (legacy)
 ```
 
-With lazy math, rollup path is disabled until post-load finalisation runs.
-After finalisation, set `CALC_ROLLUP_PATH=1` (default) for the fast path.
+With lazy math, run post-load finalisation so calc uses the rollup (HGETALL) path:
+After finalisation, `CALC_ROLLUP_PATH=1` (default) serves charges via rollup readout.
+
+### Demo day checklist (400M + 30–40s calc)
+
+1. **Cluster** — Redis Enterprise with `proxy_policy=all-master-shards`; size for ~800 GB row data + indexes.
+2. **Launch stack** — `scripts/docker-up.sh --scale 400m --build`
+3. **Ingest** — UI preset **400M** (or custom `400_000_000`), workers **4–8**
+4. **After ingest completes** (mandatory before calc demo):
+   ```bash
+   node --env-file=.env.local scripts/finalise-rollups.mjs
+   node --env-file=.env.local scripts/finalise-seen-sets.mjs
+   ```
+5. **Verify** — `GET /admin/calc-coverage` shows rollups present; run `/calc/sbm/total` once (cold), then repeat (cache hit <1s)
+6. **Env tuning** (api):
+   - `POOL_COMMAND_TIMEOUT_HEAVY_CALC_MS=180000` (compose default)
+   - `RUNTIME_REDIS_POOL_SIZE_HEAVY_CALC=8`
+   - `CALC_CACHE_TTL_MS=300000` (optional — 5 min cache for demo repeats)
 
 ---
 

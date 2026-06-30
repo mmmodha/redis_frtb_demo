@@ -1166,7 +1166,7 @@ describe("POST /admin/cancel-all-runs (Wave 5.44 / 6.44.E) — admin stop all ge
 
     const res = await app.inject({ method: "POST", url: "/admin/cancel-all-runs" });
     expect(res.statusCode).toBe(200);
-    expect(res.json()).toEqual({ ok: true, cancelled: 0, run_ids: [], flush: FLUSH_OK });
+    expect(res.json()).toEqual({ ok: true, cancelled: 0, run_ids: [], bulk_cancelled: 0, bulk_run_ids: [], flush: FLUSH_OK });
     expect(stub.calls).toHaveLength(1);
     expect(stub.calls[0]!.url).toBe("http://stub-ingest:8083/ingest/halt-and-flush");
     expect((stub.calls[0]!.init as RequestInit).method).toBe("POST");
@@ -1236,7 +1236,7 @@ describe("POST /admin/cancel-all-runs (Wave 5.44 / 6.44.E) — admin stop all ge
     // flush still runs and is idempotent on the ingest side too — DoD #2.
     const second = await app.inject({ method: "POST", url: "/admin/cancel-all-runs" });
     expect(second.statusCode).toBe(200);
-    expect(second.json()).toEqual({ ok: true, cancelled: 0, run_ids: [], flush: FLUSH_OK });
+    expect(second.json()).toEqual({ ok: true, cancelled: 0, run_ids: [], bulk_cancelled: 0, bulk_run_ids: [], flush: FLUSH_OK });
     expect(stub.calls).toHaveLength(2);
   });
 
@@ -1363,7 +1363,7 @@ describe("POST /admin/stop-runs (Wave 6.53.A / 6.53.B) — non-destructive stop 
 
     const res = await app.inject({ method: "POST", url: "/admin/stop-runs" });
     expect(res.statusCode).toBe(200);
-    expect(res.json()).toEqual({ ok: true, cancelled: 0, run_ids: [], trim: { streams_trimmed: 4 } });
+    expect(res.json()).toEqual({ ok: true, cancelled: 0, run_ids: [], bulk_cancelled: 0, bulk_run_ids: [], trim: { streams_trimmed: 4 } });
     // Wave 6.53.B — the route calls /ingest/halt-and-flush exactly once
     // with clearDocs:false so the destructive doc-clearing step is
     // skipped on the ingest side.

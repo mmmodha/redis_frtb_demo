@@ -105,6 +105,53 @@ describe("/connections HTTP routes", () => {
     expect(get.statusCode).toBe(404);
   });
 
+  it("POST /connections/probe runs tester without persisting a profile", async () => {
+    let testerCalled = false;
+    const probeApp = await createServer({
+      store,
+      tester: async (profile) => {
+        testerCalled = true;
+        expect(profile.host).toBe("rs.probe");
+        expect(profile.port).toBe(12000);
+        expect(profile.password).toBe("probe-secret");
+        return {
+          ok: true,
+          latency_ms: 2,
+          modules: [{ name: "JSON", present: true }],
+          errors: [],
+        };
+      },
+    });
+    const res = await probeApp.inject({
+      method: "POST",
+      url: "/connections/probe",
+      payload: { name: "draft", host: "rs.probe", port: 12000, password: "probe-secret" },
+    });
+    await probeApp.close();
+    expect(res.statusCode).toBe(200);
+    expect(testerCalled).toBe(true);
+    const body = res.json();
+    expect(body.ok).toBe(true);
+    expect(JSON.stringify(body)).not.toContain("probe-secret");
+    const list = await app.inject({ method: "GET", url: "/connections" });
+    expect(list.json()).toHaveLength(0);
+  });
+
+  it("POST /connections/probe returns 400 when host or port is invalid", async () => {
+    const badHost = await app.inject({
+      method: "POST",
+      url: "/connections/probe",
+      payload: { name: "x", host: "", port: 12000 },
+    });
+    expect(badHost.statusCode).toBe(400);
+    const badPort = await app.inject({
+      method: "POST",
+      url: "/connections/probe",
+      payload: { name: "x", host: "h", port: 0 },
+    });
+    expect(badPort.statusCode).toBe(400);
+  });
+
   it("POST /connections/:id/test runs the injected tester and returns result without creds", async () => {
     const created = await app.inject({
       method: "POST", url: "/connections", payload: { name: "demo", host: "h", port: 1, password: "PW" },

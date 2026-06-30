@@ -172,6 +172,11 @@ export async function testConnection(id: string): Promise<ConnectionTestResult> 
   return r as ConnectionTestResult;
 }
 
+export async function probeConnection(input: ConnectionInput): Promise<ConnectionTestResult> {
+  const r = await sendJson<ConnectionTestResult>("/connections/probe", "POST", input);
+  return r as ConnectionTestResult;
+}
+
 // Wave 5.16z2 — typed error raised when the api refuses activation with a
 // 409 because the inflight registry is non-empty. The panel reads .inflight
 // to render a per-row "Cannot activate: N runs still in flight (…)" message.

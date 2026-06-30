@@ -8,7 +8,7 @@
 
 import { apiBase } from "./api";
 
-export type BootstrapPhase = "idle" | "running" | "ready" | "failed";
+export type BootstrapPhase = "idle" | "running" | "ready" | "partial" | "failed";
 
 export interface BootstrapStatusSnapshot {
   phase: BootstrapPhase;
@@ -16,6 +16,11 @@ export interface BootstrapStatusSnapshot {
   started_at?: string;
   finished_at?: string;
   err?: string;
+}
+
+/** True when bootstrap is finished enough to hide the blocking overlay. */
+export function isBootstrapSettled(phase: BootstrapPhase): boolean {
+  return phase === "idle" || phase === "ready" || phase === "partial";
 }
 
 export async function getBootstrapStatus(): Promise<BootstrapStatusSnapshot> {

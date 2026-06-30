@@ -188,7 +188,7 @@ async function main(): Promise<void> {
         // Wave 6.18i — opt boot-time into the skip-when-unchanged path so
         // an unchanged schema short-circuits past FT.DROPINDEX/FT.CREATE
         // and clears the BOOT_BOOTSTRAP_TIMEOUT_MS window comfortably.
-        bootstrapFrtb(redis, schema, undefined, { target_label: target.label }),
+        bootstrapFrtb(redis!, schema, undefined, { target_label: target.label }),
         BOOT_BOOTSTRAP_TIMEOUT_MS,
         "bootstrapFrtb",
       );
@@ -323,7 +323,7 @@ async function main(): Promise<void> {
   if (process.env.SMOKE === "1") {
     l4Crons?.stop();
     await app.close();
-    await redis.quit().catch(() => undefined);
+    await redis?.quit().catch(() => undefined);
     process.exit(0);
   }
 
@@ -331,7 +331,7 @@ async function main(): Promise<void> {
     process.on(sig, async () => {
       l4Crons?.stop();
       await app.close();
-      await redis.quit().catch(() => undefined);
+      await redis?.quit().catch(() => undefined);
       process.exit(0);
     });
   }

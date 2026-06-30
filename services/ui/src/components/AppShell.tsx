@@ -8,6 +8,7 @@ import { getActiveTarget, type ActiveTarget } from "../lib/connections";
 import { CalcRunContext } from "../context/CalcRunContext";
 import { GeneratorRunContext } from "../context/GeneratorRunContext";
 import { PivotBurstContext } from "../context/PivotBurstContext";
+import { useIngestRun } from "../hooks/useIngestRun";
 
 const SECTIONS = [
   { to: "/connections", label: "Connections" },
@@ -31,6 +32,7 @@ export function AppShell({ children }: AppShellProps) {
   const burstCtx = useContext(PivotBurstContext);
   const generatorCtx = useContext(GeneratorRunContext);
   const calcCtx = useContext(CalcRunContext);
+  const { view: ingestView } = useIngestRun();
   const location = useLocation();
   const burst = burstCtx?.burst ?? null;
   const showBurstPill = burst !== null && location.pathname !== "/pivot";
@@ -41,6 +43,9 @@ export function AppShell({ children }: AppShellProps) {
     location.pathname !== "/ingest";
   const calcBusy = calcCtx !== null && (calcCtx.perClassLoading || calcCtx.totalLoading);
   const showCalcPill = calcBusy && location.pathname !== "/calc";
+  const showIngestPill =
+    ingestView.phase === "running" &&
+    location.pathname !== "/ingest";
 
   const refreshTarget = useCallback(async () => {
     try {
@@ -88,6 +93,17 @@ export function AppShell({ children }: AppShellProps) {
                   aria-label={`Search burst running, ${burst.done} of ${burst.total}`}
                 >
                   {burst.done} / {burst.total}
+                </span>
+              )}
+              {s.to === "/ingest" && showIngestPill && (
+                <span
+                  className="app-shell__nav-pill"
+                  data-testid="ingest-run-nav-pill"
+                  role="status"
+                  aria-live="polite"
+                  aria-label={`Ingest running, ${ingestView.written} of ${ingestView.total}`}
+                >
+                  {ingestView.written.toLocaleString("en-US")} / {ingestView.total.toLocaleString("en-US")}
                 </span>
               )}
               {s.to === "/ingest" && showGeneratorPill && generatorRun !== null && (

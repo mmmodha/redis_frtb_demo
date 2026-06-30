@@ -87,6 +87,27 @@ export function registerConnectionsRoutes(
     }
   });
 
+  // Stateless reachability probe for the add-connection wizard. Accepts the
+  // same body as POST /connections but does not persist a profile.
+  app.post<{ Body: CreateInput }>(
+    "/connections/probe",
+    { config: { category: "light" } },
+    async (req, reply) => {
+      const body = req.body;
+      if (!body?.host || typeof body.host !== "string" || !body.host.trim()) {
+        reply.code(400);
+        return { error: "host is required" };
+      }
+      const port = Number(body.port);
+      if (!Number.isFinite(port) || port < 1 || port > 65535) {
+        reply.code(400);
+        return { error: "port must be between 1 and 65535" };
+      }
+      const t: ConnectionTester = tester ?? defaultTester;
+      return t(profileFromProbeInput(body));
+    },
+  );
+
   // Wave 6.21 — connection-store reads are in-memory (the store keeps a
   // snapshot) but tag them `light` for consistency: the small subset of
   // routes here that hit Redis (the source-of-truth load on cold start) all
@@ -243,6 +264,23 @@ export function registerConnectionsRoutes(
     if (raw) activateProfileTarget(raw);
     return publicProfile(p);
   });
+}
+
+function profileFromProbeInput(input: CreateInput): ConnectionProfile {
+  const now = new Date().toISOString();
+  return {
+    id: "probe-ephemeral",
+    name: input.name?.trim() || "probe",
+    host: input.host.trim(),
+    port: Number(input.port),
+    username: input.username,
+    password: input.password,
+    tls: input.tls,
+    db: input.db,
+    clusterMode: input.clusterMode,
+    created_at: now,
+    updated_at: now,
+  };
 }
 
 async function defaultTester(profile: ConnectionProfile): Promise<TestResult> {

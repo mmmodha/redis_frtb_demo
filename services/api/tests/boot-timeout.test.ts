@@ -90,7 +90,7 @@ describe("Wave 6.18c — boot timeout: hung bootstrapFrtb does not block app.lis
     // branch starts and before any assertion.
     process.env.API_BOOT_BOOTSTRAP_TIMEOUT_MS = "150";
     process.env.SMOKE = "1"; // exit-spy intercepts process.exit
-    delete process.env.REDIS_URL;
+    process.env.REDIS_URL = "redis://127.0.0.1:6379";
     listenSpy.mockClear();
     closeSpy.mockClear();
     injectSpy.mockClear();

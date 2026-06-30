@@ -14,20 +14,16 @@ export function sumBulkLoaderFlushed(load: { workers?: Array<{ flushed?: number 
 export function computeBulkRunDone(params: {
   rowsTotal: number;
   rowsSent: number;
-  indexCount: number;
   baseline: BulkRunProgressBaseline | null;
   totalFlushed: number;
 }): number {
-  const { rowsTotal, rowsSent, indexCount, baseline, totalFlushed } = params;
+  const { rowsTotal, rowsSent, baseline, totalFlushed } = params;
   if (!Number.isFinite(rowsTotal) || rowsTotal <= 0) return 0;
 
-  const indexedDelta = baseline !== null
-    ? Math.max(0, indexCount - baseline.indexCountAtStart)
-    : 0;
   const flushedDelta = baseline !== null && baseline.flushedAtStart !== null
     ? Math.max(0, totalFlushed - baseline.flushedAtStart)
     : 0;
 
-  // rows_sent is run-scoped from the api; loader/index deltas are anchored.
-  return Math.min(rowsTotal, Math.max(0, rowsSent, flushedDelta, indexedDelta));
+  // rows_sent is run-scoped from the api; loader flush delta is anchored.
+  return Math.min(rowsTotal, Math.max(0, rowsSent, flushedDelta));
 }

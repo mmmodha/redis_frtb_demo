@@ -408,7 +408,7 @@ async function main(): Promise<void> {
     clearInterval(staleTimer);
     if (state.checkpointer) await state.checkpointer.stop();
     if (state.dispatcher) await state.dispatcher.stop();
-    await state.pool.stop();
+    if (state.pool) await state.pool.stop();
     process.exit(0);
   }
 

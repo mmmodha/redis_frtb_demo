@@ -23,6 +23,11 @@ x-service-defaults: &service-defaults
   networks:
     - frtb
   init: true
+  # Reach Redis (or other services) running on the laptop host from inside
+  # containers. On Docker Desktop (Mac/Win) this hostname already exists;
+  # on Linux Compose maps it to the host gateway.
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
 
 x-app-env: &app-env
   NODE_ENV: ${NODE_ENV:-development}
@@ -64,6 +69,11 @@ x-api-env: &api-env
   RUNTIME_REDIS_POOL_SIZE_LIGHT: ${RUNTIME_REDIS_POOL_SIZE_LIGHT:-4}
   MAX_INFLIGHT_HEAVY: ${MAX_INFLIGHT_HEAVY:-24}
   MAX_INFLIGHT_LIGHT: ${MAX_INFLIGHT_LIGHT:-12}
+  # 5M+ row portfolios: Total SBM wall-clock can exceed 2 min; per-command
+  # budget must outlast slow FT.AGGREGATE cells (default 35s was too low).
+  POOL_COMMAND_TIMEOUT_HEAVY_CALC_MS: ${POOL_COMMAND_TIMEOUT_HEAVY_CALC_MS:-180000}
+  RUNTIME_REDIS_COMMAND_TIMEOUT_MS: ${RUNTIME_REDIS_COMMAND_TIMEOUT_MS:-180000}
+  CALC_CACHE_TTL_MS: ${CALC_CACHE_TTL_MS:-300000}
   HEALTH_PORT: 8080
   CONN_STORE_FILE: /data/connections.enc.json
   CONN_STORE_KEY: ${CONN_STORE_KEY:-dev-only-change-in-prod}

@@ -378,6 +378,7 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
   registerIngestRoutes(app, opts.schema, {
     bulkLoaderBase: opts.bulkLoaderBase,
     fetchImpl: opts.ingestFetchImpl,
+    getRedis,
   });
 
   // Wave 5.16t — auto-bootstrap on every active-target change. The hook is

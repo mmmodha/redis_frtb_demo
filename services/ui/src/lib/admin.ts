@@ -69,6 +69,48 @@ export interface ReconcileBucketResponse {
   sensitivity_type: DriftSensitivity;
 }
 
+// POST /admin/ingest-capacity-test — Wave 7.0.9
+export type CapacityBottleneck =
+  | "redis_write"
+  | "bulk_loader_queue"
+  | "balanced"
+  | "under_utilized";
+
+export type CapacityStepVerdict = "optimal" | "under_utilized" | "saturated";
+
+export interface CapacityStepResult {
+  workers: number;
+  gen_rps: number;
+  write_rps: number;
+  throttled_samples: number;
+  total_samples: number;
+  recent_429_max: number;
+  duration_ms: number;
+  rows_sent: number;
+  verdict: CapacityStepVerdict;
+}
+
+export interface CapacityTestResult {
+  ok: true;
+  target_label: string | null;
+  deployment: {
+    cores: number;
+    recommended_max_workers: number;
+    bulk_loader_pool_size: number;
+    bulk_loader_replicas: number;
+    bulk_loader_instance_ids?: string[];
+    recommended_bulk_loader_replicas: number;
+    shards: number | null;
+  };
+  worker_sweep: number[];
+  rows_per_step: number;
+  steps: CapacityStepResult[];
+  recommended_workers: number;
+  bottleneck: CapacityBottleneck;
+  notes: string[];
+  total_ms: number;
+}
+
 async function getJson<T>(path: string): Promise<T> {
   const res = await fetch(`${apiBase()}${path}`);
   if (!res.ok) {
@@ -93,6 +135,25 @@ export function getSnapshots(): Promise<SnapshotsResponse> {
 }
 export function getStreamStatus(): Promise<StreamStatusResponse> {
   return getJson<StreamStatusResponse>("/admin/stream-status");
+}
+
+export async function postIngestCapacityTest(
+  body: { rows_per_step?: number; worker_sweep?: number[] } = {},
+): Promise<CapacityTestResult> {
+  const res = await fetch(`${apiBase()}/admin/ingest-capacity-test`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    let detail = `${res.status}`;
+    try {
+      const errBody = (await res.json()) as { error?: string };
+      if (errBody?.error) detail = `${res.status}: ${errBody.error}`;
+    } catch { /* not json */ }
+    throw new Error(`api /admin/ingest-capacity-test ${detail}`);
+  }
+  return (await res.json()) as CapacityTestResult;
 }
 
 export async function postReconcileBucket(

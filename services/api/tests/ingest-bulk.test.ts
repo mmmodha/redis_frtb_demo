@@ -23,6 +23,22 @@ function loadFixtureSchema(): Schema {
   );
 }
 
+/** Status probes resolve; producer POSTs hang — for in-flight cancel/list tests. */
+function hangingProducerFetch(
+  statusBody: Record<string, unknown> = { workers: [{ flushed: 0 }] },
+): typeof fetch {
+  return ((url: string | URL | Request) => {
+    const u = String(url);
+    if (u.includes("/load/status")) {
+      return Promise.resolve(new Response(JSON.stringify(statusBody), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }));
+    }
+    return new Promise<Response>(() => { /* hang producer */ });
+  }) as typeof fetch;
+}
+
 // Build a Fastify app with only the ingest routes wired. Mock fetch swallows
 // the bulk-loader POSTs so the inline workers=1 path can complete without a
 // live :8086 server. The `availableCores` seam pins the host-cores cap so
@@ -97,6 +113,27 @@ describe("POST /ingest/bulk/start — workers field", () => {
     });
     expect(res.statusCode).toBe(400);
   });
+
+  it("captures flushed_at_start synchronously before the run begins", async () => {
+    const bulkStatus = { workers: [{ flushed: 42_000 }] };
+    app = Fastify({ logger: false });
+    registerIngestRoutes(app, loadFixtureSchema(), {
+      bulkLoaderBase: "http://127.0.0.1:1",
+      fetchImpl: async () => new Response(JSON.stringify(bulkStatus), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+      availableCores: () => 8,
+    });
+    const res = await app.inject({
+      method: "POST",
+      url: "/ingest/bulk/start",
+      payload: { rows: 10 },
+    });
+    expect(res.statusCode).toBe(202);
+    const run = _testGetBulkRun(res.json().run_id as string);
+    expect(run?.flushed_at_start).toBe(42_000);
+  });
 });
 
 describe("POST /ingest/bulk/cancel", () => {
@@ -144,7 +181,15 @@ describe("POST /ingest/bulk/cancel", () => {
   });
 
   it("cancelAllBulkRuns flips cancel on running entries", async () => {
-    app = mountIngest(loadFixtureSchema(), 8);
+    app = Fastify({ logger: false });
+    app.addHook("onRequest", async (req) => {
+      (req as unknown as { poolCategory: string }).poolCategory = "light";
+    });
+    registerIngestRoutes(app, loadFixtureSchema(), {
+      bulkLoaderBase: "http://127.0.0.1:1",
+      fetchImpl: hangingProducerFetch(),
+      availableCores: () => 8,
+    });
     const start = await app.inject({
       method: "POST",
       url: "/ingest/bulk/start",
@@ -173,7 +218,7 @@ describe("GET /ingest/bulk/runs", () => {
     });
     registerIngestRoutes(app, loadFixtureSchema(), {
       bulkLoaderBase: "http://127.0.0.1:1",
-      fetchImpl: () => new Promise<Response>(() => { /* never settles */ }),
+      fetchImpl: hangingProducerFetch(),
       availableCores: () => 8,
     });
     await app.ready();

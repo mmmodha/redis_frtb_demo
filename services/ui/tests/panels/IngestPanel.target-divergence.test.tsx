@@ -10,9 +10,8 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
 import { IngestPanel } from "../../src/panels/IngestPanel";
-import { GeneratorRunProvider } from "../../src/context/GeneratorRunContext";
+import { renderIngestPanelOnly } from "./ingestPanelTestHelpers";
 
 vi.mock("../../src/components/PanelCard", () => ({
   PanelCard: ({ title, children, actions }: any) => (
@@ -48,29 +47,36 @@ function stubHostInfo(stub: HostInfoStub): void {
     if (url.endsWith("/admin/host-info")) {
       return new Response(JSON.stringify({
         cores: 8, recommended_max_workers: 6, max_workers_hard_cap: 32,
-        bulk_loader_pool_size: 32, shards: 1, target_label: "redis-cloud-prod",
+        bulk_loader_pool_size: 32, bulk_loader_replicas: 1, shards: 1, target_label: "redis-cloud-prod",
         ...stub,
       }), { status: 200 });
     }
     if (url.endsWith("/sources")) return new Response(JSON.stringify([]), { status: 200 });
     if (url.includes("/observability")) {
-      return new Response(JSON.stringify({ prefix: "sens:", dbsize: 0, sample: [], sample_size: 0, used_memory: 0, used_memory_human: "0B", count: 0, ms: 1 }), { status: 200 });
+      return new Response(JSON.stringify({ used_memory_human: "0B" }), { status: 200 });
+    }
+    if (url.endsWith("/admin/index-count")) {
+      return new Response(JSON.stringify({ count: 0, index_name: "sens:", refreshing: false }), { status: 200 });
     }
     if (url.endsWith("/admin/preflight")) {
       return new Response(JSON.stringify({ ok: true, checks: { idx_sens: { ok: true, missing: [] }, frtb_library: { ok: true, loaded: true }, stream: { ok: true, exists: true } }, can_rebuild: false }), { status: 200 });
+    }
+    if (url.endsWith("/ingest/snapshot")) {
+      return new Response(JSON.stringify({
+        ok: true,
+        target_label: "redis-cloud-prod",
+        cluster: { sens_count: 0, sens_count_refreshing: false, memory_bytes: 0, memory_human: "0B" },
+        loader: { in_flight: 0, flush_rps: 0, flushed_total: 0, throttled: false, recent_429_count: 0 },
+        runs: [],
+        focused_run_id: null,
+      }), { status: 200 });
     }
     return new Response("{}", { status: 200 });
   }));
 }
 
 function renderPanel() {
-  return render(
-    <MemoryRouter>
-      <GeneratorRunProvider>
-        <IngestPanel />
-      </GeneratorRunProvider>
-    </MemoryRouter>,
-  );
+  return renderIngestPanelOnly();
 }
 
 describe("IngestPanel — bulk-loader target divergence banner (Wave 7.0.6.17)", () => {
@@ -120,8 +126,7 @@ describe("IngestPanel — bulk-loader target divergence banner (Wave 7.0.6.17)",
     const banner = await screen.findByTestId("bulk-loader-target-banner");
     expect(banner.getAttribute("data-stale")).toBe("false");
     expect(banner.getAttribute("data-watcher")).toBe("enabled");
-    expect(banner.textContent).toMatch(/Watcher is enabled/);
-    expect(banner.textContent).toMatch(/should re-bind automatically/);
+    expect(banner.textContent).toMatch(/watcher should re-bind/i);
     const startBtn = screen.getByRole("button", { name: /^Start / });
     expect(startBtn).toBeDisabled();
   });

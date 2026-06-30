@@ -111,10 +111,17 @@ export function lookupCalcCache(key: string): CacheHit | null {
 export function storeCalcCache(key: string, value: unknown): void {
   cache.set(key, {
     value,
-    expiresAt: Date.now() + TTL_MS,
+    expiresAt: Date.now() + CALC_CACHE_TTL_MS,
     cachedAtIso: new Date().toISOString(),
   });
 }
 
-export const CALC_CACHE_TTL_MS = TTL_MS;
+export const CALC_CACHE_TTL_MS = readCalcCacheTtlMs();
+
+function readCalcCacheTtlMs(): number {
+  const raw = process.env.CALC_CACHE_TTL_MS;
+  if (raw === undefined || raw === "") return TTL_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : TTL_MS;
+}
 export const CALC_DATA_VERSION_KEY = DATA_VERSION_KEY;

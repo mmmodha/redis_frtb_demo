@@ -187,6 +187,11 @@ async function main(): Promise<void> {
     logger: log,
   });
   const redisUrl = resolved.url;
+  if (!redisUrl) {
+    throw new Error(
+      "Redis target URL missing: pass --redis-url, configure active target via API, or set REDIS_URL",
+    );
+  }
   if (!PROFILE_NAMES.has(opts.profile)) {
     throw new Error(`--profile must be one of auto|small|medium|large (got: ${opts.profile})`);
   }

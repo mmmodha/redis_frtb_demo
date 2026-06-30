@@ -1,5 +1,24 @@
 // Wave 7.0.6.13 — bulk-loader ingest fast path.
 //
+import {
+  bulkLoaderFanOutAttempts,
+  createBulkLoaderStatusFetch,
+  discoverBulkLoaderTopology,
+  fetchAggregatedBulkLoadStatus,
+  sumFlushed,
+} from "../bulk-loader-topology.ts";
+import type { RedisLike } from "../redis-like.ts";
+import type { RuntimeCategory } from "../active-target.ts";
+import {
+  buildSnapshotRun,
+  registerIngestSnapshotRoute,
+} from "./ingest-snapshot.ts";
+import {
+  archiveBulkRunHistory,
+  getRunHistoryEntry,
+  listRunHistory,
+} from "../lib/ingest-run-history.ts";
+//
 // POST /ingest/bulk/start drives the bulk-loader (POST :8086/load/rows) with
 // a generated row stream so the UI's "Start ingest" button can bypass the
 // latency-bound stream consumer (XADD sensitivities:in → per-row WATCH/MULTI
@@ -43,6 +62,8 @@ export interface IngestRoutesOpts {
   // `Schema` is not structured-clonable). Falls back to $SCHEMA_FILE or the
   // repo-root default, mirroring services/api/src/index.ts.
   schemaPath?: string;
+  // Redis accessor for GET /ingest/snapshot (cluster stats).
+  getRedis?: (category?: RuntimeCategory) => RedisLike | Promise<RedisLike>;
   // Wave 7.0.6.15 — host parallelism override (test seam). Defaults to
   // node:os.availableParallelism().
   availableCores?: () => number;
@@ -80,6 +101,8 @@ interface BulkRunRecord {
   ms: number;
   bulk_loader_base: string;
   error?: string;
+  /** Aggregated bulk-loader flushed count at run start (rows_written baseline). */
+  flushed_at_start: number | null;
   // Wave 7.0.6.15 — co-located cancel surface. SAB for workers>1 (workers
   // poll Atomics.load(cancelView, 0)); `cancelled` flag for inline.
   cancelView?: Int32Array;
@@ -129,7 +152,151 @@ const DEFAULT_SENSITIVITY_TYPES = ["Delta", "Vega", "Curvature"] as const;
 // is in flight and a few seconds after completion, then drops the handle.
 const RUN_GRACE_MS = 60_000;
 
+// Logger surface narrow enough that both fastify's pino instance and the
+// console satisfy it without an explicit dependency on pino.
+interface RouteLogger {
+  warn: (...args: unknown[]) => void;
+  info?: (...args: unknown[]) => void;
+}
+
 const activeRuns = new Map<string, BulkRunRecord>();
+
+// Wave 7.0.9 — runtime context for ingest-capacity-test (same process).
+export interface IngestRuntimeContext {
+  schema: Schema | undefined;
+  schemaPath: string | undefined;
+  bulkBase: string;
+  fetchImpl: typeof fetch;
+  availableCores: () => number;
+  log: RouteLogger;
+}
+
+let ingestRuntime: IngestRuntimeContext | null = null;
+
+export function getIngestRuntime(): IngestRuntimeContext | null {
+  return ingestRuntime;
+}
+
+export function hasRunningBulkRuns(): boolean {
+  for (const r of activeRuns.values()) {
+    if (r.status === "running") return true;
+  }
+  return false;
+}
+
+export function getBulkRunRecord(run_id: string): BulkRunRecord | undefined {
+  return activeRuns.get(run_id);
+}
+
+export function getAllBulkRunRecords(): BulkRunRecord[] {
+  return Array.from(activeRuns.values());
+}
+
+export type StartBulkIngestResult =
+  | { ok: true; run_id: string; workers: number; rows_total: number }
+  | { ok: false; status: number; error: string };
+
+export async function captureBulkLoaderFlushBaseline(
+  bulkBase: string,
+  fetchImpl: typeof fetch,
+): Promise<number | null> {
+  try {
+    const fetchOne = createBulkLoaderStatusFetch({ base: bulkBase, fetchImpl });
+    const topo = await discoverBulkLoaderTopology(fetchOne);
+    const agg = await fetchAggregatedBulkLoadStatus(fetchOne, topo.replicas);
+    return sumFlushed(agg);
+  } catch {
+    return null;
+  }
+}
+
+export function startBulkIngestRun(
+  ctx: IngestRuntimeContext,
+  body: BulkRunBody,
+  flushedAtStart: number | null = null,
+): StartBulkIngestResult {
+  const schema = ctx.schema;
+  if (!schema) {
+    return { ok: false, status: 503, error: "schema not loaded" };
+  }
+  const rowsTotal = pickInt(body.rowsTotal, body.rows);
+  if (rowsTotal === undefined || !Number.isInteger(rowsTotal) || rowsTotal < 1) {
+    return { ok: false, status: 400, error: "rows must be a positive integer" };
+  }
+  const batchSize = clamp(body.batch_size ?? DEFAULT_BATCH_SIZE, 1, MAX_BATCH_SIZE);
+  const concurrency = clamp(body.concurrency ?? DEFAULT_CONCURRENCY, 1, MAX_CONCURRENCY);
+  const requestedWorkers = pickInt(body.workers) ?? 1;
+  const hostCores = Math.max(1, ctx.availableCores());
+  const workers = clamp(
+    Number.isInteger(requestedWorkers) ? requestedWorkers : 1,
+    1,
+    Math.min(MAX_WORKERS, hostCores),
+  );
+  const classes = (Array.isArray(body.classes) && body.classes.length > 0
+    ? body.classes
+    : [...DEFAULT_CLASSES]).map(String);
+  const sensitivityTypes = Array.isArray(body.sensitivity_types) && body.sensitivity_types.length > 0
+    ? body.sensitivity_types.map(String)
+    : [...DEFAULT_SENSITIVITY_TYPES];
+
+  const run_id = ulid();
+  const started_at_iso = new Date().toISOString();
+  const record: BulkRunRecord = {
+    run_id,
+    status: "running",
+    rows_total: rowsTotal,
+    rows_sent: 0,
+    rows_skipped: 0,
+    batch_size: batchSize,
+    concurrency,
+    workers,
+    started_at_iso,
+    ms: 0,
+    bulk_loader_base: ctx.bulkBase,
+    flushed_at_start: flushedAtStart,
+  };
+  activeRuns.set(run_id, record);
+
+  if (workers === 1) {
+    runInline({
+      schema,
+      body,
+      rowsTotal,
+      batchSize,
+      concurrency,
+      classes,
+      sensitivityTypes,
+      bulkBase: ctx.bulkBase,
+      fetchImpl: ctx.fetchImpl,
+      log: ctx.log,
+      record,
+      run_id,
+    });
+  } else {
+    const schemaPath = ctx.schemaPath;
+    if (!schemaPath) {
+      activeRuns.delete(run_id);
+      return { ok: false, status: 503, error: "schemaPath not resolvable for multi-worker run" };
+    }
+    runWithWorkers({
+      schemaPath,
+      body,
+      rowsTotal,
+      batchSize,
+      concurrency,
+      classes,
+      sensitivityTypes,
+      bulkBase: ctx.bulkBase,
+      fetchImpl: ctx.fetchImpl,
+      workers,
+      log: ctx.log,
+      record,
+      run_id,
+    });
+  }
+
+  return { ok: true, run_id, workers, rows_total: rowsTotal };
+}
 
 // Wave 7.0.8 — bulk-loader lifecycle hooks shared by cancel + stop-runs.
 let bulkLoaderHaltBase = "";
@@ -143,7 +310,12 @@ function configureBulkLoaderHalt(base: string, fetchImpl: typeof fetch): void {
 /** POST /load/stop on every replica (round-robin fan-out). */
 export async function haltBulkLoaderAccept(): Promise<void> {
   if (!bulkLoaderHaltBase) return;
-  const attempts = Math.max(1, Number(process.env.BULK_LOADER_STOP_ATTEMPTS ?? 8));
+  const fetchOne = createBulkLoaderStatusFetch({
+    base: bulkLoaderHaltBase,
+    fetchImpl: bulkLoaderHaltFetch,
+  });
+  const topo = await discoverBulkLoaderTopology(fetchOne);
+  const attempts = bulkLoaderFanOutAttempts(topo.replicas);
   await Promise.allSettled(
     Array.from({ length: attempts }, () =>
       bulkLoaderHaltFetch(`${bulkLoaderHaltBase}/load/stop`, { method: "POST" }),
@@ -151,12 +323,26 @@ export async function haltBulkLoaderAccept(): Promise<void> {
   );
 }
 
-/** Re-enable bulk-loader after a deliberate stop. */
+/** Re-enable bulk-loader after a deliberate stop (all replicas). */
 export async function resumeBulkLoaderAccept(): Promise<void> {
   if (!bulkLoaderHaltBase) return;
+  const fetchOne = createBulkLoaderStatusFetch({
+    base: bulkLoaderHaltBase,
+    fetchImpl: bulkLoaderHaltFetch,
+  });
   try {
-    await bulkLoaderHaltFetch(`${bulkLoaderHaltBase}/load/start`, { method: "POST" });
-  } catch { /* tolerate unreachable bulk-loader */ }
+    const topo = await discoverBulkLoaderTopology(fetchOne);
+    const attempts = bulkLoaderFanOutAttempts(topo.replicas);
+    await Promise.allSettled(
+      Array.from({ length: attempts }, () =>
+        bulkLoaderHaltFetch(`${bulkLoaderHaltBase}/load/start`, { method: "POST" }),
+      ),
+    );
+  } catch {
+    try {
+      await bulkLoaderHaltFetch(`${bulkLoaderHaltBase}/load/start`, { method: "POST" });
+    } catch { /* tolerate unreachable bulk-loader */ }
+  }
 }
 
 function pickInt(...vals: Array<number | undefined>): number | undefined {
@@ -231,110 +417,39 @@ export function registerIngestRoutes(
   const fetchImpl = opts.fetchImpl ?? (globalThis.fetch as typeof fetch);
   const availableCores = opts.availableCores ?? availableParallelism;
   const schemaPath = resolveSchemaPath(opts);
+  ingestRuntime = {
+    schema,
+    schemaPath,
+    bulkBase,
+    fetchImpl,
+    availableCores,
+    log: app.log,
+  };
   configureBulkLoaderHalt(bulkBase, fetchImpl);
 
   app.post<{ Body: BulkRunBody }>(
     "/ingest/bulk/start",
     { config: { category: "heavy-ingest" } },
     async (req, reply) => {
-      if (!schema) {
-        reply.code(503);
-        return { ok: false, error: "schema not loaded" };
-      }
       const body = (req.body ?? {}) as BulkRunBody;
-      const rowsTotal = pickInt(body.rowsTotal, body.rows);
-      if (rowsTotal === undefined || !Number.isInteger(rowsTotal) || rowsTotal < 1) {
-        reply.code(400);
-        return { ok: false, error: "rows must be a positive integer" };
-      }
-      const batchSize = clamp(body.batch_size ?? DEFAULT_BATCH_SIZE, 1, MAX_BATCH_SIZE);
-      const concurrency = clamp(body.concurrency ?? DEFAULT_CONCURRENCY, 1, MAX_CONCURRENCY);
-      // Wave 7.0.6.15 — host-aware worker cap. The UI exposes a slider that
-      // /admin/host-info pre-fills with cores-2; the route still clamps so
-      // a hand-rolled curl can't oversubscribe the host.
-      const requestedWorkers = pickInt(body.workers) ?? 1;
-      const hostCores = Math.max(1, availableCores());
-      const workers = clamp(
-        Number.isInteger(requestedWorkers) ? requestedWorkers : 1,
-        1,
-        Math.min(MAX_WORKERS, hostCores),
-      );
-
-      const classes = (Array.isArray(body.classes) && body.classes.length > 0
-        ? body.classes
-        : [...DEFAULT_CLASSES]).map(String);
-      const sensitivityTypes = Array.isArray(body.sensitivity_types) && body.sensitivity_types.length > 0
-        ? body.sensitivity_types.map(String)
-        : [...DEFAULT_SENSITIVITY_TYPES];
-
       await resumeBulkLoaderAccept();
-
-      const run_id = ulid();
-      const started_at_iso = new Date().toISOString();
-      const record: BulkRunRecord = {
-        run_id,
-        status: "running",
-        rows_total: rowsTotal,
-        rows_sent: 0,
-        rows_skipped: 0,
-        batch_size: batchSize,
-        concurrency,
-        workers,
-        started_at_iso,
-        ms: 0,
-        bulk_loader_base: bulkBase,
-      };
-      activeRuns.set(run_id, record);
-
-      // Wave 7.0.6.15 — workers=1 stays on the inline path so the
-      // single-worker bit-equivalence canary holds (CLI mirrors this skip).
-      if (workers === 1) {
-        runInline({
-          schema,
-          body,
-          rowsTotal,
-          batchSize,
-          concurrency,
-          classes,
-          sensitivityTypes,
-          bulkBase,
-          fetchImpl,
-          log: app.log,
-          record,
-          run_id,
-        });
-      } else {
-        if (!schemaPath) {
-          reply.code(503);
-          activeRuns.delete(run_id);
-          return { ok: false, error: "schemaPath not resolvable for multi-worker run" };
-        }
-        runWithWorkers({
-          schemaPath,
-          body,
-          rowsTotal,
-          batchSize,
-          concurrency,
-          classes,
-          sensitivityTypes,
-          bulkBase,
-          workers,
-          log: app.log,
-          record,
-          run_id,
-        });
+      const flushedAtStart = await captureBulkLoaderFlushBaseline(bulkBase, fetchImpl);
+      const started = startBulkIngestRun(ingestRuntime!, body, flushedAtStart);
+      if (!started.ok) {
+        reply.code(started.status);
+        return { ok: false, error: started.error };
       }
-
+      const record = activeRuns.get(started.run_id)!;
       reply.code(202);
       return {
         ok: true,
-        run_id,
-        rows_total: rowsTotal,
-        batch_size: batchSize,
-        concurrency,
-        workers,
+        run_id: started.run_id,
+        rows_total: started.rows_total,
+        batch_size: record.batch_size,
+        concurrency: record.concurrency,
+        workers: started.workers,
         bulk_loader_base: bulkBase,
-        started_at_iso,
+        started_at_iso: record.started_at_iso,
       };
     },
   );
@@ -370,6 +485,25 @@ export function registerIngestRoutes(
   // Wave 7.0.8 — orphan discovery for UI reconnect after refresh (mirrors
   // GET /generator/runs). Returns running bulk-loader producer runs only.
   app.get(
+    "/ingest/bulk/runs/history",
+    { config: { category: "light" } },
+    async () => ({ runs: listRunHistory() }),
+  );
+
+  app.get<{ Params: { run_id: string } }>(
+    "/ingest/bulk/runs/history/:run_id",
+    { config: { category: "light" } },
+    async (req, reply) => {
+      const entry = getRunHistoryEntry(req.params.run_id);
+      if (!entry) {
+        reply.code(404);
+        return { error: "run not found in history" };
+      }
+      return entry;
+    },
+  );
+
+  app.get(
     "/ingest/bulk/runs",
     { config: { category: "light" } },
     async () => {
@@ -399,19 +533,40 @@ export function registerIngestRoutes(
       const rps = r.status === "running" && r.ms > 0
         ? Math.round((r.rows_sent * 1000) / r.ms)
         : 0;
-      // Strip non-serialisable fields (Int32Array view over SAB) and the
-      // per-worker bookkeeping maps (only the run-wide aggregates are part
-      // of the wire shape). Spread preserves every other key so the UI and
-      // existing tests see no shape change.
       const {
         cancelView: _cv,
         perWorkerThrottled: _pwt,
         perWorkerRetries: _pwr,
         perWorkerThrottledAt: _pwa,
+        httpAbort: _ha,
+        workerHandles: _wh,
+        cancelled: _c,
         ...wireFields
       } = r;
-      void _cv; void _pwt; void _pwr; void _pwa;
-      return { ...wireFields, rows_per_sec: rps };
+      void _cv; void _pwt; void _pwr; void _pwa; void _ha; void _wh; void _c;
+
+      let snapshotFields: Record<string, unknown> = {};
+      try {
+        const fetchOne = createBulkLoaderStatusFetch({ base: bulkBase, fetchImpl });
+        const topo = await discoverBulkLoaderTopology(fetchOne);
+        const agg = await fetchAggregatedBulkLoadStatus(fetchOne, topo.replicas);
+        const snap = buildSnapshotRun(r, agg, sumFlushed(agg), Date.now());
+        snapshotFields = {
+          rows_written: snap.rows_written,
+          rows_per_sec_write: snap.rows_per_sec_write,
+          rows_per_sec_producer: snap.rows_per_sec_producer,
+          phase: snap.phase,
+        };
+      } catch {
+        snapshotFields = {
+          rows_written: r.flushed_at_start != null ? 0 : 0,
+          rows_per_sec_write: 0,
+          rows_per_sec_producer: rps,
+          phase: r.status === "error" ? "error" : r.status === "cancelled" ? "cancelled" : "producing",
+        };
+      }
+
+      return { ...wireFields, rows_per_sec: rps, ...snapshotFields };
     },
   );
 
@@ -420,17 +575,30 @@ export function registerIngestRoutes(
     { config: { category: "light" } },
     async (_req, reply) => {
       try {
-        const res = await fetchImpl(`${bulkBase}/load/status`, { method: "GET" });
-        const text = await res.text();
-        reply.code(res.status);
-        reply.header("content-type", res.headers.get("content-type") ?? "application/json");
-        return text;
+        const fetchOne = createBulkLoaderStatusFetch({
+          base: bulkBase,
+          fetchImpl,
+        });
+        const topo = await discoverBulkLoaderTopology(fetchOne);
+        const agg = await fetchAggregatedBulkLoadStatus(fetchOne, topo.replicas);
+        reply.code(200);
+        reply.header("content-type", "application/json");
+        return agg;
       } catch (err) {
         reply.code(502);
         return { error: "bulk-loader unreachable", detail: err instanceof Error ? err.message : String(err) };
       }
     },
   );
+
+  if (opts.getRedis) {
+    registerIngestSnapshotRoute(app, {
+      bulkBase,
+      fetchImpl,
+      getRedis: opts.getRedis,
+      listRuns: getAllBulkRunRecords,
+    });
+  }
 }
 
 // Test-only inspector — used by ingest.test.ts to assert run tracking.
@@ -466,16 +634,35 @@ export function cancelAllBulkRuns(): string[] {
   return run_ids;
 }
 
+function archiveTerminalRun(
+  record: BulkRunRecord,
+  ctx: { bulkBase: string; fetchImpl: typeof fetch },
+): void {
+  const status = record.status;
+  if (status === "running") return;
+  void archiveBulkRunHistory(
+    {
+      run_id: record.run_id,
+      status,
+      rows_total: record.rows_total,
+      rows_sent: record.rows_sent,
+      rows_skipped: record.rows_skipped,
+      batch_size: record.batch_size,
+      concurrency: record.concurrency,
+      workers: record.workers,
+      started_at_iso: record.started_at_iso,
+      ms: record.ms,
+      bulk_loader_base: record.bulk_loader_base,
+      flushed_at_start: record.flushed_at_start,
+      ...(record.error ? { error: record.error } : {}),
+    },
+    ctx,
+  ).catch(() => { /* best-effort */ });
+}
+
 // ---------------------------------------------------------------------------
 // Wave 7.0.6.15 — run executors
 // ---------------------------------------------------------------------------
-
-// Logger surface narrow enough that both fastify's pino instance and the
-// console satisfy it without an explicit dependency on pino.
-interface RouteLogger {
-  warn: (...args: unknown[]) => void;
-  info?: (...args: unknown[]) => void;
-}
 
 interface InlineRunArgs {
   schema: Schema;
@@ -576,6 +763,7 @@ function runInline(args: InlineRunArgs): void {
         );
       }
     } finally {
+      archiveTerminalRun(record, { bulkBase, fetchImpl });
       setTimeout(() => activeRuns.delete(run_id), RUN_GRACE_MS).unref?.();
     }
   })();
@@ -590,6 +778,7 @@ interface WorkerRunArgs {
   classes: string[];
   sensitivityTypes: string[];
   bulkBase: string;
+  fetchImpl: typeof fetch;
   workers: number;
   log: RouteLogger;
   record: BulkRunRecord;
@@ -603,7 +792,7 @@ interface WorkerRunArgs {
 // SharedArrayBuffer Int32 polled inside each worker every 1024 rows.
 function runWithWorkers(args: WorkerRunArgs): void {
   const { schemaPath, body, rowsTotal, batchSize, concurrency, classes, sensitivityTypes,
-    bulkBase, workers, log, record, run_id } = args;
+    bulkBase, fetchImpl, workers, log, record, run_id } = args;
 
   const cancelBuffer = new SharedArrayBuffer(4);
   const cancelView = new Int32Array(cancelBuffer);
@@ -753,6 +942,7 @@ function runWithWorkers(args: WorkerRunArgs): void {
         "multi-worker bulk ingest threw",
       );
     } finally {
+      archiveTerminalRun(record, { bulkBase, fetchImpl });
       setTimeout(() => activeRuns.delete(run_id), RUN_GRACE_MS).unref?.();
     }
   })();

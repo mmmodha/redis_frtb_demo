@@ -1202,6 +1202,13 @@ export function cancelAllActiveRuns(): string[] {
   return run_ids;
 }
 
+export function hasRunningGeneratorRuns(): boolean {
+  for (const entry of activeRuns.values()) {
+    if (entry.status === "running") return true;
+  }
+  return false;
+}
+
 // Wave 6.44.E — proxy the halt-and-flush call to ingest. Returns the parsed
 // upstream report on success; `null` (with a logged warning) on any failure
 // so the caller can degrade to a partial-success banner without a 5xx. The

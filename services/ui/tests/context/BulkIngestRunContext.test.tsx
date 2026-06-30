@@ -2,8 +2,9 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { render, waitFor } from "@testing-library/react";
-import { BulkIngestRunProvider, useBulkIngestRun } from "../../src/context/BulkIngestRunContext";
+import { BulkIngestRunProvider, useBulkIngestRun, useIngestRun } from "../../src/context/BulkIngestRunContext";
 import { BULK_INGEST_STORAGE_KEY } from "../../src/lib/bulkIngestState";
+import { SUMMARY_VISIBLE_MS } from "../../src/lib/ingestRunState";
 
 function makeMemoryStorage(): Storage {
   const m = new Map<string, string>();
@@ -62,6 +63,31 @@ describe("BulkIngestRunContext", () => {
             started_at_iso: new Date().toISOString(),
             bulk_loader_base: "http://bl:8086",
             rows_per_sec: 4200,
+            rows_written: 4200,
+          }),
+        };
+      }
+      if (url.endsWith("/ingest/snapshot")) {
+        return {
+          ok: true,
+          json: async () => ({
+            ok: true,
+            target_label: "local",
+            cluster: { sens_count: 0, sens_count_refreshing: false, memory_bytes: 0, memory_human: "0B" },
+            loader: { in_flight: 0, flush_rps: 4200, flushed_total: 4200, throttled: false, recent_429_count: 0 },
+            runs: [{
+              run_id: "01RESUME",
+              status: "running",
+              rows_total: 10_000,
+              rows_sent: 4200,
+              rows_written: 4200,
+              rows_per_sec_producer: 4200,
+              rows_per_sec_write: 4200,
+              phase: "producing",
+              workers: 2,
+              started_at_iso: new Date().toISOString(),
+            }],
+            focused_run_id: "01RESUME",
           }),
         };
       }
@@ -150,6 +176,31 @@ describe("BulkIngestRunContext", () => {
             started_at_iso: new Date().toISOString(),
             bulk_loader_base: "http://bl:8086",
             rows_per_sec: 0,
+            rows_written: 1000,
+          }),
+        };
+      }
+      if (url.endsWith("/ingest/snapshot")) {
+        return {
+          ok: true,
+          json: async () => ({
+            ok: true,
+            target_label: "local",
+            cluster: { sens_count: 0, sens_count_refreshing: false, memory_bytes: 0, memory_human: "0B" },
+            loader: { in_flight: 0, flush_rps: 0, flushed_total: 1000, throttled: false, recent_429_count: 0 },
+            runs: [{
+              run_id: "01CANCEL",
+              status,
+              rows_total: 10_000,
+              rows_sent: 1000,
+              rows_written: 1000,
+              rows_per_sec_producer: 0,
+              rows_per_sec_write: 0,
+              phase: "producing",
+              workers: 2,
+              started_at_iso: new Date().toISOString(),
+            }],
+            focused_run_id: "01CANCEL",
           }),
         };
       }
@@ -194,9 +245,95 @@ describe("BulkIngestRunContext", () => {
     await waitFor(() => {
       expect(status).toBe("cancelled");
     });
-    vi.advanceTimersByTime(4_500);
+    vi.advanceTimersByTime(SUMMARY_VISIBLE_MS + 100);
     await waitFor(() => {
       expect(document.querySelector('[data-testid="run-id"]')?.textContent).toBe("");
     });
+  });
+
+  it("keeps polling progress while the ingest panel is unmounted", async () => {
+    localStorage.setItem(BULK_INGEST_STORAGE_KEY, JSON.stringify({
+      run_id: "01NAV",
+      rows_total: 50_000,
+      started_at: Date.now(),
+    }));
+    let rowsSent = 12_000;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo) => {
+      const url = String(input);
+      if (url.includes("/ingest/bulk/runs/01NAV")) {
+        return {
+          ok: true,
+          json: async () => ({
+            run_id: "01NAV",
+            status: "running",
+            rows_total: 50_000,
+            rows_sent: rowsSent,
+            rows_skipped: 0,
+            batch_size: 500,
+            concurrency: 32,
+            ms: 2000,
+            started_at_iso: new Date().toISOString(),
+            bulk_loader_base: "http://bl:8086",
+            rows_per_sec: 6000,
+            rows_written: rowsSent,
+          }),
+        };
+      }
+      if (url.endsWith("/ingest/snapshot")) {
+        return {
+          ok: true,
+          json: async () => ({
+            ok: true,
+            target_label: "local",
+            cluster: { sens_count: 0, sens_count_refreshing: false, memory_bytes: 0, memory_human: "0B" },
+            loader: { in_flight: 2, flush_rps: 6000, flushed_total: rowsSent, throttled: false, recent_429_count: 0 },
+            runs: [{
+              run_id: "01NAV",
+              status: "running",
+              rows_total: 50_000,
+              rows_sent: rowsSent,
+              rows_written: rowsSent,
+              rows_per_sec_producer: 6000,
+              rows_per_sec_write: 6000,
+              phase: "producing",
+              workers: 4,
+              started_at_iso: new Date().toISOString(),
+            }],
+            focused_run_id: "01NAV",
+          }),
+        };
+      }
+      if (url.endsWith("/ingest/bulk/runs")) {
+        return { ok: true, json: async () => ({ active: [] }) };
+      }
+      return { ok: true, json: async () => ({}) };
+    }));
+
+    function Shell({ onIngestPage }: { onIngestPage: boolean }) {
+      const { view } = useIngestRun();
+      return (
+        <div>
+          <span data-testid="page">{onIngestPage ? "ingest" : "other"}</span>
+          <span data-testid="written">{view.written}</span>
+        </div>
+      );
+    }
+
+    const { rerender } = render(
+      <BulkIngestRunProvider><Shell onIngestPage /></BulkIngestRunProvider>,
+    );
+    await waitFor(() => {
+      expect(document.querySelector('[data-testid="written"]')?.textContent).toBe("12000");
+    });
+
+    rerender(<BulkIngestRunProvider><Shell onIngestPage={false} /></BulkIngestRunProvider>);
+    rowsSent = 18_000;
+    vi.advanceTimersByTime(1_100);
+    await waitFor(() => {
+      expect(document.querySelector('[data-testid="written"]')?.textContent).toBe("18000");
+    });
+
+    rerender(<BulkIngestRunProvider><Shell onIngestPage /></BulkIngestRunProvider>);
+    expect(document.querySelector('[data-testid="written"]')?.textContent).toBe("18000");
   });
 });

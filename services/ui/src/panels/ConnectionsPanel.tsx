@@ -25,6 +25,7 @@ import {
   type ConnectionProfile,
   type ConnectionTestResult,
 } from "../lib/connections";
+import { ConnectionWizard } from "./ConnectionWizard";
 
 const LOCKOUT_TITLE = "Cannot switch targets while runs are in flight";
 
@@ -462,14 +463,24 @@ export function ConnectionsPanel() {
         ) : null}
       </PanelCard>
 
-      {dialog.kind !== "closed" ? (
+      {dialog.kind === "add" ? (
+        <ConnectionWizard
+          onCancel={() => { setDialog({ kind: "closed" }); setDialogBanner(null); }}
+          onSubmit={(input) => onSubmitDialog("add", input)}
+          bannerError={dialogBanner?.message ?? null}
+          onSwitchToEdit={
+            dialogBanner?.existingId
+              ? () => onSwitchToEdit(dialogBanner.existingId!)
+              : null
+          }
+        />
+      ) : null}
+
+      {dialog.kind === "edit" ? (
         <ConnectionDialog
-          // Wave 5.60 — `key` forces a remount when the dialog target changes
-          // (e.g. Switch-to-Edit hops Add → Edit on a specific profile). The
-          // form's internal useState would otherwise persist the prior values.
-          key={dialog.kind === "edit" ? `edit-${dialog.profile.id}` : "add"}
-          mode={dialog.kind}
-          initial={dialog.kind === "edit" ? inputFromProfile(dialog.profile) : emptyInput()}
+          key={`edit-${dialog.profile.id}`}
+          mode="edit"
+          initial={inputFromProfile(dialog.profile)}
           onCancel={() => { setDialog({ kind: "closed" }); setDialogBanner(null); }}
           onSubmit={onSubmitDialog}
           bannerError={dialogBanner?.message ?? null}

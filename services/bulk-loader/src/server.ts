@@ -19,10 +19,14 @@
 //                          malformed body, 5xx on dispatcher failure.
 
 import Fastify, { type FastifyInstance } from "fastify";
+import { hostname } from "node:os";
 import type { WorkerPool } from "./pool.ts";
 import type { DispatcherHandle, Row } from "./dispatcher.ts";
 import type { CheckpointRecord } from "./checkpoint.ts";
 import { createBulkLoaderState, type BulkLoaderState } from "./swap-target.ts";
+
+/** Stable per-process id surfaced on /load/status for replica discovery (Compose scale). */
+export const BULK_LOADER_INSTANCE_ID = `${hostname()}:${process.pid}`;
 
 export interface CreateServerOpts {
   // Wave 7.0.6.17 — preferred: pass a `state` holder so the active-target
@@ -147,6 +151,7 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
     // The UI banner + operator tools use this to detect the awaiting state.
     if (!state.pool) {
       return {
+        instance_id: BULK_LOADER_INSTANCE_ID,
         pool_size: 0,
         connected: 0,
         dispatcher: null,
@@ -228,6 +233,7 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
     }
     const throttled = recent429Count > 0 || (headroomPct !== null && headroomPct < 0.2);
     return {
+      instance_id: BULK_LOADER_INSTANCE_ID,
       pool_size: s.poolSize,
       connected: s.connected,
       dispatcher: d

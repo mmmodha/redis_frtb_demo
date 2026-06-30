@@ -8,6 +8,7 @@
 import { useState } from "react";
 import { useBootstrapStatus } from "../hooks/useBootstrapStatus";
 import { activateConnection, listConnections } from "../lib/connections";
+import { isBootstrapSettled } from "../lib/bootstrap-status";
 
 export function BootstrapStatusOverlay() {
   const { snapshot, refresh } = useBootstrapStatus();
@@ -15,7 +16,7 @@ export function BootstrapStatusOverlay() {
   const [retryError, setRetryError] = useState<string | null>(null);
 
   const phase = snapshot?.phase ?? "idle";
-  if (phase === "idle" || phase === "ready") return null;
+  if (isBootstrapSettled(phase)) return null;
 
   const targetLabel = snapshot?.target_label ?? "active target";
 
