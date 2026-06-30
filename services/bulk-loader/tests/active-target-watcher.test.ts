@@ -80,8 +80,10 @@ describe("active-target watcher — Wave 7.0.6.17", () => {
       fetchImpl, onSwitch, logger: { info: () => { }, warn: () => { } },
     });
     const first = w.pollOnce();
-    // Yield a few microtasks so the in-flight flag is set before the next call.
-    for (let i = 0; i < 5; i++) await Promise.resolve();
+    // Yield until the first poll enters onSwitch (fetch + applySwitch are async).
+    for (let i = 0; i < 50 && onSwitch.mock.calls.length === 0; i++) {
+      await Promise.resolve();
+    }
     const second = await w.pollOnce(); // should no-op while first is parked
     expect(second).toBeUndefined();
     expect(onSwitch).toHaveBeenCalledTimes(1);

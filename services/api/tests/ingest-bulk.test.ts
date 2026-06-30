@@ -35,6 +35,9 @@ function hangingProducerFetch(
         headers: { "content-type": "application/json" },
       }));
     }
+    if (u.includes("/load/start") || u.includes("/load/stop")) {
+      return Promise.resolve(new Response("{}", { status: 200, headers: { "content-type": "application/json" } }));
+    }
     return new Promise<Response>(() => { /* hang producer */ });
   }) as typeof fetch;
 }
