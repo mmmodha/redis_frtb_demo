@@ -75,6 +75,15 @@ function fmtProgress(done: number, total: number): string {
   return `${done.toLocaleString("en-US")} / ${total.toLocaleString("en-US")} (${pct}%)`;
 }
 
+/** Rows written to Redis for this run — matches IngestSnapshotCard. */
+function bulkRunProgressDone(run: ActiveBulkIngestRun): number {
+  const written = run.rows_written;
+  if (typeof written === "number" && Number.isFinite(written) && written >= 0) {
+    return written;
+  }
+  return run.rows_sent;
+}
+
 export interface ActiveJobsCardProps {
   onSnapshot?: (snap: ActiveJobsSnapshot) => void;
   onRequestStopAll?: () => void;
@@ -212,7 +221,7 @@ export function ActiveJobsCard(props: ActiveJobsCardProps): JSX.Element {
                       {typeof r.workers === "number" ? ` · ${r.workers} workers` : ""}
                     </td>
                     <td><code>{r.run_id}</code></td>
-                    <td>{fmtProgress(r.rows_sent, r.rows_total)}</td>
+                    <td>{fmtProgress(bulkRunProgressDone(r), r.rows_total)}</td>
                     <td>
                       <button
                         type="button"

@@ -276,6 +276,8 @@ export interface ActiveBulkIngestRun {
   run_id: string;
   status: string;
   rows_sent: number;
+  /** Run-scoped rows flushed to Redis (matches ingest snapshot). */
+  rows_written?: number;
   rows_total: number;
   started_at_iso?: string;
   workers?: number;

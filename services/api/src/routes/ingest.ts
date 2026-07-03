@@ -525,16 +525,28 @@ export function registerIngestRoutes(
     "/ingest/bulk/runs",
     { config: { category: "light" } },
     async () => {
-      const active = Array.from(activeRuns.values())
-        .filter((r) => r.status === "running")
-        .map((r) => ({
+      const running = Array.from(activeRuns.values()).filter((r) => r.status === "running");
+      let loaderSnap: Awaited<ReturnType<typeof fetchAggregatedBulkLoadStatus>> = { workers: [] };
+      let flushedTotal = 0;
+      try {
+        const fetchOne = createBulkLoaderStatusFetch({ base: bulkBase, fetchImpl });
+        const topo = await discoverBulkLoaderTopology(fetchOne);
+        loaderSnap = await fetchAggregatedBulkLoadStatus(fetchOne, topo.replicas);
+        flushedTotal = sumFlushed(loaderSnap);
+      } catch { /* bulk-loader unreachable — rows_written falls back to 0 */ }
+      const now = Date.now();
+      const active = running.map((r) => {
+        const snap = buildSnapshotRun(r, loaderSnap, flushedTotal, now);
+        return {
           run_id: r.run_id,
           status: r.status,
           rows_sent: r.rows_sent,
+          rows_written: snap.rows_written,
           rows_total: r.rows_total,
           started_at_iso: r.started_at_iso,
           workers: r.workers,
-        }));
+        };
+      });
       return { active };
     },
   );

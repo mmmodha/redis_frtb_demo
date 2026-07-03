@@ -47,15 +47,16 @@ describe("<ActiveJobsCard />", () => {
     expect(screen.getByTestId("active-jobs-card")).toHaveAttribute("data-status", "idle");
   });
 
-  it("lists active bulk-ingest runs", async () => {
+  it("lists active bulk-ingest runs using rows_written for progress", async () => {
     stubFetch({
       bulkRuns: {
         active: [{
           run_id: "01BULK",
           status: "running",
-          rows_sent: 1000,
-          rows_total: 50000,
-          workers: 4,
+          rows_sent: 22_000_000,
+          rows_written: 10_675_314,
+          rows_total: 100_000_000,
+          workers: 8,
         }],
       },
     });
@@ -63,6 +64,7 @@ describe("<ActiveJobsCard />", () => {
     await waitFor(() => {
       expect(screen.getByTestId("active-job-bulk-01BULK")).toBeInTheDocument();
     });
+    expect(screen.getByTestId("active-job-bulk-01BULK")).toHaveTextContent("10,675,314 / 100,000,000");
     expect(screen.getByTestId("active-jobs-card")).toHaveAttribute("data-status", "active");
   });
 
