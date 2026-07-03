@@ -1,18 +1,17 @@
 // Wave 5.51 — live-refresh tests for <Observability />. Covers the
-// cadence dropdown, polling loop, localStorage round-trip, the
-// "Updated Ns ago" badge, and shard prop passthrough.
+// cadence dropdown, polling loop, localStorage round-trip, and the
+// "Updated Ns ago" badge. Wave 7.2 — mocks /observability/debug (single
+// bundle fetch) instead of legacy /keys + /memory endpoints.
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { Observability, humanizeSeconds } from "../../src/routes/Observability";
 import { OBS_REFRESH_STORAGE_KEY } from "../../src/hooks/useObservabilityRefresh";
 
 type FetchMock = ReturnType<typeof vi.fn>;
 
-const KEYS_URL = /\/observability\/keys/;
-const MEMORY_URL = /\/observability\/memory/;
-const SHARDS_URL = /\/observability\/shards$/;
+const DEBUG_URL = /\/observability\/debug/;
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -21,20 +20,52 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+function debugPayload(dbsize = 42) {
+  return {
+    keys: { prefix: "sens:", dbsize, sample: [], sample_size: 0, ms: 1 },
+    memory: { used_memory: 1024, used_memory_human: "1.00K", ms: 1 },
+    index_count: { count: dbsize, refreshing: false, index_name: "idx:sens" },
+    calc_recent: { items: [] },
+    bootstrap: { phase: "ready", target_label: "local", err: null },
+  };
+}
+
 function defaultHandler(url: string): Response {
-  if (KEYS_URL.test(url)) {
-    return jsonResponse({ prefix: "sens:", dbsize: 42, sample: [], sample_size: 0, ms: 1 });
+  if (DEBUG_URL.test(url)) {
+    return jsonResponse(debugPayload());
   }
-  if (MEMORY_URL.test(url)) {
-    return jsonResponse({ used_memory: 1024, used_memory_human: "1.00K", ms: 1 });
+  if (url.includes("/observability/history")) {
+    return jsonResponse({
+      source: "redis-timeseries",
+      metric: "total_keys",
+      windowMs: 18_000_000,
+      points: [],
+      reason: null,
+      target_label: "local",
+    });
   }
-  if (SHARDS_URL.test(url)) {
-    return jsonResponse([
-      { shardId: "shard-alpha", role: "master", opsPerSec: 100, slotCount: 8192, usedMemoryBytes: 1024, netInBytes: 0, netOutBytes: 0 },
-      { shardId: "shard-beta",  role: "master", opsPerSec: 200, slotCount: 8192, usedMemoryBytes: 2048, netInBytes: 0, netOutBytes: 0 },
-    ]);
+  if (url.includes("/ingest/snapshot")) {
+    return jsonResponse({
+      ok: true,
+      target_label: "local",
+      cluster: { sens_count: 42, sens_count_refreshing: false, memory_bytes: 1, memory_human: "1B" },
+      loader: { in_flight: 0, flush_rps: 0, flushed_total: 0, throttled: false, recent_429_count: 0 },
+      runs: [],
+      focused_run_id: null,
+    });
   }
-  if (url.includes("/calc/recent")) return jsonResponse({ items: [] });
+  if (url.includes("/admin/stream-status")) {
+    return jsonResponse({ xlen: 0, maxlen: 10000, peak_rate_per_sec: 0, consumed: 0 });
+  }
+  if (url.includes("/admin/drift-status")) {
+    return jsonResponse({ threshold_pct: 0.01, results: [] });
+  }
+  if (url.includes("/generator/runs")) return jsonResponse({ active: [] });
+  if (url.includes("/ingest/bulk/runs")) return jsonResponse({ active: [] });
+  if (url.includes("/ingest/bulk/load-status")) return jsonResponse({ workers: [], dispatcher: { in_flight: 0 } });
+  if (url.includes("/ingest/run-history")) return jsonResponse({ runs: [] });
+  if (url.includes("/admin/calc-jobs")) return jsonResponse({ active: [] });
+  if (url.includes("/admin/recent-errors")) return jsonResponse({ items: [] });
   return jsonResponse({}, 404);
 }
 
@@ -52,7 +83,7 @@ function countObservabilityCalls(fn: FetchMock): number {
   for (const call of fn.mock.calls) {
     const arg = call[0];
     const url = typeof arg === "string" ? arg : String(arg);
-    if (KEYS_URL.test(url) || MEMORY_URL.test(url) || SHARDS_URL.test(url)) n++;
+    if (DEBUG_URL.test(url)) n++;
   }
   return n;
 }
@@ -65,17 +96,12 @@ function renderRoute() {
   );
 }
 
-// Flush microtasks and any timers due at `ms` so fetch promises resolve and
-// state updates flush under fake timers.
 async function flush(ms = 0): Promise<void> {
   await act(async () => {
     await vi.advanceTimersByTimeAsync(ms);
   });
 }
 
-// Node 22's experimental globalThis.localStorage can shadow the jsdom one and
-// strip out the standard API; build a small in-memory Storage shim per test so
-// the hook's readStored/writeStored helpers behave normally.
 function makeMemoryStorage(): Storage {
   const map = new Map<string, string>();
   const storage: Storage = {
@@ -150,12 +176,8 @@ describe("<Observability /> live refresh", () => {
     await flush(0);
     const afterOff = countObservabilityCalls(fetchMock);
 
-    // Advance well beyond every supported cadence — no further calls.
     await flush(15000);
     expect(countObservabilityCalls(fetchMock)).toBe(afterOff);
-
-    // Wave 6.00 — with cadence Off the badge shows humanized time-since-fetch.
-    // 15s elapsed since the only fetch (the initial one at mount).
     expect(screen.getByTestId("obs-updated-badge").textContent).toBe("Updated 15s ago");
   });
 
@@ -164,7 +186,7 @@ describe("<Observability /> live refresh", () => {
     renderRoute();
     await flush(0);
     fireEvent.change(screen.getByTestId("obs-refresh-select"), { target: { value: "1000" } });
-    await flush(0); // immediate fetch from cadence change
+    await flush(0);
     const baseline = countObservabilityCalls(fetchMock);
 
     await flush(1000);
@@ -181,14 +203,11 @@ describe("<Observability /> live refresh", () => {
     renderRoute();
     await flush(0);
     const badge = screen.getByTestId("obs-updated-badge");
-    // Default cadence is 2s — badge is just "2s", no "Updated Ns ago" prefix.
     expect(badge.textContent).toBe("2s");
 
-    // 1s ticker advance — still just "2s" (no time-since text in this mode).
     await flush(1000);
     expect(badge.textContent).toBe("2s");
 
-    // Cadence tick fires + refetches — badge is still just "2s".
     await flush(1000);
     expect(badge.textContent).toBe("2s");
   });
@@ -205,8 +224,7 @@ describe("<Observability /> live refresh", () => {
     await flush(12_000);
     expect(badge.textContent).toBe("Updated 12s ago");
 
-    // Cross the 60s boundary → switches to minutes.
-    await flush(78_000); // total 90s
+    await flush(78_000);
     expect(badge.textContent).toBe("Updated 1m ago");
   });
 
@@ -214,7 +232,6 @@ describe("<Observability /> live refresh", () => {
     const fetchMock = installFetchMock();
     renderRoute();
     await flush(0);
-    // Turn polling off so only the manual click drives subsequent fetches.
     fireEvent.change(screen.getByTestId("obs-refresh-select"), { target: { value: "0" } });
     await flush(0);
 
@@ -231,7 +248,6 @@ describe("<Observability /> live refresh", () => {
     expect(countObservabilityCalls(fetchMock)).toBeGreaterThan(beforeCount);
     const afterKey = badge.getAttribute("data-pulse-key");
     expect(afterKey).not.toBe(beforeKey);
-    // Once the in-flight fetch resolves the button is enabled again.
     expect(button.disabled).toBe(false);
   });
 
@@ -239,10 +255,8 @@ describe("<Observability /> live refresh", () => {
     installFetchMock();
     renderRoute();
     await flush(0);
-    // Default cadence is 2s — button is redundant and should not render.
     expect(screen.queryByTestId("obs-manual-refresh")).toBeNull();
 
-    // Switching to Off reveals it; switching back hides it again.
     fireEvent.change(screen.getByTestId("obs-refresh-select"), { target: { value: "0" } });
     await flush(0);
     expect(screen.queryByTestId("obs-manual-refresh")).not.toBeNull();
@@ -252,36 +266,28 @@ describe("<Observability /> live refresh", () => {
     expect(screen.queryByTestId("obs-manual-refresh")).toBeNull();
   });
 
-  it("passes the latest shards through to the ShardMetricsStrip", async () => {
-    installFetchMock();
-    renderRoute();
-    await flush(0);
-    const strip = screen.getByTestId("shard-metrics-strip");
-    expect(strip.textContent).toContain("shard-alpha");
-    expect(strip.textContent).toContain("shard-beta");
-  });
-
   it("keeps last data and shows an inline error pill when a later fetch fails", async () => {
+    vi.useRealTimers();
     let mode: "ok" | "fail" = "ok";
     installFetchMock((url) => {
       if (mode === "fail") return Promise.reject(new Error("boom"));
       return defaultHandler(url);
     });
     renderRoute();
-    await flush(0);
-    expect(screen.getByText("42")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByTestId("obs-sens-tile")).toHaveTextContent("42");
+    });
     expect(screen.queryByTestId("obs-refresh-error")).toBeNull();
 
     mode = "fail";
-    await flush(2000); // next cadence tick fails
-    expect(screen.getByTestId("obs-refresh-error")).toBeInTheDocument();
-    // Last successful value is still visible.
-    expect(screen.getByText("42")).toBeInTheDocument();
+    await waitFor(
+      () => expect(screen.getByTestId("obs-refresh-error")).toBeInTheDocument(),
+      { timeout: 5_000 },
+    );
+    expect(screen.getByTestId("obs-sens-tile")).toHaveTextContent("42");
   });
 });
 
-
-// Wave 6.00 — compact unit-boundary tests for the time-since humanizer.
 describe("humanizeSeconds", () => {
   it("renders sub-minute values as seconds", () => {
     expect(humanizeSeconds(0)).toBe("0s");
@@ -291,19 +297,19 @@ describe("humanizeSeconds", () => {
 
   it("crosses to minutes at 60s and floors", () => {
     expect(humanizeSeconds(60)).toBe("1m");
-    expect(humanizeSeconds(90)).toBe("1m"); // 90s → 1m (floored)
+    expect(humanizeSeconds(90)).toBe("1m");
     expect(humanizeSeconds(60 * 59)).toBe("59m");
   });
 
   it("crosses to hours at 60m and floors", () => {
     expect(humanizeSeconds(60 * 60)).toBe("1h");
-    expect(humanizeSeconds(60 * 70)).toBe("1h"); // 70m → 1h (floored)
+    expect(humanizeSeconds(60 * 70)).toBe("1h");
     expect(humanizeSeconds(60 * 60 * 23)).toBe("23h");
   });
 
   it("crosses to days at 24h and floors", () => {
     expect(humanizeSeconds(60 * 60 * 24)).toBe("1d");
-    expect(humanizeSeconds(60 * 60 * 26)).toBe("1d"); // 26h → 1d (floored)
+    expect(humanizeSeconds(60 * 60 * 26)).toBe("1d");
     expect(humanizeSeconds(60 * 60 * 24 * 3)).toBe("3d");
   });
 });

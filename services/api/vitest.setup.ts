@@ -22,3 +22,16 @@ if (process.env.CALC_ROLLUP_PATH === undefined) {
 if (process.env.CALC_FCALL_FALLBACK === undefined) {
   process.env.CALC_FCALL_FALLBACK = "1";
 }
+
+// Wave 7.2 — reset in-process diagnostic registries between tests so calc
+// job timers / error buffers from one case cannot slow or block the next.
+import { afterEach } from "vitest";
+import { __resetCalcJobsForTests } from "./src/calc/calc-jobs.ts";
+import { __resetRecentErrorsForTests } from "./src/ops/recent-errors.ts";
+import { __resetLogBufferForTests } from "./src/ops/log-buffer.ts";
+
+afterEach(() => {
+  __resetCalcJobsForTests();
+  __resetRecentErrorsForTests();
+  __resetLogBufferForTests();
+});
