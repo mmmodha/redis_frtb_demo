@@ -1,9 +1,25 @@
 // Total SBM benchmark ladder — presentation timings at row-scale increments.
 
-import { getActiveBulkIngestRuns, getIndexCount } from "./ingest";
+import { apiBase } from "./api";
+import { getActiveBulkIngestRuns } from "./ingest";
 import { getIngestRunHistory, type IngestRunHistoryEntry } from "./ingestRunHistory";
-import { getCalcCoverage, type CalcCoverageResponse } from "./admin";
+import type { CalcCoverageResponse } from "./admin";
 import { postCalcSbmTotal, type TotalSbmResponse } from "./calc";
+
+const PORTFOLIO_FETCH_TIMEOUT_MS = 15_000;
+const ROLLUP_PREFLIGHT_TIMEOUT_MS = 8_000;
+
+async function fetchJsonWithTimeout<T>(url: string, timeoutMs: number): Promise<T> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return (await res.json()) as T;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 /** Fixed portfolio scale steps for customer-facing benchmarks. */
 export const BENCHMARK_ROW_TIERS = [
@@ -145,18 +161,37 @@ export async function estimatePortfolioRows(): Promise<PortfolioRowEstimate> {
   } catch { /* fall through */ }
 
   try {
-    const { count } = await getIndexCount();
+    const facets = await fetchJsonWithTimeout<{ ok?: boolean; total_rows?: number }>(
+      `${apiBase()}/facets`,
+      PORTFOLIO_FETCH_TIMEOUT_MS,
+    );
+    if (facets.ok === true && typeof facets.total_rows === "number" && facets.total_rows > 0) {
+      return { rows: facets.total_rows, source: "sensitivity index (facets)" };
+    }
+  } catch { /* fall through */ }
+
+  try {
+    const body = await fetchJsonWithTimeout<{ count?: number }>(
+      `${apiBase()}/admin/index-count`,
+      PORTFOLIO_FETCH_TIMEOUT_MS,
+    );
+    const count = typeof body.count === "number" && body.count > 0 ? body.count : 0;
     if (count > 0) {
-      return { rows: count, source: "Redis index count (approx — run bulk ingest for exact)" };
+      return { rows: count, source: "Redis key count (approx — run bulk ingest for exact)" };
     }
   } catch { /* fall through */ }
 
   return { rows: 0, source: "unknown" };
 }
 
-export async function fetchRollupPreflight(): Promise<RollupPreflight | null> {
+export async function fetchRollupPreflight(
+  timeoutMs = ROLLUP_PREFLIGHT_TIMEOUT_MS,
+): Promise<RollupPreflight | null> {
   try {
-    const cov: CalcCoverageResponse = await getCalcCoverage();
+    const cov = await fetchJsonWithTimeout<CalcCoverageResponse>(
+      `${apiBase()}/admin/calc-coverage`,
+      timeoutMs,
+    );
     return {
       present: cov.summary?.present ?? 0,
       total: cov.summary?.total ?? 0,

@@ -183,9 +183,10 @@ export function BenchmarkingPanel() {
 
       {steps.length > 0 && (
         <p className="admin-stub benchmark-note">
-          At 10M rows with rollups, expect roughly 5–30s for one cold Total SBM. Without rollups,
-          a full index scan can take minutes. This benchmark never runs more than one cold calc
-          per click on the current cluster.
+          Click <strong>Run benchmark</strong> — when the runnable row shows Done, the{" "}
+          <strong>Wall time</strong> column holds <code>performance.total_ms</code> from the cold
+          Total SBM response. Lower ladder rows need a separate ingest at that scale (or a future
+          bucket-subset mode) before they can record their own timings.
         </p>
       )}
     </PanelCard>

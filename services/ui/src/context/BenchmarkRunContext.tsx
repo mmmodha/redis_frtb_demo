@@ -61,15 +61,15 @@ export function BenchmarkRunProvider({ children }: { children: ReactNode }): JSX
     if (benchmarkInFlight) return;
     setPhase("loading-rows");
     setRunError(null);
+    setRollup(null);
     try {
-      const [est, rollupSnap] = await Promise.all([
-        estimatePortfolioRows(),
-        fetchRollupPreflight(),
-      ]);
+      const est = await estimatePortfolioRows();
       setPortfolio(est);
-      setRollup(rollupSnap);
       setSteps(buildBenchmarkPlan(est.rows));
       setPhase("ready");
+      // Rollup preflight can take minutes on large clusters (/admin/calc-coverage
+      // 502s behind nginx) — never block the panel on it.
+      void fetchRollupPreflight().then(setRollup).catch(() => setRollup(null));
     } catch (err) {
       setRunError(err instanceof Error ? err.message : String(err));
       setPhase("error");
@@ -112,8 +112,12 @@ export function BenchmarkRunProvider({ children }: { children: ReactNode }): JSX
             idx === i ? { ...s, status: "running" } : s
           )));
           try {
+            const t0 = performance.now();
             const res = await runTotalSbmBenchmarkCold();
-            const wallMs = res.performance?.total_ms ?? null;
+            const apiMs = res.performance?.total_ms;
+            const wallMs = typeof apiMs === "number" && Number.isFinite(apiMs)
+              ? apiMs
+              : Math.round(performance.now() - t0);
             setSteps((prev) => prev.map((s, idx) => (
               idx === i
                 ? {
