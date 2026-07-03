@@ -66,8 +66,9 @@ export function BenchmarkingPanel() {
     <PanelCard title="Total SBM benchmark">
       <p className="admin-stub">
         Runs cold <code>POST /calc/sbm/total?nocache=1</code> at each ladder step using a{" "}
-        <strong>bucket subset</strong> (~target row count) from the loaded portfolio — no flush
-        required. Timings measure calc throughput at scale, not full-portfolio capital.
+        <strong>bucket subsets</strong> (~target rows, smallest buckets first) from the loaded
+        portfolio — <strong>no flush</strong>. Each ladder step runs a cold Total SBM on more
+        buckets; the Subset column shows the approx row count reached.
       </p>
 
       <div className="benchmark-summary" data-testid="benchmark-summary">

@@ -124,19 +124,48 @@ function latestCompletedIngestRun(runs: IngestRunHistoryEntry[]): IngestRunHisto
 }
 
 /**
+ * Sum of per-bucket row counts — best sensitivity-row total for subset sizing.
+ */
+export function totalRowsFromBucketFacets(facets: BucketFacetRow[]): number {
+  let total = 0;
+  for (const f of facets) {
+    if (f.count > 0) total += f.count;
+  }
+  return total;
+}
+
+/** Prefer facet sum over DBSIZE / key-count when bucket facets are available. */
+export function resolveBenchmarkPortfolioRows(
+  est: PortfolioRowEstimate,
+  bucketFacets: BucketFacetRow[],
+): PortfolioRowEstimate {
+  const facetTotal = totalRowsFromBucketFacets(bucketFacets);
+  if (facetTotal <= 0) return est;
+  return {
+    rows: facetTotal,
+    source: "bucket facets (sum of counts)",
+  };
+}
+
+function sortBucketsForSubset(facets: BucketFacetRow[]): BucketFacetRow[] {
+  return [...facets]
+    .filter((f) => f.count > 0)
+    .sort((a, b) => {
+      if (a.count !== b.count) return a.count - b.count;
+      const rc = a.risk_class.localeCompare(b.risk_class);
+      return rc !== 0 ? rc : a.bucket.localeCompare(b.bucket);
+    });
+}
+
+/**
  * Greedy deterministic bucket pick until cumulative row count reaches target.
- * Nested tiers (10M ⊂ 50M ⊂ …) share a prefix so wall times scale monotonically.
+ * Smallest buckets first → tighter row approximations; nested tiers share a prefix.
  */
 export function selectBucketCellsForTarget(
   facets: BucketFacetRow[],
   targetRows: number,
 ): BucketSubsetSelection {
-  const sorted = [...facets]
-    .filter((f) => f.count > 0)
-    .sort((a, b) => {
-      const rc = a.risk_class.localeCompare(b.risk_class);
-      return rc !== 0 ? rc : a.bucket.localeCompare(b.bucket);
-    });
+  const sorted = sortBucketsForSubset(facets);
 
   let totalRows = 0;
   for (const f of sorted) totalRows += f.count;

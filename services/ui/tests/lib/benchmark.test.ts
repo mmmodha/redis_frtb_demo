@@ -5,6 +5,7 @@ import {
   buildBenchmarkPlan,
   formatBenchmarkRows,
   formatBenchmarkWallMs,
+  resolveBenchmarkPortfolioRows,
   runnableBenchmarkSteps,
   selectBucketCellsForTarget,
   snapPortfolioTier,
@@ -19,7 +20,24 @@ const SAMPLE_FACETS: BucketFacetRow[] = [
   { risk_class: "FX", bucket: "EURUSD", count: 40_000_000 },
 ];
 
+describe("resolveBenchmarkPortfolioRows", () => {
+  it("uses facet sum when bucket facets are available", () => {
+    const r = resolveBenchmarkPortfolioRows(
+      { rows: 500_000_000, source: "Redis key count (approx)" },
+      SAMPLE_FACETS,
+    );
+    expect(r.rows).toBe(140_000_000);
+    expect(r.source).toContain("bucket facets");
+  });
+});
+
 describe("selectBucketCellsForTarget", () => {
+  it("picks smallest buckets first for tighter approximations", () => {
+    const s10 = selectBucketCellsForTarget(SAMPLE_FACETS, 10_000_000);
+    expect(s10.selectedRows).toBe(10_000_000);
+    expect(s10.cells).toEqual([{ risk_class: "EQUITY", bucket: "1" }]);
+  });
+
   it("returns nested subsets for increasing targets", () => {
     const s10 = selectBucketCellsForTarget(SAMPLE_FACETS, 10_000_000);
     expect(s10.isFull).toBe(false);

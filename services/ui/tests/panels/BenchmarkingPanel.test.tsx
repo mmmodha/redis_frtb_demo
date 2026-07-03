@@ -38,6 +38,7 @@ function mockBenchmarkFetch(opts: {
   delayMs?: number;
   latestRows?: number;
   rollupMissing?: number;
+  bucketFacets?: typeof MOCK_BUCKET_FACETS | [];
 }) {
   let totalCalls = 0;
   const latestRows = opts.latestRows ?? opts.rows;
@@ -70,7 +71,8 @@ function mockBenchmarkFetch(opts: {
       }), { headers: { "content-type": "application/json" } });
     }
     if (url.includes("/facets/bucket")) {
-      return new Response(JSON.stringify({ ok: true, buckets: MOCK_BUCKET_FACETS }), {
+      const buckets = opts.bucketFacets !== undefined ? opts.bucketFacets : MOCK_BUCKET_FACETS;
+      return new Response(JSON.stringify({ ok: true, buckets }), {
         headers: { "content-type": "application/json" },
       });
     }
@@ -85,7 +87,8 @@ function mockBenchmarkFetch(opts: {
       totalCalls += 1;
       expect(url).toContain("nocache=1");
       const body = init?.body ? JSON.parse(String(init.body)) as { bucket_cells?: unknown[] } : {};
-      if (totalCalls < 5) {
+      const facets = opts.bucketFacets !== undefined ? opts.bucketFacets : MOCK_BUCKET_FACETS;
+      if (facets.length > 0 && totalCalls < 5) {
         expect(Array.isArray(body.bucket_cells)).toBe(true);
         expect(body.bucket_cells!.length).toBeGreaterThan(0);
       }
@@ -126,7 +129,7 @@ describe("<BenchmarkingPanel />", () => {
 
     expect(await screen.findByTestId("benchmark-portfolio-rows")).toHaveTextContent("400M");
     expect(screen.getByTestId("benchmark-step-count")).toHaveTextContent("5");
-    expect(screen.getByText(/bucket subsets/)).toBeInTheDocument();
+    expect(screen.getByTestId("benchmark-summary")).toHaveTextContent("no re-ingest");
 
     fireEvent.click(screen.getByTestId("benchmark-run"));
 
@@ -140,7 +143,7 @@ describe("<BenchmarkingPanel />", () => {
   });
 
   it("uses latest ingest not max history (10M after 400M)", async () => {
-    const getTotalCalls = mockBenchmarkFetch({ rows: 400_000_000, latestRows: 10_000_000 });
+    const getTotalCalls = mockBenchmarkFetch({ rows: 400_000_000, latestRows: 10_000_000, bucketFacets: [] });
 
     renderPanel();
 

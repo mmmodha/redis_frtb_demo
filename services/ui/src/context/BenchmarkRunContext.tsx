@@ -17,6 +17,7 @@ import {
   fetchBucketFacetsForBenchmark,
   fetchRollupPreflight,
   formatBenchmarkRows,
+  resolveBenchmarkPortfolioRows,
   runTotalSbmBenchmarkCold,
   runnableBenchmarkSteps,
   type BenchmarkStep,
@@ -68,8 +69,9 @@ export function BenchmarkRunProvider({ children }: { children: ReactNode }): JSX
         estimatePortfolioRows(),
         fetchBucketFacetsForBenchmark(),
       ]);
-      setPortfolio(est);
-      setSteps(buildBenchmarkPlan(est.rows, bucketFacets));
+      const portfolio = resolveBenchmarkPortfolioRows(est, bucketFacets);
+      setPortfolio(portfolio);
+      setSteps(buildBenchmarkPlan(portfolio.rows, bucketFacets));
       setPhase("ready");
       // Rollup preflight can take minutes on large clusters (/admin/calc-coverage
       // 502s behind nginx) — never block the panel on it.
