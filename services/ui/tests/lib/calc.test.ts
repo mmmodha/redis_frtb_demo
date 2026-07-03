@@ -89,4 +89,18 @@ describe("postCalcSbmTotal", () => {
     await postCalcSbmTotal({}, { nocache: true });
     expect(calls[0]?.url).toContain("nocache=1");
   });
+
+  it("omits bucket_cells from the body unless explicitly provided (Calc tab path)", async () => {
+    const calls = mockFetch(async () =>
+      new Response(JSON.stringify({ total_sbm: 1, performance: { total_ms: 1 } }), {
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const { postCalcSbmTotal } = await import("../../src/lib/calc");
+    await postCalcSbmTotal({});
+    expect(JSON.parse(String(calls[0]?.init?.body))).toEqual({});
+    await postCalcSbmTotal({ bucket_subset: ["USD"] });
+    expect(JSON.parse(String(calls[1]?.init?.body))).toEqual({ bucket_subset: ["USD"] });
+    expect(JSON.parse(String(calls[1]?.init?.body))).not.toHaveProperty("bucket_cells");
+  });
 });
