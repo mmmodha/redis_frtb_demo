@@ -12,13 +12,15 @@ import {
   type ReactNode,
 } from "react";
 import {
-  benchmarkTiersUpTo,
+  buildBenchmarkPlan,
   estimatePortfolioRows,
+  fetchRollupPreflight,
   formatBenchmarkRows,
-  initialBenchmarkSteps,
   runTotalSbmBenchmarkCold,
+  runnableBenchmarkSteps,
   type BenchmarkStep,
   type PortfolioRowEstimate,
+  type RollupPreflight,
 } from "../lib/benchmark";
 
 export type BenchmarkPhase = "idle" | "loading-rows" | "ready" | "running" | "done" | "error";
@@ -27,8 +29,10 @@ export interface BenchmarkRunContextValue {
   phase: BenchmarkPhase;
   portfolio: PortfolioRowEstimate;
   steps: BenchmarkStep[];
+  rollup: RollupPreflight | null;
   runError: string | null;
   runningIndex: number;
+  runnableCount: number;
   isRunning: boolean;
   refreshPortfolio: () => Promise<void>;
   startBenchmark: () => void;
@@ -47,6 +51,7 @@ export function BenchmarkRunProvider({ children }: { children: ReactNode }): JSX
   const [phase, setPhase] = useState<BenchmarkPhase>("loading-rows");
   const [portfolio, setPortfolio] = useState<PortfolioRowEstimate>({ rows: 0, source: "unknown" });
   const [steps, setSteps] = useState<BenchmarkStep[]>([]);
+  const [rollup, setRollup] = useState<RollupPreflight | null>(null);
   const [runError, setRunError] = useState<string | null>(null);
   const [runningIndex, setRunningIndex] = useState(-1);
   const stepsRef = useRef(steps);
@@ -57,10 +62,13 @@ export function BenchmarkRunProvider({ children }: { children: ReactNode }): JSX
     setPhase("loading-rows");
     setRunError(null);
     try {
-      const est = await estimatePortfolioRows();
+      const [est, rollupSnap] = await Promise.all([
+        estimatePortfolioRows(),
+        fetchRollupPreflight(),
+      ]);
       setPortfolio(est);
-      const tiers = benchmarkTiersUpTo(est.rows);
-      setSteps(initialBenchmarkSteps(tiers));
+      setRollup(rollupSnap);
+      setSteps(buildBenchmarkPlan(est.rows));
       setPhase("ready");
     } catch (err) {
       setRunError(err instanceof Error ? err.message : String(err));
@@ -74,26 +82,32 @@ export function BenchmarkRunProvider({ children }: { children: ReactNode }): JSX
 
   const startBenchmark = useCallback(() => {
     if (benchmarkInFlight) return;
-    const tierSteps = stepsRef.current;
-    if (tierSteps.length === 0) return;
+    const plan = stepsRef.current;
+    const toRun = runnableBenchmarkSteps(plan);
+    if (toRun.length === 0) return;
 
     benchmarkInFlight = true;
     setRunError(null);
     setPhase("running");
     setRunningIndex(-1);
-    setSteps(tierSteps.map((s) => ({
+    setSteps(plan.map((s) => ({
       ...s,
       wall_ms: null,
       total_sbm: null,
-      status: "pending",
+      status: s.runnable ? "pending" : "skipped",
       error: undefined,
     })));
 
     void (async () => {
       try {
-        for (let i = 0; i < tierSteps.length; i++) {
-          const tier = tierSteps[i]!.tier_rows;
-          setRunningIndex(i);
+        let runIdx = 0;
+        for (let i = 0; i < plan.length; i++) {
+          const step = plan[i]!;
+          if (!step.runnable) continue;
+
+          const tier = step.tier_rows;
+          setRunningIndex(runIdx);
+          runIdx += 1;
           setSteps((prev) => prev.map((s, idx) => (
             idx === i ? { ...s, status: "running" } : s
           )));
@@ -129,12 +143,16 @@ export function BenchmarkRunProvider({ children }: { children: ReactNode }): JSX
     })();
   }, []);
 
+  const runnableCount = runnableBenchmarkSteps(steps).length;
+
   const value: BenchmarkRunContextValue = {
     phase,
     portfolio,
     steps,
+    rollup,
     runError,
     runningIndex,
+    runnableCount,
     isRunning: phase === "running",
     refreshPortfolio,
     startBenchmark,

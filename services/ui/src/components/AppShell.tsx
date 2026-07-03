@@ -177,9 +177,9 @@ export function AppShell({ children }: AppShellProps) {
                   data-testid="benchmark-run-nav-pill"
                   role="status"
                   aria-live="polite"
-                  aria-label={`Benchmark running, step ${benchmarkRun.runningIndex + 1} of ${benchmarkRun.steps.length}`}
+                  aria-label={`Benchmark running, step ${benchmarkRun.runningIndex + 1} of ${benchmarkRun.runnableCount}`}
                 >
-                  {benchmarkRun.runningIndex + 1} / {benchmarkRun.steps.length}
+                  {benchmarkRun.runningIndex + 1} / {benchmarkRun.runnableCount}
                 </span>
               )}
             </li>

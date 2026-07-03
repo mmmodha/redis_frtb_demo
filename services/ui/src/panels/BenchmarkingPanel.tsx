@@ -30,6 +30,13 @@ function BenchmarkStepStatus({ step }: { step: BenchmarkStep }) {
       </span>
     );
   }
+  if (step.status === "skipped" || !step.runnable) {
+    return (
+      <span className="benchmark-status benchmark-status--skipped">
+        Needs ingest at this scale
+      </span>
+    );
+  }
   return (
     <span className="benchmark-status benchmark-status--pending">
       Pending
@@ -42,21 +49,24 @@ export function BenchmarkingPanel() {
     phase,
     portfolio,
     steps,
+    rollup,
     runError,
     runningIndex,
+    runnableCount,
     isRunning,
     refreshPortfolio,
     startBenchmark,
   } = useBenchmarkRun();
 
-  const canRun = (phase === "ready" || phase === "done" || phase === "error") && steps.length > 0;
+  const canRun = (phase === "ready" || phase === "done" || phase === "error") && runnableCount > 0;
+  const rollupWarn = rollup !== null && rollup.total > 0 && rollup.missing > 0;
 
   return (
     <PanelCard title="Total SBM benchmark">
       <p className="admin-stub">
-        Cold <code>POST /calc/sbm/total?nocache=1</code> at each portfolio scale step up to the
-        detected row count. This panel only — the Calculation tab is unchanged and still uses the
-        normal cache on repeat runs.
+        One cold <code>POST /calc/sbm/total?nocache=1</code> for the current ingested portfolio
+        (labelled at the nearest ladder step). Lower ladder rows are for separate ingests at those
+        scales. The Calculation tab is unchanged and still uses cache on repeat runs.
       </p>
 
       <div className="benchmark-summary" data-testid="benchmark-summary">
@@ -70,20 +80,30 @@ export function BenchmarkingPanel() {
           )}
         </div>
         <div>
-          Ladder steps:{" "}
-          <strong data-testid="benchmark-step-count">{steps.length}</strong>
-          {steps.length > 0 && (
+          Cold runs this click:{" "}
+          <strong data-testid="benchmark-step-count">{runnableCount}</strong>
+          {steps.length > runnableCount && (
             <span className="benchmark-summary__meta">
               {" "}
-              ({steps.map((s) => formatBenchmarkRows(s.tier_rows)).join(", ")})
+              ({steps.length - runnableCount} ladder row
+              {steps.length - runnableCount === 1 ? "" : "s"} skipped — need ingest at that scale)
             </span>
           )}
         </div>
+        {rollup !== null && rollup.total > 0 && (
+          <div data-testid="benchmark-rollup-status">
+            Rollups: {rollup.present}/{rollup.total} present
+          </div>
+        )}
+        {rollupWarn && (
+          <div className="benchmark-warning" data-testid="benchmark-rollup-warn" role="alert">
+            {rollup.missing} rollup tuple(s) missing — calc may fall back to a slow FT.AGGREGATE
+            scan. Run <code>finalise-rollups.mjs</code> after ingest before benchmarking.
+          </div>
+        )}
         {isRunning && (
           <div className="benchmark-summary__active" data-testid="benchmark-running-banner">
             Benchmark in progress — you can switch tabs; progress continues in the background.
-            {" "}
-            Step {runningIndex + 1} of {steps.length}.
           </div>
         )}
       </div>
@@ -97,7 +117,7 @@ export function BenchmarkingPanel() {
           data-testid="benchmark-run"
         >
           {isRunning
-            ? `Running ${runningIndex + 1}/${steps.length}…`
+            ? `Running cold Total SBM (${runningIndex + 1}/${runnableCount})…`
             : "Run benchmark"}
         </button>
         <button
@@ -125,7 +145,7 @@ export function BenchmarkingPanel() {
 
       {steps.length === 0 && phase === "ready" && (
         <p className="admin-stub" data-testid="benchmark-no-tiers">
-          No benchmark steps — ingest data or set an active target, then refresh.
+          No benchmark steps — run a bulk ingest, then refresh.
         </p>
       )}
 
@@ -145,6 +165,7 @@ export function BenchmarkingPanel() {
                   key={step.tier_rows}
                   data-testid={`benchmark-row-${step.tier_rows}`}
                   data-status={step.status}
+                  data-runnable={step.runnable ? "true" : "false"}
                 >
                   <td>{formatBenchmarkRows(step.tier_rows)}</td>
                   <td data-testid={`benchmark-wall-${step.tier_rows}`}>
@@ -162,9 +183,9 @@ export function BenchmarkingPanel() {
 
       {steps.length > 0 && (
         <p className="admin-stub benchmark-note">
-          Each step runs a full cold Total SBM over the entire ingested portfolio (~30–40s per
-          step at 400M with rollups). Five steps typically take several minutes — this is expected
-          and does not affect normal Calculation performance.
+          At 10M rows with rollups, expect roughly 5–30s for one cold Total SBM. Without rollups,
+          a full index scan can take minutes. This benchmark never runs more than one cold calc
+          per click on the current cluster.
         </p>
       )}
     </PanelCard>

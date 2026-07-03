@@ -2,9 +2,11 @@ import { describe, it, expect } from "vitest";
 import {
   BENCHMARK_ROW_TIERS,
   benchmarkTiersUpTo,
+  buildBenchmarkPlan,
   formatBenchmarkRows,
   formatBenchmarkWallMs,
-  initialBenchmarkSteps,
+  runnableBenchmarkSteps,
+  snapPortfolioTier,
 } from "../../src/lib/benchmark";
 
 describe("benchmarkTiersUpTo", () => {
@@ -26,6 +28,40 @@ describe("benchmarkTiersUpTo", () => {
   });
 });
 
+describe("snapPortfolioTier", () => {
+  it("snaps down to the nearest ladder label", () => {
+    expect(snapPortfolioTier(12_000_000)).toBe(10_000_000);
+    expect(snapPortfolioTier(400_000_000)).toBe(400_000_000);
+    expect(snapPortfolioTier(3_000_000)).toBeNull();
+  });
+});
+
+describe("buildBenchmarkPlan", () => {
+  it("runs only the snapped tier on a 10M portfolio", () => {
+    const steps = buildBenchmarkPlan(10_000_000);
+    expect(steps).toHaveLength(1);
+    expect(steps[0]).toMatchObject({ tier_rows: 10_000_000, runnable: true, status: "pending" });
+    expect(runnableBenchmarkSteps(steps)).toHaveLength(1);
+  });
+
+  it("shows full ladder but only the top tier is runnable at 400M", () => {
+    const steps = buildBenchmarkPlan(400_000_000);
+    expect(steps).toHaveLength(5);
+    expect(runnableBenchmarkSteps(steps)).toEqual([
+      expect.objectContaining({ tier_rows: 400_000_000, runnable: true }),
+    ]);
+    expect(steps.filter((s) => s.status === "skipped")).toHaveLength(4);
+  });
+
+  it("snaps 120M portfolio to 100M runnable tier", () => {
+    const steps = buildBenchmarkPlan(120_000_000);
+    expect(steps.map((s) => s.tier_rows)).toEqual([10_000_000, 50_000_000, 100_000_000]);
+    expect(runnableBenchmarkSteps(steps)).toEqual([
+      expect.objectContaining({ tier_rows: 100_000_000, runnable: true }),
+    ]);
+  });
+});
+
 describe("formatBenchmarkRows", () => {
   it("formats millions", () => {
     expect(formatBenchmarkRows(10_000_000)).toBe("10M");
@@ -37,13 +73,5 @@ describe("formatBenchmarkWallMs", () => {
   it("formats seconds and minutes", () => {
     expect(formatBenchmarkWallMs(38_200)).toBe("38.20 s");
     expect(formatBenchmarkWallMs(null)).toBe("—");
-  });
-});
-
-describe("initialBenchmarkSteps", () => {
-  it("creates pending rows for each tier", () => {
-    const steps = initialBenchmarkSteps([10_000_000, 50_000_000]);
-    expect(steps).toHaveLength(2);
-    expect(steps[0]).toMatchObject({ tier_rows: 10_000_000, status: "pending" });
   });
 });
