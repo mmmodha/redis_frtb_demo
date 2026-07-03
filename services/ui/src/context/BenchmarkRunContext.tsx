@@ -77,7 +77,9 @@ export function BenchmarkRunProvider({ children }: { children: ReactNode }): JSX
       setPortfolio(portfolio);
       setBucketFacetsApproximate(facetSnap.approximate);
       setFacetsUnavailable(facetSnap.buckets.length === 0 && portfolio.rows > 0);
-      setSteps(buildBenchmarkPlan(portfolio.rows, facetSnap.buckets));
+      setSteps(buildBenchmarkPlan(portfolio.rows, facetSnap.buckets, {
+        bucketCountsApproximate: facetSnap.approximate,
+      }));
       setPhase("ready");
       // Rollup preflight can take minutes on large clusters (/admin/calc-coverage
       // 502s behind nginx) — never block the panel on it.

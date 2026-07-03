@@ -104,7 +104,8 @@ export function BenchmarkingPanel() {
         )}
         {bucketFacetsApproximate && !facetsUnavailable && (
           <div className="benchmark-summary__meta" data-testid="benchmark-facets-approx">
-            Subset row counts are uniform estimates (index empty; using seen-bucket sets).
+            Row counts are uniform estimates — ladder steps scale by bucket count, not exact rows.
+            Wall time should increase as more buckets are included each step.
           </div>
         )}
         {rollupWarn && (

@@ -162,13 +162,29 @@ function sortBucketsForSubset(facets: BucketFacetRow[]): BucketFacetRow[] {
     });
 }
 
+function bucketCountsAreUniform(facets: BucketFacetRow[]): boolean {
+  if (facets.length <= 1) return true;
+  const first = facets[0]!.count;
+  return facets.every((f) => f.count === first);
+}
+
+export interface BucketSubsetOptions {
+  /** 0-based ladder index (10M → 0). */
+  tierIndex?: number;
+  tierCount?: number;
+  /** Scale subset by tier position when facet row counts are uniform estimates. */
+  proportionalByTier?: boolean;
+}
+
 /**
- * Greedy deterministic bucket pick until cumulative row count reaches target.
- * Smallest buckets first → tighter row approximations; nested tiers share a prefix.
+ * Pick buckets for a target row count. Uses row-sum greedy when counts vary;
+ * when counts are uniform (seen-bucket fallback), scales by ladder position
+ * so 10M/50M/100M tiers fan out to different bucket counts and wall times differ.
  */
 export function selectBucketCellsForTarget(
   facets: BucketFacetRow[],
   targetRows: number,
+  opts: BucketSubsetOptions = {},
 ): BucketSubsetSelection {
   const sorted = sortBucketsForSubset(facets);
 
@@ -177,6 +193,34 @@ export function selectBucketCellsForTarget(
 
   if (sorted.length === 0 || targetRows >= totalRows) {
     return { cells: [], selectedRows: totalRows, isFull: true };
+  }
+
+  const useProportional = opts.proportionalByTier === true
+    || bucketCountsAreUniform(sorted);
+
+  if (
+    useProportional
+    && opts.tierIndex != null
+    && opts.tierCount != null
+    && opts.tierCount > 0
+  ) {
+    const nBuckets = Math.max(
+      1,
+      Math.min(
+        sorted.length,
+        Math.ceil(((opts.tierIndex + 1) / opts.tierCount) * sorted.length),
+      ),
+    );
+    if (nBuckets >= sorted.length) {
+      return { cells: [], selectedRows: totalRows, isFull: true };
+    }
+    const picked = sorted.slice(0, nBuckets);
+    const selectedRows = picked.reduce((s, f) => s + f.count, 0);
+    return {
+      cells: picked.map((f) => ({ risk_class: f.risk_class, bucket: f.bucket })),
+      selectedRows,
+      isFull: false,
+    };
   }
 
   const cells: BucketCell[] = [];
@@ -194,6 +238,7 @@ export function selectBucketCellsForTarget(
 export function buildBenchmarkPlan(
   portfolioRows: number,
   bucketFacets: BucketFacetRow[],
+  opts?: { bucketCountsApproximate?: boolean },
 ): BenchmarkStep[] {
   if (!Number.isFinite(portfolioRows) || portfolioRows <= 0) return [];
 
@@ -204,7 +249,10 @@ export function buildBenchmarkPlan(
 
   const hasFacets = bucketFacets.length > 0;
 
-  return tiers.map((tier_rows) => {
+  const proportional = opts?.bucketCountsApproximate === true
+    || bucketCountsAreUniform(bucketFacets);
+
+  return tiers.map((tier_rows, tierIndex) => {
     if (tier_rows > portfolioRows) {
       return {
         tier_rows,
@@ -230,7 +278,15 @@ export function buildBenchmarkPlan(
       };
     }
 
-    const { cells, selectedRows, isFull } = selectBucketCellsForTarget(bucketFacets, tier_rows);
+    const { cells, selectedRows, isFull } = selectBucketCellsForTarget(
+      bucketFacets,
+      tier_rows,
+      {
+        tierIndex,
+        tierCount: tiers.length,
+        proportionalByTier: proportional,
+      },
+    );
     return {
       tier_rows,
       wall_ms: null,

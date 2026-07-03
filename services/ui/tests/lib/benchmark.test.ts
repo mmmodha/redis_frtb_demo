@@ -31,8 +31,31 @@ describe("resolveBenchmarkPortfolioRows", () => {
   });
 });
 
+const UNIFORM_FACETS: BucketFacetRow[] = [
+  { risk_class: "GIRR", bucket: "USD", count: 100_000_000 },
+  { risk_class: "GIRR", bucket: "EUR", count: 100_000_000 },
+  { risk_class: "EQUITY", bucket: "1", count: 100_000_000 },
+  { risk_class: "FX", bucket: "EURUSD", count: 100_000_000 },
+];
+
 describe("selectBucketCellsForTarget", () => {
-  it("picks smallest buckets first for tighter approximations", () => {
+  it("uses tier-proportional bucket counts when row counts are uniform", () => {
+    const s0 = selectBucketCellsForTarget(UNIFORM_FACETS, 10_000_000, {
+      tierIndex: 0,
+      tierCount: 5,
+      proportionalByTier: true,
+    });
+    const s2 = selectBucketCellsForTarget(UNIFORM_FACETS, 100_000_000, {
+      tierIndex: 2,
+      tierCount: 5,
+      proportionalByTier: true,
+    });
+    expect(s0.cells).toHaveLength(1);
+    expect(s2.cells.length).toBeGreaterThan(s0.cells.length);
+    expect(s2.cells.slice(0, s0.cells.length)).toEqual(s0.cells);
+  });
+
+  it("picks smallest buckets first for tighter approximations when counts vary", () => {
     const s10 = selectBucketCellsForTarget(SAMPLE_FACETS, 10_000_000);
     expect(s10.selectedRows).toBe(10_000_000);
     expect(s10.cells).toEqual([{ risk_class: "EQUITY", bucket: "1" }]);
@@ -57,6 +80,14 @@ describe("selectBucketCellsForTarget", () => {
 });
 
 describe("buildBenchmarkPlan", () => {
+  it("uses proportional subsets for approximate uniform facets", () => {
+    const steps = buildBenchmarkPlan(400_000_000, UNIFORM_FACETS, {
+      bucketCountsApproximate: true,
+    });
+    const bucketCounts = steps.map((s) => s.bucket_cells.length);
+    expect(new Set(bucketCounts).size).toBeGreaterThan(1);
+  });
+
   it("marks all tiers runnable with bucket subsets when facets exist", () => {
     const steps = buildBenchmarkPlan(400_000_000, SAMPLE_FACETS);
     expect(steps).toHaveLength(5);
