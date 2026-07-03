@@ -32,6 +32,8 @@ export interface BenchmarkRunContextValue {
   portfolio: PortfolioRowEstimate;
   steps: BenchmarkStep[];
   rollup: RollupPreflight | null;
+  bucketFacetsApproximate: boolean;
+  facetsUnavailable: boolean;
   runError: string | null;
   runningIndex: number;
   runnableCount: number;
@@ -54,6 +56,8 @@ export function BenchmarkRunProvider({ children }: { children: ReactNode }): JSX
   const [portfolio, setPortfolio] = useState<PortfolioRowEstimate>({ rows: 0, source: "unknown" });
   const [steps, setSteps] = useState<BenchmarkStep[]>([]);
   const [rollup, setRollup] = useState<RollupPreflight | null>(null);
+  const [bucketFacetsApproximate, setBucketFacetsApproximate] = useState(false);
+  const [facetsUnavailable, setFacetsUnavailable] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
   const [runningIndex, setRunningIndex] = useState(-1);
   const stepsRef = useRef(steps);
@@ -65,13 +69,15 @@ export function BenchmarkRunProvider({ children }: { children: ReactNode }): JSX
     setRunError(null);
     setRollup(null);
     try {
-      const [est, bucketFacets] = await Promise.all([
+      const [est, facetSnap] = await Promise.all([
         estimatePortfolioRows(),
         fetchBucketFacetsForBenchmark(),
       ]);
-      const portfolio = resolveBenchmarkPortfolioRows(est, bucketFacets);
+      const portfolio = resolveBenchmarkPortfolioRows(est, facetSnap.buckets);
       setPortfolio(portfolio);
-      setSteps(buildBenchmarkPlan(portfolio.rows, bucketFacets));
+      setBucketFacetsApproximate(facetSnap.approximate);
+      setFacetsUnavailable(facetSnap.buckets.length === 0 && portfolio.rows > 0);
+      setSteps(buildBenchmarkPlan(portfolio.rows, facetSnap.buckets));
       setPhase("ready");
       // Rollup preflight can take minutes on large clusters (/admin/calc-coverage
       // 502s behind nginx) — never block the panel on it.
@@ -160,6 +166,8 @@ export function BenchmarkRunProvider({ children }: { children: ReactNode }): JSX
     portfolio,
     steps,
     rollup,
+    bucketFacetsApproximate,
+    facetsUnavailable,
     runError,
     runningIndex,
     runnableCount,

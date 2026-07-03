@@ -72,6 +72,11 @@ export interface RollupPreflight {
   missing: number;
 }
 
+export interface BucketFacetFetch {
+  buckets: BucketFacetRow[];
+  approximate: boolean;
+}
+
 export interface BucketSubsetSelection {
   cells: BucketCell[];
   selectedRows: number;
@@ -242,21 +247,26 @@ export function runnableBenchmarkSteps(steps: BenchmarkStep[]): BenchmarkStep[] 
   return steps.filter((s) => s.runnable);
 }
 
-export async function fetchBucketFacetsForBenchmark(): Promise<BucketFacetRow[]> {
+export async function fetchBucketFacetsForBenchmark(): Promise<BucketFacetFetch> {
   try {
-    const body = await fetchJsonWithTimeout<{ ok?: boolean; buckets?: BucketFacetRow[] }>(
-      `${apiBase()}/facets/bucket`,
+    const body = await fetchJsonWithTimeout<{
+      ok?: boolean;
+      buckets?: BucketFacetRow[];
+      approximate?: boolean;
+    }>(
+      `${apiBase()}/facets/bucket?refresh=1`,
       PORTFOLIO_FETCH_TIMEOUT_MS,
     );
-    if (!Array.isArray(body.buckets)) return [];
-    return body.buckets.filter(
+    if (!Array.isArray(body.buckets)) return { buckets: [], approximate: false };
+    const buckets = body.buckets.filter(
       (b) => typeof b.risk_class === "string"
         && typeof b.bucket === "string"
         && typeof b.count === "number"
         && b.count > 0,
     );
+    return { buckets, approximate: body.approximate === true };
   } catch {
-    return [];
+    return { buckets: [], approximate: false };
   }
 }
 

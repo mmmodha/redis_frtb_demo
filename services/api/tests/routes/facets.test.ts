@@ -324,3 +324,36 @@ describe("GET /facets", () => {
     expect(after3).toBeGreaterThan(after2);
   });
 });
+
+describe("GET /facets/bucket", () => {
+  let app: Awaited<ReturnType<typeof createServer>>;
+
+  beforeEach(() => {
+    __resetFacetsCacheForTests();
+  });
+
+  afterEach(async () => {
+    if (app) await app.close();
+  });
+
+  it("falls back to seen:bucket sets when FT.AGGREGATE returns no groups", async () => {
+    const fr = fakeRedis();
+    fr.setResponse("FT.AGGREGATE", [0]);
+    fr.setResponse("SMEMBERS", async (args: unknown[]) => {
+      const key = String(args[0]);
+      if (key === "seen:bucket:GIRR") return ["USD", "EUR"];
+      if (key === "seen:bucket:EQUITY") return ["1"];
+      if (key === "seen:bucket:FX") return ["EURUSD"];
+      return [];
+    });
+    fr.setResponse("DBSIZE", 400_000_000);
+    app = await createServer({ redis: fr, schema: fixtureSchema() });
+
+    const res = await app.inject({ method: "GET", url: "/facets/bucket?refresh=1" });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.approximate).toBe(true);
+    expect(body.buckets).toHaveLength(4);
+    expect(body.buckets[0].count).toBe(100_000_000);
+  });
+});

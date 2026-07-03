@@ -33,7 +33,7 @@ function BenchmarkStepStatus({ step }: { step: BenchmarkStep }) {
   if (step.status === "skipped" || !step.runnable) {
     return (
       <span className="benchmark-status benchmark-status--skipped">
-        Unavailable
+        {step.status === "skipped" ? "Needs bucket map" : "Unavailable"}
       </span>
     );
   }
@@ -50,6 +50,8 @@ export function BenchmarkingPanel() {
     portfolio,
     steps,
     rollup,
+    bucketFacetsApproximate,
+    facetsUnavailable,
     runError,
     runningIndex,
     runnableCount,
@@ -91,6 +93,18 @@ export function BenchmarkingPanel() {
         {rollup !== null && rollup.total > 0 && (
           <div data-testid="benchmark-rollup-status">
             Rollups: {rollup.present}/{rollup.total} present
+          </div>
+        )}
+        {facetsUnavailable && (
+          <div className="benchmark-warning" data-testid="benchmark-facets-warn" role="alert">
+            Bucket row counts unavailable (search index empty on this cluster). Only the full-portfolio
+            tier can run until <code>/facets/bucket</code> returns data — redeploy the latest API
+            for seen-bucket fallback, or run <code>finalise-rollups.mjs</code>.
+          </div>
+        )}
+        {bucketFacetsApproximate && !facetsUnavailable && (
+          <div className="benchmark-summary__meta" data-testid="benchmark-facets-approx">
+            Subset row counts are uniform estimates (index empty; using seen-bucket sets).
           </div>
         )}
         {rollupWarn && (

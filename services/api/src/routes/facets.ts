@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadSchema, type Schema } from "@frtb/schema";
-import { rollupKey } from "@frtb/calc-shared/rollup-keys";
+import { rollupKey, seenBucketKey } from "@frtb/calc-shared/rollup-keys";
 import { regionFromDesk } from "@frtb/calc-shared/region";
 import type { RedisLike } from "../redis-like.ts";
 import { getActiveTarget, onActiveTargetChange } from "../active-target.ts";
@@ -45,6 +45,8 @@ import { getSensIndexName } from "../lib/sens-index.ts";
 
 const CACHE_TTL_MS = 30_000;
 const SENSITIVITY_TYPES = ["Delta", "Vega", "Curvature"] as const;
+/** Total SBM orchestrator classes — used for seen-bucket fallback when FT index is empty. */
+const SEEN_BUCKET_CLASSES = ["GIRR", "EQUITY", "FX"] as const;
 
 interface FacetsResponseOk {
   ok: true;
@@ -409,26 +411,32 @@ export function registerFacetsRoute(
   // @bucket REDUCE COUNT 0 AS count SORTBY 4 @risk_class ASC @bucket ASC
   // LIMIT 0 500`. Returns (risk_class, bucket, count) triples so the UI can
   // group buckets by risk_class for the calc filter pane.
-  app.get("/facets/bucket", { config: { category: "heavy-calc" } }, async (_req, reply) => {
+  app.get<{ Querystring: { refresh?: string } }>(
+    "/facets/bucket",
+    { config: { category: "heavy-calc" } },
+    async (req, reply) => {
     const t0 = process.hrtime.bigint();
     const key = identityKey();
     const now = Date.now();
-    if (bucketCache && bucketCache.key === key && bucketCache.expiresAt > now) {
+    const skipCache = req.query?.refresh === "1";
+    if (!skipCache && bucketCache && bucketCache.key === key && bucketCache.expiresAt > now) {
       const ms = elapsedMs(t0);
       return { ...(bucketCache.body as Record<string, unknown>), ms, cached: true };
     }
     const redis = await getRedis();
     const target_label = getActiveTarget().label;
     const indexName = await getSensIndexName(redis, target_label);
-    let reply2: unknown;
+    let buckets: Array<{ risk_class: string; bucket: string; count: number }> = [];
+    let approximate = false;
     try {
-      reply2 = await redis.call(
+      const reply2 = await redis.call(
         "FT.AGGREGATE", indexName, "*",
         "GROUPBY", "2", "@risk_class", "@bucket",
         "REDUCE", "COUNT", "0", "AS", "count",
         "SORTBY", "4", "@risk_class", "ASC", "@bucket", "ASC",
         "LIMIT", "0", "500",
       );
+      buckets = parseRiskClassBucketRows(reply2);
     } catch (err) {
       const translated = translateRedisError(err, target_label, getBootstrapStatus().phase);
       if (translated) {
@@ -437,10 +445,28 @@ export function registerFacetsRoute(
       }
       throw err;
     }
-    const buckets = parseRiskClassBucketRows(reply2);
+    // Bulk-loaded clusters often have sens: keys but an empty/stale idx:sens.
+    // Fall back to ingest-maintained seen:bucket:<rc> sets with uniform row
+    // estimates from DBSIZE so the benchmark panel can build subsets without flush.
+    if (buckets.length === 0) {
+      const fallback = await bucketFacetsFromSeenSets(redis);
+      if (fallback.length > 0) {
+        buckets = fallback;
+        approximate = true;
+      }
+    }
     const ms = elapsedMs(t0);
-    const body = { ok: true as const, ms, target_label, buckets, cached: false };
-    bucketCache = { key, body, expiresAt: Date.now() + DESK_CACHE_TTL_MS };
+    const body = {
+      ok: true as const,
+      ms,
+      target_label,
+      buckets,
+      approximate,
+      cached: false,
+    };
+    if (buckets.length > 0) {
+      bucketCache = { key, body, expiresAt: Date.now() + DESK_CACHE_TTL_MS };
+    }
     return body;
   });
 }
@@ -470,6 +496,36 @@ function parseDeskCountRows(reply: unknown): Array<{ desk: string; count: number
     }
   }
   return out;
+}
+
+async function bucketFacetsFromSeenSets(
+  redis: RedisLike,
+): Promise<Array<{ risk_class: string; bucket: string; count: number }>> {
+  const cells: Array<{ risk_class: string; bucket: string }> = [];
+  for (const rc of SEEN_BUCKET_CLASSES) {
+    try {
+      const reply = await redis.call("SMEMBERS", seenBucketKey(rc));
+      if (!Array.isArray(reply)) continue;
+      for (const b of reply) {
+        if (typeof b === "string" && b.length > 0) {
+          cells.push({ risk_class: rc, bucket: b });
+        }
+      }
+    } catch { /* skip class */ }
+  }
+  if (cells.length === 0) return [];
+
+  let rowTotal = 0;
+  try {
+    const raw = await redis.call("DBSIZE");
+    const n = Number(raw);
+    if (Number.isFinite(n) && n > 0) rowTotal = n;
+  } catch { /* fall through */ }
+  const perCell = rowTotal > 0
+    ? Math.max(1, Math.floor(rowTotal / cells.length))
+    : 1;
+
+  return cells.map((c) => ({ ...c, count: perCell }));
 }
 
 function parseRiskClassBucketRows(
