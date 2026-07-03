@@ -53,6 +53,10 @@ function mountApp(schema: Schema, redis: FakeRedis) {
 }
 
 describe("ingest snapshot helpers", () => {
+  afterEach(() => {
+    _testResetIngestSnapshotState();
+  });
+
   it("computeRowsWritten subtracts flushed_at_start", () => {
     expect(computeRowsWritten(9000, 4000)).toBe(5000);
     expect(computeRowsWritten(3000, 4000)).toBe(0);
