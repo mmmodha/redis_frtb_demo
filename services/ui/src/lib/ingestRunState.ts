@@ -35,7 +35,7 @@ export function elapsedMsSince(iso: string, nowMs: number): number {
   return Math.max(0, nowMs - t);
 }
 
-/** Progress uses the best run-scoped signal: producer rows_sent or loader flush delta. */
+/** Progress for the "Rows written" bar — loader flush delta, matching observability. */
 export function effectiveRunWritten(
   run: {
     status: string;
@@ -57,12 +57,16 @@ export function effectiveRunWritten(
   }
 
   if (run.status === "running") {
-    // Producers stalled on bulk-loader 503s — don't advance on stray flush deltas.
+    // Once the loader reports writes, track actual Redis progress (not producer rows_sent,
+    // which can sit at rows_total while the bulk-loader is still flushing).
+    if (flushed > 0) {
+      return total > 0 ? Math.min(total, flushed) : flushed;
+    }
+    // Producers stalled on bulk-loader 503s before any rows landed.
     if (sent === 0 && retries >= 5) {
       return 0;
     }
-    const value = Math.max(sent, flushed);
-    return total > 0 ? Math.min(total, value) : value;
+    return total > 0 ? Math.min(total, sent) : sent;
   }
 
   const value = Math.max(flushed, sent);

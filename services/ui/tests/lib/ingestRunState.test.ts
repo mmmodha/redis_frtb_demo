@@ -48,7 +48,7 @@ describe("ingestRunState", () => {
     expect(elapsedMsSince(start, now)).toBe(3500);
   });
 
-  it("effectiveRunWritten uses best run-scoped signal while producing", () => {
+  it("effectiveRunWritten tracks loader flush delta while producing", () => {
     expect(effectiveRunWritten(
       { status: "running", rows_total: 10_000, rows_sent: 0, rows_written: 6500, phase: "producing" },
       6500,
@@ -56,18 +56,22 @@ describe("ingestRunState", () => {
     expect(effectiveRunWritten(
       { status: "running", rows_total: 10_000, rows_sent: 0, rows_written: 6500, phase: "producing", retries_total: 10 },
       6500,
-    )).toBe(0);
+    )).toBe(6500);
     expect(effectiveRunWritten(
       { status: "running", rows_total: 1_000_000, rows_sent: 200_000, rows_written: 450_000, phase: "producing" },
       450_000,
     )).toBe(450_000);
   });
 
-  it("effectiveRunWritten uses flush delta during writing phase", () => {
+  it("effectiveRunWritten keeps advancing during writing phase after producers finish", () => {
     expect(effectiveRunWritten(
-      { status: "running", rows_total: 10_000, rows_sent: 4000, rows_written: 0, phase: "writing" },
+      { status: "running", rows_total: 10_000, rows_sent: 10_000, rows_written: 3500, phase: "writing" },
       3500,
-    )).toBe(4000);
+    )).toBe(3500);
+    expect(effectiveRunWritten(
+      { status: "running", rows_total: 10_000_000, rows_sent: 10_000_000, rows_written: 7_213_500, phase: "writing" },
+      7_213_500,
+    )).toBe(7_213_500);
     expect(effectiveRunWritten(
       { status: "running", rows_total: 10_000, rows_sent: 8000, rows_written: 0, phase: "writing" },
       0,
