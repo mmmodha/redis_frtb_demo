@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
+import { BenchmarkRunProvider, resetBenchmarkRunForTests } from "../../src/context/BenchmarkRunContext";
 import { BenchmarkingPanel } from "../../src/panels/BenchmarkingPanel";
 import type { TotalSbmResponse } from "../../src/lib/calc";
 
@@ -24,7 +25,7 @@ function buildTotalResponse(wallMs: number): TotalSbmResponse {
   };
 }
 
-function mockBenchmarkFetch(opts: { rows: number; wallMsPerRun?: number }) {
+function mockBenchmarkFetch(opts: { rows: number; wallMsPerRun?: number; delayMs?: number }) {
   let totalCalls = 0;
   globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
@@ -57,6 +58,9 @@ function mockBenchmarkFetch(opts: { rows: number; wallMsPerRun?: number }) {
     if (url.includes("/calc/sbm/total")) {
       totalCalls += 1;
       expect(url).toContain("nocache=1");
+      if (opts.delayMs) {
+        await new Promise((r) => setTimeout(r, opts.delayMs));
+      }
       const wallMs = opts.wallMsPerRun ?? 40_000;
       return new Response(JSON.stringify(buildTotalResponse(wallMs)), {
         headers: { "content-type": "application/json" },
@@ -70,13 +74,16 @@ function mockBenchmarkFetch(opts: { rows: number; wallMsPerRun?: number }) {
 function renderPanel() {
   return render(
     <MemoryRouter>
-      <BenchmarkingPanel />
+      <BenchmarkRunProvider>
+        <BenchmarkingPanel />
+      </BenchmarkRunProvider>
     </MemoryRouter>,
   );
 }
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
+  resetBenchmarkRunForTests();
   vi.restoreAllMocks();
 });
 
@@ -97,6 +104,7 @@ describe("<BenchmarkingPanel />", () => {
 
     expect(getTotalCalls()).toBe(5);
     expect(screen.getByTestId("benchmark-wall-10000000")).toHaveTextContent("40.00 s");
+    expect(screen.getByTestId("benchmark-row-10000000")).toHaveAttribute("data-status", "done");
   });
 
   it("limits ladder when portfolio is below 400M", async () => {
@@ -105,5 +113,46 @@ describe("<BenchmarkingPanel />", () => {
 
     expect(await screen.findByTestId("benchmark-step-count")).toHaveTextContent("3");
     expect(screen.queryByTestId("benchmark-row-400000000")).toBeNull();
+  });
+
+  it("keeps benchmark progress when navigating away from the panel", async () => {
+    mockBenchmarkFetch({ rows: 400_000_000, delayMs: 80 });
+
+    const { rerender } = render(
+      <MemoryRouter>
+        <BenchmarkRunProvider>
+          <BenchmarkingPanel />
+        </BenchmarkRunProvider>
+      </MemoryRouter>,
+    );
+    expect(await screen.findByTestId("benchmark-portfolio-rows")).toHaveTextContent("400M");
+    fireEvent.click(screen.getByTestId("benchmark-run"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("benchmark-row-10000000")).toHaveAttribute("data-status", "running");
+    });
+
+    rerender(
+      <MemoryRouter>
+        <BenchmarkRunProvider>
+          <div data-testid="other-route">Other page</div>
+        </BenchmarkRunProvider>
+      </MemoryRouter>,
+    );
+
+    rerender(
+      <MemoryRouter>
+        <BenchmarkRunProvider>
+          <BenchmarkingPanel />
+        </BenchmarkRunProvider>
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByTestId("benchmark-running-banner")).toBeInTheDocument();
+    expect(screen.getByTestId("benchmark-row-10000000")).toHaveAttribute("data-status", "running");
+
+    await waitFor(() => {
+      expect(screen.getByTestId("benchmark-row-400000000")).toHaveAttribute("data-status", "done");
+    }, { timeout: 10_000 });
   });
 });

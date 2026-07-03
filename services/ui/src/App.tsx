@@ -1,6 +1,7 @@
 import { Navigate, Route, Routes } from "react-router-dom";
 import { AppShell } from "./components/AppShell";
 import { CalcRunProvider } from "./context/CalcRunContext";
+import { BenchmarkRunProvider } from "./context/BenchmarkRunContext";
 import { BulkIngestRunProvider } from "./context/BulkIngestRunContext";
 import { GeneratorRunProvider } from "./context/GeneratorRunContext";
 import { PivotBurstProvider } from "./context/PivotBurstContext";
@@ -23,6 +24,7 @@ export function App() {
     <PivotBurstProvider>
       <GeneratorRunProvider>
         <CalcRunProvider>
+        <BenchmarkRunProvider>
         <BulkIngestRunProvider>
         <PivotHistoryProvider>
           <UploadsProvider>
@@ -45,6 +47,7 @@ export function App() {
           </UploadsProvider>
         </PivotHistoryProvider>
         </BulkIngestRunProvider>
+        </BenchmarkRunProvider>
         </CalcRunProvider>
       </GeneratorRunProvider>
     </PivotBurstProvider>

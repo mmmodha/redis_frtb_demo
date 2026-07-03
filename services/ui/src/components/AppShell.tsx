@@ -6,6 +6,7 @@ import { LockoutBanner } from "./LockoutBanner";
 import { useBootstrapStatus } from "../hooks/useBootstrapStatus";
 import { getActiveTarget, type ActiveTarget } from "../lib/connections";
 import { CalcRunContext } from "../context/CalcRunContext";
+import { BenchmarkRunContext } from "../context/BenchmarkRunContext";
 import { GeneratorRunContext } from "../context/GeneratorRunContext";
 import { PivotBurstContext } from "../context/PivotBurstContext";
 import { useIngestRun } from "../hooks/useIngestRun";
@@ -34,6 +35,7 @@ export function AppShell({ children }: AppShellProps) {
   const burstCtx = useContext(PivotBurstContext);
   const generatorCtx = useContext(GeneratorRunContext);
   const calcCtx = useContext(CalcRunContext);
+  const benchmarkCtx = useContext(BenchmarkRunContext);
   const { view: ingestView } = useIngestRun();
   const location = useLocation();
   const burst = burstCtx?.burst ?? null;
@@ -45,6 +47,9 @@ export function AppShell({ children }: AppShellProps) {
     location.pathname !== "/ingest";
   const calcBusy = calcCtx !== null && (calcCtx.perClassLoading || calcCtx.totalLoading);
   const showCalcPill = calcBusy && location.pathname !== "/calc";
+  const benchmarkRun = benchmarkCtx?.isRunning === true ? benchmarkCtx : null;
+  const showBenchmarkPill =
+    benchmarkRun !== null && location.pathname !== "/benchmarking";
   const showIngestPill =
     ingestView.phase === "running" &&
     location.pathname !== "/ingest";
@@ -164,6 +169,17 @@ export function AppShell({ children }: AppShellProps) {
                   aria-label="Calculation in progress"
                 >
                   Calculating…
+                </span>
+              )}
+              {s.to === "/benchmarking" && showBenchmarkPill && benchmarkRun !== null && (
+                <span
+                  className="app-shell__nav-pill"
+                  data-testid="benchmark-run-nav-pill"
+                  role="status"
+                  aria-live="polite"
+                  aria-label={`Benchmark running, step ${benchmarkRun.runningIndex + 1} of ${benchmarkRun.steps.length}`}
+                >
+                  {benchmarkRun.runningIndex + 1} / {benchmarkRun.steps.length}
                 </span>
               )}
             </li>

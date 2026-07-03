@@ -65,3 +65,28 @@ describe("postCalcSbm", () => {
     ).rejects.toThrow(/bad input/);
   });
 });
+
+describe("postCalcSbmTotal", () => {
+  it("does not add nocache unless explicitly requested", async () => {
+    const calls = mockFetch(async () =>
+      new Response(JSON.stringify({ total_sbm: 1, performance: { total_ms: 1 } }), {
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const { postCalcSbmTotal } = await import("../../src/lib/calc");
+    await postCalcSbmTotal({});
+    expect(calls[0]?.url).toMatch(/\/calc\/sbm\/total$/);
+    expect(calls[0]?.url).not.toContain("nocache=1");
+  });
+
+  it("adds nocache=1 when opts.nocache is true", async () => {
+    const calls = mockFetch(async () =>
+      new Response(JSON.stringify({ total_sbm: 1, performance: { total_ms: 1 } }), {
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const { postCalcSbmTotal } = await import("../../src/lib/calc");
+    await postCalcSbmTotal({}, { nocache: true });
+    expect(calls[0]?.url).toContain("nocache=1");
+  });
+});

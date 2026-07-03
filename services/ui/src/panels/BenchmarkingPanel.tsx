@@ -1,99 +1,62 @@
-import { useCallback, useEffect, useState } from "react";
 import { PanelCard } from "../components/PanelCard";
+import { useBenchmarkRun } from "../context/BenchmarkRunContext";
 import {
-  benchmarkTiersUpTo,
-  estimatePortfolioRows,
   formatBenchmarkRows,
   formatBenchmarkWallMs,
-  initialBenchmarkSteps,
-  runTotalSbmBenchmarkCold,
   type BenchmarkStep,
-  type PortfolioRowEstimate,
 } from "../lib/benchmark";
 
-type PanelPhase = "idle" | "loading-rows" | "ready" | "running" | "done" | "error";
+function BenchmarkStepStatus({ step }: { step: BenchmarkStep }) {
+  if (step.status === "running") {
+    return (
+      <span className="benchmark-status benchmark-status--running">
+        <span className="spinner benchmark-status__spinner" aria-hidden="true" />
+        Running…
+      </span>
+    );
+  }
+  if (step.status === "done") {
+    return (
+      <span className="benchmark-status benchmark-status--done">
+        <span className="benchmark-status__tick" aria-hidden="true">✓</span>
+        Done
+      </span>
+    );
+  }
+  if (step.status === "error") {
+    return (
+      <span className="benchmark-status benchmark-status--error">
+        {step.error ?? "Error"}
+      </span>
+    );
+  }
+  return (
+    <span className="benchmark-status benchmark-status--pending">
+      Pending
+    </span>
+  );
+}
 
 export function BenchmarkingPanel() {
-  const [phase, setPhase] = useState<PanelPhase>("loading-rows");
-  const [portfolio, setPortfolio] = useState<PortfolioRowEstimate>({ rows: 0, source: "unknown" });
-  const [steps, setSteps] = useState<BenchmarkStep[]>([]);
-  const [runError, setRunError] = useState<string | null>(null);
-  const [runningIndex, setRunningIndex] = useState(-1);
+  const {
+    phase,
+    portfolio,
+    steps,
+    runError,
+    runningIndex,
+    isRunning,
+    refreshPortfolio,
+    startBenchmark,
+  } = useBenchmarkRun();
 
-  const refreshPortfolio = useCallback(async () => {
-    setPhase("loading-rows");
-    setRunError(null);
-    try {
-      const est = await estimatePortfolioRows();
-      setPortfolio(est);
-      const tiers = benchmarkTiersUpTo(est.rows);
-      setSteps(initialBenchmarkSteps(tiers));
-      setPhase("ready");
-    } catch (err) {
-      setRunError(err instanceof Error ? err.message : String(err));
-      setPhase("error");
-    }
-  }, []);
-
-  useEffect(() => {
-    void refreshPortfolio();
-  }, [refreshPortfolio]);
-
-  const onRun = useCallback(async () => {
-    if (steps.length === 0) return;
-    setRunError(null);
-    setPhase("running");
-    setSteps((prev) => prev.map((s) => ({
-      ...s,
-      wall_ms: null,
-      total_sbm: null,
-      status: "pending",
-      error: undefined,
-    })));
-
-    for (let i = 0; i < steps.length; i++) {
-      const tier = steps[i]!.tier_rows;
-      setRunningIndex(i);
-      setSteps((prev) => prev.map((s, idx) => (
-        idx === i ? { ...s, status: "running" } : s
-      )));
-      try {
-        const res = await runTotalSbmBenchmarkCold();
-        const wallMs = res.performance?.total_ms ?? null;
-        setSteps((prev) => prev.map((s, idx) => (
-          idx === i
-            ? {
-              ...s,
-              status: "done",
-              wall_ms: wallMs,
-              total_sbm: res.total_sbm ?? null,
-            }
-            : s
-        )));
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        setSteps((prev) => prev.map((s, idx) => (
-          idx === i ? { ...s, status: "error", error: message } : s
-        )));
-        setRunError(`Failed at ${formatBenchmarkRows(tier)} scale: ${message}`);
-        setPhase("error");
-        setRunningIndex(-1);
-        return;
-      }
-    }
-
-    setRunningIndex(-1);
-    setPhase("done");
-  }, [steps]);
-
-  const isRunning = phase === "running";
   const canRun = (phase === "ready" || phase === "done" || phase === "error") && steps.length > 0;
 
   return (
     <PanelCard title="Total SBM benchmark">
       <p className="admin-stub">
         Cold <code>POST /calc/sbm/total?nocache=1</code> at each portfolio scale step up to the
-        detected row count. Each step measures wall-clock time for a full Total SBM calculation.
+        detected row count. This panel only — the Calculation tab is unchanged and still uses the
+        normal cache on repeat runs.
       </p>
 
       <div className="benchmark-summary" data-testid="benchmark-summary">
@@ -116,13 +79,20 @@ export function BenchmarkingPanel() {
             </span>
           )}
         </div>
+        {isRunning && (
+          <div className="benchmark-summary__active" data-testid="benchmark-running-banner">
+            Benchmark in progress — you can switch tabs; progress continues in the background.
+            {" "}
+            Step {runningIndex + 1} of {steps.length}.
+          </div>
+        )}
       </div>
 
       <div className="admin-form__actions benchmark-actions">
         <button
           type="button"
           className="benchmark-btn benchmark-btn--primary"
-          onClick={() => void onRun()}
+          onClick={() => startBenchmark()}
           disabled={!canRun || isRunning}
           data-testid="benchmark-run"
         >
@@ -181,10 +151,7 @@ export function BenchmarkingPanel() {
                     {formatBenchmarkWallMs(step.wall_ms)}
                   </td>
                   <td>
-                    {step.status === "pending" && "Pending"}
-                    {step.status === "running" && "Running…"}
-                    {step.status === "done" && "Done"}
-                    {step.status === "error" && (step.error ?? "Error")}
+                    <BenchmarkStepStatus step={step} />
                   </td>
                 </tr>
               ))}
@@ -195,8 +162,9 @@ export function BenchmarkingPanel() {
 
       {steps.length > 0 && (
         <p className="admin-stub benchmark-note">
-          Each run executes Total SBM over the full ingested portfolio. With rollups present,
-          wall times are typically similar across scale labels on a single loaded cluster.
+          Each step runs a full cold Total SBM over the entire ingested portfolio (~30–40s per
+          step at 400M with rollups). Five steps typically take several minutes — this is expected
+          and does not affect normal Calculation performance.
         </p>
       )}
     </PanelCard>

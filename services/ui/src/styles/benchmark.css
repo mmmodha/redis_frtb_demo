@@ -68,7 +68,51 @@
 }
 
 .benchmark-table tr[data-status="running"] td {
-  font-style: italic;
+  font-style: normal;
+}
+
+.benchmark-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.benchmark-status__spinner {
+  width: 0.85rem;
+  height: 0.85rem;
+  flex-shrink: 0;
+}
+
+.benchmark-status__tick {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1rem;
+  height: 1rem;
+  border-radius: 50%;
+  background: #1f7a3f;
+  color: #fff;
+  font-size: 0.7rem;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.benchmark-status--done {
+  color: #3ddc84;
+}
+
+.benchmark-status--error {
+  color: var(--redis-red, #dc382d);
+}
+
+.benchmark-status--pending {
+  color: var(--redis-text-secondary, #8a8f99);
+}
+
+.benchmark-summary__active {
+  margin-top: 0.35rem;
+  color: var(--redis-accent, #dc382d);
+  font-size: 0.9rem;
 }
 
 .benchmark-note {
