@@ -264,9 +264,6 @@ export async function buildIngestSnapshot(opts: BuildIngestSnapshotOpts): Promis
   try { target_label = getActiveTarget().label; } catch { /* no active target */ }
 
   const redis = await opts.getRedis(opts.poolCategory);
-  const sens = target_label
-    ? await getSensKeyCountSnapshot(target_label, redis)
-    : { count: 0, refreshing: false, index_name: null };
 
   let memory_bytes = 0;
   let memory_human = "0B";
@@ -288,9 +285,16 @@ export async function buildIngestSnapshot(opts: BuildIngestSnapshotOpts): Promis
     loaderSnap = await fetchAggregatedBulkLoadStatus(fetchOne, topo.replicas);
   } catch { /* bulk-loader unreachable */ }
 
+  const records = opts.listRuns();
+  const inFlight = sumInFlight(loaderSnap);
+  const sens = target_label
+    ? await getSensKeyCountSnapshot(target_label, redis, {
+      forceRefresh: records.length > 0 || inFlight > 0,
+    })
+    : { count: 0, refreshing: false, index_name: null };
+
   const flushedTotal = sumFlushed(loaderSnap);
   const now = Date.now();
-  const records = opts.listRuns();
   const runs = records.map((r) => {
     const snap = buildSnapshotRun(r, loaderSnap, flushedTotal, now);
     return {
@@ -305,7 +309,6 @@ export async function buildIngestSnapshot(opts: BuildIngestSnapshotOpts): Promis
   });
   pruneRunWriteSamples(new Set(runs.map((r) => r.run_id)));
 
-  const inFlight = sumInFlight(loaderSnap);
   let flush_rps = updateFlushRps(flushedTotal, now);
   if (!isLoaderActivelyWriting(runs, inFlight)) {
     flush_rps = 0;

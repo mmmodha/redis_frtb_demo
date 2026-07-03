@@ -69,6 +69,28 @@ describe("<ActiveJobsCard />", () => {
     expect(screen.getByTestId("active-jobs-card")).toHaveAttribute("data-status", "active");
   });
 
+  it("shows draining banner when a done bulk run is still tracked", async () => {
+    stubFetch({
+      bulkRuns: {
+        active: [{
+          run_id: "01DRAIN",
+          status: "done",
+          rows_sent: 50_000_000,
+          rows_written: 40_000_000,
+          rows_total: 50_000_000,
+          workers: 8,
+          phase: "writing",
+        }],
+      },
+    });
+    render(<ActiveJobsCard />);
+    await waitFor(() => {
+      expect(screen.getByTestId("active-job-bulk-01DRAIN")).toBeInTheDocument();
+    });
+    expect(screen.getByTestId("active-jobs-card")).toHaveAttribute("data-status", "draining");
+    expect(screen.getByTestId("active-jobs-draining")).toBeInTheDocument();
+  });
+
   it("shows draining banner when pending rows remain after stop", async () => {
     stubFetch({
       loadStatus: {

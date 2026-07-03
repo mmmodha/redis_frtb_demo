@@ -55,9 +55,11 @@ function buildSnapshot(
 ): ActiveJobsSnapshot {
   const pending = pendingRows(bulkLoad);
   const flushedTotal = sumFlushed(bulkLoad);
-  const hasActiveProducers = generatorRuns.length > 0 || bulkRuns.length > 0;
-  const isDraining = !hasActiveProducers
-    && (pending > 0 || flushRps >= DRAIN_FLUSH_RPS_MIN);
+  const runningBulk = bulkRuns.filter((r) => r.status === "running");
+  const drainingBulk = bulkRuns.filter((r) => r.status === "done");
+  const hasActiveProducers = generatorRuns.length > 0 || runningBulk.length > 0;
+  const isDraining = drainingBulk.length > 0
+    || (!hasActiveProducers && (pending > 0 || flushRps >= DRAIN_FLUSH_RPS_MIN));
   return {
     generatorRuns,
     bulkRuns,
@@ -197,7 +199,7 @@ export function ActiveJobsCard(props: ActiveJobsCardProps): JSX.Element {
           <p className="active-jobs__error" role="alert">{error}</p>
         ) : null}
 
-        {snap.hasActiveProducers ? (
+        {snap.hasActiveProducers || snap.isDraining ? (
           <div className="admin-table-wrap">
             <table className="admin-table" data-testid="active-jobs-table">
               <thead>
@@ -229,20 +231,22 @@ export function ActiveJobsCard(props: ActiveJobsCardProps): JSX.Element {
                 {snap.bulkRuns.map((r) => (
                   <tr key={`bulk-${r.run_id}`} data-testid={`active-job-bulk-${r.run_id}`}>
                     <td>
-                      Bulk ingest
+                      Bulk ingest{r.status === "done" ? " · draining" : ""}
                       {typeof r.workers === "number" ? ` · ${r.workers} workers` : ""}
                     </td>
                     <td><code>{r.run_id}</code></td>
                     <td>{fmtProgress(bulkProgressRef.current.get(r.run_id) ?? bulkRunProgressDone(r, 0), r.rows_total)}</td>
                     <td>
-                      <button
-                        type="button"
-                        className="btn"
-                        disabled={cancelling === r.run_id}
-                        onClick={() => { void onCancelBulk(r.run_id); }}
-                      >
-                        {cancelling === r.run_id ? "Stopping…" : "Stop"}
-                      </button>
+                      {r.status === "running" ? (
+                        <button
+                          type="button"
+                          className="btn"
+                          disabled={cancelling === r.run_id}
+                          onClick={() => { void onCancelBulk(r.run_id); }}
+                        >
+                          {cancelling === r.run_id ? "Stopping…" : "Stop"}
+                        </button>
+                      ) : null}
                     </td>
                   </tr>
                 ))}

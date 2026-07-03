@@ -6,11 +6,13 @@ import {
   discoverBulkLoaderTopology,
   fetchAggregatedBulkLoadStatus,
   sumFlushed,
+  sumInFlight,
 } from "../bulk-loader-topology.ts";
 import type { RedisLike } from "../redis-like.ts";
 import type { RuntimeCategory } from "../active-target.ts";
 import {
   buildSnapshotRun,
+  computeRowsWritten,
   registerIngestSnapshotRoute,
   stabilizeRunRowsWritten,
 } from "./ingest-snapshot.ts";
@@ -152,6 +154,8 @@ const DEFAULT_SENSITIVITY_TYPES = ["Delta", "Vega", "Curvature"] as const;
 // Bulk-loader-only retention; the UI polls /ingest/bulk/runs/:id while a run
 // is in flight and a few seconds after completion, then drops the handle.
 const RUN_GRACE_MS = 60_000;
+/** Max time to keep a terminal run visible while the bulk-loader drains. */
+const DRAIN_WATCH_MS = 30 * 60_000;
 
 // Logger surface narrow enough that both fastify's pino instance and the
 // console satisfy it without an explicit dependency on pino.
@@ -200,15 +204,41 @@ export function listActiveBulkIngestRuns(): Array<{
   rows_total: number;
   workers: number;
 }> {
-  return Array.from(activeRuns.values())
-    .filter((r) => r.status === "running")
-    .map((r) => ({
-      run_id: r.run_id,
-      status: r.status,
-      rows_sent: r.rows_sent,
-      rows_total: r.rows_total,
-      workers: r.workers,
-    }));
+  return Array.from(activeRuns.values()).map((r) => ({
+    run_id: r.run_id,
+    status: r.status,
+    rows_sent: r.rows_sent,
+    rows_total: r.rows_total,
+    workers: r.workers,
+  }));
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => { setTimeout(resolve, ms); });
+}
+
+function scheduleRunRemoval(
+  record: BulkRunRecord,
+  ctx: { bulkBase: string; fetchImpl: typeof fetch },
+): void {
+  void (async () => {
+    const minUntil = Date.now() + RUN_GRACE_MS;
+    const deadline = Date.now() + DRAIN_WATCH_MS;
+    while (Date.now() < deadline) {
+      await sleep(2_000);
+      if (Date.now() < minUntil) continue;
+      try {
+        const fetchOne = createBulkLoaderStatusFetch({ base: ctx.bulkBase, fetchImpl: ctx.fetchImpl });
+        const topo = await discoverBulkLoaderTopology(fetchOne);
+        const agg = await fetchAggregatedBulkLoadStatus(fetchOne, topo.replicas);
+        const inFlight = sumInFlight(agg);
+        const written = computeRowsWritten(sumFlushed(agg), record.flushed_at_start);
+        const target = Math.min(record.rows_sent, record.rows_total);
+        if (inFlight === 0 && written >= target) break;
+      } catch { /* bulk-loader unreachable — keep run visible */ }
+    }
+    activeRuns.delete(record.run_id);
+  })();
 }
 
 export type StartBulkIngestResult =
@@ -526,7 +556,7 @@ export function registerIngestRoutes(
     "/ingest/bulk/runs",
     { config: { category: "light" } },
     async () => {
-      const running = Array.from(activeRuns.values()).filter((r) => r.status === "running");
+      const visible = Array.from(activeRuns.values());
       let loaderSnap: Awaited<ReturnType<typeof fetchAggregatedBulkLoadStatus>> = { workers: [] };
       let flushedTotal = 0;
       try {
@@ -536,7 +566,7 @@ export function registerIngestRoutes(
         flushedTotal = sumFlushed(loaderSnap);
       } catch { /* bulk-loader unreachable — rows_written falls back to 0 */ }
       const now = Date.now();
-      const active = running.map((r) => {
+      const active = visible.map((r) => {
         const snap = buildSnapshotRun(r, loaderSnap, flushedTotal, now);
         const rows_written = stabilizeRunRowsWritten(r.run_id, {
           status: r.status,
@@ -808,7 +838,7 @@ function runInline(args: InlineRunArgs): void {
       }
     } finally {
       archiveTerminalRun(record, { bulkBase, fetchImpl });
-      setTimeout(() => activeRuns.delete(run_id), RUN_GRACE_MS).unref?.();
+      scheduleRunRemoval(record, { bulkBase, fetchImpl });
     }
   })();
 }
@@ -987,7 +1017,7 @@ function runWithWorkers(args: WorkerRunArgs): void {
       );
     } finally {
       archiveTerminalRun(record, { bulkBase, fetchImpl });
-      setTimeout(() => activeRuns.delete(run_id), RUN_GRACE_MS).unref?.();
+      scheduleRunRemoval(record, { bulkBase, fetchImpl });
     }
   })();
 }

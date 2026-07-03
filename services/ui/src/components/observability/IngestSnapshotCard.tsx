@@ -94,7 +94,17 @@ export function IngestSnapshotCard(): JSX.Element {
                 {focused.error ? <span className="obs-ingest-snap__warn">{focused.error}</span> : null}
               </div>
             ) : (
-              <p className="obs-ingest-snap__idle" data-testid="ingest-snapshot-idle">No active ingest run.</p>
+              <div className="obs-ingest-snap__idle" data-testid="ingest-snapshot-idle">
+                <p>No tracked ingest run on the API.</p>
+                {snap.cluster.sens_count > 0 ? (
+                  <p className="obs-ingest-snap__cluster-hint" data-testid="ingest-snapshot-cluster-keys">
+                    Cluster has {fmt(snap.cluster.sens_count)} keys
+                    {snap.loader.in_flight > 0 || snap.loader.flush_rps > 0
+                      ? " — bulk-loader still flushing"
+                      : ""}.
+                  </p>
+                ) : null}
+              </div>
             )}
           </>
         )}
