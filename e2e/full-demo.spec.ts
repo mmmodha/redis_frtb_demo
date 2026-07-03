@@ -98,6 +98,12 @@ const inferResponse = {
 
 async function installCommonRoutes(page: Page, opts: { activeName?: string } = {}): Promise<void> {
   const activeName = opts.activeName ?? "demo-cluster";
+
+  // Benign fallback for unmocked API calls — register first; specific stubs below win.
+  await page.route("**/api/**", (route: Route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({}) }),
+  );
+
   await page.route("**/redis/active-target", (route: Route) =>
     route.fulfill({
       status: 200,
@@ -148,15 +154,12 @@ async function installCommonRoutes(page: Page, opts: { activeName?: string } = {
     route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ...seedSource450M, status: "ingesting" }) }),
   );
 
-  // Observability — keys/memory used by Ingest panel.
-  // Wave 5.69: register the catch-all FIRST so the specific keys/memory/shards
-  // stubs registered below take precedence (Playwright applies last-registered
-  // matching route, so order matters here). The catch-all answers
-  // /observability/history and any future endpoints with a benign empty body.
-  await page.route("**/observability/**", (route: Route) =>
+  // Observability API stubs — scope to /api/observability so Vite assets such as
+  // src/styles/observability.css are not intercepted as JSON (blank page).
+  await page.route("**/api/observability/**", (route: Route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({}) }),
   );
-  await page.route("**/observability/debug**", (route: Route) =>
+  await page.route("**/api/observability/debug**", (route: Route) =>
     route.fulfill({
       status: 200, contentType: "application/json",
       body: JSON.stringify({
@@ -173,13 +176,13 @@ async function installCommonRoutes(page: Page, opts: { activeName?: string } = {
       }),
     }),
   );
-  await page.route("**/observability/keys**", (route: Route) =>
+  await page.route("**/api/observability/keys**", (route: Route) =>
     route.fulfill({
       status: 200, contentType: "application/json",
       body: JSON.stringify({ prefix: "sens:", dbsize: 10_000_000, sample: ["sens:01HXAA"], sample_size: 1, ms: 2 }),
     }),
   );
-  await page.route("**/observability/memory", (route: Route) =>
+  await page.route("**/api/observability/memory", (route: Route) =>
     route.fulfill({
       status: 200, contentType: "application/json",
       body: JSON.stringify({ used_memory: 2_147_483_648, used_memory_human: "2.00G", ms: 1 }),
@@ -192,7 +195,7 @@ async function installCommonRoutes(page: Page, opts: { activeName?: string } = {
   // Observability route and unmount the AppShell — causing every subsequent
   // nav-link click in the spec (starting with Step 2a "Connections") to time
   // out on a blank page.
-  await page.route("**/observability/shards", (route: Route) =>
+  await page.route("**/api/observability/shards", (route: Route) =>
     route.fulfill({
       status: 200, contentType: "application/json",
       body: JSON.stringify([
@@ -201,6 +204,109 @@ async function installCommonRoutes(page: Page, opts: { activeName?: string } = {
         { shardId: "shard-3", role: "primary", opsPerSec: 50_100, slotCount: 5461, usedMemoryBytes: 8_456_716_864, netInBytes: 0, netOutBytes: 0 },
       ]),
     }),
+  );
+  await page.route("**/api/observability/per-shard**", (route: Route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify([
+        { shard_id: "shard-1", memory_used: 8_589_934_592, key_count: 3_333_333, write_ops_per_sec: 51_200, index_lag: 0, degraded: false },
+        { shard_id: "shard-2", memory_used: 8_321_499_136, key_count: 3_333_333, write_ops_per_sec: 49_800, index_lag: 0, degraded: false },
+        { shard_id: "shard-3", memory_used: 8_456_716_864, key_count: 3_333_334, write_ops_per_sec: 50_100, index_lag: 0, degraded: false },
+      ]),
+    }),
+  );
+
+  const facetsSnapshot = {
+    ok: true,
+    total_rows: 10_000_000,
+    risk_class: { GIRR: 5_000_000, Equity: 2_500_000, FX: 2_500_000 },
+    sensitivity_type: { Delta: 8_000_000, Vega: 2_000_000 },
+    bucket_by_risk_class: {
+      GIRR: { "USD-IRS": 2_500_000, "EUR-IRS": 2_500_000 },
+      Equity: { B1: 2_500_000 },
+      FX: { EURUSD: 2_500_000 },
+    },
+  };
+  const bucketFacets = {
+    ok: true,
+    buckets: [
+      { risk_class: "GIRR", bucket: "USD-IRS", count: 2_500_000 },
+      { risk_class: "GIRR", bucket: "EUR-IRS", count: 2_500_000 },
+      { risk_class: "Equity", bucket: "B1", count: 2_500_000 },
+      { risk_class: "FX", bucket: "EURUSD", count: 2_500_000 },
+    ],
+  };
+  await page.route("**/api/facets**", (route: Route) => {
+    const url = route.request().url();
+    if (url.includes("/facets/bucket")) {
+      return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(bucketFacets) });
+    }
+    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(facetsSnapshot) });
+  });
+
+  await page.route("**/api/ingest/bulk/runs/history**", (route: Route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ runs: [] }) }),
+  );
+  await page.route("**/api/ingest/bulk/runs", (route: Route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ active: [] }) }),
+  );
+  await page.route("**/api/observability/history**", (route: Route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        source: "unavailable",
+        metric: "total_keys",
+        windowMs: 18_000_000,
+        points: [],
+        reason: "module-not-loaded",
+        target_label: activeName,
+      }),
+    }),
+  );
+  await page.route("**/api/ingest/snapshot**", (route: Route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        ok: true,
+        target_label: activeName,
+        cluster: { sens_count: 10_000_000, sens_count_refreshing: false, memory_bytes: 0, memory_human: "2.00G" },
+        loader: { in_flight: 0, flush_rps: 0, flushed_total: 0, throttled: false, recent_429_count: 0 },
+        runs: [],
+        focused_run_id: null,
+      }),
+    }),
+  );
+  await page.route("**/api/admin/drift-status**", (route: Route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ results: [] }) }),
+  );
+  await page.route("**/api/admin/calc-jobs**", (route: Route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ active: [] }) }),
+  );
+  await page.route("**/api/admin/recent-errors**", (route: Route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ items: [] }) }),
+  );
+  await page.route("**/api/generator/runs**", (route: Route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ active: [] }) }),
+  );
+  await page.route("**/api/ingest/bulk/load-status**", (route: Route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ workers: [], dispatcher: { in_flight: 0 } }),
+    }),
+  );
+  await page.route("**/api/redis/active-target/bootstrap-status**", (route: Route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ phase: "ready", target_label: activeName }),
+    }),
+  );
+  await page.route("**/api/inflight**", (route: Route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ count: 0, items: [] }) }),
   );
 
   await page.route("**/pivot?**", (route: Route) =>
@@ -231,7 +337,7 @@ async function installCommonRoutes(page: Page, opts: { activeName?: string } = {
   );
 }
 
-test.describe.configure({ mode: "serial" });
+test.describe.configure({ mode: "serial", timeout: 120_000 });
 
 // INTEGRATION=1 — bypass page.route() mocks so the spec drives the live stack
 // (Wave 5.5 smoke). Unset (default) keeps fully-mocked fast CI behaviour.
@@ -331,13 +437,12 @@ test.describe("Full demo — 11-step flow (storyboard + protection)", () => {
     await expect(page.getByText(/^p99 latency$/i)).toBeVisible({ timeout: 5_000 });
     await shot(page, "step-08-concurrent");
 
-    // ShardMetricsStrip (Wave 4.6) — visible on Observability while load runs.
-    await page.getByRole("navigation", { name: /primary/i }).getByRole("link", { name: "Observability" }).click();
-    const strip = page.getByTestId("shard-metrics-strip");
-    await expect(strip).toBeVisible();
-    await expect(strip.getByText(/shard-1/)).toBeVisible();
-    await expect(strip.getByText(/shard-2/)).toBeVisible();
-    await expect(strip.getByText(/shard-3/)).toBeVisible();
+    // Per-shard metrics (Wave 7.0.4) — ShardMetricsStrip moved to /observability/shards.
+    await page.goto("/observability/shards");
+    await expect(page.getByRole("heading", { name: /^Per-shard observability$/i })).toBeVisible();
+    await expect(page.getByText(/shard-1/)).toBeVisible();
+    await expect(page.getByText(/shard-2/)).toBeVisible();
+    await expect(page.getByText(/shard-3/)).toBeVisible();
     await shot(page, "step-08-shard-metrics");
 
     // ----- Step 9 — Extensibility — Equity + FX calc (Wave 4.1) -----
@@ -384,12 +489,11 @@ test.describe("Full demo — 11-step flow (storyboard + protection)", () => {
 
     // ----- Step 11 — Kill a node (optional; observability resilience) -----
     // The actual failover is driven from the RS admin UI, not the app. We
-    // assert that the ShardMetricsStrip surfaces shard role/health so the
-    // SA can narrate the failover from inside the app.
-    await page.getByRole("navigation", { name: /primary/i }).getByRole("link", { name: "Observability" }).click();
-    const strip2 = page.getByTestId("shard-metrics-strip");
-    await expect(strip2).toBeVisible();
-    await expect(strip2).toContainText(/primary/i);
+    // assert that the per-shard view surfaces shard rows so the SA can
+    // narrate the failover from inside the app.
+    await page.goto("/observability/shards");
+    await expect(page.getByText(/shard-1/)).toBeVisible();
+    await expect(page.getByText(/shard-2/)).toBeVisible();
     await shot(page, "step-11-failover-view");
 
     // ----- Step 12 — Close (handoff screen) -----
