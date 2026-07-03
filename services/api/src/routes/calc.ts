@@ -87,6 +87,7 @@ interface CalcBody {
   // bucket-discovery to a caller-supplied subset so the second Calculate fans
   // out FCALL only over those buckets. Empty array or omitted = no narrowing.
   bucket_subset?: string[];
+  bucket_cells?: Array<{ risk_class: string; bucket: string | number }>;
   // Wave 5.31b: Basel MAR21.6 cross-bucket γ regime selector. Omitted defaults
   // to "medium" (factor 1.0) which is a no-op vs. pre-5.31b behaviour.
   correlation_regime?: CorrelationRegime;
@@ -128,6 +129,8 @@ const ALLOWED_REGIME = new Set<CorrelationRegime>(["low", "medium", "high"]);
 // across the entire 27-cell matrix.
 interface TotalSbmBody {
   bucket_subset?: string[];
+  /** Per-(risk_class, bucket) narrowing — avoids bucket-name collisions across classes. */
+  bucket_cells?: Array<{ risk_class: string; bucket: string | number }>;
   // Wave 6.41.A — exclude / include shape matches CalcBody.
   exclude?: {
     book?: string[];
@@ -171,6 +174,56 @@ function escapeTag(v: string): string {
 // FT.AGGREGATE query string. Matches the implicit cap of the existing
 // "LIMIT 0 10000" — far more than any realistic bucket count per risk_class.
 const MAX_BUCKET_SUBSET = 256;
+
+interface BucketCell {
+  risk_class: string;
+  bucket: string;
+}
+
+function parseBucketCells(
+  raw: unknown,
+): { cells: BucketCell[] } | { status: number; message: string } {
+  if (raw === undefined || raw === null) return { cells: [] };
+  if (!Array.isArray(raw)) {
+    return { status: 400, message: "bucket_cells must be an array of { risk_class, bucket } objects" };
+  }
+  if (raw.length > MAX_BUCKET_SUBSET) {
+    return { status: 400, message: `bucket_cells exceeds maximum of ${MAX_BUCKET_SUBSET} entries` };
+  }
+  const seen = new Set<string>();
+  const cells: BucketCell[] = [];
+  for (const item of raw) {
+    if (typeof item !== "object" || item === null || Array.isArray(item)) {
+      return { status: 400, message: "bucket_cells must be an array of { risk_class, bucket } objects" };
+    }
+    const o = item as Record<string, unknown>;
+    const rcRaw = o.risk_class;
+    if (typeof rcRaw !== "string" || rcRaw.length === 0) {
+      return { status: 400, message: "bucket_cells[].risk_class must be a non-empty string" };
+    }
+    const bktRaw = o.bucket;
+    const bucket =
+      typeof bktRaw === "number" && Number.isFinite(bktRaw)
+        ? String(bktRaw)
+        : typeof bktRaw === "string" && bktRaw.length > 0
+          ? bktRaw
+          : null;
+    if (bucket === null) {
+      return { status: 400, message: "bucket_cells[].bucket must be a non-empty string or number" };
+    }
+    const key = `${rcRaw.toUpperCase()}|${bucket}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    cells.push({ risk_class: rcRaw.toUpperCase(), bucket });
+  }
+  return { cells };
+}
+
+function bucketCellsCacheKey(cells: BucketCell[]): string[] {
+  return cells
+    .map((c) => `${c.risk_class}:${c.bucket}`)
+    .sort();
+}
 
 // Wave 5.31c: per-list cap on the exclude predicate sets. Each list is
 // marshalled into a CSV FCALL arg; this protects Lua memory on hostile input
@@ -451,6 +504,7 @@ interface ComputeSbmInput {
   risk_class: string; // already UPPERCASE
   leg: Leg;
   bucket_subset: string[]; // already validated + deduped + uppercased
+  bucket_cells: BucketCell[];
   regime: CorrelationRegime;
   excludeCsv: Record<ExcludeKey, string>;
   // Wave 6.41.A — positive-include lists, CSV-marshalled in the same shape
@@ -511,6 +565,7 @@ interface SbmFanoutInput {
   risk_class: string;
   leg: Leg;
   bucket_subset: string[];
+  bucket_cells: BucketCell[];
   excludeCsv: Record<ExcludeKey, string>;
   includeCsv: Record<IncludeKey, string>;
   forcePath: "lua" | "fast" | null;
@@ -549,7 +604,7 @@ async function runSbmFanoutPhase(
   input: SbmFanoutInput,
   ctx: ComputeSbmCtx,
 ): Promise<SbmFanoutOutcome> {
-  const { risk_class, leg, bucket_subset, excludeCsv, includeCsv, forcePath } = input;
+  const { risk_class, leg, bucket_subset, bucket_cells, excludeCsv, includeCsv, forcePath } = input;
   const { redis, schema, log } = ctx;
   const funcName = funcNameFor(risk_class, leg);
   const target_label = getActiveTarget().label;
@@ -581,7 +636,20 @@ async function runSbmFanoutPhase(
     if (Array.isArray(seenReply)) {
       for (const b of seenReply) if (typeof b === "string") bucketSet.add(b);
     }
-    if (bucket_subset.length > 0) {
+    if (bucket_cells.length > 0) {
+      const allowed = new Set(
+        bucket_cells
+          .filter((c) => c.risk_class === risk_class)
+          .map((c) => c.bucket),
+      );
+      if (allowed.size === 0) {
+        bucketSet.clear();
+      } else {
+        for (const b of Array.from(bucketSet)) {
+          if (!allowed.has(b)) bucketSet.delete(b);
+        }
+      }
+    } else if (bucket_subset.length > 0) {
       // Intersect: keep only subset entries that are actually populated.
       const subset = new Set(bucket_subset);
       for (const b of Array.from(bucketSet)) {
@@ -1081,7 +1149,7 @@ async function computeSbmCharge(
   ctx: ComputeSbmCtx,
   share?: FanoutShareCtx,
 ): Promise<ComputeSbmOutcome> {
-  const { risk_class, leg, bucket_subset, regime, excludeCsv, includeCsv, forcePath, noCache } = input;
+  const { risk_class, leg, bucket_subset, bucket_cells, regime, excludeCsv, includeCsv, forcePath, noCache } = input;
   const { redis } = ctx;
   const t0 = process.hrtime.bigint();
 
@@ -1089,6 +1157,7 @@ async function computeSbmCharge(
     risk_class,
     sensitivity_type: leg,
     bucket_subset: [...bucket_subset].sort(),
+    ...(bucket_cells.length > 0 ? { bucket_cells: bucketCellsCacheKey(bucket_cells) } : {}),
     correlation_regime: regime,
     exclude: excludeCsv,
     include: includeCsv,
@@ -1119,6 +1188,7 @@ async function computeSbmCharge(
     risk_class,
     leg,
     bucket_subset,
+    bucket_cells,
     excludeCsv,
     includeCsv,
     forcePath,
@@ -1232,6 +1302,13 @@ export function registerCalcRoute(
       bucket_subset = Array.from(seen);
     }
 
+    const cellsParsed = parseBucketCells(req.body?.bucket_cells);
+    if ("status" in cellsParsed) {
+      reply.code(cellsParsed.status);
+      return { error: cellsParsed.message };
+    }
+    const bucket_cells = cellsParsed.cells;
+
     // Wave 5.31b: validate optional correlation_regime (Basel MAR21.6). Default
     // "medium" → factor 1.0 → scaleCorrelationSpec returns the spec unchanged
     // → wire-shape regression is preserved vs. pre-5.31b.
@@ -1279,6 +1356,7 @@ export function registerCalcRoute(
         risk_class,
         leg: leg as Leg,
         bucket_subset,
+        bucket_cells,
         regime,
         excludeCsv,
         includeCsv,
@@ -1377,6 +1455,13 @@ export function registerCalcRoute(
         bucket_subset = Array.from(seen);
       }
 
+      const cellsParsed = parseBucketCells(req.body?.bucket_cells);
+      if ("status" in cellsParsed) {
+        reply.code(cellsParsed.status);
+        return { error: cellsParsed.message };
+      }
+      const bucket_cells = cellsParsed.cells;
+
       const excludeRaw = req.body?.exclude;
       const excludeCsv: Record<ExcludeKey, string> = emptyExcludeCsv();
       const excludeErr = validateAndMarshalCsv(excludeRaw, EXCLUDE_KEYS, "exclude", excludeCsv);
@@ -1437,6 +1522,7 @@ export function registerCalcRoute(
               risk_class: p.risk_class,
               leg: p.leg,
               bucket_subset,
+              bucket_cells,
               regime: p.regime,
               excludeCsv,
               includeCsv,
@@ -1786,6 +1872,7 @@ export function registerCalcRoute(
           risk_class,
           leg: leg as Leg,
           bucket_subset: [bucket],
+          bucket_cells: [],
           regime,
           excludeCsv,
           includeCsv,

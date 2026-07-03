@@ -35,16 +35,29 @@ export type BenchmarkStepStatus =
   | "running"
   | "done"
   | "error"
-  /** Shown for ladder rows below the current portfolio — needs a separate ingest. */
   | "skipped";
+
+export interface BucketCell {
+  risk_class: string;
+  bucket: string;
+}
+
+export interface BucketFacetRow {
+  risk_class: string;
+  bucket: string;
+  count: number;
+}
 
 export interface BenchmarkStep {
   tier_rows: number;
   wall_ms: number | null;
   total_sbm: number | null;
   status: BenchmarkStepStatus;
-  /** When false the row is display-only until ingest reaches that scale. */
   runnable: boolean;
+  /** Empty = full portfolio; non-empty = bucket subset for this tier. */
+  bucket_cells: BucketCell[];
+  /** Approximate row count covered by bucket_cells. */
+  subset_rows: number | null;
   error?: string;
 }
 
@@ -57,6 +70,12 @@ export interface RollupPreflight {
   present: number;
   total: number;
   missing: number;
+}
+
+export interface BucketSubsetSelection {
+  cells: BucketCell[];
+  selectedRows: number;
+  isFull: boolean;
 }
 
 export function formatBenchmarkRows(n: number): string {
@@ -104,35 +123,114 @@ function latestCompletedIngestRun(runs: IngestRunHistoryEntry[]): IngestRunHisto
   return done.sort((a, b) => b.ended_at_iso.localeCompare(a.ended_at_iso))[0] ?? null;
 }
 
-/** Build the display ladder; only the snapped/current tier is runnable on this cluster. */
-export function buildBenchmarkPlan(portfolioRows: number): BenchmarkStep[] {
+/**
+ * Greedy deterministic bucket pick until cumulative row count reaches target.
+ * Nested tiers (10M ⊂ 50M ⊂ …) share a prefix so wall times scale monotonically.
+ */
+export function selectBucketCellsForTarget(
+  facets: BucketFacetRow[],
+  targetRows: number,
+): BucketSubsetSelection {
+  const sorted = [...facets]
+    .filter((f) => f.count > 0)
+    .sort((a, b) => {
+      const rc = a.risk_class.localeCompare(b.risk_class);
+      return rc !== 0 ? rc : a.bucket.localeCompare(b.bucket);
+    });
+
+  let totalRows = 0;
+  for (const f of sorted) totalRows += f.count;
+
+  if (sorted.length === 0 || targetRows >= totalRows) {
+    return { cells: [], selectedRows: totalRows, isFull: true };
+  }
+
+  const cells: BucketCell[] = [];
+  let selectedRows = 0;
+  for (const f of sorted) {
+    cells.push({ risk_class: f.risk_class, bucket: f.bucket });
+    selectedRows += f.count;
+    if (selectedRows >= targetRows) break;
+  }
+
+  return { cells, selectedRows, isFull: false };
+}
+
+/** Build ladder steps; each tier runs a cold Total SBM on a bucket subset. */
+export function buildBenchmarkPlan(
+  portfolioRows: number,
+  bucketFacets: BucketFacetRow[],
+): BenchmarkStep[] {
   if (!Number.isFinite(portfolioRows) || portfolioRows <= 0) return [];
 
   const snapped = snapPortfolioTier(portfolioRows);
-  const runnableTier = snapped ?? portfolioRows;
   const tiers = snapped !== null
     ? benchmarkTiersUpTo(snapped)
     : [portfolioRows];
 
-  return tiers.map((tier_rows) => ({
-    tier_rows,
-    wall_ms: null,
-    total_sbm: null,
-    status: tier_rows === runnableTier ? "pending" : "skipped",
-    runnable: tier_rows === runnableTier,
-  }));
+  const hasFacets = bucketFacets.length > 0;
+
+  return tiers.map((tier_rows) => {
+    if (tier_rows > portfolioRows) {
+      return {
+        tier_rows,
+        wall_ms: null,
+        total_sbm: null,
+        status: "skipped" as const,
+        runnable: false,
+        bucket_cells: [],
+        subset_rows: null,
+      };
+    }
+
+    if (!hasFacets) {
+      const onlyTop = tier_rows === (snapped ?? portfolioRows);
+      return {
+        tier_rows,
+        wall_ms: null,
+        total_sbm: null,
+        status: onlyTop ? "pending" as const : "skipped" as const,
+        runnable: onlyTop,
+        bucket_cells: [],
+        subset_rows: onlyTop ? portfolioRows : null,
+      };
+    }
+
+    const { cells, selectedRows, isFull } = selectBucketCellsForTarget(bucketFacets, tier_rows);
+    return {
+      tier_rows,
+      wall_ms: null,
+      total_sbm: null,
+      status: "pending" as const,
+      runnable: true,
+      bucket_cells: isFull ? [] : cells,
+      subset_rows: selectedRows,
+    };
+  });
 }
 
 export function runnableBenchmarkSteps(steps: BenchmarkStep[]): BenchmarkStep[] {
   return steps.filter((s) => s.runnable);
 }
 
-/**
- * Best-effort row count for the *current* portfolio. Uses the latest completed
- * bulk ingest (not the max across history) so a fresh 10M run is not masked by
- * an older 400M entry. DBSIZE is intentionally excluded — it counts all keys,
- * not sensitivity rows, and inflates the ladder.
- */
+export async function fetchBucketFacetsForBenchmark(): Promise<BucketFacetRow[]> {
+  try {
+    const body = await fetchJsonWithTimeout<{ ok?: boolean; buckets?: BucketFacetRow[] }>(
+      `${apiBase()}/facets/bucket`,
+      PORTFOLIO_FETCH_TIMEOUT_MS,
+    );
+    if (!Array.isArray(body.buckets)) return [];
+    return body.buckets.filter(
+      (b) => typeof b.risk_class === "string"
+        && typeof b.bucket === "string"
+        && typeof b.count === "number"
+        && b.count > 0,
+    );
+  } catch {
+    return [];
+  }
+}
+
 export async function estimatePortfolioRows(): Promise<PortfolioRowEstimate> {
   try {
     const { active } = await getActiveBulkIngestRuns();
@@ -177,7 +275,7 @@ export async function estimatePortfolioRows(): Promise<PortfolioRowEstimate> {
     );
     const count = typeof body.count === "number" && body.count > 0 ? body.count : 0;
     if (count > 0) {
-      return { rows: count, source: "Redis key count (approx — run bulk ingest for exact)" };
+      return { rows: count, source: "Redis key count (approx)" };
     }
   } catch { /* fall through */ }
 
@@ -202,6 +300,9 @@ export async function fetchRollupPreflight(
   }
 }
 
-export async function runTotalSbmBenchmarkCold(): Promise<TotalSbmResponse> {
-  return postCalcSbmTotal({}, { nocache: true });
+export async function runTotalSbmBenchmarkCold(
+  bucketCells: BucketCell[] = [],
+): Promise<TotalSbmResponse> {
+  const body = bucketCells.length > 0 ? { bucket_cells: bucketCells } : {};
+  return postCalcSbmTotal(body, { nocache: true });
 }

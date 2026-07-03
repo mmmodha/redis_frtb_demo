@@ -132,6 +132,39 @@ describe("POST /calc/sbm/total — Wave 5.96B orchestrator", () => {
     expect(res.json().error).toMatch(/bucket_subset/);
   });
 
+  it("accepts bucket_cells to narrow per risk_class without name collisions", async () => {
+    const fr = delayedFakeRedis(0, ["USD-IRS", "EUR-IRS", "1"]);
+    app = await createServer({
+      redis: fr,
+      correlations: {
+        GIRR: { kind: "constant", value: 0 },
+        EQUITY: { kind: "constant", value: 0 },
+        FX: { kind: "constant", value: 0 },
+      },
+    });
+    const res = await app.inject({
+      method: "POST",
+      url: "/calc/sbm/total?nocache=1",
+      payload: {
+        bucket_cells: [{ risk_class: "GIRR", bucket: "USD-IRS" }],
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().total_sbm).toBeGreaterThanOrEqual(0);
+  });
+
+  it("rejects malformed bucket_cells with 400", async () => {
+    const fr = delayedFakeRedis(0, ["USD-IRS"]);
+    app = await createServer({ redis: fr, correlations: {} });
+    const res = await app.inject({
+      method: "POST",
+      url: "/calc/sbm/total",
+      payload: { bucket_cells: [{ risk_class: "", bucket: "X" }] },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toMatch(/bucket_cells/);
+  });
+
   it("rejects malformed exclude with 400 (mirrors /calc/sbm)", async () => {
     const fr = delayedFakeRedis(0, ["USD-IRS"]);
     app = await createServer({ redis: fr, correlations: {} });

@@ -6,8 +6,52 @@ import {
   formatBenchmarkRows,
   formatBenchmarkWallMs,
   runnableBenchmarkSteps,
+  selectBucketCellsForTarget,
   snapPortfolioTier,
+  type BucketFacetRow,
 } from "../../src/lib/benchmark";
+
+const SAMPLE_FACETS: BucketFacetRow[] = [
+  { risk_class: "GIRR", bucket: "EUR", count: 40_000_000 },
+  { risk_class: "GIRR", bucket: "USD", count: 40_000_000 },
+  { risk_class: "EQUITY", bucket: "1", count: 10_000_000 },
+  { risk_class: "EQUITY", bucket: "2", count: 10_000_000 },
+  { risk_class: "FX", bucket: "EURUSD", count: 40_000_000 },
+];
+
+describe("selectBucketCellsForTarget", () => {
+  it("returns nested subsets for increasing targets", () => {
+    const s10 = selectBucketCellsForTarget(SAMPLE_FACETS, 10_000_000);
+    expect(s10.isFull).toBe(false);
+    expect(s10.cells).toEqual([{ risk_class: "EQUITY", bucket: "1" }]);
+
+    const s50 = selectBucketCellsForTarget(SAMPLE_FACETS, 50_000_000);
+    expect(s50.cells.length).toBeGreaterThan(s10.cells.length);
+    expect(s50.cells.slice(0, s10.cells.length)).toEqual(s10.cells);
+  });
+
+  it("returns full portfolio when target exceeds total", () => {
+    const full = selectBucketCellsForTarget(SAMPLE_FACETS, 400_000_000);
+    expect(full.isFull).toBe(true);
+    expect(full.cells).toEqual([]);
+    expect(full.selectedRows).toBe(140_000_000);
+  });
+});
+
+describe("buildBenchmarkPlan", () => {
+  it("marks all tiers runnable with bucket subsets when facets exist", () => {
+    const steps = buildBenchmarkPlan(400_000_000, SAMPLE_FACETS);
+    expect(steps).toHaveLength(5);
+    expect(runnableBenchmarkSteps(steps)).toHaveLength(5);
+    expect(steps[0]!.bucket_cells.length).toBeGreaterThan(0);
+    expect(steps[4]!.bucket_cells).toEqual([]);
+  });
+
+  it("falls back to single full run when facets are unavailable", () => {
+    const steps = buildBenchmarkPlan(10_000_000, []);
+    expect(runnableBenchmarkSteps(steps)).toHaveLength(1);
+  });
+});
 
 describe("benchmarkTiersUpTo", () => {
   it("returns empty when portfolio is unknown", () => {
@@ -24,7 +68,6 @@ describe("benchmarkTiersUpTo", () => {
 
   it("includes full ladder at 400M+", () => {
     expect(benchmarkTiersUpTo(400_000_000)).toEqual([...BENCHMARK_ROW_TIERS]);
-    expect(benchmarkTiersUpTo(900_000_000)).toEqual([...BENCHMARK_ROW_TIERS]);
   });
 });
 
@@ -32,33 +75,6 @@ describe("snapPortfolioTier", () => {
   it("snaps down to the nearest ladder label", () => {
     expect(snapPortfolioTier(12_000_000)).toBe(10_000_000);
     expect(snapPortfolioTier(400_000_000)).toBe(400_000_000);
-    expect(snapPortfolioTier(3_000_000)).toBeNull();
-  });
-});
-
-describe("buildBenchmarkPlan", () => {
-  it("runs only the snapped tier on a 10M portfolio", () => {
-    const steps = buildBenchmarkPlan(10_000_000);
-    expect(steps).toHaveLength(1);
-    expect(steps[0]).toMatchObject({ tier_rows: 10_000_000, runnable: true, status: "pending" });
-    expect(runnableBenchmarkSteps(steps)).toHaveLength(1);
-  });
-
-  it("shows full ladder but only the top tier is runnable at 400M", () => {
-    const steps = buildBenchmarkPlan(400_000_000);
-    expect(steps).toHaveLength(5);
-    expect(runnableBenchmarkSteps(steps)).toEqual([
-      expect.objectContaining({ tier_rows: 400_000_000, runnable: true }),
-    ]);
-    expect(steps.filter((s) => s.status === "skipped")).toHaveLength(4);
-  });
-
-  it("snaps 120M portfolio to 100M runnable tier", () => {
-    const steps = buildBenchmarkPlan(120_000_000);
-    expect(steps.map((s) => s.tier_rows)).toEqual([10_000_000, 50_000_000, 100_000_000]);
-    expect(runnableBenchmarkSteps(steps)).toEqual([
-      expect.objectContaining({ tier_rows: 100_000_000, runnable: true }),
-    ]);
   });
 });
 

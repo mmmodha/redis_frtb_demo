@@ -33,7 +33,7 @@ function BenchmarkStepStatus({ step }: { step: BenchmarkStep }) {
   if (step.status === "skipped" || !step.runnable) {
     return (
       <span className="benchmark-status benchmark-status--skipped">
-        Needs ingest at this scale
+        Unavailable
       </span>
     );
   }
@@ -60,13 +60,14 @@ export function BenchmarkingPanel() {
 
   const canRun = (phase === "ready" || phase === "done" || phase === "error") && runnableCount > 0;
   const rollupWarn = rollup !== null && rollup.total > 0 && rollup.missing > 0;
+  const usesSubsets = steps.some((s) => s.bucket_cells.length > 0);
 
   return (
     <PanelCard title="Total SBM benchmark">
       <p className="admin-stub">
-        One cold <code>POST /calc/sbm/total?nocache=1</code> for the current ingested portfolio
-        (labelled at the nearest ladder step). Lower ladder rows are for separate ingests at those
-        scales. The Calculation tab is unchanged and still uses cache on repeat runs.
+        Runs cold <code>POST /calc/sbm/total?nocache=1</code> at each ladder step using a{" "}
+        <strong>bucket subset</strong> (~target row count) from the loaded portfolio — no flush
+        required. Timings measure calc throughput at scale, not full-portfolio capital.
       </p>
 
       <div className="benchmark-summary" data-testid="benchmark-summary">
@@ -82,12 +83,8 @@ export function BenchmarkingPanel() {
         <div>
           Cold runs this click:{" "}
           <strong data-testid="benchmark-step-count">{runnableCount}</strong>
-          {steps.length > runnableCount && (
-            <span className="benchmark-summary__meta">
-              {" "}
-              ({steps.length - runnableCount} ladder row
-              {steps.length - runnableCount === 1 ? "" : "s"} skipped — need ingest at that scale)
-            </span>
+          {usesSubsets && (
+            <span className="benchmark-summary__meta"> (bucket subsets — no re-ingest)</span>
           )}
         </div>
         {rollup !== null && rollup.total > 0 && (
@@ -118,7 +115,7 @@ export function BenchmarkingPanel() {
         >
           {isRunning
             ? `Running cold Total SBM (${runningIndex + 1}/${runnableCount})…`
-            : "Run benchmark"}
+            : "Run benchmark ladder"}
         </button>
         <button
           type="button"
@@ -154,7 +151,8 @@ export function BenchmarkingPanel() {
           <table className="benchmark-table" data-testid="benchmark-table">
             <thead>
               <tr>
-                <th scope="col">Rows</th>
+                <th scope="col">Target</th>
+                <th scope="col">Subset</th>
                 <th scope="col">Wall time</th>
                 <th scope="col">Status</th>
               </tr>
@@ -168,6 +166,17 @@ export function BenchmarkingPanel() {
                   data-runnable={step.runnable ? "true" : "false"}
                 >
                   <td>{formatBenchmarkRows(step.tier_rows)}</td>
+                  <td data-testid={`benchmark-subset-${step.tier_rows}`}>
+                    {step.subset_rows != null
+                      ? `~${formatBenchmarkRows(step.subset_rows)}`
+                      : "—"}
+                    {step.bucket_cells.length > 0 && (
+                      <span className="benchmark-summary__meta">
+                        {" "}
+                        ({step.bucket_cells.length} buckets)
+                      </span>
+                    )}
+                  </td>
                   <td data-testid={`benchmark-wall-${step.tier_rows}`}>
                     {formatBenchmarkWallMs(step.wall_ms)}
                   </td>
@@ -179,15 +188,6 @@ export function BenchmarkingPanel() {
             </tbody>
           </table>
         </div>
-      )}
-
-      {steps.length > 0 && (
-        <p className="admin-stub benchmark-note">
-          Click <strong>Run benchmark</strong> — when the runnable row shows Done, the{" "}
-          <strong>Wall time</strong> column holds <code>performance.total_ms</code> from the cold
-          Total SBM response. Lower ladder rows need a separate ingest at that scale (or a future
-          bucket-subset mode) before they can record their own timings.
-        </p>
       )}
     </PanelCard>
   );

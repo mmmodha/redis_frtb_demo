@@ -14,6 +14,7 @@ import {
 import {
   buildBenchmarkPlan,
   estimatePortfolioRows,
+  fetchBucketFacetsForBenchmark,
   fetchRollupPreflight,
   formatBenchmarkRows,
   runTotalSbmBenchmarkCold,
@@ -63,9 +64,12 @@ export function BenchmarkRunProvider({ children }: { children: ReactNode }): JSX
     setRunError(null);
     setRollup(null);
     try {
-      const est = await estimatePortfolioRows();
+      const [est, bucketFacets] = await Promise.all([
+        estimatePortfolioRows(),
+        fetchBucketFacetsForBenchmark(),
+      ]);
       setPortfolio(est);
-      setSteps(buildBenchmarkPlan(est.rows));
+      setSteps(buildBenchmarkPlan(est.rows, bucketFacets));
       setPhase("ready");
       // Rollup preflight can take minutes on large clusters (/admin/calc-coverage
       // 502s behind nginx) — never block the panel on it.
@@ -113,7 +117,7 @@ export function BenchmarkRunProvider({ children }: { children: ReactNode }): JSX
           )));
           try {
             const t0 = performance.now();
-            const res = await runTotalSbmBenchmarkCold();
+            const res = await runTotalSbmBenchmarkCold(step.bucket_cells);
             const apiMs = res.performance?.total_ms;
             const wallMs = typeof apiMs === "number" && Number.isFinite(apiMs)
               ? apiMs

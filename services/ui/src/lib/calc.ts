@@ -210,6 +210,7 @@ export async function postBucketCrossDetail(
 // metrics for the "Redis-fast" badge.
 export interface TotalSbmRequest {
   bucket_subset?: string[];
+  bucket_cells?: Array<{ risk_class: string; bucket: string }>;
   exclude?: { book?: string[]; trade_id?: string[]; risk_factor?: string[] };
   // Wave 6.41.C — same positive-include predicate as CalcSbmRequest.include,
   // passed straight through to every inner /calc/sbm cell on the api side.
