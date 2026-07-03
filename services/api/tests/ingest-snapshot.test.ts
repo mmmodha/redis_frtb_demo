@@ -11,6 +11,7 @@ import {
   computeRunPhase,
   computeRowsWritten,
   computeFlushRpsFromDelta,
+  stabilizeRunRowsWritten,
   _testResetIngestSnapshotState,
 } from "../src/routes/ingest-snapshot.ts";
 import { _testResetSensKeyCountCache } from "../src/lib/sens-key-count-cache.ts";
@@ -75,6 +76,19 @@ describe("ingest snapshot helpers", () => {
     expect(computeFlushRpsFromDelta(10_000, 1)).toBe(10_000);
     expect(computeFlushRpsFromDelta(0, 1)).toBe(0);
     expect(computeFlushRpsFromDelta(10_000, 0.1)).toBe(0);
+  });
+
+  it("stabilizeRunRowsWritten stays monotonic when raw flush delta drops to zero", () => {
+    _testResetIngestSnapshotState();
+    const run = {
+      status: "running",
+      rows_sent: 4_400_000,
+      rows_total: 50_000_000,
+      phase: "producing" as const,
+    };
+    expect(stabilizeRunRowsWritten("01RUN", run, 3_537_782)).toBe(4_400_000);
+    expect(stabilizeRunRowsWritten("01RUN", run, 0)).toBe(4_400_000);
+    expect(stabilizeRunRowsWritten("01RUN", { ...run, rows_sent: 4_800_000 }, 0)).toBe(4_800_000);
   });
 });
 

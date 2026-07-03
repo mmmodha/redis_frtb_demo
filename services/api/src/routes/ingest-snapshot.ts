@@ -96,6 +96,44 @@ export function computeRowsWritten(
   return Math.max(0, flushedTotal - flushedAtStart);
 }
 
+const runWrittenHighWater = new Map<string, number>();
+
+/** Phase-aware monotonic rows_written — tolerates flaky bulk-loader aggregation. */
+export function stabilizeRunRowsWritten(
+  runId: string,
+  run: {
+    status: string;
+    rows_sent: number;
+    rows_total: number;
+    phase?: RunPhase;
+  },
+  rawWritten: number,
+): number {
+  const total = Number.isFinite(run.rows_total) && run.rows_total > 0 ? run.rows_total : 0;
+  const sent = Math.max(0, run.rows_sent);
+  const written = Number.isFinite(rawWritten) && rawWritten >= 0 ? rawWritten : 0;
+  const prev = runWrittenHighWater.get(runId) ?? 0;
+
+  const inWritingPhase = run.phase === "writing" || run.phase === "draining"
+    || (total > 0 && sent >= total);
+
+  let raw: number;
+  if (inWritingPhase) {
+    raw = written > 0 ? written : sent;
+  } else {
+    raw = Math.max(sent, written);
+  }
+  if (total > 0) raw = Math.min(total, raw);
+
+  const next = Math.max(prev, raw);
+  if (run.status !== "running") {
+    runWrittenHighWater.delete(runId);
+  } else {
+    runWrittenHighWater.set(runId, next);
+  }
+  return next;
+}
+
 export function computeRunPhase(
   run: { status: string; rows_total: number; rows_sent: number; rows_written: number },
   loader: { throttled: boolean; in_flight: number },
@@ -253,7 +291,18 @@ export async function buildIngestSnapshot(opts: BuildIngestSnapshotOpts): Promis
   const flushedTotal = sumFlushed(loaderSnap);
   const now = Date.now();
   const records = opts.listRuns();
-  const runs = records.map((r) => buildSnapshotRun(r, loaderSnap, flushedTotal, now));
+  const runs = records.map((r) => {
+    const snap = buildSnapshotRun(r, loaderSnap, flushedTotal, now);
+    return {
+      ...snap,
+      rows_written: stabilizeRunRowsWritten(r.run_id, {
+        status: r.status,
+        rows_sent: r.rows_sent,
+        rows_total: r.rows_total,
+        phase: snap.phase,
+      }, snap.rows_written),
+    };
+  });
   pruneRunWriteSamples(new Set(runs.map((r) => r.run_id)));
 
   const inFlight = sumInFlight(loaderSnap);
@@ -301,4 +350,5 @@ export function _testResetIngestSnapshotState(): void {
   prevFlushAtMs = 0;
   flushRpsSmoothed = 0;
   runWriteSamples.clear();
+  runWrittenHighWater.clear();
 }

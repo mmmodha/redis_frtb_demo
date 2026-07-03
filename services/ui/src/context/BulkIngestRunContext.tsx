@@ -129,9 +129,6 @@ export function BulkIngestRunProvider({ children }: { children: ReactNode }): JS
   const applyRun = useCallback((run: IngestSnapshotRun, loaderFlushRps: number) => {
     const monotonicFlushed = monotonicWritten(writtenRef.current, run.rows_written);
     const nextWritten = effectiveRunWritten(run, monotonicFlushed);
-    // #region agent log
-    fetch('http://127.0.0.1:7607/ingest/7ff27258-4498-4d23-9f58-aa9dac097748',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'fed362'},body:JSON.stringify({sessionId:'fed362',location:'BulkIngestRunContext.tsx:applyRun',message:'ingest bar progress tick',data:{runId:run.run_id,rows_sent:run.rows_sent,rows_written:run.rows_written,phase:run.phase,monotonicFlushed,nextWritten,prevWritten:writtenRef.current},timestamp:Date.now(),hypothesisId:'H4'})}).catch(()=>{});
-    // #endregion
     writtenRef.current = nextWritten;
     setWritten(nextWritten);
     if (Number.isFinite(run.rows_total) && run.rows_total > 0) {

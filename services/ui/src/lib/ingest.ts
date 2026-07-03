@@ -281,6 +281,7 @@ export interface ActiveBulkIngestRun {
   rows_total: number;
   started_at_iso?: string;
   workers?: number;
+  phase?: string;
 }
 
 export async function getActiveBulkIngestRuns(): Promise<{ active: ActiveBulkIngestRun[] }> {

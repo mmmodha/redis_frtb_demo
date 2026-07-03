@@ -125,9 +125,6 @@ export function ActiveJobsCard(props: ActiveJobsCardProps): JSX.Element {
         const prevDone = bulkProgressRef.current.get(r.run_id) ?? 0;
         const done = bulkRunProgressDone(r, prevDone);
         bulkProgressRef.current.set(r.run_id, done);
-        // #region agent log
-        fetch('http://127.0.0.1:7607/ingest/7ff27258-4498-4d23-9f58-aa9dac097748',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'fed362'},body:JSON.stringify({sessionId:'fed362',location:'ActiveJobsCard.tsx:poll',message:'bulk run progress tick',data:{runId:r.run_id,rows_sent:r.rows_sent,rows_written:r.rows_written,prevDone,done},timestamp:Date.now(),hypothesisId:'H2-H3'})}).catch(()=>{});
-        // #endregion
       }
 
       const next = buildSnapshot(gen.active, bulk.active, load, flushRps);

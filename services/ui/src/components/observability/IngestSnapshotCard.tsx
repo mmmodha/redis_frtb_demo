@@ -29,9 +29,6 @@ export function IngestSnapshotCard(): JSX.Element {
         const done = pickBulkRunProgress(focusedRun, prev);
         progressRef.current.set(focusedRun.run_id, done);
         setDisplayWritten(done);
-        // #region agent log
-        fetch('http://127.0.0.1:7607/ingest/7ff27258-4498-4d23-9f58-aa9dac097748',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'fed362'},body:JSON.stringify({sessionId:'fed362',location:'IngestSnapshotCard.tsx:poll',message:'snapshot progress tick',data:{runId:focusedRun.run_id,rows_sent:focusedRun.rows_sent,rows_written:focusedRun.rows_written,phase:focusedRun.phase,prev,done},timestamp:Date.now(),hypothesisId:'H2'})}).catch(()=>{});
-        // #endregion
       } else {
         setDisplayWritten(null);
       }

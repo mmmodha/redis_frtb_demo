@@ -12,6 +12,7 @@ import type { RuntimeCategory } from "../active-target.ts";
 import {
   buildSnapshotRun,
   registerIngestSnapshotRoute,
+  stabilizeRunRowsWritten,
 } from "./ingest-snapshot.ts";
 import {
   archiveBulkRunHistory,
@@ -537,14 +538,21 @@ export function registerIngestRoutes(
       const now = Date.now();
       const active = running.map((r) => {
         const snap = buildSnapshotRun(r, loaderSnap, flushedTotal, now);
+        const rows_written = stabilizeRunRowsWritten(r.run_id, {
+          status: r.status,
+          rows_sent: r.rows_sent,
+          rows_total: r.rows_total,
+          phase: snap.phase,
+        }, snap.rows_written);
         return {
           run_id: r.run_id,
           status: r.status,
           rows_sent: r.rows_sent,
-          rows_written: snap.rows_written,
+          rows_written,
           rows_total: r.rows_total,
           started_at_iso: r.started_at_iso,
           workers: r.workers,
+          phase: snap.phase,
         };
       });
       return { active };
@@ -581,8 +589,14 @@ export function registerIngestRoutes(
         const topo = await discoverBulkLoaderTopology(fetchOne);
         const agg = await fetchAggregatedBulkLoadStatus(fetchOne, topo.replicas);
         const snap = buildSnapshotRun(r, agg, sumFlushed(agg), Date.now());
+        const rows_written = stabilizeRunRowsWritten(r.run_id, {
+          status: r.status,
+          rows_sent: r.rows_sent,
+          rows_total: r.rows_total,
+          phase: snap.phase,
+        }, snap.rows_written);
         snapshotFields = {
-          rows_written: snap.rows_written,
+          rows_written,
           rows_per_sec_write: snap.rows_per_sec_write,
           rows_per_sec_producer: snap.rows_per_sec_producer,
           phase: snap.phase,
