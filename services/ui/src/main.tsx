@@ -10,6 +10,7 @@ import "./styles/connections.css";
 import "./styles/connections-wizard.css";
 import "./styles/sources.css";
 import "./styles/calc.css";
+import "./styles/benchmark.css";
 import "./styles/pivot.css";
 import "./styles/ingest.css";
 import "./styles/loadgen.css";

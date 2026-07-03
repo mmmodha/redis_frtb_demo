@@ -274,8 +274,12 @@ export interface TotalSbmResponse {
   performance: TotalSbmPerformance;
   resolved_command_summary: string;
 }
-export async function postCalcSbmTotal(body: TotalSbmRequest): Promise<TotalSbmResponse> {
-  const res = await fetch(`${apiBase()}/calc/sbm/total`, {
+export async function postCalcSbmTotal(
+  body: TotalSbmRequest = {},
+  opts?: { nocache?: boolean },
+): Promise<TotalSbmResponse> {
+  const qs = opts?.nocache ? "?nocache=1" : "";
+  const res = await fetch(`${apiBase()}/calc/sbm/total${qs}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),

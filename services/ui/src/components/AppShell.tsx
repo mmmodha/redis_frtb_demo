@@ -16,6 +16,7 @@ const SECTIONS = [
   { to: "/ingest", label: "Ingest" },
   { to: "/pivot", label: "Search" },
   { to: "/calc", label: "Calculation" },
+  { to: "/benchmarking", label: "Benchmarking" },
   { to: "/observability", label: "Observability" },
   { to: "/explorer", label: "JSON Explorer" },
   { to: "/admin", label: "Admin" },

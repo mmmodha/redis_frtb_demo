@@ -16,6 +16,7 @@ import { Shards } from "./routes/Shards";
 import { Loadgen } from "./routes/Loadgen";
 import { Explorer } from "./routes/Explorer";
 import { Admin } from "./routes/Admin";
+import { Benchmarking } from "./routes/Benchmarking";
 
 export function App() {
   return (
@@ -33,6 +34,7 @@ export function App() {
                 <Route path="/ingest" element={<Ingest />} />
                 <Route path="/pivot" element={<Pivot />} />
                 <Route path="/calc" element={<Calc />} />
+                <Route path="/benchmarking" element={<Benchmarking />} />
                 <Route path="/observability" element={<Observability />} />
                 <Route path="/observability/shards" element={<Shards />} />
                 <Route path="/loadgen" element={<Loadgen />} />
