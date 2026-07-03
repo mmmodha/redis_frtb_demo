@@ -12,6 +12,7 @@ import {
   computeRowsWritten,
   computeFlushRpsFromDelta,
   stabilizeRunRowsWritten,
+  trackLoaderFlushedTotal,
   _testResetIngestSnapshotState,
 } from "../src/routes/ingest-snapshot.ts";
 import { _testResetSensKeyCountCache } from "../src/lib/sens-key-count-cache.ts";
@@ -89,6 +90,15 @@ describe("ingest snapshot helpers", () => {
     expect(stabilizeRunRowsWritten("01RUN", run, 3_537_782)).toBe(4_400_000);
     expect(stabilizeRunRowsWritten("01RUN", run, 0)).toBe(4_400_000);
     expect(stabilizeRunRowsWritten("01RUN", { ...run, rows_sent: 4_800_000 }, 0)).toBe(4_800_000);
+  });
+
+  it("trackLoaderFlushedTotal stays monotonic across flaky replica probes", () => {
+    _testResetIngestSnapshotState();
+    expect(trackLoaderFlushedTotal(101_092_735, true)).toBe(101_092_735);
+    expect(trackLoaderFlushedTotal(32_593_540, true)).toBe(101_092_735);
+    expect(trackLoaderFlushedTotal(105_483_848, true)).toBe(105_483_848);
+    trackLoaderFlushedTotal(0, false);
+    expect(trackLoaderFlushedTotal(50_000, true)).toBe(50_000);
   });
 });
 

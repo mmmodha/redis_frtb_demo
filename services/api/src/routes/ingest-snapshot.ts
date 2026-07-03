@@ -153,6 +153,20 @@ const MIN_FLUSH_DT_SEC = 0.5;
 let prevFlushedTotal = 0;
 let prevFlushAtMs = 0;
 let flushRpsSmoothed = 0;
+/** Monotonic loader flush counter — probes may see different replica subsets. */
+let loaderFlushedHighWater = 0;
+
+/** Track the highest flushed total seen this ingest (exported for tests). */
+export function trackLoaderFlushedTotal(raw: number, hasActiveRuns: boolean): number {
+  if (!hasActiveRuns) {
+    loaderFlushedHighWater = 0;
+    return Math.max(0, raw);
+  }
+  if (Number.isFinite(raw) && raw > loaderFlushedHighWater) {
+    loaderFlushedHighWater = raw;
+  }
+  return loaderFlushedHighWater;
+}
 
 const runWriteSamples = new Map<string, { written: number; at: number }>();
 
@@ -293,18 +307,21 @@ export async function buildIngestSnapshot(opts: BuildIngestSnapshotOpts): Promis
     })
     : { count: 0, refreshing: false, index_name: null };
 
-  const flushedTotal = sumFlushed(loaderSnap);
+  const rawFlushed = sumFlushed(loaderSnap);
+  const flushedTotal = trackLoaderFlushedTotal(rawFlushed, records.length > 0);
   const now = Date.now();
   const runs = records.map((r) => {
     const snap = buildSnapshotRun(r, loaderSnap, flushedTotal, now);
+    const rows_written = stabilizeRunRowsWritten(r.run_id, {
+      status: r.status,
+      rows_sent: r.rows_sent,
+      rows_total: r.rows_total,
+      phase: snap.phase,
+    }, snap.rows_written);
     return {
       ...snap,
-      rows_written: stabilizeRunRowsWritten(r.run_id, {
-        status: r.status,
-        rows_sent: r.rows_sent,
-        rows_total: r.rows_total,
-        phase: snap.phase,
-      }, snap.rows_written),
+      rows_written,
+      rows_per_sec_write: computeRunWriteRps(r.run_id, rows_written, now),
     };
   });
   pruneRunWriteSamples(new Set(runs.map((r) => r.run_id)));
@@ -352,6 +369,7 @@ export function _testResetIngestSnapshotState(): void {
   prevFlushedTotal = 0;
   prevFlushAtMs = 0;
   flushRpsSmoothed = 0;
+  loaderFlushedHighWater = 0;
   runWriteSamples.clear();
   runWrittenHighWater.clear();
 }

@@ -49,6 +49,10 @@ export function IngestSnapshotCard(): JSX.Element {
     ? snap.runs.find((r) => r.run_id === snap.focused_run_id) ?? snap.runs[0]
     : snap?.runs[0];
 
+  const liveRps = focused
+    ? Math.max(snap?.loader.flush_rps ?? 0, focused.rows_per_sec_write, focused.rows_per_sec_producer)
+    : (snap?.loader.flush_rps ?? 0);
+
   return (
     <PanelCard
       title="Ingest snapshot"
@@ -67,7 +71,7 @@ export function IngestSnapshotCard(): JSX.Element {
               </div>
               <div className="obs-stat">
                 <span className="obs-stat__label">Flush rate</span>
-                <span className="obs-stat__value">{fmt(snap.loader.flush_rps)}<span className="obs-stat__unit"> rows/s</span></span>
+                <span className="obs-stat__value">{fmt(Math.max(snap.loader.flush_rps, liveRps))}<span className="obs-stat__unit"> rows/s</span></span>
               </div>
               <div className="obs-stat">
                 <span className="obs-stat__label">Written</span>
@@ -89,7 +93,7 @@ export function IngestSnapshotCard(): JSX.Element {
                 <span className="obs-ingest-snap__run-meta">
                   {fmt(displayWritten ?? focused.rows_written)} / {fmt(focused.rows_total)} rows
                   {" · "}
-                  {fmt(focused.rows_per_sec_write)} rows/s write
+                  {fmt(liveRps)} rows/s
                 </span>
                 {focused.error ? <span className="obs-ingest-snap__warn">{focused.error}</span> : null}
               </div>
