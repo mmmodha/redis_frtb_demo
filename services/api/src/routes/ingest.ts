@@ -192,6 +192,24 @@ export function getAllBulkRunRecords(): BulkRunRecord[] {
   return Array.from(activeRuns.values());
 }
 
+export function listActiveBulkIngestRuns(): Array<{
+  run_id: string;
+  status: string;
+  rows_sent: number;
+  rows_total: number;
+  workers: number;
+}> {
+  return Array.from(activeRuns.values())
+    .filter((r) => r.status === "running")
+    .map((r) => ({
+      run_id: r.run_id,
+      status: r.status,
+      rows_sent: r.rows_sent,
+      rows_total: r.rows_total,
+      workers: r.workers,
+    }));
+}
+
 export type StartBulkIngestResult =
   | { ok: true; run_id: string; workers: number; rows_total: number }
   | { ok: false; status: number; error: string };

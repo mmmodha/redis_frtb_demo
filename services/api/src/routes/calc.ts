@@ -47,7 +47,13 @@ import {
 // successful /calc/sbm and /calc/sbm/total response so the Observability
 // "Last Calculation" card can surface concrete telemetry without re-hitting
 // the calculator UI. In-memory only; cleared on active-target switch.
-import { listRecentRuns, pushRecentRun } from "../calc/recent-runs.ts";
+import { listRecentRuns, pushRecentFailure, pushRecentRun } from "../calc/recent-runs.ts";
+import {
+  finishCalcJob,
+  startCalcJob,
+  updateCalcJob,
+} from "../calc/calc-jobs.ts";
+import { pushRecentError } from "../ops/recent-errors.ts";
 
 // Wave 5.83C-1 — engine label stamped on every per-bucket result so the UI can
 // render the badge (fast path vs. legacy Lua kernel). Mirrors the literals in
@@ -459,6 +465,41 @@ interface ComputeSbmCtx {
   schema?: Schema;
   correlations: Record<string, CorrelationSpec>;
   log: LogLike;
+  calcJobId?: string;
+}
+
+function recordCalcFailure(opts: {
+  jobId: string;
+  calcKind: "per_class" | "total";
+  requestId: string;
+  statusCode: number;
+  error: string;
+  risk_class?: string;
+  leg?: string;
+  route: string;
+}): void {
+  finishCalcJob(opts.jobId, {
+    status: "error",
+    error: opts.error,
+    status_code: opts.statusCode,
+  });
+  pushRecentFailure({
+    calc_kind: opts.calcKind,
+    risk_class: opts.risk_class,
+    leg: opts.leg,
+    error: opts.error,
+    status_code: opts.statusCode,
+    request_id: opts.requestId,
+  });
+  if (opts.statusCode >= 500) {
+    pushRecentError({
+      request_id: opts.requestId,
+      method: "POST",
+      route: opts.route,
+      status_code: opts.statusCode,
+      error: opts.error,
+    });
+  }
 }
 
 type ComputeSbmOutcome =
@@ -563,6 +604,13 @@ async function runSbmFanoutPhase(
     });
   }
   const buckets = Array.from(bucketSet);
+  if (ctx.calcJobId && buckets.length > 0) {
+    updateCalcJob(ctx.calcJobId, {
+      cells_total: buckets.length,
+      cells_done: 0,
+      current_cell: `fan-out ${buckets.length} buckets`,
+    });
+  }
 
   // 1a) Precondition probe via FT.INFO num_docs.
   let numDocs: number | null = null;
@@ -831,29 +879,46 @@ async function runSbmFanoutPhase(
           return { ...r, engine: FAST_PATH_ENGINE, resolved_command: buildResolvedCommand(b) };
         });
       }
+      if (ctx.calcJobId && buckets.length > 0) {
+        updateCalcJob(ctx.calcJobId, {
+          cells_done: buckets.length,
+          current_cell: `fast-path ${buckets.length} buckets`,
+        });
+      }
     } else {
+      let bucketsDone = 0;
       results = await Promise.all(
         buckets.map(async (b, i): Promise<BucketResultWithEngine> => {
           const routeKey = dispatchedKeys[i]!;
-          const r = (await redis.call(
-            "FCALL",
-            funcName,
-            "1",
-            routeKey,
-            risk_class,
-            b,
-            excludeCsv.book,
-            excludeCsv.trade_id,
-            excludeCsv.risk_factor,
-          )) as unknown;
-          const parsed = parseBucketReply(r) ?? { bucket: "", K_b: 0, S_b: 0, count: 0, ms: 0 };
-          parsed.bucket = b;
-          const intermediate = { path: "lua" as const };
-          const resolved_command = formatRedisCommand("FCALL", [
-            funcName, "1", routeKey, risk_class, b,
-            excludeCsv.book, excludeCsv.trade_id, excludeCsv.risk_factor,
-          ]);
-          return { ...parsed, engine: LUA_PATH_ENGINE, intermediate, resolved_command };
+          try {
+            const r = (await redis.call(
+              "FCALL",
+              funcName,
+              "1",
+              routeKey,
+              risk_class,
+              b,
+              excludeCsv.book,
+              excludeCsv.trade_id,
+              excludeCsv.risk_factor,
+            )) as unknown;
+            const parsed = parseBucketReply(r) ?? { bucket: "", K_b: 0, S_b: 0, count: 0, ms: 0 };
+            parsed.bucket = b;
+            const intermediate = { path: "lua" as const };
+            const resolved_command = formatRedisCommand("FCALL", [
+              funcName, "1", routeKey, risk_class, b,
+              excludeCsv.book, excludeCsv.trade_id, excludeCsv.risk_factor,
+            ]);
+            return { ...parsed, engine: LUA_PATH_ENGINE, intermediate, resolved_command };
+          } finally {
+            bucketsDone += 1;
+            if (ctx.calcJobId) {
+              updateCalcJob(ctx.calcJobId, {
+                cells_done: bucketsDone,
+                current_cell: `${b} (${bucketsDone}/${buckets.length})`,
+              });
+            }
+          }
         }),
       );
     }
@@ -1203,6 +1268,12 @@ export function registerCalcRoute(
     // Wave 5.96B — delegate to the shared compute helper so /calc/sbm/total
     // can fan out the same logic in-process across (class, leg, scenario)
     // cells without HTTP self-recursion.
+    const job = startCalcJob({
+      kind: "per_class",
+      request_id: req.id,
+      risk_class,
+      leg,
+    });
     const outcome = await computeSbmCharge(
       {
         risk_class,
@@ -1221,12 +1292,25 @@ export function registerCalcRoute(
         schema: opts.schema,
         correlations: opts.correlations,
         log: app.log,
+        calcJobId: job.id,
       },
     );
     if (!outcome.ok) {
+      const errMsg = String((outcome.body as { error?: string }).error ?? "calc failed");
+      recordCalcFailure({
+        jobId: job.id,
+        calcKind: "per_class",
+        requestId: req.id,
+        statusCode: outcome.statusCode,
+        error: errMsg,
+        risk_class,
+        leg,
+        route: "/calc/sbm",
+      });
       reply.code(outcome.statusCode);
-      return outcome.body;
+      return { ...outcome.body, request_id: req.id };
     }
+    finishCalcJob(job.id, { status: "done" });
     // Wave 6.01 — record the served per-class response so the Observability
     // "Last Calculation" card can surface it. Push on cache hits too with
     // cache: "hit" so a warm cell still updates the card. Scenario only
@@ -1338,29 +1422,44 @@ export function registerCalcRoute(
       // members. The cumulative_ms / wall_clock_ms ratio still reflects overlap.
       const cellConcurrency = getRuntimePoolSize("heavy-calc");
       const fanoutShare: FanoutShareCtx = { inflight: new Map() };
+      const totalJob = startCalcJob({
+        kind: "total",
+        request_id: req.id,
+        cells_total: plan.length,
+      });
+      let cellsDone = 0;
       const cells = await mapWithConcurrency(plan, cellConcurrency, async (p) => {
         const cellStart = process.hrtime.bigint();
-        const outcome = await computeSbmCharge(
-          {
-            risk_class: p.risk_class,
-            leg: p.leg,
-            bucket_subset,
-            regime: p.regime,
-            excludeCsv,
-            includeCsv,
-            forcePath,
-            noCache,
-          },
-          {
-            redis: await getRedis(),
-            schema: opts.schema,
-            correlations: opts.correlations,
-            log: app.log,
-          },
-          fanoutShare,
-        );
-        const cell_ms = Number(process.hrtime.bigint() - cellStart) / 1e6;
-        return { plan: p, outcome, cell_ms };
+        const cellLabel = `${p.risk_class} ${p.leg} ${p.regime}`;
+        try {
+          const outcome = await computeSbmCharge(
+            {
+              risk_class: p.risk_class,
+              leg: p.leg,
+              bucket_subset,
+              regime: p.regime,
+              excludeCsv,
+              includeCsv,
+              forcePath,
+              noCache,
+            },
+            {
+              redis: await getRedis(),
+              schema: opts.schema,
+              correlations: opts.correlations,
+              log: app.log,
+            },
+            fanoutShare,
+          );
+          const cell_ms = Number(process.hrtime.bigint() - cellStart) / 1e6;
+          return { plan: p, outcome, cell_ms };
+        } finally {
+          cellsDone += 1;
+          updateCalcJob(totalJob.id, {
+            cells_done: cellsDone,
+            current_cell: cellLabel,
+          });
+        }
       });
       const wallClockMs = Number(process.hrtime.bigint() - wallStart) / 1e6;
 
@@ -1376,12 +1475,24 @@ export function registerCalcRoute(
           const body = c.outcome.body as { error?: string };
           const isPerCellSkip = status === 503 && body.error === "no-data-or-index";
           if (!isPerCellSkip) {
+            const errMsg = String(body.error ?? "calc failed");
+            recordCalcFailure({
+              jobId: totalJob.id,
+              calcKind: "total",
+              requestId: req.id,
+              statusCode: status,
+              error: errMsg,
+              risk_class: c.plan.risk_class,
+              leg: c.plan.leg,
+              route: "/calc/sbm/total",
+            });
             reply.code(status);
             return {
               ...body,
               risk_class: c.plan.risk_class,
               sensitivity_type: c.plan.leg,
               correlation_regime: c.plan.regime,
+              request_id: req.id,
             };
           }
         }
@@ -1593,7 +1704,8 @@ export function registerCalcRoute(
         cache: orchestratorCache === "hit" ? "hit" : "miss",
         engine: "orchestrator",
       });
-      return responseBody;
+      finishCalcJob(totalJob.id, { status: "done" });
+      return { ...responseBody, request_id: req.id };
     },
   );
 

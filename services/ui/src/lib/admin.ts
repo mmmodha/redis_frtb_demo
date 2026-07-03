@@ -137,6 +137,97 @@ export function getStreamStatus(): Promise<StreamStatusResponse> {
   return getJson<StreamStatusResponse>("/admin/stream-status");
 }
 
+// Wave 7.2 — run diagnostics for large-scale ingest/calc debugging.
+export interface CalcJobEntry {
+  id: string;
+  kind: "per_class" | "total";
+  status: "running" | "done" | "error";
+  started_at: string;
+  finished_at?: string;
+  request_id?: string;
+  risk_class?: string;
+  leg?: string;
+  cells_total: number;
+  cells_done: number;
+  current_cell?: string;
+  error?: string;
+  status_code?: number;
+}
+
+export interface RecentErrorEntry {
+  id: string;
+  ts: string;
+  request_id: string;
+  method: string;
+  route: string;
+  status_code: number;
+  error: string;
+  detail?: string;
+}
+
+export interface DebugBundleResponse {
+  generated_at: string;
+  target: { host: string; port: number; label: string; version: number } | null;
+  bootstrap: {
+    phase: string;
+    target_label: string;
+    err: string | null;
+    server_ready: boolean;
+    server_boot_err: string | null;
+  };
+  backpressure: {
+    heavy_inflight: number;
+    heavy_limit: number;
+    light_inflight: number;
+    light_limit: number;
+  } | null;
+  runtime_pools: { heavy_calc: number; heavy_ingest: number; light: number };
+  cluster: Record<string, unknown> | null;
+  calc: { active_jobs: CalcJobEntry[]; recent_runs: unknown[] };
+  ingest: {
+    generator_active: Array<{ run_id: string; status: string; rows_done: number; rows_total: number }>;
+    bulk_active: Array<{ run_id: string; status: string; rows_sent: number; rows_total: number; workers: number }>;
+    bulk_loader: unknown | null;
+  };
+  drift: { threshold_pct: number; total_checks: number; drift_count: number; recent: unknown[] };
+  inflight: { count: number; items: unknown[]; stale: unknown[] };
+  recent_errors: RecentErrorEntry[];
+  recent_logs?: LogLine[];
+}
+
+export interface LogLine {
+  ts: string;
+  level: string;
+  msg: string;
+  request_id?: string;
+  status_code?: number;
+  route?: string;
+  fields?: Record<string, unknown>;
+}
+
+export interface LogTailResponse {
+  tail: number;
+  count: number;
+  docker_hint: string;
+  items: LogLine[];
+}
+
+export function getDebugBundle(): Promise<DebugBundleResponse> {
+  return getJson<DebugBundleResponse>("/admin/debug-bundle");
+}
+
+export function getCalcJobs(): Promise<{ active: CalcJobEntry[] }> {
+  return getJson<{ active: CalcJobEntry[] }>("/admin/calc-jobs");
+}
+
+export function getRecentErrors(limit = 20): Promise<{ items: RecentErrorEntry[] }> {
+  return getJson<{ items: RecentErrorEntry[] }>(`/admin/recent-errors?limit=${limit}`);
+}
+
+export function getLogTail(tail = 200): Promise<LogTailResponse> {
+  return getJson<LogTailResponse>(`/admin/logs?tail=${tail}`);
+}
+
 export async function postIngestCapacityTest(
   body: { rows_per_step?: number; worker_sweep?: number[] } = {},
 ): Promise<CapacityTestResult> {

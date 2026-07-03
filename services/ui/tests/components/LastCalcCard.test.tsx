@@ -4,6 +4,7 @@
 
 import { describe, it, expect } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { LastCalcCard } from "../../src/components/LastCalcCard";
 import type { RecentCalcRun } from "../../src/lib/api";
 
@@ -25,27 +26,37 @@ function total(over: Partial<RecentCalcRun> = {}): RecentCalcRun {
 }
 
 describe("<LastCalcCard />", () => {
+  function renderCard(items: RecentCalcRun[], now = Date.now()) {
+    return render(
+      <MemoryRouter>
+        <LastCalcCard items={items} now={now} />
+      </MemoryRouter>,
+    );
+  }
+
   it("renders the empty-state copy when items is empty", () => {
-    render(<LastCalcCard items={[]} now={Date.now()} />);
+    renderCard([]);
     expect(screen.getByTestId("last-calc-empty")).toHaveTextContent(/No calculations yet/i);
   });
 
-  it("renders per_class header + Wall time / Engine / Cache / Cells tiles", () => {
-    render(<LastCalcCard items={[perClass()]} now={Date.now()} />);
+  it("renders per_class header + Wall time / Fan-out / Engine / Cache / Cells tiles", () => {
+    renderCard([perClass()]);
     expect(screen.getByTestId("last-calc-header").textContent).toMatch(/GIRR Delta · Medium · 12s ago/);
     const tiles = screen.getByTestId("last-calc-tiles-per-class");
     expect(tiles).toHaveTextContent(/Wall time/);
     expect(tiles).toHaveTextContent("4.2");
+    expect(tiles).toHaveTextContent(/Fan-out/);
+    expect(tiles).toHaveTextContent("1.1");
     expect(tiles).toHaveTextContent(/Engine/);
     expect(tiles).toHaveTextContent("fast");
     expect(tiles).toHaveTextContent(/Cache/);
     expect(tiles).toHaveTextContent("miss");
-    expect(tiles).toHaveTextContent(/Cells evaluated/);
+    expect(tiles).toHaveTextContent(/Cells/);
     expect(tiles).toHaveTextContent("3");
   });
 
   it("renders total header + Redis ops / Parallelism tiles", () => {
-    render(<LastCalcCard items={[total()]} now={Date.now()} />);
+    renderCard([total()]);
     expect(screen.getByTestId("last-calc-header").textContent).toMatch(/Total SBM · 2s ago/);
     const tiles = screen.getByTestId("last-calc-tiles-total");
     expect(tiles).toHaveTextContent(/Redis ops/);
@@ -56,7 +67,7 @@ describe("<LastCalcCard />", () => {
 
   it("click toggles a 5-row history table; second click collapses it", () => {
     const items = [perClass(), total(), perClass({ id: "01J2", risk_class: "EQUITY" })];
-    render(<LastCalcCard items={items} now={Date.now()} />);
+    renderCard(items);
     expect(screen.queryByTestId("last-calc-table")).toBeNull();
     fireEvent.click(screen.getByTestId("last-calc-toggle"));
     const table = screen.getByTestId("last-calc-table");
@@ -66,11 +77,11 @@ describe("<LastCalcCard />", () => {
     expect(screen.queryByTestId("last-calc-table")).toBeNull();
   });
 
-  it("caps the expanded table at 5 rows", () => {
+  it("caps the expanded table at 10 rows", () => {
     const items: RecentCalcRun[] = [];
-    for (let i = 0; i < 8; i++) items.push(perClass({ id: `id-${i}` }));
-    render(<LastCalcCard items={items} now={Date.now()} />);
+    for (let i = 0; i < 12; i++) items.push(perClass({ id: `id-${i}` }));
+    renderCard(items);
     fireEvent.click(screen.getByTestId("last-calc-toggle"));
-    expect(screen.getByTestId("last-calc-table").querySelectorAll("tbody tr").length).toBe(5);
+    expect(screen.getByTestId("last-calc-table").querySelectorAll("tbody tr").length).toBe(10);
   });
 });

@@ -171,6 +171,13 @@ function makeProductionClassify(
   };
 }
 
+let backpressureStateRef: BackpressureState | null = null;
+
+/** Snapshot of heavy/light admission counters for Admin debug bundle. */
+export function getBackpressureSnapshot(): BackpressureState | null {
+  return backpressureStateRef;
+}
+
 export function registerBackpressure(app: FastifyInstance, opts: BackpressureOpts = {}): BackpressureState {
   // Pool-derived defaults keep the in-flight budget in lockstep with the
   // Wave 6.21 pool size. Env overrides (`MAX_INFLIGHT_HEAVY` /
@@ -183,6 +190,7 @@ export function registerBackpressure(app: FastifyInstance, opts: BackpressureOpt
   const classify = opts.classify ?? makeProductionClassify(warnedRoutes);
 
   const state: BackpressureState = { heavy: 0, light: 0, heavyLimit, lightLimit };
+  backpressureStateRef = state;
 
   // preHandler (not onRequest) so `req.routeOptions.config` is populated
   // by the route-resolution step before we read the category.

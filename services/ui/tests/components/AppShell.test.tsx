@@ -72,6 +72,13 @@ function makeRunningGenerator(rowsDone = 50, rowsTotal = 200): GeneratorRunState
 }
 
 describe("<AppShell />", () => {
+  it("renders a mobile nav toggle for small screens", () => {
+    renderShell();
+    const toggle = screen.getByTestId("app-shell-nav-toggle");
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(toggle).toHaveAttribute("aria-controls", "app-shell-primary-nav");
+  });
+
   it("renders a left rail with the 6 locked navigation sections", () => {
     renderShell();
     const nav = screen.getByRole("navigation", { name: /primary/i });

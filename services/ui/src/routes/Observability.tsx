@@ -1,37 +1,50 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import { PanelCard } from "../components/PanelCard";
 import { MetricTile } from "../components/MetricTile";
 import { MetricHistoryModal } from "../components/MetricHistoryModal";
-import { TimingStrip } from "../components/TimingStrip";
 import { EnterpriseCallout } from "../components/EnterpriseCallout";
-import { ShardMetricsStrip } from "../components/ShardMetricsStrip";
 import { LastCalcCard } from "../components/LastCalcCard";
+import { ActiveJobsCard } from "../components/ActiveJobsCard";
+import { KeysSampleModal } from "../components/KeysSampleModal";
+import { IngestSnapshotCard } from "../components/observability/IngestSnapshotCard";
+import { IngestRunsCompactCard } from "../components/observability/IngestRunsCompactCard";
+import { CalcHealthStrip } from "../components/observability/CalcHealthStrip";
+import { ObservabilityOpsBanner } from "../components/observability/ObservabilityOpsBanner";
 import {
-  getObservabilityKeys,
-  getObservabilityMemory,
-  getObservabilityShards,
-  getRecentCalcRuns,
+  getObservabilityDebug,
+  type ObservabilityDebugResponse,
   type ObservabilityKeysResponse,
   type ObservabilityMemoryResponse,
-  type ObservabilityShardsResponse,
   type RecentCalcRun,
 } from "../lib/api";
+import { stopAllRuns } from "../lib/ingest";
 import {
   OBS_REFRESH_OPTIONS,
   useObservabilityRefresh,
 } from "../hooks/useObservabilityRefresh";
 import { useMetricHistory, RETENTION_MS, type MetricName } from "../hooks/useMetricHistory";
+import {
+  formatBytesCompact,
+  memoryBarLevel,
+  memoryUsagePct,
+  resolveMemoryCapBytes,
+} from "../lib/ingestMemoryDisplay";
+import type { MetricStatus } from "../components/MetricTile";
 
 interface ObservabilityData {
   keys: ObservabilityKeysResponse;
   memory: ObservabilityMemoryResponse;
-  shards: ObservabilityShardsResponse;
+  indexCount: number;
+  indexRefreshing: boolean;
   recent: RecentCalcRun[];
+  bootstrap: ObservabilityDebugResponse["bootstrap"];
 }
 
 type Status =
   | { kind: "loading" }
   | { kind: "ready"; data: ObservabilityData }
+  | { kind: "degraded" }
   | { kind: "error"; message: string };
 
 function formatNumber(n: number): string {
@@ -42,8 +55,6 @@ function cadenceLabel(cadenceMs: number): string {
   return cadenceMs === 0 ? "Off" : `${cadenceMs / 1000}s`;
 }
 
-// Wave 6.00 — compact humanized time-since: Ns (<60s), Nm (<60m), Nh (<24h),
-// Nd (≥24h). Exported for unit tests covering each unit boundary.
 export function humanizeSeconds(s: number): string {
   const n = Math.max(0, Math.floor(s));
   if (n < 60) return `${n}s`;
@@ -63,23 +74,26 @@ export function Observability() {
   const [now, setNow] = useState<number>(() => Date.now());
   const [pulseKey, setPulseKey] = useState<number>(0);
   const [inFlight, setInFlight] = useState<boolean>(false);
+  const [stopAllBusy, setStopAllBusy] = useState(false);
   const inFlightRef = useRef<boolean>(false);
 
-  // Hoisted fetch so the polling loop and the manual refresh button can share
-  // a single in-flight guard. inFlightRef avoids a stale-closure race where
-  // two near-simultaneous callers both see inFlight=false.
   const fetchOnce = useCallback(async (): Promise<void> => {
     if (inFlightRef.current) return;
     inFlightRef.current = true;
     setInFlight(true);
     try {
-      const [keys, memory, shards, recent] = await Promise.all([
-        getObservabilityKeys("sens:"),
-        getObservabilityMemory(),
-        getObservabilityShards(),
-        getRecentCalcRuns(5),
-      ]);
-      setStatus({ kind: "ready", data: { keys, memory, shards, recent: recent.items } });
+      const debug = await getObservabilityDebug(10);
+      setStatus({
+        kind: "ready",
+        data: {
+          keys: debug.keys,
+          memory: debug.memory,
+          indexCount: debug.index_count.count,
+          indexRefreshing: debug.index_count.refreshing,
+          recent: debug.calc_recent.items,
+          bootstrap: debug.bootstrap,
+        },
+      });
       setLastError(null);
       setLastFetchAt(Date.now());
       setNow(Date.now());
@@ -87,12 +101,9 @@ export function Observability() {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       const isBusy = msg.includes("503") || /busy|calculation/i.test(msg);
-      // Only blow away the page on first-load failure. After we have data,
-      // keep showing it and surface the failure as an inline pill. When Redis
-      // is busy with a calc, stay in loading — the cadence loop retries.
       setStatus((prev) => {
-        if (prev.kind !== "loading") return prev;
-        if (isBusy) return prev;
+        if (prev.kind === "ready") return prev;
+        if (isBusy) return { kind: "degraded" };
         return { kind: "error", message: msg };
       });
       setLastError(msg);
@@ -102,9 +113,6 @@ export function Observability() {
     }
   }, []);
 
-  // Cadence-driven polling loop. Pauses when the tab is hidden and resumes
-  // (with an immediate fetch) on visibilitychange. Cleanup clears the
-  // interval on unmount or cadence change.
   useEffect(() => {
     let timer: ReturnType<typeof setInterval> | null = null;
 
@@ -146,26 +154,40 @@ export function Observability() {
     };
   }, [cadenceMs, fetchOnce]);
 
-  // Lightweight 1s ticker so the "Updated Ns ago" badge counts up between
-  // fetches; independent of the cadence loop so it stays smooth even when
-  // cadence is 5s/10s.
   useEffect(() => {
     const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
   }, []);
 
+  const onStopAll = useCallback(async () => {
+    if (!window.confirm("Stop all generator and bulk-ingest runs?")) return;
+    setStopAllBusy(true);
+    try {
+      await stopAllRuns();
+    } finally {
+      setStopAllBusy(false);
+    }
+  }, []);
+
   const secondsAgo = lastFetchAt !== null ? Math.max(0, Math.floor((now - lastFetchAt) / 1000)) : 0;
   const showRefreshError = lastError !== null && status.kind === "ready";
-  // Wave 6.00 — when auto-refresh is on, the cadence itself tells you how
-  // fresh the data is, so the "Updated Ns ago" prefix is redundant noise.
-  // When cadence is Off, the humanized timestamp is the most useful thing.
   const badgeText =
     cadenceMs === 0 ? `Updated ${humanizeSeconds(secondsAgo)} ago` : cadenceLabel(cadenceMs);
 
+  const bootstrap = status.kind === "ready" ? status.data.bootstrap : null;
+  const showBootstrapBar = bootstrap != null
+    && bootstrap.phase !== "ready"
+    && bootstrap.phase !== "idle";
+
   return (
-    <>
-      <header className="observability__header">
-        <h1>Observability</h1>
+    <div className="obs-page">
+      <header className="obs-page__header">
+        <div className="obs-page__intro">
+          <h1>Observability</h1>
+          <p className="obs-page__subtitle">
+            Live Redis health, ingest workloads, and calculation activity for the active target.
+          </p>
+        </div>
         <div className="observability__controls">
           <label className="observability__refresh-label" htmlFor="obs-refresh-select">
             Refresh
@@ -234,11 +256,24 @@ export function Observability() {
           ) : null}
         </div>
       </header>
-      <EnterpriseCallout signal="ObservabilityModule">
-        RedisInsight-style observability built into the app — ops/sec, memory,
-        per-shard breakdown — all from the bundled enterprise modules. No third
-        party telemetry stack required.
-      </EnterpriseCallout>
+
+      {showBootstrapBar ? (
+        <div className="obs-bootstrap-bar" data-testid="obs-bootstrap-bar" data-phase={bootstrap!.phase}>
+          <span className="obs-bootstrap-bar__label">Bootstrap</span>
+          <span className={`pill pill--${bootstrap!.phase === "failed" ? "err" : "warn"}`}>
+            {bootstrap!.phase}
+          </span>
+          {bootstrap!.target_label ? (
+            <span className="obs-bootstrap-bar__target">target <code>{bootstrap!.target_label}</code></span>
+          ) : null}
+          {bootstrap!.err ? (
+            <span className="obs-bootstrap-bar__err">{bootstrap!.err}</span>
+          ) : null}
+          <Link to="/connections" className="obs-bootstrap-bar__link">Connections</Link>
+        </div>
+      ) : null}
+
+      <ObservabilityOpsBanner />
 
       {status.kind === "loading" && (
         <div className="observability__loading" role="status">
@@ -252,6 +287,27 @@ export function Observability() {
         </div>
       )}
 
+      {status.kind === "degraded" && (
+        <>
+          <div
+            className="obs-bootstrap-bar obs-bootstrap-bar--calc"
+            data-testid="obs-degraded-banner"
+            role="status"
+          >
+            <span className="obs-bootstrap-bar__label">Redis busy</span>
+            <span className="pill pill--warn">calc in flight</span>
+            <span>
+              Cluster metrics are paused while Redis runs the calculation — workload
+              and calc progress cards below still update.
+            </span>
+          </div>
+          <ObservabilityWorkloads
+            now={now}
+            onStopAll={stopAllBusy ? undefined : () => { void onStopAll(); }}
+          />
+        </>
+      )}
+
       {status.kind === "error" && (
         <div className="observability__error" role="alert">
           failed to load observability: {status.message}
@@ -259,128 +315,282 @@ export function Observability() {
       )}
 
       {status.kind === "ready" && (
-        <ObservabilityReady data={status.data} pulseKey={pulseKey} now={now} />
+        <ObservabilityReady
+          data={status.data}
+          pulseKey={pulseKey}
+          now={now}
+          onStopAll={stopAllBusy ? undefined : () => { void onStopAll(); }}
+        />
       )}
-    </>
+
+      <div className="obs-page__footnote">
+        <EnterpriseCallout signal="ObservabilityModule">
+          RedisInsight-style observability built into the app — keys, memory,
+          ops/sec, and live ingest/calc workload health from the bundled enterprise
+          modules. No third-party telemetry stack required.
+        </EnterpriseCallout>
+      </div>
+    </div>
   );
 }
 
 interface SnapshotMetricSpec {
-  key: MetricName;
+  key?: MetricName;
   label: string;
   unit?: string;
   value: number;
   display: string;
   format: (v: number) => string;
+  status?: MetricStatus;
+  hint: string;
+  onClick?: () => void;
+  history?: boolean;
+  testId?: string;
 }
 
 function ObservabilityReady({
   data,
   pulseKey,
   now,
+  onStopAll,
 }: {
   data: ObservabilityData;
   pulseKey: number;
   now: number;
+  onStopAll?: () => void;
 }) {
+  const [keysModalOpen, setKeysModalOpen] = useState(false);
   const totalKeys = data.keys.dbsize;
   const memHuman = data.memory.used_memory_human ?? "—";
   const memBytes = Number(data.memory.used_memory ?? 0);
-  const shards = data.shards;
+  const capBytes = resolveMemoryCapBytes({
+    maxmemory_bytes: data.memory.maxmemory_bytes,
+    total_system_memory_bytes: data.memory.total_system_memory_bytes,
+  });
+  const memPct = memoryUsagePct(memBytes, capBytes);
+  const memLevel = memoryBarLevel(memPct);
+  const opsPerSec = Number(data.memory.instantaneous_ops_per_sec ?? 0);
+  const sensCount = data.indexCount;
+  const sensRefreshing = data.indexRefreshing;
 
-  if (totalKeys === 0 && shards.length === 0) {
+  if (totalKeys === 0 && sensCount === 0) {
     return (
-      <PanelCard title="Cluster state">
-        <div className="observability__empty" role="status">
-          no sensitivities loaded yet — run a generator job to populate the
-          cluster, then this tab will light up with live metrics.
-        </div>
-      </PanelCard>
+      <section className="obs-section">
+        <PanelCard title="Cluster health">
+          <div className="observability__empty" role="status">
+            No sensitivities loaded yet. Run a generator or bulk ingest job to populate
+            the cluster — metrics will appear here once data is written.
+          </div>
+        </PanelCard>
+      </section>
     );
   }
 
-  const totalOps = shards.reduce((acc, s) => acc + (s.opsPerSec ?? 0), 0);
+  const memDisplay = memPct != null
+    ? `${memHuman} · ${memPct.toFixed(1)}%`
+    : memHuman;
+
   const specs: SnapshotMetricSpec[] = [
-    { key: "total_keys", label: "Total keys", unit: "keys", value: totalKeys, display: formatNumber(totalKeys), format: formatNumber },
-    { key: "memory_used_bytes", label: "Memory used", value: memBytes, display: memHuman, format: (v) => `${(v / (1024 * 1024)).toFixed(2)} MB` },
-    { key: "shard_count", label: "Shards", unit: "primaries", value: shards.length, display: String(shards.length), format: (v) => String(Math.round(v)) },
-    { key: "ops_per_sec", label: "Ops / sec", unit: "ops/s", value: totalOps, display: formatNumber(totalOps), format: formatNumber },
+    {
+      key: "total_keys",
+      label: "Total keys",
+      unit: "keys",
+      value: totalKeys,
+      display: formatNumber(totalKeys),
+      format: formatNumber,
+      hint: "Click for key sample",
+      onClick: () => setKeysModalOpen(true),
+      history: true,
+    },
+    {
+      key: "memory_used_bytes",
+      label: "Memory used",
+      value: memBytes,
+      display: memDisplay,
+      format: (v) => `${(v / (1024 * 1024)).toFixed(2)} MB`,
+      hint: "Click for history",
+      history: true,
+    },
+    {
+      key: "ops_per_sec",
+      label: "Ops / sec",
+      unit: "ops/s",
+      value: opsPerSec,
+      display: formatNumber(opsPerSec),
+      format: formatNumber,
+      hint: "Click for history",
+      history: true,
+    },
+    {
+      label: "Sensitivities",
+      unit: "indexed",
+      value: sensCount,
+      display: formatNumber(sensCount),
+      format: formatNumber,
+      status: sensRefreshing ? "pending" : "live",
+      hint: "Cached index row estimate",
+      history: false,
+      testId: "obs-sens-tile",
+    },
   ];
 
   return (
     <>
-      <PanelCard title="Cluster snapshot">
-        <div className="metric-grid">
-          {specs.map((s) => (
-            <SnapshotTile key={s.key} spec={s} pulseKey={pulseKey} />
-          ))}
-        </div>
-      </PanelCard>
-      <LastCalcCard items={data.recent} now={now} />
-      <PanelCard title="Per-shard ops/sec">
-        <TimingStrip
-          shards={shards.map((s) => ({
-            id: s.shardId,
-            label: s.shardId,
-            ms: s.opsPerSec ?? 0,
-          }))}
-          unit="ops/s"
-        />
-      </PanelCard>
-      <PanelCard title="Live shard metrics">
-        <ShardMetricsStrip shards={shards} />
-      </PanelCard>
+      <section className="obs-section" aria-labelledby="obs-cluster-heading">
+        <PanelCard title="Cluster health">
+          <p id="obs-cluster-heading" className="obs-section__lede">
+            Snapshot of the active Redis target — refreshed on your cadence above.
+          </p>
+          <div className="obs-cluster-grid">
+            {specs.map((s) => (
+              <ClusterTile key={s.label} spec={s} pulseKey={pulseKey} />
+            ))}
+          </div>
+          {memPct != null && capBytes != null ? (
+            <div
+              className="ingest-memory-bar obs-memory-bar"
+              data-testid="obs-memory-bar"
+              data-level={memLevel}
+              role="meter"
+              aria-valuenow={Math.round(memPct)}
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-label={`Memory ${Math.round(memPct)}% used`}
+            >
+              <div className="ingest-memory-bar__track" aria-hidden="true">
+                <div
+                  className="ingest-memory-bar__fill"
+                  style={{ width: `${memPct.toFixed(1)}%` }}
+                />
+              </div>
+              <span className="ingest-memory-bar__caption">
+                {memHuman} / {formatBytesCompact(capBytes)}
+                {` · ${memPct.toFixed(1)}% of cap`}
+              </span>
+            </div>
+          ) : null}
+        </PanelCard>
+      </section>
+
+      <KeysSampleModal
+        open={keysModalOpen}
+        onClose={() => setKeysModalOpen(false)}
+        dbsize={totalKeys}
+        prefix={data.keys.prefix}
+        sample={data.keys.sample}
+      />
+
+      <ObservabilityWorkloads now={now} onStopAll={onStopAll} recent={data.recent} />
     </>
   );
 }
 
-function SnapshotTile({ spec, pulseKey }: { spec: SnapshotMetricSpec; pulseKey: number }) {
+function ObservabilityWorkloads({
+  now,
+  onStopAll,
+  recent = [],
+}: {
+  now: number;
+  onStopAll?: () => void;
+  recent?: RecentCalcRun[];
+}) {
+  return (
+    <>
+      <section className="obs-section" aria-labelledby="obs-workloads-heading">
+        <h2 id="obs-workloads-heading" className="obs-section__heading">Active workloads</h2>
+        <div className="obs-dual-grid">
+          <div className="obs-dual-grid__item">
+            <ActiveJobsCard onRequestStopAll={onStopAll} />
+          </div>
+          <div className="obs-dual-grid__item">
+            <IngestSnapshotCard />
+          </div>
+        </div>
+      </section>
+
+      <section className="obs-section" aria-labelledby="obs-calc-heading">
+        <h2 id="obs-calc-heading" className="obs-section__heading">Calculations</h2>
+        <div className="obs-dual-grid">
+          <div className="obs-dual-grid__item">
+            <LastCalcCard items={recent} now={now} />
+          </div>
+          <div className="obs-dual-grid__item">
+            <CalcHealthStrip />
+          </div>
+        </div>
+      </section>
+
+      <section className="obs-section" aria-labelledby="obs-history-heading">
+        <h2 id="obs-history-heading" className="obs-section__heading">Ingest history</h2>
+        <IngestRunsCompactCard />
+      </section>
+    </>
+  );
+}
+
+function ClusterTile({ spec, pulseKey }: { spec: SnapshotMetricSpec; pulseKey: number }) {
   const [open, setOpen] = useState(false);
-  // Wave 5.61 — Option B: the inline sparkline keeps its own 5h history,
-  // while the popout modal owns a separate windowMs that the user can zoom
-  // independently. The modal-side hook is enabled only while open.
   const [modalWindowMs, setModalWindowMs] = useState<number>(RETENTION_MS);
   const currentValue = Number.isFinite(spec.value) ? spec.value : null;
+  const useHistoryModal = spec.history !== false && spec.onClick == null;
   const sparkline = useMetricHistory({
-    metric: spec.key,
+    metric: spec.key ?? "total_keys",
     currentValue,
     pulseKey,
+    enabled: spec.history !== false && spec.key != null,
   });
   const modalHistory = useMetricHistory({
-    metric: spec.key,
+    metric: spec.key ?? "total_keys",
     currentValue,
     pulseKey,
-    enabled: open,
+    enabled: open && spec.key != null,
     windowMs: modalWindowMs,
   });
-  const sparkPoints = sparkline.points.map((p) => p.v);
+  const sparkPoints = spec.history === false
+    ? (currentValue != null ? Array(8).fill(currentValue) : [])
+    : sparkline.points.map((p) => p.v);
   const handleClose = (): void => {
     setOpen(false);
     setModalWindowMs(RETENTION_MS);
   };
+  const handleClick = (): void => {
+    if (spec.onClick) {
+      spec.onClick();
+      return;
+    }
+    if (useHistoryModal) setOpen(true);
+  };
+  const interactive = spec.onClick != null || useHistoryModal;
+
   return (
-    <>
+    <div className="obs-cluster-tile" data-testid={spec.testId}>
       <MetricTile
         label={spec.label}
         value={spec.display}
         unit={spec.unit}
-        status="live"
-        history={{ points: sparkPoints, ariaLabel: `${spec.label} history sparkline` }}
-        onClick={() => setOpen(true)}
+        status={spec.status ?? "live"}
+        history={{
+          points: sparkPoints,
+          ariaLabel: `${spec.label} sparkline`,
+        }}
+        onClick={interactive ? handleClick : undefined}
       />
-      <MetricHistoryModal
-        open={open}
-        onClose={handleClose}
-        title={spec.label}
-        unit={spec.unit}
-        formatValue={spec.format}
-        points={modalHistory.points}
-        source={modalHistory.source}
-        reason={modalHistory.reason}
-        windowMs={modalWindowMs}
-        onWindowChange={setModalWindowMs}
-        targetLabel={modalHistory.target_label}
-      />
-    </>
+      <span className="obs-cluster-tile__hint">{spec.hint}</span>
+      {useHistoryModal ? (
+        <MetricHistoryModal
+          open={open}
+          onClose={handleClose}
+          title={spec.label}
+          unit={spec.unit}
+          formatValue={spec.format}
+          points={modalHistory.points}
+          source={modalHistory.source}
+          reason={modalHistory.reason}
+          windowMs={modalWindowMs}
+          onWindowChange={setModalWindowMs}
+          targetLabel={modalHistory.target_label}
+        />
+      ) : null}
+    </div>
   );
 }

@@ -49,6 +49,7 @@ import {
   DEFAULT_STREAM_KEY,
 } from "../jobs/stream-retention.ts";
 import { registerAdminCalcRoutes } from "./admin-calc.ts";
+import { registerAdminDebugRoutes } from "./admin-debug.ts";
 import { cancelAllBulkRuns, haltBulkLoaderAccept, resumeBulkLoaderAccept } from "./ingest.ts";
 import { cancelAllActiveRuns } from "./generator.ts";
 import { runIngestCapacityTest, type CapacityTestOptions } from "../jobs/ingest-capacity-test.ts";
@@ -101,6 +102,8 @@ export function registerAdminRoutes(
   // under the same surface so a single import path (registerAdminRoutes)
   // wires every calc-side admin route.
   registerAdminCalcRoutes(app, getRedis);
+
+  registerAdminDebugRoutes(app, getRedis);
 
   // Wave 6.39.C — Layer 4 safety nets (drift-status, snapshots, stream-
   // status, reconcile-bucket). /metrics is owned by admin-calc.ts; the

@@ -42,7 +42,19 @@ export interface RecentRunTotal extends RecentRunCommon {
   cache_hits: number;
 }
 
-export type RecentRunEntry = RecentRunPerClass | RecentRunTotal;
+export type RecentRunEntry = RecentRunPerClass | RecentRunTotal | RecentRunFailed;
+
+export interface RecentRunFailed {
+  kind: "failed";
+  id: string;
+  ts: string;
+  calc_kind: "per_class" | "total";
+  risk_class?: string;
+  leg?: string;
+  error: string;
+  status_code: number;
+  request_id?: string;
+}
 
 // Caller-supplied input — id / ts are filled in here so every entry carries
 // a consistent ulid + server-stamped iso timestamp regardless of where in
@@ -65,6 +77,20 @@ export function pushRecentRun(input: RecentRunInput): RecentRunEntry {
     id: ulid(),
     ts: new Date().toISOString(),
   } as RecentRunEntry;
+  buffer.unshift(entry);
+  if (buffer.length > CAPACITY) buffer.length = CAPACITY;
+  return entry;
+}
+
+export function pushRecentFailure(
+  input: Omit<RecentRunFailed, "id" | "ts" | "kind">,
+): RecentRunFailed {
+  const entry: RecentRunFailed = {
+    kind: "failed",
+    id: ulid(),
+    ts: new Date().toISOString(),
+    ...input,
+  };
   buffer.unshift(entry);
   if (buffer.length > CAPACITY) buffer.length = CAPACITY;
   return entry;

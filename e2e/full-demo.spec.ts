@@ -156,6 +156,23 @@ async function installCommonRoutes(page: Page, opts: { activeName?: string } = {
   await page.route("**/observability/**", (route: Route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({}) }),
   );
+  await page.route("**/observability/debug**", (route: Route) =>
+    route.fulfill({
+      status: 200, contentType: "application/json",
+      body: JSON.stringify({
+        keys: { prefix: "sens:", dbsize: 10_000_000, sample: ["sens:01HXAA"], sample_size: 1, ms: 2 },
+        memory: {
+          used_memory: 2_147_483_648,
+          used_memory_human: "2.00G",
+          instantaneous_ops_per_sec: 101_100,
+          ms: 1,
+        },
+        index_count: { count: 10_000_000, refreshing: false, index_name: "idx:sens" },
+        calc_recent: { items: [] },
+        bootstrap: { phase: "ready", target_label: "demo", err: null },
+      }),
+    }),
+  );
   await page.route("**/observability/keys**", (route: Route) =>
     route.fulfill({
       status: 200, contentType: "application/json",

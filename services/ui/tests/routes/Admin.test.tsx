@@ -72,6 +72,35 @@ function routeFetch() {
         total_ms: 5000,
       }), { status: 200, headers: { "content-type": "application/json" } });
     }
+    if (url.includes("/admin/calc-jobs")) {
+      return new Response(JSON.stringify({ active: [] }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (url.includes("/admin/recent-errors")) {
+      return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (url.includes("/admin/logs")) {
+      return new Response(JSON.stringify({
+        tail: 200,
+        count: 1,
+        docker_hint: "docker compose logs api --tail=500",
+        items: [{ ts: "2026-06-23T12:00:00.000Z", level: "info", msg: "test line" }],
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (url.includes("/admin/debug-bundle")) {
+      return new Response(JSON.stringify({
+        generated_at: new Date().toISOString(),
+        target: { host: "127.0.0.1", port: 6379, label: "test", version: 1 },
+        bootstrap: { phase: "ready", target_label: "test", err: null, server_ready: true, server_boot_err: null },
+        backpressure: { heavy_inflight: 0, heavy_limit: 4, light_inflight: 0, light_limit: 8 },
+        runtime_pools: { heavy_calc: 2, heavy_ingest: 2, light: 4 },
+        cluster: null,
+        calc: { active_jobs: [], recent_runs: [] },
+        ingest: { generator_active: [], bulk_active: [], bulk_loader: null },
+        drift: { threshold_pct: 0.01, total_checks: 0, drift_count: 0, recent: [] },
+        inflight: { count: 0, items: [], stale: [] },
+        recent_errors: [],
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
     return new Response("not found", { status: 404 });
   }) as typeof fetch;
 }
@@ -96,6 +125,7 @@ describe("<Admin /> route", () => {
     expect(screen.getByRole("heading", { name: /^snapshots$/i, level: 2 })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: /^stream status$/i, level: 2 })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: /^reconcile bucket$/i, level: 2 })).toBeInTheDocument();
+    expect(screen.getByTestId("admin-per-shard-link")).toBeInTheDocument();
   });
 
   it("runs capacity test and shows recommended workers", async () => {

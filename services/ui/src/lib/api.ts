@@ -19,6 +19,7 @@ export interface ObservabilityMemoryResponse {
   maxmemory_bytes?: number;
   total_system_memory_bytes?: number;
   dbsize?: number;
+  instantaneous_ops_per_sec?: number;
   ms: number;
   [k: string]: number | string | undefined;
 }
@@ -73,6 +74,8 @@ async function getJson<T>(
 }
 
 const OBS_FETCH_OPTS = { retries: 4, retryDelayMs: 2_000 } as const;
+/** Debug bundle hits SCAN/INFO/DBSIZE — fail fast when Redis is busy with calc. */
+const OBS_DEBUG_OPTS = { retries: 1, retryDelayMs: 1_000 } as const;
 
 export function getObservabilityKeys(prefix = "sens:"): Promise<ObservabilityKeysResponse> {
   return getJson<ObservabilityKeysResponse>(`/observability/keys?prefix=${prefix}`, OBS_FETCH_OPTS);
@@ -80,6 +83,21 @@ export function getObservabilityKeys(prefix = "sens:"): Promise<ObservabilityKey
 
 export function getObservabilityMemory(): Promise<ObservabilityMemoryResponse> {
   return getJson<ObservabilityMemoryResponse>(`/observability/memory`, OBS_FETCH_OPTS);
+}
+
+export interface ObservabilityDebugResponse {
+  keys: ObservabilityKeysResponse;
+  memory: ObservabilityMemoryResponse;
+  index_count: { count: number; refreshing: boolean; index_name: string | null };
+  calc_recent: RecentCalcRunsResponse;
+  bootstrap: { phase: string; target_label: string; err: string | null };
+}
+
+export function getObservabilityDebug(calcLimit = 10): Promise<ObservabilityDebugResponse> {
+  return getJson<ObservabilityDebugResponse>(
+    `/observability/debug?prefix=sens:&calc_limit=${calcLimit}`,
+    OBS_DEBUG_OPTS,
+  );
 }
 
 export function getObservabilityShards(): Promise<ObservabilityShardsResponse> {
@@ -138,7 +156,19 @@ export interface RecentCalcRunTotal extends RecentCalcRunCommon {
   cells_empty: number;
   cache_hits: number;
 }
-export type RecentCalcRun = RecentCalcRunPerClass | RecentCalcRunTotal;
+export type RecentCalcRun = RecentCalcRunPerClass | RecentCalcRunTotal | RecentCalcRunFailed;
+
+export interface RecentCalcRunFailed {
+  kind: "failed";
+  id: string;
+  ts: string;
+  calc_kind: "per_class" | "total";
+  risk_class?: string;
+  leg?: string;
+  error: string;
+  status_code: number;
+  request_id?: string;
+}
 export interface RecentCalcRunsResponse { items: RecentCalcRun[] }
 
 export function getRecentCalcRuns(limit = 5): Promise<RecentCalcRunsResponse> {

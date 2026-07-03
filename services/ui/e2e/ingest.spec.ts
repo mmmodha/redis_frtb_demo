@@ -2,6 +2,19 @@ import { test, expect } from "@playwright/test";
 
 // Default routes used by the shell scaffold; tests below override per-case.
 test.beforeEach(async ({ page }) => {
+  await page.route("**/observability/debug**", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        keys: { prefix: "sens:", dbsize: 0, sample: [], sample_size: 0, ms: 0 },
+        memory: { used_memory: 0, used_memory_human: "0B", instantaneous_ops_per_sec: 0, ms: 0 },
+        index_count: { count: 0, refreshing: false, index_name: null },
+        calc_recent: { items: [] },
+        bootstrap: { phase: "ready", target_label: "local", err: null },
+      }),
+    }),
+  );
   await page.route("**/observability/shards", (route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ shards: [] }) }),
   );

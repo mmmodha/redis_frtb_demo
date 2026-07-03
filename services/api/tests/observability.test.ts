@@ -110,4 +110,46 @@ describe("GET /observability/memory", () => {
     const body = res.json() as { error?: string };
     expect(body.error ?? "").toMatch(/busy/i);
   });
+
+  it("includes instantaneous_ops_per_sec from INFO stats", async () => {
+    const fr = fakeRedis();
+    fr.setInfo(
+      "# Memory\r\nused_memory:1048576\r\nused_memory_human:1.00M\r\nmaxmemory:0\r\n"
+      + "# Stats\r\ninstantaneous_ops_per_sec:4200\r\n",
+    );
+    app = await createServer({ redis: fr });
+    const res = await app.inject({ method: "GET", url: "/observability/memory" });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().instantaneous_ops_per_sec).toBe(4200);
+    const infoCalls = fr.calls.filter((c) => c.command === "INFO");
+    expect(infoCalls.some((c) => c.args[0] === "stats")).toBe(true);
+  });
+});
+
+describe("GET /observability/debug", () => {
+  let app: Awaited<ReturnType<typeof createServer>>;
+  afterEach(async () => {
+    if (app) await app.close();
+  });
+
+  it("bundles keys, memory, index_count, calc_recent, and bootstrap without shards", async () => {
+    const fr = fakeRedis();
+    fr.setDbsize(50);
+    fr.setScan("0", ["sens:a", "sens:b"]);
+    fr.setInfo(
+      "# Memory\r\nused_memory:2048\r\nused_memory_human:2K\r\nmaxmemory:0\r\n"
+      + "# Stats\r\ninstantaneous_ops_per_sec:99\r\n",
+    );
+    app = await createServer({ redis: fr });
+    const res = await app.inject({ method: "GET", url: "/observability/debug?prefix=sens:" });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.keys.dbsize).toBe(50);
+    expect(body.keys.sample).toEqual(["sens:a", "sens:b"]);
+    expect(body.memory.instantaneous_ops_per_sec).toBe(99);
+    expect(body.index_count).toMatchObject({ count: expect.any(Number), refreshing: expect.any(Boolean) });
+    expect(body.calc_recent.items).toEqual(expect.any(Array));
+    expect(body.bootstrap.phase).toBeDefined();
+    expect(body.shards).toBeUndefined();
+  });
 });

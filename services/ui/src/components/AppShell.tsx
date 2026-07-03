@@ -28,6 +28,7 @@ export interface AppShellProps {
 export function AppShell({ children }: AppShellProps) {
   const [target, setTarget] = useState<ActiveTarget | null>(null);
   const [state, setState] = useState<ActiveTargetState>("disconnected");
+  const [navOpen, setNavOpen] = useState(false);
   const { phase: bootstrapPhase } = useBootstrapStatus();
   const burstCtx = useContext(PivotBurstContext);
   const generatorCtx = useContext(GeneratorRunContext);
@@ -65,22 +66,58 @@ export function AppShell({ children }: AppShellProps) {
     return () => window.removeEventListener("connections:active-changed", onChanged);
   }, [refreshTarget]);
 
+  useEffect(() => {
+    setNavOpen(false);
+  }, [location.pathname]);
+
+  useEffect(() => {
+    if (!navOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setNavOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [navOpen]);
+
   return (
-    <div className="app-shell">
+    <div className={`app-shell${navOpen ? " app-shell--nav-open" : ""}`}>
       <header className="app-shell__header" role="banner">
+        <button
+          type="button"
+          className="app-shell__nav-toggle"
+          data-testid="app-shell-nav-toggle"
+          aria-label={navOpen ? "Close navigation menu" : "Open navigation menu"}
+          aria-expanded={navOpen}
+          aria-controls="app-shell-primary-nav"
+          onClick={() => setNavOpen((v) => !v)}
+        >
+          <span className="app-shell__nav-toggle-icon" aria-hidden="true" />
+        </button>
         <span className="app-shell__brand-mark" aria-hidden="true" />
         <span className="app-shell__brand">FRTB SBM</span>
         <span className="app-shell__brand-sub">· on Redis Enterprise</span>
         <div className="app-shell__header-spacer" />
         <ActiveTargetPill target={target} state={state} bootstrapPhase={bootstrapPhase} />
       </header>
-      <nav className="app-shell__nav" aria-label="Primary">
+      <button
+        type="button"
+        className="app-shell__nav-backdrop"
+        aria-label="Close navigation menu"
+        tabIndex={navOpen ? 0 : -1}
+        onClick={() => setNavOpen(false)}
+      />
+      <nav
+        id="app-shell-primary-nav"
+        className="app-shell__nav"
+        aria-label="Primary"
+      >
         <ul>
           {SECTIONS.map((s) => (
             <li key={s.to}>
               <NavLink
                 to={s.to}
                 className={({ isActive }) => (isActive ? "is-active" : undefined)}
+                onClick={() => setNavOpen(false)}
               >
                 {s.label}
               </NavLink>

@@ -1,4 +1,7 @@
 import Fastify, { type FastifyInstance } from "fastify";
+import { randomUUID } from "node:crypto";
+import { Writable } from "node:stream";
+import pino from "pino";
 import fastifyCors from "@fastify/cors";
 import type { Schema } from "@frtb/schema";
 import type { RedisLike } from "./redis-like.ts";
@@ -36,6 +39,8 @@ import { registerInternalTargetRoutes } from "./routes/internal-target.ts";
 import * as inflight from "./inflight-registry.ts";
 import { corsHeadersForRequest } from "./cors-headers.ts";
 import { registerBackpressure } from "./backpressure.ts";
+import { pushRecentError } from "./ops/recent-errors.ts";
+import { appendLog, ingestPinoLine } from "./ops/log-buffer.ts";
 import type { ConnectionsStore as RealConnectionsStore } from "./store.ts";
 // Wave 6.21 (B1) — side-effect import: brings the FastifyContextConfig.category
 // + FastifyRequest.poolCategory module augmentation into scope so route files
@@ -181,8 +186,55 @@ function parseAllowedOrigins(raw: string | undefined): true | string | string[] 
   return list;
 }
 
+function buildPinoLoggerConfig(): { level: string; stream: pino.MultiStreamRes } {
+  const ring = new Writable({
+    write(chunk, _encoding, callback) {
+      ingestPinoLine(chunk.toString());
+      callback();
+    },
+  });
+  return {
+    level: process.env.LOG_LEVEL ?? "info",
+    stream: pino.multistream([
+      { stream: process.stdout },
+      { stream: ring },
+    ]),
+  };
+}
+
 export async function createServer(opts: CreateServerOpts): Promise<FastifyInstance> {
-  const app = Fastify({ logger: opts.logger ?? false });
+  const app = Fastify({
+    logger: opts.logger ? buildPinoLoggerConfig() : false,
+    requestIdHeader: "x-request-id",
+    genReqId: (req) => {
+      const hdr = req.headers["x-request-id"];
+      if (typeof hdr === "string" && hdr.length > 0) return hdr;
+      return randomUUID();
+    },
+  });
+
+  app.setErrorHandler((err: unknown, req, reply) => {
+    const e = err instanceof Error ? err : new Error(String(err));
+    const status = (err as { statusCode?: number }).statusCode ?? 500;
+    const message = e.message || "Internal Server Error";
+    if (status >= 500) {
+      pushRecentError({
+        request_id: req.id,
+        method: req.method,
+        route: (req.url.split("?", 1)[0] ?? req.url),
+        status_code: status,
+        error: message,
+        detail: e.stack?.split("\n").slice(0, 4).join("\n"),
+      });
+    }
+    if (!reply.sent) {
+      reply.status(status).send({
+        error: message,
+        request_id: req.id,
+        statusCode: status,
+      });
+    }
+  });
 
   // Wave 5.16g — register CORS before any route so OPTIONS preflight is
   // handled for every endpoint (including the dynamically-loaded
@@ -226,6 +278,19 @@ export async function createServer(opts: CreateServerOpts): Promise<FastifyInsta
   // exempts /healthz, /readyz, /redis/active-target*, /inflight*, and SSE
   // streams). Defaults from MAX_INFLIGHT_HEAVY / MAX_INFLIGHT_LIGHT.
   registerBackpressure(app);
+
+  app.addHook("onResponse", async (req, reply) => {
+    if (reply.statusCode >= 400) {
+      const route = req.url.split("?", 1)[0] ?? req.url;
+      appendLog({
+        level: reply.statusCode >= 500 ? "error" : "warn",
+        msg: `${req.method} ${route} → ${reply.statusCode}`,
+        request_id: req.id,
+        status_code: reply.statusCode,
+        route,
+      });
+    }
+  });
 
   if (opts.activeTarget) {
     setActiveTarget(opts.activeTarget);

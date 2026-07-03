@@ -11,6 +11,8 @@ import {
   readHistory,
   writeMetric,
 } from "../lib/timeseries.ts";
+import { listRecentRuns } from "../calc/recent-runs.ts";
+import { getSensKeyCountSnapshot } from "../lib/sens-key-count-cache.ts";
 
 const NUMERIC_INFO_FIELDS = new Set([
   "used_memory",
@@ -478,11 +480,14 @@ export function registerObservabilityRoutes(
     const target_label = getActiveTarget().label;
     const t0 = process.hrtime.bigint();
     try {
-      const [text, dbsize] = await Promise.all([
+      const [text, statsText, dbsize] = await Promise.all([
         redis.info("memory"),
+        redis.info("stats"),
         redis.dbsize(),
       ]);
       const parsed = parseInfo(text);
+      const statsParsed = parseInfo(statsText);
+      const instantaneous_ops_per_sec = Number(statsParsed.instantaneous_ops_per_sec ?? 0);
       // Wave 5.20a — surface cluster capacity for the UI's pre-submit sanity
       // check. `maxmemory_bytes`/`total_system_memory_bytes` are the same
       // numeric values already parsed from INFO memory under their canonical
@@ -492,11 +497,13 @@ export function registerObservabilityRoutes(
       const ms = Number(process.hrtime.bigint() - t0) / 1e6;
       const used_memory_bytes = Number(parsed.used_memory ?? 0);
       void writeMetric(redis, "memory_used_bytes", used_memory_bytes, target_label);
+      void writeMetric(redis, "ops_per_sec", instantaneous_ops_per_sec, target_label);
       return {
         ...parsed,
         maxmemory_bytes,
         total_system_memory_bytes,
         dbsize,
+        instantaneous_ops_per_sec,
         ms: Math.round(ms * 1000) / 1000,
       };
     } catch (err) {
@@ -508,6 +515,80 @@ export function registerObservabilityRoutes(
       throw err;
     }
   });
+
+  // Wave 7.1 — single poll bundle for the Observability page cluster + calc
+  // snapshot. Omits shard topology (unreliable on standalone/proxy targets).
+  // Active jobs / stream / drift stay on dedicated endpoints the UI polls
+  // from child cards.
+  app.get<{ Querystring: { prefix?: string; calc_limit?: string } }>(
+    "/observability/debug",
+    { config: { category: "light" } },
+    async (req, reply) => {
+      const prefix = req.query.prefix ?? "sens:";
+      const redis = await getRedis(req.poolCategory);
+      let target_label = "";
+      try { target_label = getActiveTarget().label; } catch { /* no target */ }
+      const bootstrap = getBootstrapStatus();
+      const calcLimitRaw = Number(req.query.calc_limit);
+      const calcLimit = Number.isFinite(calcLimitRaw) && calcLimitRaw > 0
+        ? Math.min(Math.floor(calcLimitRaw), 20)
+        : 10;
+      try {
+        const t0 = process.hrtime.bigint();
+        const [, keys] = await redis.scan("0", "MATCH", `${prefix}*`, "COUNT", "1000");
+        const [memText, statsText, dbsize] = await Promise.all([
+          redis.info("memory"),
+          redis.info("stats"),
+          redis.dbsize(),
+        ]);
+        const parsed = parseInfo(memText);
+        const statsParsed = parseInfo(statsText);
+        const maxmemory_bytes = Number(parsed.maxmemory ?? 0);
+        const total_system_memory_bytes = Number(parsed.total_system_memory ?? 0);
+        const used_memory_bytes = Number(parsed.used_memory ?? 0);
+        const instantaneous_ops_per_sec = Number(statsParsed.instantaneous_ops_per_sec ?? 0);
+        const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+        void writeMetric(redis, "total_keys", dbsize, target_label);
+        void writeMetric(redis, "memory_used_bytes", used_memory_bytes, target_label);
+        void writeMetric(redis, "ops_per_sec", instantaneous_ops_per_sec, target_label);
+        const index_count = target_label
+          ? await getSensKeyCountSnapshot(target_label, redis)
+          : { count: 0, refreshing: false, index_name: null };
+        return {
+          keys: {
+            prefix,
+            dbsize,
+            sample: keys.slice(0, 50),
+            sample_size: Math.min(keys.length, 50),
+            ms: Math.round(ms * 1000) / 1000,
+          },
+          memory: {
+            ...parsed,
+            used_memory: used_memory_bytes,
+            maxmemory_bytes,
+            total_system_memory_bytes,
+            dbsize,
+            instantaneous_ops_per_sec,
+            ms: Math.round(ms * 1000) / 1000,
+          },
+          index_count,
+          calc_recent: { items: listRecentRuns(calcLimit) },
+          bootstrap: {
+            phase: bootstrap.phase,
+            target_label: bootstrap.target_label ?? target_label,
+            err: bootstrap.err ?? null,
+          },
+        };
+      } catch (err) {
+        const translated = translateObservabilityRedisError(err, target_label, bootstrap.phase);
+        if (translated) {
+          reply.code(translated.status);
+          return translated.body;
+        }
+        throw err;
+      }
+    },
+  );
 
   app.get("/observability/shards", { config: { category: "light" } }, async (req, reply) => {
     const redis = await getRedis(req.poolCategory);

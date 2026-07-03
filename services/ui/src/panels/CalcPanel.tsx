@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent } from "react";
 import { BlockMath, InlineMath } from "react-katex";
 import { CommandPreview, EnterpriseCallout, PanelCard, Sparkline, TimingStrip } from "../components";
+import { CalcJobProgressBar } from "../components/CalcJobProgressBar";
 import { SuggestCombobox } from "../components/SuggestCombobox";
 import type { ShardTiming } from "../components/TimingStrip";
 import {
@@ -19,10 +20,13 @@ import {
   type TotalSbmResponse,
   type WsComponent,
 } from "../lib/calc";
+import type { CalcJobEntry } from "../lib/admin";
 import { EmptyTargetError } from "../lib/empty-target";
 import { formatCharge } from "../lib/format";
 import { fetchPivot, type PivotDoc, type PivotRow } from "../lib/pivot";
 import { useFacets } from "../hooks/useFacets";
+import { useCalcJobsPoll } from "../hooks/useCalcJobsPoll";
+import { findRunningPerClassJob, findRunningTotalJob } from "../lib/calcJobDisplay";
 import { useCalcRun } from "../context/CalcRunContext";
 import type { CalcResultContext } from "../lib/calcRunState";
 
@@ -310,6 +314,11 @@ export function CalcPanel() {
     clearTotalRun,
   } = useCalcRun();
   const loading = perClassLoading;
+  const { jobs: calcJobs } = useCalcJobsPoll(loading || totalLoading);
+  const perClassJob = loading
+    ? findRunningPerClassJob(calcJobs, riskClass, sensitivityType)
+    : null;
+  const totalJob = totalLoading ? findRunningTotalJob(calcJobs) : null;
   const result = perClassRun.result ?? null;
   const resultContext = perClassRun.resultContext ?? null;
   const error = perClassRun.error ?? null;
@@ -529,6 +538,9 @@ export function CalcPanel() {
             {loading ? "Calculating…" : "Calculate SBM risk charge"}
           </button>
         </div>
+        {loading ? (
+          <CalcJobProgressBar job={perClassJob} testId="calc-per-class-progress" />
+        ) : null}
         <AdvancedFilters
           open={advancedOpen}
           onToggle={(next) => {
@@ -586,6 +598,7 @@ export function CalcPanel() {
 
       <TotalSbmCard
         loading={totalLoading}
+        runningJob={totalJob}
         startedAt={totalRun.startedAt ?? null}
         finishedAt={totalRun.finishedAt ?? null}
         result={totalResult}
@@ -603,6 +616,7 @@ export function CalcPanel() {
 // concrete numbers (wall-clock vs cumulative ms, parallelism factor).
 function TotalSbmCard({
   loading,
+  runningJob,
   startedAt,
   finishedAt,
   result,
@@ -611,6 +625,7 @@ function TotalSbmCard({
   onDismiss,
 }: {
   loading: boolean;
+  runningJob: CalcJobEntry | null;
   startedAt: number | null;
   finishedAt: number | null;
   result: TotalSbmResponse | null;
@@ -674,6 +689,9 @@ function TotalSbmCard({
           </button>
         ) : null}
       </div>
+      {loading ? (
+        <CalcJobProgressBar job={runningJob} testId="calc-total-progress" />
+      ) : null}
       {loading ? <TotalSbmSkeletonGrid /> : null}
       {error ? (
         <div role="alert" className="calc-panel__error">
@@ -1752,6 +1770,7 @@ function CalcResult({
       </section>
 
       <PanelCard title="Per-bucket breakdown">
+        <div className="calc-panel__table-wrap">
         <table aria-label="per-bucket K_b breakdown" className="calc-panel__table">
           <thead>
             <tr>
@@ -1825,6 +1844,7 @@ function CalcResult({
             })}
           </tbody>
         </table>
+        </div>
       </PanelCard>
     </>
   );
@@ -2547,6 +2567,7 @@ function BucketDrilldown({
             onChange={setGroupBy}
           />
           {groupBy === "none" ? (
+          <div className="bucket-drilldown__table-wrap">
           <table className="bucket-drilldown__table" aria-label={`trades in bucket ${bucket}`}>
             <thead>
               <tr>
@@ -2598,6 +2619,7 @@ function BucketDrilldown({
               })}
             </tbody>
           </table>
+          </div>
           ) : (
             <BucketDrilldownGroups rows={state.rows} groupBy={groupBy} />
           )}
@@ -2712,6 +2734,7 @@ function BucketDrilldownGroups({ rows, groupBy }: { rows: PivotRow[]; groupBy: G
   }
 
   return (
+    <div className="bucket-drilldown__table-wrap">
     <table className="bucket-drilldown__table bucket-drilldown__groups" aria-label="grouped trades">
       <thead>
         <tr>
@@ -2730,6 +2753,7 @@ function BucketDrilldownGroups({ rows, groupBy }: { rows: PivotRow[]; groupBy: G
         ))}
       </tbody>
     </table>
+    </div>
   );
 }
 

@@ -426,6 +426,21 @@ describe("<CalcPanel /> — Total SBM progressive UX (Wave 5.96D)", () => {
           resolveTotal = res;
         });
       }
+      if (url.includes("/admin/calc-jobs")) {
+        return Promise.resolve(
+          new Response(JSON.stringify({
+            active: [{
+              id: "j1",
+              kind: "total",
+              status: "running",
+              started_at: new Date().toISOString(),
+              cells_total: 27,
+              cells_done: 9,
+              current_cell: "GIRR delta low",
+            }],
+          }), { headers: { "content-type": "application/json" } }),
+        );
+      }
       return Promise.resolve(
         new Response("{}", { headers: { "content-type": "application/json" } }),
       );
@@ -501,6 +516,18 @@ describe("<CalcPanel /> — Total SBM progressive UX (Wave 5.96D)", () => {
     deferred.resolve();
     await waitFor(() => expect(screen.getByTestId("calc-total-result")).toBeInTheDocument());
     expect(screen.queryByTestId("calc-total-skeleton")).toBeNull();
+  });
+
+  it("shows server-reported cell progress during total SBM in-flight", async () => {
+    const deferred = deferredTotalFetch(buildTotalResponse());
+    renderCalcPanel();
+    fireEvent.click(screen.getByTestId("calc-total-cta"));
+    await waitFor(() => expect(screen.getByTestId("calc-total-progress")).toBeInTheDocument());
+    expect(screen.getByTestId("calc-total-progress-fraction")).toHaveTextContent("9/27 (33%)");
+    expect(screen.getByTestId("calc-total-progress-cell")).toHaveTextContent(/GIRR delta low/i);
+
+    deferred.resolve();
+    await waitFor(() => expect(screen.queryByTestId("calc-total-progress")).toBeNull());
   });
 
   it("surfaces a 3×3×3 = 27 tooltip on the perf-chip describing the parallel kernel calls", async () => {
@@ -703,6 +730,21 @@ describe("<CalcPanel /> — Total SBM elapsed pill polish (Wave 6.02)", () => {
         return new Promise<Response>((res) => {
           resolveTotal = res;
         });
+      }
+      if (url.includes("/admin/calc-jobs")) {
+        return Promise.resolve(
+          new Response(JSON.stringify({
+            active: [{
+              id: "j1",
+              kind: "total",
+              status: "running",
+              started_at: new Date().toISOString(),
+              cells_total: 27,
+              cells_done: 9,
+              current_cell: "GIRR delta low",
+            }],
+          }), { headers: { "content-type": "application/json" } }),
+        );
       }
       return Promise.resolve(
         new Response("{}", { headers: { "content-type": "application/json" } }),

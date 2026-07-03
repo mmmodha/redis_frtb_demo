@@ -1,6 +1,118 @@
 /* Calc panel styles. Reserved for panel-specific rules; shared primitives
    (panel-card, metric-tile, btn) live in shell.css. */
 
+.calc-panel {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.calc-panel__callouts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: calc(var(--grid) * 2);
+  margin-bottom: calc(var(--grid) * 2);
+}
+
+.calc-panel__callouts .enterprise-callout {
+  margin-bottom: 0;
+}
+
+.calc-panel__callouts .enterprise-callout__body {
+  min-width: 0;
+  word-break: break-word;
+}
+
+.calc-panel__callouts code {
+  word-break: break-all;
+}
+
+.calc-panel__charge {
+  font-family: var(--font-mono);
+  font-size: clamp(1.75rem, 5vw, 2.5rem);
+  font-weight: 700;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+  color: var(--redis-text-primary);
+}
+
+.charge-tile__regime-badge {
+  display: inline-block;
+  padding: 0.125rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  border: 1px solid var(--redis-border-primary);
+  background: var(--redis-bg-tertiary);
+  color: var(--redis-text-secondary);
+  white-space: normal;
+  max-width: 100%;
+  word-break: break-word;
+}
+
+.calc-panel__wallclock {
+  display: inline-block;
+  max-width: 100%;
+  padding: 0.25rem 0.625rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.35;
+  white-space: normal;
+  word-break: break-word;
+  border: 1px solid transparent;
+  color: var(--redis-text-secondary);
+}
+
+.calc-panel__wallclock--green {
+  background: rgba(91, 211, 123, 0.10);
+  border-color: rgba(91, 211, 123, 0.45);
+  color: #5BD37B;
+}
+
+.calc-panel__wallclock--amber {
+  background: rgba(240, 180, 41, 0.12);
+  border-color: rgba(240, 180, 41, 0.50);
+  color: #f0b429;
+}
+
+.calc-panel__wallclock--red {
+  background: rgba(255, 68, 56, 0.12);
+  border-color: rgba(255, 68, 56, 0.50);
+  color: var(--redis-hyper, #FF4438);
+}
+
+.calc-panel__table-wrap {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.calc-panel__table {
+  width: 100%;
+  min-width: 28rem;
+  border-collapse: collapse;
+  font-size: 0.875rem;
+}
+
+.calc-panel__table th,
+.calc-panel__table td {
+  padding: calc(var(--grid) * 0.75) var(--grid);
+  text-align: left;
+  border-bottom: 1px solid var(--redis-border-secondary);
+}
+
+.calc-panel__table th {
+  color: var(--redis-text-secondary);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.calc-panel__advanced-toggles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: calc(var(--grid) * 1);
+}
+
 /* Wave 5.18: Basel-clause caption beneath the hero charge tile. Muted
    secondary text so it sits under the big number without competing. */
 .calc-panel__basel-caption {
@@ -166,6 +278,11 @@
   color: #dc382d;
   font-size: 0.875rem;
   padding: 0.25rem 0;
+}
+
+.bucket-drilldown__table-wrap {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
 }
 
 .bucket-drilldown__table {
@@ -1089,4 +1206,32 @@ button.drilldown-pill:focus-visible {
   border-color: var(--redis-hyper, #FF4438);
   color: var(--redis-hyper, #FF4438);
   outline: none;
+}
+
+/* Wave 7.2 — server-reported calc cell progress on /calc */
+.calc-job-progress {
+  margin-top: calc(var(--grid) * 1.25);
+  display: grid;
+  gap: calc(var(--grid) * 0.75);
+}
+.calc-job-progress__header {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: calc(var(--grid) * 0.5);
+  font-size: 0.8125rem;
+  color: var(--redis-text-secondary);
+}
+.calc-job-progress__cell code {
+  font-family: var(--font-mono);
+  color: var(--redis-text-primary);
+}
+.calc-job-progress__fraction {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--redis-text-primary);
+}
+.calc-job-progress__bar {
+  margin-top: 0;
 }

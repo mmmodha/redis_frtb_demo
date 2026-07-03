@@ -1209,6 +1209,26 @@ export function hasRunningGeneratorRuns(): boolean {
   return false;
 }
 
+export function listActiveGeneratorRuns(): Array<{
+  run_id: string;
+  status: string;
+  rows_done: number;
+  rows_total: number;
+}> {
+  const active: Array<{ run_id: string; status: string; rows_done: number; rows_total: number }> = [];
+  for (const entry of activeRuns.values()) {
+    if (entry.status === "running") {
+      active.push({
+        run_id: entry.run_id,
+        status: entry.status,
+        rows_done: entry.rows_done,
+        rows_total: entry.rows_total,
+      });
+    }
+  }
+  return active;
+}
+
 // Wave 6.44.E — proxy the halt-and-flush call to ingest. Returns the parsed
 // upstream report on success; `null` (with a logged warning) on any failure
 // so the caller can degrade to a partial-success banner without a 5xx. The
