@@ -13,6 +13,7 @@ import {
   type ActiveGeneratorRun,
   type BulkLoadStatus,
 } from "../lib/ingest";
+import { pickBulkRunProgress } from "../lib/ingestRunState";
 
 const POLL_MS = 2_000;
 /** Treat bulk-loader as actively draining when flush rate exceeds this. */
@@ -75,13 +76,12 @@ function fmtProgress(done: number, total: number): string {
   return `${done.toLocaleString("en-US")} / ${total.toLocaleString("en-US")} (${pct}%)`;
 }
 
-/** Rows written to Redis for this run — matches IngestSnapshotCard. */
-function bulkRunProgressDone(run: ActiveBulkIngestRun): number {
-  const written = run.rows_written;
-  if (typeof written === "number" && Number.isFinite(written) && written >= 0) {
-    return written;
-  }
-  return run.rows_sent;
+/** Rows written to Redis for this run — phase-aware + monotonic across polls. */
+function bulkRunProgressDone(
+  run: ActiveBulkIngestRun,
+  previous: number,
+): number {
+  return pickBulkRunProgress(run, previous);
 }
 
 export interface ActiveJobsCardProps {
@@ -97,6 +97,7 @@ export function ActiveJobsCard(props: ActiveJobsCardProps): JSX.Element {
   const [error, setError] = useState<string | null>(null);
   const [cancelling, setCancelling] = useState<string | null>(null);
   const flushSampleRef = useRef<{ flushed: number; t: number } | null>(null);
+  const bulkProgressRef = useRef<Map<string, number>>(new Map());
 
   const poll = useCallback(async () => {
     try {
@@ -115,6 +116,20 @@ export function ActiveJobsCard(props: ActiveJobsCardProps): JSX.Element {
         if (dt > 0 && delta > 0) flushRps = Math.round(delta / dt);
       }
       flushSampleRef.current = { flushed: flushedTotal, t: now };
+
+      const activeBulkIds = new Set(bulk.active.map((r) => r.run_id));
+      for (const id of bulkProgressRef.current.keys()) {
+        if (!activeBulkIds.has(id)) bulkProgressRef.current.delete(id);
+      }
+      for (const r of bulk.active) {
+        const prevDone = bulkProgressRef.current.get(r.run_id) ?? 0;
+        const done = bulkRunProgressDone(r, prevDone);
+        bulkProgressRef.current.set(r.run_id, done);
+        // #region agent log
+        fetch('http://127.0.0.1:7607/ingest/7ff27258-4498-4d23-9f58-aa9dac097748',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'fed362'},body:JSON.stringify({sessionId:'fed362',location:'ActiveJobsCard.tsx:poll',message:'bulk run progress tick',data:{runId:r.run_id,rows_sent:r.rows_sent,rows_written:r.rows_written,prevDone,done},timestamp:Date.now(),hypothesisId:'H2-H3'})}).catch(()=>{});
+        // #endregion
+      }
+
       const next = buildSnapshot(gen.active, bulk.active, load, flushRps);
       setSnap(next);
       setError(null);
@@ -221,7 +236,7 @@ export function ActiveJobsCard(props: ActiveJobsCardProps): JSX.Element {
                       {typeof r.workers === "number" ? ` · ${r.workers} workers` : ""}
                     </td>
                     <td><code>{r.run_id}</code></td>
-                    <td>{fmtProgress(bulkRunProgressDone(r), r.rows_total)}</td>
+                    <td>{fmtProgress(bulkProgressRef.current.get(r.run_id) ?? bulkRunProgressDone(r, 0), r.rows_total)}</td>
                     <td>
                       <button
                         type="button"

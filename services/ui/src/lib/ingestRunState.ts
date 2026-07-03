@@ -35,7 +35,39 @@ export function elapsedMsSince(iso: string, nowMs: number): number {
   return Math.max(0, nowMs - t);
 }
 
-/** Progress for the "Rows written" bar — loader flush delta, matching observability. */
+/** Monotonic bulk-ingest progress for UI display. */
+export function pickBulkRunProgress(
+  run: {
+    rows_sent: number;
+    rows_written?: number;
+    rows_total: number;
+    phase?: string;
+  },
+  previous: number = 0,
+): number {
+  const total = Number.isFinite(run.rows_total) && run.rows_total > 0 ? run.rows_total : 0;
+  const sent = Math.max(0, run.rows_sent ?? 0);
+  const written = typeof run.rows_written === "number" && Number.isFinite(run.rows_written) && run.rows_written >= 0
+    ? run.rows_written
+    : 0;
+
+  const inWritingPhase = run.phase === "writing" || run.phase === "draining"
+    || (total > 0 && sent >= total);
+
+  let raw: number;
+  if (inWritingPhase) {
+    // Producers done — track Redis writes; fall back to sent if loader snapshot missed.
+    raw = written > 0 ? written : sent;
+  } else {
+    // Producing — rows_sent is monotonic; rows_written can drop when loader probes miss replicas.
+    raw = Math.max(sent, written);
+  }
+
+  if (total > 0) raw = Math.min(total, raw);
+  return monotonicWritten(previous, raw);
+}
+
+/** Progress for the "Rows written" bar — phase-aware, monotonic, matches observability. */
 export function effectiveRunWritten(
   run: {
     status: string;
@@ -57,16 +89,13 @@ export function effectiveRunWritten(
   }
 
   if (run.status === "running") {
-    // Once the loader reports writes, track actual Redis progress (not producer rows_sent,
-    // which can sit at rows_total while the bulk-loader is still flushing).
-    if (flushed > 0) {
-      return total > 0 ? Math.min(total, flushed) : flushed;
-    }
-    // Producers stalled on bulk-loader 503s before any rows landed.
-    if (sent === 0 && retries >= 5) {
+    if (sent === 0 && retries >= 5 && flushed === 0) {
       return 0;
     }
-    return total > 0 ? Math.min(total, sent) : sent;
+    return pickBulkRunProgress(
+      { rows_sent: sent, rows_written: flushed, rows_total: total, phase: run.phase },
+      flushed,
+    );
   }
 
   const value = Math.max(flushed, sent);

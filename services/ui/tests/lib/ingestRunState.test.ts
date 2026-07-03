@@ -6,6 +6,7 @@ import {
   shouldShowProgressCard,
   formatRunSummary,
   elapsedMsSince,
+  pickBulkRunProgress,
   effectiveRunWritten,
   pickRunWriteRps,
   ingestStallHint,
@@ -48,6 +49,17 @@ describe("ingestRunState", () => {
     expect(elapsedMsSince(start, now)).toBe(3500);
   });
 
+  it("pickBulkRunProgress stays monotonic when rows_written drops to zero", () => {
+    const run = {
+      rows_sent: 4_400_000,
+      rows_written: 0,
+      rows_total: 50_000_000,
+      phase: "producing" as const,
+    };
+    expect(pickBulkRunProgress(run, 3_537_782)).toBe(4_400_000);
+    expect(pickBulkRunProgress(run, 4_400_000)).toBe(4_400_000);
+  });
+
   it("effectiveRunWritten tracks loader flush delta while producing", () => {
     expect(effectiveRunWritten(
       { status: "running", rows_total: 10_000, rows_sent: 0, rows_written: 6500, phase: "producing" },
@@ -61,6 +73,10 @@ describe("ingestRunState", () => {
       { status: "running", rows_total: 1_000_000, rows_sent: 200_000, rows_written: 450_000, phase: "producing" },
       450_000,
     )).toBe(450_000);
+    expect(effectiveRunWritten(
+      { status: "running", rows_total: 50_000_000, rows_sent: 4_400_000, rows_written: 0, phase: "producing" },
+      3_537_782,
+    )).toBe(4_400_000);
   });
 
   it("effectiveRunWritten keeps advancing during writing phase after producers finish", () => {

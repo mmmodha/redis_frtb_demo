@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { PanelCard } from "../PanelCard";
 import { getIngestSnapshot, type IngestSnapshot } from "../../lib/ingest";
+import { pickBulkRunProgress } from "../../lib/ingestRunState";
 
 const POLL_MS = 2_000;
 
@@ -12,12 +13,28 @@ function fmt(n: number): string {
 export function IngestSnapshotCard(): JSX.Element {
   const [snap, setSnap] = useState<IngestSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const progressRef = useRef<Map<string, number>>(new Map());
+  const [displayWritten, setDisplayWritten] = useState<number | null>(null);
 
   const poll = useCallback(async () => {
     try {
       const data = await getIngestSnapshot();
       setSnap(data);
       setError(null);
+      const focusedRun = data.focused_run_id
+        ? data.runs.find((r) => r.run_id === data.focused_run_id) ?? data.runs[0]
+        : data.runs[0];
+      if (focusedRun) {
+        const prev = progressRef.current.get(focusedRun.run_id) ?? 0;
+        const done = pickBulkRunProgress(focusedRun, prev);
+        progressRef.current.set(focusedRun.run_id, done);
+        setDisplayWritten(done);
+        // #region agent log
+        fetch('http://127.0.0.1:7607/ingest/7ff27258-4498-4d23-9f58-aa9dac097748',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'fed362'},body:JSON.stringify({sessionId:'fed362',location:'IngestSnapshotCard.tsx:poll',message:'snapshot progress tick',data:{runId:focusedRun.run_id,rows_sent:focusedRun.rows_sent,rows_written:focusedRun.rows_written,phase:focusedRun.phase,prev,done},timestamp:Date.now(),hypothesisId:'H2'})}).catch(()=>{});
+        // #endregion
+      } else {
+        setDisplayWritten(null);
+      }
     } catch (e) {
       setError((e as Error).message);
     }
@@ -73,7 +90,7 @@ export function IngestSnapshotCard(): JSX.Element {
                 <span className={`pill pill--${focused.status === "running" ? "ok" : "muted"}`}>{focused.status}</span>
                 <code className="obs-ingest-snap__run-id">{focused.run_id}</code>
                 <span className="obs-ingest-snap__run-meta">
-                  {fmt(focused.rows_written)} / {fmt(focused.rows_total)} rows
+                  {fmt(displayWritten ?? focused.rows_written)} / {fmt(focused.rows_total)} rows
                   {" · "}
                   {fmt(focused.rows_per_sec_write)} rows/s write
                 </span>
