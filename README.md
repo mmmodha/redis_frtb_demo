@@ -31,7 +31,7 @@ Eight application services. No Redis container; the active target is nominated a
 
 ```text
                                        ┌────────────────────────┐
-   browser ──► :3000 (ui) ──► :8080 (api) ──► │  Active Redis target  ☁  │
+   browser ──► :443 TLS (ui/nginx) ──► :8080 (api) ──► │  Active Redis target  ☁  │
                                     ▲          │  (OSS / Stack / Cloud  │
                                     │          │   / Enterprise)        │
    source ────────────────┐         │          └────────────────────────┘
@@ -58,7 +58,8 @@ Hard requirement: Redis **7.0+** (Functions are core from 7.0 onward) with the S
 
 ```bash
 scripts/docker-up.sh              # or: npm start
-open http://localhost:3000        # → Connections → Add → Test → Set active
+open https://localhost            # → Connections → Add → Test → Set active
+# Self-signed cert by default — accept the browser warning, or replace certs/.
 ```
 
 Full guide: [`docs/docker-deploy.md`](docs/docker-deploy.md) — includes the **400M-row ingest playbook** and calc tuning.
@@ -93,7 +94,8 @@ open http://localhost:3000
 
 ```bash
 docker compose up -d --wait --scale bulk-loader=4
-open http://localhost:3000
+# ensure certs first: scripts/ensure-tls-certs.sh
+open https://localhost
 ```
 
 ## Connecting Redis (cold vs warm)
@@ -200,24 +202,24 @@ Set via the `STORAGE_FORMAT` env on the ingest service. The default works for ev
 
 See [`.env.example`](.env.example) for the full annotated list, including per-service ports, TLS, pool sizing, and calc-path selectors.
 
-## Single-port deploy
+## Single-port deploy (TLS)
 
-Both deployment paths only need **port 3000** exposed externally. The UI server reverse-proxies every `/api/*` request to the api over loopback, so the browser never has to know the api's host or port.
+Docker Compose publishes **only HTTPS :443** on the host. The UI nginx terminates TLS and reverse-proxies every `/api/*` request to the api over the Compose network, so the browser never talks to the api's host or port.
 
 ```text
-browser ──► :3000 (UI) ──► 127.0.0.1:8080 (api)  ◄── same-origin /api/*
+browser ──► :443 TLS (UI/nginx) ──► api:8080  ◄── same-origin /api/*
                                   │
-                                  └── never exposed beyond the host
+                                  └── not published to the host
 ```
 
-- **Docker compose** — only the `ui` service needs a host-port binding. The `8080:8080` mapping on api is a convenience for local debugging; remove it (or block at the firewall) on a deploy VM. The UI reaches api via the compose-internal DNS name `api:8080`.
-- **Bare-metal (`scripts/run-local.sh`)** — services bind on `127.0.0.1` by default. Only `:3000` needs to be reachable from your browser.
+- **Docker compose** — only `443:443` on `ui` is bound. Certs mount from `./certs` (or `TLS_CERT_DIR`); `scripts/docker-up.sh` generates a self-signed pair if missing. Replace with a real cert for demos. The api and other services have **no** host-port bindings.
+- **Bare-metal (`scripts/run-local.sh`)** — services bind on `127.0.0.1` by default. Only `:3000` (HTTP) needs to be reachable from your browser for laptop debugging.
 
 ### Quick validation
 
 ```bash
-curl -fsS http://localhost:3000/healthz       # UI's own healthz
-curl -fsS http://localhost:3000/api/healthz   # api via the UI proxy — must NOT return HTML
+curl -fskS https://localhost/healthz       # UI's own healthz
+curl -fskS https://localhost/api/healthz   # api via the UI proxy — must NOT return HTML
 ```
 
 If the second call returns HTML, the bundle was built against an older `VITE_API_BASE` or the proxy block is missing — rebuild the UI image or re-run `scripts/run-local.sh doctor`.

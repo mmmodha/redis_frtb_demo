@@ -39,3 +39,7 @@ services/ui/test-results/
 
 # scripts/run-local.sh runtime state (PIDs, logs, env snapshot)
 .run/
+
+# TLS material for Docker UI (self-signed by scripts/ensure-tls-certs.sh)
+certs/tls.crt
+certs/tls.key

@@ -75,11 +75,12 @@ CONN_STORE_KEY=${conn_key}
 INTERNAL_API_TOKEN=${token}
 # REDIS_URL=redis://localhost:6379
 EOF
-  echo "  → Configure Redis via http://localhost:3000/connections (REDIS_URL optional)."
+  echo "  → Configure Redis via https://localhost/connections (REDIS_URL optional)."
 }
 
 cd "${REPO_ROOT}"
 ensure_env_local
+bash "${REPO_ROOT}/scripts/ensure-tls-certs.sh"
 
 echo "Starting FRTB stack (profile=${PROFILE}, bulk-loader replicas=${SCALE_BULK_LOADER})…"
 UP_ARGS=(-d --wait --scale "bulk-loader=${SCALE_BULK_LOADER}")
@@ -87,7 +88,8 @@ UP_ARGS=(-d --wait --scale "bulk-loader=${SCALE_BULK_LOADER}")
 "${COMPOSE[@]}" up "${UP_ARGS[@]}"
 
 echo ""
-echo "Stack healthy. Open http://localhost:3000 → Connections → Set active Redis target."
+echo "Stack healthy. Open https://localhost → Connections → Set active Redis target."
+echo "  (Self-signed cert by default — accept the browser warning, or replace certs/.)"
 echo "Bulk ingest: Ingest panel → Start preset (uses api → bulk-loader × ${SCALE_BULK_LOADER})."
 if [[ "${PROFILE}" == "400m" ]]; then
   echo ""

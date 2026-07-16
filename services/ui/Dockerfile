@@ -1,8 +1,9 @@
 # syntax=docker/dockerfile:1.7
 # Multi-stage build for the @frtb/ui Vite + React app.
 # Stage 1: node:20-alpine builds the SPA. Stage 2: nginx:alpine serves the
-# built dist/ on :3000 and answers /healthz for the compose healthcheck.
-# Built from the monorepo root so npm workspaces resolves @frtb/ui correctly.
+# built dist/ on :443 (TLS, host-published) and :3000 (container-local
+# healthcheck). Built from the monorepo root so npm workspaces resolves
+# @frtb/ui correctly.
 
 FROM node:20-alpine AS builder
 WORKDIR /app
@@ -40,4 +41,4 @@ RUN apk add --no-cache curl
 COPY services/ui/nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=builder /app/services/ui/dist /usr/share/nginx/html
 
-EXPOSE 3000
+EXPOSE 3000 443

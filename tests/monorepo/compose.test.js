@@ -86,4 +86,45 @@ describe('docker-compose.yml', () => {
     expect(Number(composeDefault(env.BULK_LOADER_POOL_SIZE))).toBeGreaterThanOrEqual(16);
     expect(Number(composeDefault(env.BULK_LOADER_BATCH_SIZE))).toBeGreaterThanOrEqual(2000);
   });
+
+  it('ui is the only host-published app port and it is TLS (:443)', () => {
+    const uiPorts = doc.services.ui.ports || [];
+    expect(uiPorts).toEqual(expect.arrayContaining(['443:443']));
+    expect(uiPorts.some((p) => String(p).includes('3000'))).toBe(false);
+
+    for (const name of APP_SERVICES) {
+      if (name === 'ui') continue;
+      const ports = doc.services[name].ports;
+      expect(ports, `service "${name}" must not publish host ports (reach via ui TLS proxy)`).toBeUndefined();
+    }
+  });
+
+  it('ui mounts TLS certs and ALLOWED_ORIGINS defaults to https://localhost', () => {
+    const vols = doc.services.ui.volumes || [];
+    const mountsCerts = vols.some((v) => {
+      const s = typeof v === 'string' ? v : `${v.source ?? ''}:${v.target ?? ''}`;
+      return s.includes('/etc/nginx/certs');
+    });
+    expect(mountsCerts, 'ui must mount TLS certs at /etc/nginx/certs').toBe(true);
+
+    const env = doc.services.api.environment || {};
+    expect(composeDefault(env.ALLOWED_ORIGINS)).toBe('https://localhost');
+  });
+});
+
+describe('services/ui/nginx.conf', () => {
+  const NGINX = resolve(ROOT, 'services/ui/nginx.conf');
+  let conf;
+
+  beforeAll(() => {
+    expect(existsSync(NGINX)).toBe(true);
+    conf = readFileSync(NGINX, 'utf8');
+  });
+
+  it('terminates TLS on 443 and keeps :3000 internal-only for healthchecks', () => {
+    expect(conf).toMatch(/listen\s+443\s+ssl/);
+    expect(conf).toMatch(/ssl_certificate\s+/);
+    expect(conf).toMatch(/ssl_certificate_key\s+/);
+    expect(conf).toMatch(/listen\s+3000/);
+  });
 });

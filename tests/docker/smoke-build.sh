@@ -41,7 +41,8 @@ for svc in "${SERVICES[@]}"; do
   log "  $svc: $HUMAN"
 done
 
-log "step 3: docker compose up -d ${SERVICES[*]}"
+log "step 3: ensure TLS certs + docker compose up -d ${SERVICES[*]}"
+bash scripts/ensure-tls-certs.sh
 if ! docker compose -p "$PROJECT" up -d "${SERVICES[@]}"; then
   fail "docker compose up exited non-zero"
 fi
@@ -62,8 +63,8 @@ log "  calc health: $CALC_STATE"
 [ "$UI_OK" = "1" ] || fail "ui did not reach healthy within 45s (last: $UI_STATE)"
 [ "$CALC_OK" = "1" ] || fail "calc did not reach healthy within 45s (last: $CALC_STATE)"
 
-log "step 5: curl host :3000 — must return real React shell"
-BODY=$(curl -fsS --max-time 5 http://localhost:3000/ 2>&1 || echo "")
+log "step 5: curl host :443 (TLS) — must return real React shell"
+BODY=$(curl -fskS --max-time 5 https://localhost/ 2>&1 || echo "")
 if printf '%s' "$BODY" | grep -q 'id="root"'; then
   log "  ui served React shell (found id=\"root\")"
 else

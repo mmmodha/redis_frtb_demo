@@ -6,7 +6,7 @@ const PORT = Number(process.env.UI_E2E_PORT ?? 5174);
 // the dev-server webServer block. Mocks mode (default) keeps the fast vite
 // dev-server flow exactly as before.
 const INTEGRATION = process.env.INTEGRATION === "1";
-const LIVE_BASE_URL = process.env.UI_BASE_URL ?? "http://localhost:3000";
+const LIVE_BASE_URL = process.env.UI_BASE_URL ?? "https://localhost";
 
 // Top-level e2e config — drives the UI dev server end-to-end through the
 // 11-step demo flow (e2e/full-demo.spec.ts). Per-panel happy-paths live
@@ -26,6 +26,8 @@ export default defineConfig({
     trace: process.env.CI ? "on-first-retry" : "retain-on-failure",
     screenshot: "only-on-failure",
     viewport: { width: 1440, height: 900 },
+    // Live Docker UI uses a self-signed cert by default.
+    ...(INTEGRATION ? { ignoreHTTPSErrors: true } : {}),
     // 30s per-action/navigation ceiling for live mode; mocks mode keeps the
     // Playwright default (0 = no per-action ceiling).
     ...(INTEGRATION ? { actionTimeout: 30_000, navigationTimeout: 30_000 } : {}),

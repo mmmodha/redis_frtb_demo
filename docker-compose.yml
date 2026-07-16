@@ -77,7 +77,7 @@ x-api-env: &api-env
   HEALTH_PORT: 8080
   CONN_STORE_FILE: /data/connections.enc.json
   CONN_STORE_KEY: ${CONN_STORE_KEY:-dev-only-change-in-prod}
-  ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000}
+  ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-https://localhost}
   SCHEMA_FILE: ${SCHEMA_FILE:-/app/config/schema/frtb-default.yaml}
   SOURCE_BASE: http://source:8082
   LOADGEN_BASE: http://loadgen:8085
@@ -123,8 +123,12 @@ services:
     environment:
       <<: *app-env
       HEALTH_PORT: 3000
+    # Only TLS is published. :3000 stays container-local for healthchecks.
     ports:
-      - "3000:3000"
+      - "443:443"
+    volumes:
+      # Self-signed by scripts/ensure-tls-certs.sh; override with TLS_CERT_DIR.
+      - ${TLS_CERT_DIR:-./certs}:/etc/nginx/certs:ro
     depends_on:
       api:
         condition: service_healthy
@@ -143,8 +147,7 @@ services:
     env_file: *env-file
     environment:
       <<: *api-env
-    ports:
-      - "8080:8080"
+    # No host ports — browser reaches api only via ui nginx /api/* on :443.
     volumes:
       - data:/data
     healthcheck:

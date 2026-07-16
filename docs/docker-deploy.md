@@ -13,7 +13,8 @@ cp .env.example .env.local   # or let scripts/docker-up.sh create a minimal file
 scripts/docker-up.sh
 
 # 3. Open the UI and nominate Redis
-open http://localhost:3000    # → Connections → Test → Set active
+open https://localhost        # → Connections → Test → Set active
+# Self-signed cert by default — accept the browser warning, or replace certs/.
 
 # 4. Bulk ingest from the Ingest panel (preset → Start)
 ```
@@ -21,8 +22,24 @@ open http://localhost:3000    # → Connections → Test → Set active
 Equivalent raw Compose:
 
 ```bash
+scripts/ensure-tls-certs.sh   # required once — self-signed under ./certs/
 docker compose up -d --wait --scale bulk-loader=4
 ```
+
+## TLS (HTTPS only)
+
+The host publishes **only** `443:443` on the `ui` service. nginx terminates TLS
+and proxies `/api/*` to `api:8080` on the internal Compose network. The API and
+other app services have **no** host-port bindings.
+
+| Path | Role |
+|------|------|
+| `./certs/tls.crt` + `tls.key` | Mounted into ui at `/etc/nginx/certs` |
+| `TLS_CERT_DIR` | Override cert directory (must contain those two files) |
+| `scripts/ensure-tls-certs.sh` | Creates a self-signed localhost cert if missing |
+
+Replace the self-signed pair with a real certificate before customer demos.
+Bare-metal `scripts/run-local.sh` still uses HTTP on `:3000` for laptop debug.
 
 ## Profiles
 
@@ -37,7 +54,7 @@ docker compose up -d --wait --scale bulk-loader=4
 
 | Service | Role |
 |---------|------|
-| `ui` | Browser entry (:3000), proxies `/api/*` |
+| `ui` | Browser entry (:443 TLS), proxies `/api/*` |
 | `api` | Gateway, bootstrap, bulk-ingest orchestrator, calc |
 | `bulk-loader` | Pooled HSET writer (scale horizontally) |
 | `ingest` | Live-tail stream consumer only |
