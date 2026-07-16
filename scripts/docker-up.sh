@@ -6,6 +6,7 @@
 #   scripts/docker-up.sh --dev        # single bulk-loader (laptop / dev-redis)
 #   scripts/docker-up.sh --scale 400m # 400M-row ingest profile (8 replicas)
 #   scripts/docker-up.sh --build      # force image rebuild
+#   PUBLIC_IP=x.x.x.x scripts/docker-up.sh   # embed VM IP in TLS SAN
 #
 # Requires Docker Engine 24+ and Compose v2. Redis is NOT started by this
 # stack — configure Redis via the UI Connections panel after boot (REDIS_URL
@@ -80,16 +81,34 @@ EOF
 
 cd "${REPO_ROOT}"
 ensure_env_local
-bash "${REPO_ROOT}/scripts/ensure-tls-certs.sh"
+
+TLS_OUT="$(bash "${REPO_ROOT}/scripts/ensure-tls-certs.sh")"
+printf '%s\n' "${TLS_OUT}"
+
+UI_RECREATE=()
+if grep -q 'TLS_CERTS_CHANGED=1' <<<"${TLS_OUT}"; then
+  UI_RECREATE=(--force-recreate ui)
+fi
+
+# Prefer the IP we embedded in the cert for the operator URL.
+PUBLIC_URL="https://localhost"
+if [[ -f "${REPO_ROOT}/certs/.public-ip" ]]; then
+  DETECTED_IP="$(tr -d '[:space:]' < "${REPO_ROOT}/certs/.public-ip")"
+  [[ -n "${DETECTED_IP}" ]] && PUBLIC_URL="https://${DETECTED_IP}"
+elif [[ -n "${PUBLIC_IP:-}" ]]; then
+  PUBLIC_URL="https://${PUBLIC_IP}"
+fi
 
 echo "Starting FRTB stack (profile=${PROFILE}, bulk-loader replicas=${SCALE_BULK_LOADER})…"
 UP_ARGS=(-d --wait --scale "bulk-loader=${SCALE_BULK_LOADER}")
 [[ "${FORCE_BUILD}" == "1" ]] && UP_ARGS=(--build "${UP_ARGS[@]}")
+[[ ${#UI_RECREATE[@]} -gt 0 ]] && UP_ARGS+=("${UI_RECREATE[@]}")
 "${COMPOSE[@]}" up "${UP_ARGS[@]}"
 
 echo ""
-echo "Stack healthy. Open https://localhost → Connections → Set active Redis target."
+echo "Stack healthy. Open ${PUBLIC_URL} → Connections → Set active Redis target."
 echo "  (Self-signed cert by default — accept the browser warning, or replace certs/.)"
+echo "  Tip: PUBLIC_IP=<ip> or TLS_HOSTNAMES=demo.example.com scripts/docker-up.sh"
 echo "Bulk ingest: Ingest panel → Start preset (uses api → bulk-loader × ${SCALE_BULK_LOADER})."
 if [[ "${PROFILE}" == "400m" ]]; then
   echo ""

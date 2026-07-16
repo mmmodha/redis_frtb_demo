@@ -36,10 +36,15 @@ other app services have **no** host-port bindings.
 |------|------|
 | `./certs/tls.crt` + `tls.key` | Mounted into ui at `/etc/nginx/certs` |
 | `TLS_CERT_DIR` | Override cert directory (must contain those two files) |
-| `scripts/ensure-tls-certs.sh` | Creates a self-signed localhost cert if missing |
+| `PUBLIC_IP` | Embed this IPv4 in the cert SAN (else auto-detect on the VM) |
+| `TLS_HOSTNAMES` | Extra DNS names (comma-separated) to embed in the SAN |
+| `TLS_SAN` | Full `subjectAltName` override |
+| `scripts/ensure-tls-certs.sh` | Creates/refreshes a self-signed cert covering localhost + public IP |
 
-Replace the self-signed pair with a real certificate before customer demos.
-Bare-metal `scripts/run-local.sh` still uses HTTP on `:3000` for laptop debug.
+On first boot (or when the public IP changes), the script regenerates the
+cert and `docker-up.sh` force-recreates `ui` so nginx picks it up. Browsers
+still warn on self-signed certs — replace with Let's Encrypt (DNS name) for
+customer demos.
 
 ## Profiles
 

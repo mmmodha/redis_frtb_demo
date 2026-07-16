@@ -43,3 +43,4 @@ services/ui/test-results/
 # TLS material for Docker UI (self-signed by scripts/ensure-tls-certs.sh)
 certs/tls.crt
 certs/tls.key
+certs/.public-ip
